@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+!Cargo.lock
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# ZenUI specific
+.zenui/
