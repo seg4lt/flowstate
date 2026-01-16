@@ -7,6 +7,7 @@ use serde_json::Value;
 pub enum ProviderKind {
     Codex,
     Claude,
+    #[serde(rename = "github_copilot")]
     GitHubCopilot,
 }
 
