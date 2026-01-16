@@ -1,0 +1,21 @@
+[package]
+name = "zenui-app-shell"
+version.workspace = true
+edition.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+tao.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+wry.workspace = true
+zenui-http-api = { path = "../http-api" }
+zenui-orchestration = { path = "../orchestration" }
+zenui-persistence = { path = "../persistence" }
+zenui-provider-api = { path = "../provider-api" }
+zenui-provider-claude-bridge = { path = "../provider-claude-bridge" }
+zenui-provider-codex = { path = "../provider-codex" }
+zenui-provider-github-copilot = { path = "../provider-github-copilot" }
+zenui-runtime-core = { path = "../runtime-core" }
