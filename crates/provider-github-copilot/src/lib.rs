@@ -438,50 +438,30 @@ async fn probe_copilot_cli(binary: &str) -> ProviderStatus {
     let kind = ProviderKind::GitHubCopilot;
     let label = kind.label();
 
-    // Check version
+    // Check version - copilot CLI doesn't have auth status command
+    // Authentication is determined when trying to start a session
     match Command::new(binary).arg("--version").output().await {
         Ok(version_output) => {
             let version = first_non_empty_line(&version_output.stdout)
                 .or_else(|| first_non_empty_line(&version_output.stderr));
 
-            // Check authentication status
-            match Command::new(binary).arg("auth").arg("status").output().await {
-                Ok(auth_output) => {
-                    let authenticated = auth_output.status.success();
-                    let message = if authenticated {
-                        Some(format!("{label} CLI is installed and authenticated."))
-                    } else {
-                        first_non_empty_line(&auth_output.stderr)
-                            .or_else(|| first_non_empty_line(&auth_output.stdout))
-                            .or_else(|| {
-                                Some(format!("{label} CLI is installed but not authenticated."))
-                            })
-                    };
-
-                    ProviderStatus {
-                        kind,
-                        label: label.to_string(),
-                        installed: true,
-                        authenticated,
-                        version,
-                        status: if authenticated {
-                            ProviderStatusLevel::Ready
-                        } else {
-                            ProviderStatusLevel::Warning
-                        },
-                        message,
-                    }
-                }
-                Err(error) => ProviderStatus {
-                    kind,
-                    label: label.to_string(),
-                    installed: true,
-                    authenticated: false,
-                    version,
-                    status: ProviderStatusLevel::Warning,
-                    message: Some(format!(
-                        "{label} CLI is installed, but auth probing failed: {error}"
-                    )),
+            let installed = version_output.status.success() || version.is_some();
+            
+            ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed,
+                authenticated: installed, // Will fail on session start if not authed
+                version,
+                status: if installed {
+                    ProviderStatusLevel::Ready
+                } else {
+                    ProviderStatusLevel::Error
+                },
+                message: if installed {
+                    Some(format!("{label} CLI is installed. Authentication verified on session start."))
+                } else {
+                    Some(format!("{label} CLI is not available."))
                 },
             }
         }
