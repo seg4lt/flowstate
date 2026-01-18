@@ -107,25 +107,33 @@ const PROVIDER_LABELS: Record<ProviderKind, string> = {
 
 // Traffic light component
 function TrafficLights() {
+  const sendCommand = (cmd: string) => {
+    // @ts-ignore - wry IPC
+    if (window.ipc?.postMessage) {
+      // @ts-ignore
+      window.ipc.postMessage(JSON.stringify({ cmd }));
+    }
+  };
+
   return (
     <div className="flex gap-2">
       <button
         className="w-3 h-3 rounded-full bg-[#ff5f57] hover:brightness-90 transition-all flex items-center justify-center group"
-        onClick={() => window.electron?.closeWindow?.()}
+        onClick={() => sendCommand("close")}
         aria-label="Close"
       >
         <X className="w-2 h-2 opacity-0 group-hover:opacity-100 text-black/60" />
       </button>
       <button
         className="w-3 h-3 rounded-full bg-[#febc2e] hover:brightness-90 transition-all flex items-center justify-center group"
-        onClick={() => window.electron?.minimizeWindow?.()}
+        onClick={() => sendCommand("minimize")}
         aria-label="Minimize"
       >
         <Minus className="w-2 h-2 opacity-0 group-hover:opacity-100 text-black/60" />
       </button>
       <button
         className="w-3 h-3 rounded-full bg-[#28c840] hover:brightness-90 transition-all flex items-center justify-center group"
-        onClick={() => window.electron?.maximizeWindow?.()}
+        onClick={() => sendCommand("maximize")}
         aria-label="Maximize"
       >
         <Square className="w-1.5 h-1.5 opacity-0 group-hover:opacity-100 text-black/60" />
@@ -228,6 +236,7 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [connectionStatus, setConnectionStatus] = useState<"connected" | "connecting" | "disconnected">("connecting");
+  const [lastAction, setLastAction] = useState<string>("Ready");
   const socketRef = useRef<WebSocket | null>(null);
 
   const activeSession = useMemo(
@@ -237,8 +246,14 @@ export default function App() {
 
   function send(message: unknown) {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify(message));
+    console.log("Send called, socket state:", socket?.readyState);
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      console.error("WebSocket not connected");
+      return;
+    }
+    const payload = JSON.stringify(message);
+    console.log("Sending:", payload);
+    socket.send(payload);
   }
 
   async function loadSnapshot() {
@@ -305,11 +320,15 @@ export default function App() {
               setSnapshot(payload.snapshot);
               break;
             case "session_created":
+              setLastAction(`Session created: ${payload.session.title}`);
               refreshSnapshot(payload.session.sessionId);
               break;
             case "event":
               if (payload.event.type === "turn_completed" || payload.event.type === "session_started") {
                 refreshSnapshot();
+              }
+              if (payload.event.type === "error") {
+                setLastAction(`Error: ${payload.event.message}`);
               }
               break;
           }
@@ -330,6 +349,7 @@ export default function App() {
   }, []);
 
   const startSession = (provider: ProviderKind) => {
+    setLastAction(`Creating ${PROVIDER_LABELS[provider]} session...`);
     send({ type: "start_session", provider, title: null });
   };
 
@@ -439,6 +459,8 @@ export default function App() {
               connectionStatus === "connecting" ? "bg-yellow-500" : "bg-red-500"
             }`} />
             <span className="capitalize">{connectionStatus}</span>
+            <span className="text-border">|</span>
+            <span className="text-foreground/70">{lastAction}</span>
           </div>
           <div className="flex items-center gap-3">
             <span>{snapshot.sessions.length} threads</span>
@@ -573,13 +595,4 @@ export default function App() {
   );
 }
 
-// Add window.electron type declaration
-declare global {
-  interface Window {
-    electron?: {
-      closeWindow?: () => void;
-      minimizeWindow?: () => void;
-      maximizeWindow?: () => void;
-    };
-  }
-}
+

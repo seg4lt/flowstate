@@ -118,7 +118,19 @@ impl RuntimeCore {
             .clone();
 
         let mut session = self.orchestration.create_session(provider, title);
-        session.provider_state = adapter.start_session(&session).await?;
+        tracing::info!("Session created in orchestration, calling adapter.start_session");
+        
+        match adapter.start_session(&session).await {
+            Ok(provider_state) => {
+                tracing::info!("Adapter start_session succeeded");
+                session.provider_state = provider_state;
+            }
+            Err(error) => {
+                tracing::error!(?error, "Adapter start_session failed");
+                return Err(format!("Failed to start {} session: {}", provider.label(), error));
+            }
+        }
+        
         self.persistence.upsert_session(session.clone()).await;
         self.publish(RuntimeEvent::SessionStarted {
             session: session.summary.clone(),

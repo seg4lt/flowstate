@@ -3708,6 +3708,8 @@ name = "zenui-app-shell"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
+ "serde_json",
  "tao",
  "tokio",
  "tracing-subscriber",
@@ -3794,6 +3796,7 @@ name = "zenui-provider-github-copilot"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
