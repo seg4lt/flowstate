@@ -1,0 +1,10 @@
+[package]
+name = "zenui-orchestration"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+chrono.workspace = true
+uuid.workspace = true
+zenui-provider-api = { path = "../provider-api" }

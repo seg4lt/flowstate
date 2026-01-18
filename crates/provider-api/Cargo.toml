@@ -1,0 +1,11 @@
+[package]
+name = "zenui-provider-api"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

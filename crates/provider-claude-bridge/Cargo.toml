@@ -1,0 +1,10 @@
+[package]
+name = "zenui-provider-claude-bridge"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+zenui-provider-api = { path = "../provider-api" }

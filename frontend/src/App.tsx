@@ -1,11 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Button } from "./components/ui/button";
+import { Badge } from "./components/ui/badge";
+import { Separator } from "./components/ui/separator";
+import { ScrollArea } from "./components/ui/scroll-area";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "./components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "./components/ui/tooltip";
+import { Plus, RefreshCw, Settings, X, Minus, Square, Send, MessageSquare, Bot } from "lucide-react";
 
 type ProviderKind = "codex" | "claude" | "github_copilot";
 type ProviderStatusLevel = "ready" | "warning" | "error";
 type SessionStatus = "ready" | "running" | "interrupted";
 type TurnStatus = "running" | "completed" | "interrupted" | "failed";
 
-type ProviderStatus = {
+interface ProviderStatus {
   kind: ProviderKind;
   label: string;
   installed: boolean;
@@ -13,18 +29,18 @@ type ProviderStatus = {
   version: string | null;
   status: ProviderStatusLevel;
   message: string | null;
-};
+}
 
-type TurnRecord = {
+interface TurnRecord {
   turnId: string;
   input: string;
   output: string;
   status: TurnStatus;
   createdAt: string;
   updatedAt: string;
-};
+}
 
-type SessionSummary = {
+interface SessionSummary {
   sessionId: string;
   provider: ProviderKind;
   title: string;
@@ -33,37 +49,31 @@ type SessionSummary = {
   updatedAt: string;
   lastTurnPreview: string | null;
   turnCount: number;
-};
+}
 
-type SessionDetail = {
+interface SessionDetail {
   summary: SessionSummary;
   turns: TurnRecord[];
-};
+}
 
-type AppSnapshot = {
+interface AppSnapshot {
   generatedAt: string;
   sessions: SessionDetail[];
-};
+}
 
-type BootstrapPayload = {
+interface BootstrapPayload {
   appName: string;
   generatedAt: string;
   wsUrl: string;
   providers: ProviderStatus[];
   snapshot: AppSnapshot;
-};
+}
 
 type RuntimeEvent =
   | { type: "runtime_ready"; message: string }
   | { type: "session_started"; session: SessionSummary }
   | { type: "turn_started"; sessionId: string; turn: TurnRecord }
-  | {
-      type: "content_delta";
-      sessionId: string;
-      turnId: string;
-      delta: string;
-      accumulatedOutput: string;
-    }
+  | { type: "content_delta"; sessionId: string; turnId: string; delta: string; accumulatedOutput: string }
   | { type: "turn_completed"; sessionId: string; session: SessionSummary; turn: TurnRecord }
   | { type: "session_interrupted"; session: SessionSummary; message: string }
   | { type: "error"; message: string }
@@ -78,132 +88,177 @@ type ServerMessage =
   | { type: "event"; event: RuntimeEvent }
   | { type: "error"; message: string };
 
-type ActivityEntry = {
-  id: string;
-  title: string;
-  body: string;
-  at: number;
-};
-
 const EMPTY_SNAPSHOT: AppSnapshot = {
   generatedAt: new Date(0).toISOString(),
   sessions: [],
 };
 
-function formatProvider(kind: ProviderKind) {
-  switch (kind) {
-    case "codex": return "Codex";
-    case "claude": return "Claude";
-    case "github_copilot": return "GitHub Copilot";
-  }
+const PROVIDER_COLORS: Record<ProviderKind, string> = {
+  codex: "bg-emerald-500",
+  claude: "bg-amber-500",
+  github_copilot: "bg-blue-500",
+};
+
+const PROVIDER_LABELS: Record<ProviderKind, string> = {
+  codex: "Codex",
+  claude: "Claude",
+  github_copilot: "GitHub Copilot",
+};
+
+// Traffic light component
+function TrafficLights() {
+  return (
+    <div className="flex gap-2">
+      <button
+        className="w-3 h-3 rounded-full bg-[#ff5f57] hover:brightness-90 transition-all flex items-center justify-center group"
+        onClick={() => window.electron?.closeWindow?.()}
+        aria-label="Close"
+      >
+        <X className="w-2 h-2 opacity-0 group-hover:opacity-100 text-black/60" />
+      </button>
+      <button
+        className="w-3 h-3 rounded-full bg-[#febc2e] hover:brightness-90 transition-all flex items-center justify-center group"
+        onClick={() => window.electron?.minimizeWindow?.()}
+        aria-label="Minimize"
+      >
+        <Minus className="w-2 h-2 opacity-0 group-hover:opacity-100 text-black/60" />
+      </button>
+      <button
+        className="w-3 h-3 rounded-full bg-[#28c840] hover:brightness-90 transition-all flex items-center justify-center group"
+        onClick={() => window.electron?.maximizeWindow?.()}
+        aria-label="Maximize"
+      >
+        <Square className="w-1.5 h-1.5 opacity-0 group-hover:opacity-100 text-black/60" />
+      </button>
+    </div>
+  );
 }
 
-function formatRelative(timestamp: string) {
-  const value = new Date(timestamp);
-  if (Number.isNaN(value.getTime())) return timestamp;
-
-  const seconds = Math.floor((Date.now() - value.getTime()) / 1000);
-  if (seconds < 10) return "just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
+// Title Bar Component
+function TitleBar() {
+  return (
+    <div className="h-[38px] bg-secondary border-b border-border flex items-center px-4 titlebar shrink-0">
+      <div className="flex items-center gap-3 titlebar-content w-full">
+        <TrafficLights />
+        <div className="flex items-center gap-2 ml-2">
+          <span className="font-semibold text-sm">ZenUI</span>
+          <Badge variant="secondary" className="text-[10px] h-4 px-1.5">Alpha</Badge>
+        </div>
+        <div className="flex-1" />
+        <div className="flex items-center gap-1">
+          <Tooltip>
+            <TooltipTrigger>
+              <Button variant="ghost" size="icon" className="h-7 w-7">
+                <Settings className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Settings</TooltipContent>
+          </Tooltip>
+        </div>
+      </div>
+    </div>
+  );
 }
 
-function activityId() {
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+// Thread Item Component
+function ThreadItem({
+  session,
+  isActive,
+  onClick,
+}: {
+  session: SessionDetail;
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  const { summary } = session;
+  const isRunning = summary.status === "running";
+
+  return (
+    <button
+      onClick={onClick}
+      className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left transition-colors ${
+        isActive
+          ? "bg-accent text-accent-foreground"
+          : "hover:bg-muted text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      <div className={`w-2 h-2 rounded-full shrink-0 ${PROVIDER_COLORS[summary.provider]}`} />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium truncate">{summary.title}</div>
+        <div className="text-xs text-muted-foreground truncate">
+          {isRunning ? (
+            <span className="flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-yellow-500 animate-pulse" />
+              Running...
+            </span>
+          ) : (
+            summary.lastTurnPreview || "No messages yet"
+          )}
+        </div>
+      </div>
+    </button>
+  );
 }
 
+// Provider Status Component
+function ProviderStatusItem({ status }: { status: ProviderStatus }) {
+  const statusColors: Record<ProviderStatusLevel, string> = {
+    ready: "bg-green-500",
+    warning: "bg-yellow-500",
+    error: "bg-red-500",
+  };
+
+  return (
+    <div className="flex items-center gap-2 px-2 py-1.5 rounded-md">
+      <div className={`w-2 h-2 rounded-full ${statusColors[status.status]}`} />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium">{status.label}</div>
+        <div className="text-xs text-muted-foreground truncate">
+          {status.installed ? (status.authenticated ? "Ready" : "Not authenticated") : "Not installed"}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Main App
 export default function App() {
   const [bootstrap, setBootstrap] = useState<BootstrapPayload | null>(null);
   const [snapshot, setSnapshot] = useState<AppSnapshot>(EMPTY_SNAPSHOT);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
-  const [transportState, setTransportState] = useState("Booting local runtime...");
-  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [connectionStatus, setConnectionStatus] = useState<"connected" | "connecting" | "disconnected">("connecting");
   const socketRef = useRef<WebSocket | null>(null);
-  const conversationRef = useRef<HTMLDivElement | null>(null);
 
   const activeSession = useMemo(
-    () => snapshot.sessions.find((session) => session.summary.sessionId === activeSessionId) ?? null,
-    [activeSessionId, snapshot.sessions],
+    () => snapshot.sessions.find((s) => s.summary.sessionId === activeSessionId) ?? null,
+    [activeSessionId, snapshot.sessions]
   );
-
-  function pushActivity(title: string, body = "") {
-    setActivity((current) => [{ id: activityId(), title, body, at: Date.now() }, ...current].slice(0, 6));
-  }
-
-  function applySnapshot(nextSnapshot: AppSnapshot, preferredSessionId?: string | null) {
-    setSnapshot(nextSnapshot);
-    setActiveSessionId((current) => {
-      const requested = preferredSessionId ?? current;
-      if (!nextSnapshot.sessions.length) return null;
-      if (requested && nextSnapshot.sessions.some((session) => session.summary.sessionId === requested)) {
-        return requested;
-      }
-      return nextSnapshot.sessions[0].summary.sessionId;
-    });
-  }
-
-  async function loadSnapshot() {
-    const response = await fetch("/api/snapshot");
-    if (!response.ok) {
-      throw new Error(`Snapshot failed with ${response.status}`);
-    }
-    return (await response.json()) as AppSnapshot;
-  }
-
-  async function refreshSnapshot(preferredSessionId?: string | null) {
-    try {
-      const nextSnapshot = await loadSnapshot();
-      applySnapshot(nextSnapshot, preferredSessionId);
-    } catch (error) {
-      pushActivity("Snapshot error", error instanceof Error ? error.message : String(error));
-    }
-  }
 
   function send(message: unknown) {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) {
-      pushActivity("Transport closed", "The websocket is not connected yet.");
-      return;
-    }
-
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify(message));
   }
 
-  function handleRuntimeEvent(event: RuntimeEvent) {
-    switch (event.type) {
-      case "runtime_ready":
-        pushActivity("Runtime ready", event.message);
-        break;
-      case "session_started":
-        pushActivity("Thread started", event.session.title);
-        void refreshSnapshot(event.session.sessionId);
-        break;
-      case "turn_started":
-        pushActivity("Turn started", event.turn.input);
-        break;
-      case "content_delta":
-        pushActivity("Response received", event.delta.slice(0, 160));
-        break;
-      case "turn_completed":
-        pushActivity("Turn completed", event.turn.output.slice(0, 160));
-        void refreshSnapshot(event.session.sessionId);
-        break;
-      case "session_interrupted":
-        pushActivity("Thread interrupted", event.message);
-        void refreshSnapshot(event.session.sessionId);
-        break;
-      case "error":
-        pushActivity("Runtime error", event.message);
-        break;
-      case "info":
-        pushActivity("Info", event.message);
-        break;
+  async function loadSnapshot() {
+    try {
+      const response = await fetch("/api/snapshot");
+      if (!response.ok) throw new Error(`Failed: ${response.status}`);
+      return (await response.json()) as AppSnapshot;
+    } catch (error) {
+      console.error("Snapshot error:", error);
+      return EMPTY_SNAPSHOT;
+    }
+  }
+
+  async function refreshSnapshot(preferredSessionId?: string | null) {
+    const nextSnapshot = await loadSnapshot();
+    setSnapshot(nextSnapshot);
+    if (preferredSessionId && nextSnapshot.sessions.some((s) => s.summary.sessionId === preferredSessionId)) {
+      setActiveSessionId(preferredSessionId);
+    } else if (nextSnapshot.sessions.length > 0 && !activeSessionId) {
+      setActiveSessionId(nextSnapshot.sessions[0].summary.sessionId);
     }
   }
 
@@ -213,70 +268,59 @@ export default function App() {
     async function boot() {
       try {
         const response = await fetch("/api/bootstrap");
-        if (!response.ok) {
-          throw new Error(`Bootstrap failed with ${response.status}`);
-        }
+        if (!response.ok) throw new Error(`Bootstrap failed: ${response.status}`);
 
         const nextBootstrap = (await response.json()) as BootstrapPayload;
         if (disposed) return;
 
         setBootstrap(nextBootstrap);
-        applySnapshot(nextBootstrap.snapshot);
-        setTransportState("Bootstrapped");
-        pushActivity("Bootstrap loaded", `Loaded ${nextBootstrap.appName}.`);
+        setSnapshot(nextBootstrap.snapshot);
+        if (nextBootstrap.snapshot.sessions.length > 0) {
+          setActiveSessionId(nextBootstrap.snapshot.sessions[0].summary.sessionId);
+        }
 
         const socket = new WebSocket(nextBootstrap.wsUrl);
         socketRef.current = socket;
 
         socket.addEventListener("open", () => {
           if (disposed) return;
-          setTransportState("Connected");
-          pushActivity("Connected", "Local websocket runtime is online.");
+          setConnectionStatus("connected");
         });
 
         socket.addEventListener("close", () => {
           if (disposed) return;
-          setTransportState("Disconnected");
-          pushActivity("Disconnected", "Websocket connection closed.");
+          setConnectionStatus("disconnected");
         });
 
-        socket.addEventListener("message", (rawEvent) => {
+        socket.addEventListener("message", (event) => {
           if (disposed) return;
+          const payload = JSON.parse(event.data) as ServerMessage;
 
-          const payload = JSON.parse(rawEvent.data as string) as ServerMessage;
           switch (payload.type) {
             case "welcome":
               setBootstrap(payload.bootstrap);
-              applySnapshot(payload.bootstrap.snapshot, payload.bootstrap.snapshot.sessions[0]?.summary.sessionId ?? null);
+              setSnapshot(payload.bootstrap.snapshot);
               break;
             case "snapshot":
-              applySnapshot(payload.snapshot);
+              setSnapshot(payload.snapshot);
               break;
             case "session_created":
-              void refreshSnapshot(payload.session.sessionId);
-              break;
-            case "ack":
-              pushActivity("Ack", payload.message);
-              break;
-            case "error":
-              pushActivity("Error", payload.message);
+              refreshSnapshot(payload.session.sessionId);
               break;
             case "event":
-              handleRuntimeEvent(payload.event);
-              break;
-            case "pong":
-              pushActivity("Pong", "Server heartbeat received.");
+              if (payload.event.type === "turn_completed" || payload.event.type === "session_started") {
+                refreshSnapshot();
+              }
               break;
           }
         });
       } catch (error) {
-        if (disposed) return;
-        setTransportState("Bootstrap failed");
-        pushActivity("Bootstrap failed", error instanceof Error ? error.message : String(error));
+        console.error("Bootstrap error:", error);
+        setConnectionStatus("disconnected");
       }
     }
 
-    void boot();
+    boot();
 
     return () => {
       disposed = true;
@@ -285,253 +329,257 @@ export default function App() {
     };
   }, []);
 
-  useEffect(() => {
-    if (!conversationRef.current) return;
-    conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
-  }, [activeSession, snapshot]);
+  const startSession = (provider: ProviderKind) => {
+    send({ type: "start_session", provider, title: null });
+  };
 
-  const composerDisabled = !activeSession || prompt.trim().length === 0;
+  const sendTurn = () => {
+    if (!activeSession || !prompt.trim()) return;
+    send({
+      type: "send_turn",
+      session_id: activeSession.summary.sessionId,
+      input: prompt,
+    });
+    setPrompt("");
+  };
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="traffic">
-            <span />
-            <span />
-            <span />
-          </div>
-          <h1>ZenUI</h1>
-          <span className="badge">Alpha</span>
-        </div>
+    <div className="h-screen w-screen flex bg-background text-foreground overflow-hidden">
+      {/* Sidebar */}
+      <div className="w-[280px] flex flex-col bg-secondary border-r border-border">
+        <TitleBar />
+        
+        <ScrollArea className="flex-1">
+          <div className="p-3 space-y-4">
+            {/* Threads Section */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between px-2">
+                <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Threads</h2>
+                <div className="flex gap-1">
+                  <Tooltip>
+                    <TooltipTrigger>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6"
+                        onClick={() => refreshSnapshot()}
+                      >
+                        <RefreshCw className="h-3.5 w-3.5" />
+                      </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>Refresh</TooltipContent>
+                  </Tooltip>
+                  
+                  <DropdownMenu>
+                    <Tooltip>
+                      <TooltipTrigger>
+                        <DropdownMenuTrigger>
+                          <Button variant="ghost" size="icon" className="h-6 w-6">
+                            <Plus className="h-3.5 w-3.5" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                      </TooltipTrigger>
+                      <TooltipContent>New Thread</TooltipContent>
+                    </Tooltip>
+                    <DropdownMenuContent align="start" className="w-48">
+                      <DropdownMenuItem onClick={() => startSession("codex")} className="gap-2">
+                        <div className="w-2 h-2 rounded-full bg-emerald-500" />
+                        New Codex Thread
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => startSession("claude")} className="gap-2">
+                        <div className="w-2 h-2 rounded-full bg-amber-500" />
+                        New Claude Thread
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => startSession("github_copilot")} className="gap-2">
+                        <div className="w-2 h-2 rounded-full bg-blue-500" />
+                        New Copilot Thread
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </div>
 
-        <section className="sidebar-section">
-          <h2 className="section-label">
-            <span>Threads</span>
-            <button type="button" onClick={() => send({ type: "load_snapshot" })}>
-              Refresh
-            </button>
-          </h2>
-          <div className="sidebar-actions">
-            <button
-              className="primary"
-              type="button"
-              onClick={() => send({ type: "start_session", provider: "codex", title: null })}
-            >
-              New Codex
-            </button>
-            <button
-              type="button"
-              onClick={() => send({ type: "start_session", provider: "claude", title: null })}
-            >
-              New Claude
-            </button>
-            <button
-              type="button"
-              onClick={() => send({ type: "start_session", provider: "github_copilot", title: null })}
-            >
-              New Copilot
-            </button>
-          </div>
-        </section>
-
-        <section className="sidebar-section sessions-panel">
-          <div className="session-list">
-            {snapshot.sessions.length === 0 ? (
-              <p className="muted">No threads yet. Start one above.</p>
-            ) : (
-              snapshot.sessions.map((session) => (
-                <button
-                  key={session.summary.sessionId}
-                  type="button"
-                  className={`session-item${session.summary.sessionId === activeSessionId ? " active" : ""}`}
-                  onClick={() => setActiveSessionId(session.summary.sessionId)}
-                >
-                  <header>
-                    <strong>{session.summary.title}</strong>
-                    <span className={`status-text status-${session.summary.status}`}>
-                      {session.summary.status}
-                    </span>
-                  </header>
-                  <p>
-                    {formatProvider(session.summary.provider)} · {session.summary.turnCount} turns
-                  </p>
-                  <p className="muted">{session.summary.lastTurnPreview ?? "No messages yet."}</p>
-                </button>
-              ))
-            )}
-          </div>
-        </section>
-
-        <section className="sidebar-section">
-          <h2 className="section-label">Providers</h2>
-          <div className="provider-list">
-            {(bootstrap?.providers ?? []).map((provider) => (
-              <article key={provider.kind} className={`provider-chip status-${provider.status}`}>
-                <header>
-                  <div className="status-block">
-                    <span className="provider-dot" />
-                    <strong>{provider.label}</strong>
+              <div className="space-y-1">
+                {snapshot.sessions.length === 0 ? (
+                  <div className="px-2 py-4 text-sm text-muted-foreground text-center">
+                    No threads yet
                   </div>
-                  <span>{provider.status}</span>
-                </header>
-                <p>
-                  {[
-                    provider.installed ? "installed" : "missing",
-                    provider.authenticated ? "authenticated" : "not authenticated",
-                    provider.version,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
-                <p className="muted">{provider.message ?? "No provider details."}</p>
-              </article>
-            ))}
-          </div>
-        </section>
+                ) : (
+                  snapshot.sessions.map((session) => (
+                    <ThreadItem
+                      key={session.summary.sessionId}
+                      session={session}
+                      isActive={session.summary.sessionId === activeSessionId}
+                      onClick={() => setActiveSessionId(session.summary.sessionId)}
+                    />
+                  ))
+                )}
+              </div>
+            </div>
 
-        <section className="sidebar-section">
-          <h2 className="section-label">Activity</h2>
-          <div className="activity-list">
-            {activity.length === 0 ? (
-              <p className="muted">No runtime events yet.</p>
-            ) : (
-              activity.map((entry) => (
-                <article key={entry.id} className="activity-item">
-                  <header>
-                    <strong>{entry.title}</strong>
-                    <span className="muted">{new Date(entry.at).toLocaleTimeString()}</span>
-                  </header>
-                  <p>{entry.body}</p>
-                </article>
-              ))
-            )}
-          </div>
-        </section>
+            <Separator />
 
-        <div className="sidebar-footer">
-          <span>{transportState}</span>
-          <span>Local</span>
+            {/* Providers Section */}
+            <div className="space-y-2">
+              <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-2">Providers</h2>
+              <div className="space-y-1">
+                {bootstrap?.providers.map((provider) => (
+                  <ProviderStatusItem key={provider.kind} status={provider} />
+                ))}
+              </div>
+            </div>
+          </div>
+        </ScrollArea>
+
+        {/* Status Bar */}
+        <div className="h-7 px-3 flex items-center justify-between text-[11px] text-muted-foreground border-t border-border bg-secondary">
+          <div className="flex items-center gap-2">
+            <div className={`w-1.5 h-1.5 rounded-full ${
+              connectionStatus === "connected" ? "bg-green-500" :
+              connectionStatus === "connecting" ? "bg-yellow-500" : "bg-red-500"
+            }`} />
+            <span className="capitalize">{connectionStatus}</span>
+          </div>
+          <div className="flex items-center gap-3">
+            <span>{snapshot.sessions.length} threads</span>
+          </div>
         </div>
-      </aside>
+      </div>
 
-      <main className="main">
-        <header className="toolbar">
-          <div className="toolbar-row">
-            <div className="toolbar-title">
-              <h2>{activeSession?.summary.title ?? "Select a thread"}</h2>
-              <p>
-                {activeSession?.summary.lastTurnPreview ??
-                  "Start a Codex or Claude thread from the left sidebar."}
-              </p>
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col bg-background">
+        {!activeSession ? (
+          <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground">
+            <div className="w-12 h-12 rounded-xl bg-muted flex items-center justify-center mb-4">
+              <MessageSquare className="w-6 h-6" />
             </div>
-
-            <div className="toolbar-actions">
-              <button
-                type="button"
-                disabled={!activeSession}
-                onClick={() => {
-                  if (!activeSession) return;
-                  send({ type: "interrupt_turn", session_id: activeSession.summary.sessionId });
-                }}
-              >
-                Interrupt
-              </button>
-            </div>
+            <h2 className="text-lg font-medium text-foreground mb-1">No active thread</h2>
+            <p className="text-sm max-w-xs text-center">
+              Select a thread from the sidebar or create a new one to get started
+            </p>
           </div>
-
-          <div className="toolbar-row">
-            <div className="toolbar-pills">
-              <span className="pill">{activeSession ? formatProvider(activeSession.summary.provider) : "No provider"}</span>
-              <span className={`pill status-${activeSession?.summary.status ?? "ready"}`}>
-                {activeSession?.summary.status ?? "idle"}
-              </span>
-              <span className="pill">{activeSession?.summary.turnCount ?? 0} turns</span>
-            </div>
-
-            <div className="toolbar-pills">
-              <span className="pill mono">{activeSession?.summary.sessionId ?? "No session"}</span>
-              <span className="pill">
-                {activeSession ? `Updated ${formatRelative(activeSession.summary.updatedAt)}` : "Not started"}
-              </span>
-            </div>
-          </div>
-        </header>
-
-        <section ref={conversationRef} className="conversation">
-          <div className="messages">
-            {!activeSession ? (
-              <div className="empty-state">
+        ) : (
+          <>
+            {/* Header */}
+            <div className="h-14 border-b border-border flex items-center justify-between px-6">
+              <div className="flex items-center gap-3">
+                <div className={`w-2.5 h-2.5 rounded-full ${PROVIDER_COLORS[activeSession.summary.provider]}`} />
                 <div>
-                  <strong>No active thread</strong>
-                  <p>Start a Codex or Claude thread from the left, then continue the conversation here.</p>
+                  <h1 className="font-semibold">{activeSession.summary.title}</h1>
+                  <p className="text-xs text-muted-foreground">
+                    {PROVIDER_LABELS[activeSession.summary.provider]} · {activeSession.summary.turnCount} turns
+                  </p>
                 </div>
               </div>
-            ) : activeSession.turns.length === 0 ? (
-              <div className="message system">
-                <div className="message-label">Session Ready</div>
-                <div className="bubble">
-                  Thread created for {formatProvider(activeSession.summary.provider)}. Send the first prompt below.
-                </div>
-              </div>
-            ) : (
-              activeSession.turns.flatMap((turn) => [
-                <div key={`${turn.turnId}-user`} className="message user">
-                  <div className="message-label">You</div>
-                  <div className="bubble">{turn.input}</div>
-                </div>,
-                <div key={`${turn.turnId}-assistant`} className="message assistant">
-                  <div className="message-meta">
-                    <div className="message-label">{formatProvider(activeSession.summary.provider)}</div>
-                    <span className={`status-text status-${turn.status}`}>{turn.status}</span>
-                  </div>
-                  <div className="bubble">{turn.output || "Awaiting response..."}</div>
-                </div>,
-              ])
-            )}
-          </div>
-        </section>
-
-        <footer className="composer-shell">
-          <div className="composer">
-            <textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              placeholder="Ask anything, continue the current thread, or start a new one from the sidebar."
-            />
-
-            <div className="composer-meta">
-              <div className="composer-left">
-                <span className="pill">{activeSession ? formatProvider(activeSession.summary.provider) : "No active provider"}</span>
-                <span className="pill">Local runtime</span>
-                <span className={`pill status-${activeSession?.summary.status ?? "ready"}`}>
-                  {activeSession?.summary.status ?? "ready"}
-                </span>
-              </div>
-
-              <div className="composer-right">
-                <div className="token-ring">{prompt.trim().length}</div>
-                <button
-                  className="primary"
-                  type="button"
-                  disabled={composerDisabled}
-                  onClick={() => {
-                    if (!activeSession || prompt.trim().length === 0) return;
-                    send({
-                      type: "send_turn",
-                      session_id: activeSession.summary.sessionId,
-                      input: prompt,
-                    });
-                    setPrompt("");
-                  }}
-                >
-                  Send
-                </button>
+              <div className="flex items-center gap-2">
+                {activeSession.summary.status === "running" && (
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() =>
+                      send({
+                        type: "interrupt_turn",
+                        session_id: activeSession.summary.sessionId,
+                      })
+                    }
+                  >
+                    Interrupt
+                  </Button>
+                )}
               </div>
             </div>
-          </div>
-        </footer>
-      </main>
+
+            {/* Conversation */}
+            <ScrollArea className="flex-1 p-6">
+              <div className="max-w-3xl mx-auto space-y-6">
+                {activeSession.turns.length === 0 ? (
+                  <div className="text-center text-muted-foreground py-12">
+                    <Bot className="w-8 h-8 mx-auto mb-3 opacity-50" />
+                    <p>Thread ready. Send your first message below.</p>
+                  </div>
+                ) : (
+                  activeSession.turns.map((turn) => (
+                    <div key={turn.turnId} className="space-y-4 animate-fade-in">
+                      {/* User Message */}
+                      <div className="flex gap-3">
+                        <div className="w-7 h-7 rounded-full bg-primary flex items-center justify-center shrink-0 text-primary-foreground text-xs font-medium">
+                          You
+                        </div>
+                        <div className="flex-1 pt-0.5">
+                          <p className="text-sm leading-relaxed">{turn.input}</p>
+                        </div>
+                      </div>
+
+                      {/* Assistant Message */}
+                      <div className="flex gap-3">
+                        <div className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 text-white text-xs font-medium ${PROVIDER_COLORS[activeSession.summary.provider]}`}>
+                          {PROVIDER_LABELS[activeSession.summary.provider][0]}
+                        </div>
+                        <div className="flex-1 pt-0.5 space-y-2">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium">
+                              {PROVIDER_LABELS[activeSession.summary.provider]}
+                            </span>
+                            {turn.status === "running" && (
+                              <Badge variant="secondary" className="text-[10px] h-4">Thinking...</Badge>
+                            )}
+                          </div>
+                          <div className="text-sm leading-relaxed whitespace-pre-wrap">
+                            {turn.output || (turn.status === "running" ? "..." : "")}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </ScrollArea>
+
+            {/* Composer */}
+            <div className="p-4 border-t border-border bg-secondary">
+              <div className="max-w-3xl mx-auto">
+                <div className="relative">
+                  <textarea
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        sendTurn();
+                      }
+                    }}
+                    placeholder="Ask anything..."
+                    className="w-full min-h-[80px] max-h-[200px] bg-background border border-input rounded-lg p-3 pr-12 resize-none focus:outline-none focus:ring-1 focus:ring-ring"
+                  />
+                  <Button
+                    size="icon"
+                    className="absolute bottom-3 right-3 h-8 w-8"
+                    disabled={!prompt.trim() || activeSession.summary.status === "running"}
+                    onClick={sendTurn}
+                  >
+                    <Send className="h-4 w-4" />
+                  </Button>
+                </div>
+                <div className="flex items-center justify-between mt-2 text-xs text-muted-foreground">
+                  <span>Press Enter to send, Shift+Enter for new line</span>
+                  <span>{prompt.length} chars</span>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
+}
+
+// Add window.electron type declaration
+declare global {
+  interface Window {
+    electron?: {
+      closeWindow?: () => void;
+      minimizeWindow?: () => void;
+      maximizeWindow?: () => void;
+    };
+  }
 }
