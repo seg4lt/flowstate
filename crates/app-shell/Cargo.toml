@@ -7,6 +7,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
+muda = "0.13"
 serde.workspace = true
 serde_json.workspace = true
 tao.workspace = true

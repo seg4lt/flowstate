@@ -3,6 +3,7 @@ name = "zenui-provider-github-copilot"
 version.workspace = true
 edition.workspace = true
 publish = false
+build = "build.rs"
 
 [dependencies]
 async-trait.workspace = true

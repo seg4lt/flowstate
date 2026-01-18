@@ -73,14 +73,36 @@ impl GitHubCopilotAdapter {
         info!("Spawning GitHub Copilot bridge process...");
 
         // Find the bridge script - look in several locations
-        let bridge_paths = [
-            // Development: relative to the crate
-            PathBuf::from("bridge/dist/index.js"),
-            PathBuf::from("crates/provider-github-copilot/bridge/dist/index.js"),
-            // Production: installed with the binary
-            PathBuf::from("./zenui-copilot-bridge/dist/index.js"),
-            PathBuf::from("/usr/share/zenui/copilot-bridge/dist/index.js"),
-        ];
+        // First, try to find relative to the current executable
+        let exe_path = std::env::current_exe().ok();
+        let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
+        
+        // Build-time location (via build.rs)
+        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
+        
+        let mut bridge_paths = vec![];
+        
+        // First check build output directory (embedded by build.rs)
+        if let Some(ref dir) = out_dir {
+            bridge_paths.push(dir.join("copilot-bridge.js"));
+        }
+        
+        // Development paths relative to working directory
+        bridge_paths.push(PathBuf::from("bridge/dist/index.js"));
+        bridge_paths.push(PathBuf::from("crates/provider-github-copilot/bridge/dist/index.js"));
+        bridge_paths.push(PathBuf::from("../crates/provider-github-copilot/bridge/dist/index.js"));
+        bridge_paths.push(PathBuf::from("../../crates/provider-github-copilot/bridge/dist/index.js"));
+        
+        // Add paths relative to the executable
+        if let Some(dir) = exe_dir {
+            bridge_paths.push(dir.join("copilot-bridge.js"));
+            bridge_paths.push(dir.join("bridge/dist/index.js"));
+            bridge_paths.push(dir.join("crates/provider-github-copilot/bridge/dist/index.js"));
+            bridge_paths.push(dir.join("../crates/provider-github-copilot/bridge/dist/index.js"));
+        }
+        
+        // Production system paths
+        bridge_paths.push(PathBuf::from("/usr/share/zenui/copilot-bridge/dist/index.js"));
 
         let bridge_path = bridge_paths
             .iter()
@@ -256,32 +278,47 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                     };
                 }
 
-                // Check if Copilot CLI is available
-                match Command::new("copilot").arg("--version").output().await {
-                    Ok(copilot_version) => {
-                        let copilot_ver = String::from_utf8_lossy(&copilot_version.stdout)
-                            .lines()
-                            .next()
-                            .map(|s| s.trim().to_string());
+                // Check if Copilot CLI is available (search common paths)
+                let copilot_paths = [
+                    "copilot",
+                    "/opt/homebrew/bin/copilot",
+                    "/usr/local/bin/copilot",
+                    "/home/linuxbrew/.linuxbrew/bin/copilot",
+                ];
+                
+                let mut copilot_found = None;
+                for path in &copilot_paths {
+                    if Command::new(path).arg("--version").output().await.is_ok() {
+                        copilot_found = Some(*path);
+                        break;
+                    }
+                }
+                
+                match copilot_found {
+                    Some(copilot_path) => {
+                        let copilot_ver = Command::new(copilot_path)
+                            .arg("--version")
+                            .output()
+                            .await
+                            .ok()
+                            .and_then(|o| String::from_utf8(o.stdout).ok())
+                            .and_then(|s| s.lines().next().map(|l| l.trim().to_string()));
                         
                         ProviderStatus {
                             kind,
                             label: label.to_string(),
                             installed: true,
-                            authenticated: copilot_version.status.success(),
+                            authenticated: true,
                             version: copilot_ver,
-                            status: if copilot_version.status.success() {
-                                ProviderStatusLevel::Ready
-                            } else {
-                                ProviderStatusLevel::Warning
-                            },
+                            status: ProviderStatusLevel::Ready,
                             message: Some(format!(
-                                "Node.js: {}, Copilot CLI available",
-                                version
+                                "Node.js: {}, Copilot CLI found at {}",
+                                version,
+                                copilot_path
                             )),
                         }
                     }
-                    Err(_) => ProviderStatus {
+                    None => ProviderStatus {
                         kind,
                         label: label.to_string(),
                         installed: true,

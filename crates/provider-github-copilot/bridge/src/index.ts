@@ -42,8 +42,30 @@ class CopilotBridge {
   private sessionId: string | null = null;
 
   async start(): Promise<void> {
+    // Find copilot binary in common locations
+    const copilotPaths = [
+      'copilot',
+      '/opt/homebrew/bin/copilot',
+      '/usr/local/bin/copilot',
+      '/home/linuxbrew/.linuxbrew/bin/copilot',
+    ];
+    
+    let copilotPath = 'copilot';
+    for (const path of copilotPaths) {
+      try {
+        // Check if path exists and is executable
+        const { execSync } = await import('child_process');
+        execSync(`${path} --version`, { stdio: 'ignore' });
+        copilotPath = path;
+        console.error(`[bridge] Found copilot at: ${path}`);
+        break;
+      } catch {
+        // Continue to next path
+      }
+    }
+
     // Spawn Copilot CLI in ACP server mode
-    this.copilotProcess = spawn('copilot', ['--acp', '--stdio'], {
+    this.copilotProcess = spawn(copilotPath, ['--acp', '--stdio'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,

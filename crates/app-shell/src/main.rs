@@ -14,6 +14,7 @@ enum WindowCommand {
     Minimize,
     Maximize,
     Close,
+    Drag { x: f64, y: f64 },
 }
 
 fn main() {
@@ -43,6 +44,9 @@ fn run() -> Result<()> {
         use tao::platform::macos::WindowExtMacOS;
         window.set_fullsize_content_view(true);
         window.set_titlebar_transparent(true);
+
+        // Initialize menu bar for copy/paste support
+        init_menu_bar();
     }
 
     let window_id = window.id();
@@ -61,6 +65,11 @@ fn run() -> Result<()> {
                         "minimize" => Some(WindowCommand::Minimize),
                         "maximize" => Some(WindowCommand::Maximize),
                         "close" => Some(WindowCommand::Close),
+                        "drag" => {
+                            let x = data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let y = data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            Some(WindowCommand::Drag { x, y })
+                        }
                         _ => None,
                     };
                     if let Some(command) = command {
@@ -90,6 +99,15 @@ fn run() -> Result<()> {
                 WindowCommand::Close => {
                     *control_flow = ControlFlow::Exit;
                 }
+                WindowCommand::Drag { .. } => {
+                    // Window dragging is handled by the drag_window API
+                    // This command is a placeholder for future drag implementation
+                    #[cfg(target_os = "macos")]
+                    {
+                        // On macOS with undecorated windows, dragging is handled
+                        // by the system when clicking on the title bar area
+                    }
+                }
             }
         }
 
@@ -104,4 +122,33 @@ fn run() -> Result<()> {
             _ => {}
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn init_menu_bar() {
+    use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+
+    // Create the menu bar
+    let menu_bar = Menu::new();
+
+    // Create Edit menu with copy/paste
+    let edit_menu = Submenu::new("Edit", true);
+    edit_menu.append(&PredefinedMenuItem::undo(None)).ok();
+    edit_menu.append(&PredefinedMenuItem::redo(None)).ok();
+    edit_menu.append(&PredefinedMenuItem::separator()).ok();
+    edit_menu.append(&PredefinedMenuItem::cut(None)).ok();
+    edit_menu.append(&PredefinedMenuItem::copy(None)).ok();
+    edit_menu.append(&PredefinedMenuItem::paste(None)).ok();
+    edit_menu.append(&PredefinedMenuItem::select_all(None)).ok();
+
+    // Add to menu bar
+    menu_bar.append(&edit_menu).ok();
+
+    // Initialize the menu bar for this window
+    menu_bar.init_for_nsapp();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn init_menu_bar() {
+    // No-op on non-macOS platforms
 }
