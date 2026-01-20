@@ -119,7 +119,22 @@ impl GitHubCopilotAdapter {
 
         info!("Using bridge at: {}", bridge_path.display());
 
-        let mut child = Command::new("node")
+        // Find Node.js binary
+        let node_paths = [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+            "/home/linuxbrew/.linuxbrew/bin/node",
+            "node",
+        ];
+        
+        let node_path = node_paths
+            .iter()
+            .find(|p| *p == &"node" || std::path::Path::new(p).exists())
+            .copied()
+            .ok_or_else(|| "Node.js not found. Install from https://nodejs.org".to_string())?;
+
+        let mut child = Command::new(node_path)
             .arg(&bridge_path)
             .current_dir(&self.working_directory)
             .stdin(Stdio::piped())
@@ -259,14 +274,23 @@ impl ProviderAdapter for GitHubCopilotAdapter {
     async fn health(&self) -> ProviderStatus {
         let kind = ProviderKind::GitHubCopilot;
         let label = kind.label();
+        
+        info!("Checking GitHub Copilot health...");
 
-        // Check if Node.js is available
-        match Command::new("node").arg("--version").output().await {
-            Ok(node_version) => {
-                let version = String::from_utf8_lossy(&node_version.stdout).trim().to_string();
-                let installed = node_version.status.success();
-
-                if !installed {
+        // Simple file existence check for Node.js
+        let node_paths = [
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+            "/home/linuxbrew/.linuxbrew/bin/node",
+        ];
+        
+        let node_found = node_paths.iter().find(|p| std::path::Path::new(p).exists());
+        
+        if node_found.is_none() {
+            // Try 'which node' as fallback
+            if let Ok(output) = Command::new("which").arg("node").output().await {
+                if !output.status.success() {
                     return ProviderStatus {
                         kind,
                         label: label.to_string(),
@@ -274,71 +298,39 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                         authenticated: false,
                         version: None,
                         status: ProviderStatusLevel::Error,
-                        message: Some("Node.js is not available. Required for GitHub Copilot SDK.".to_string()),
+                        message: Some("Node.js not found. Install from https://nodejs.org".to_string()),
                     };
                 }
-
-                // Check if Copilot CLI is available (search common paths)
-                let copilot_paths = [
-                    "copilot",
-                    "/opt/homebrew/bin/copilot",
-                    "/usr/local/bin/copilot",
-                    "/home/linuxbrew/.linuxbrew/bin/copilot",
-                ];
-                
-                let mut copilot_found = None;
-                for path in &copilot_paths {
-                    if Command::new(path).arg("--version").output().await.is_ok() {
-                        copilot_found = Some(*path);
-                        break;
-                    }
-                }
-                
-                match copilot_found {
-                    Some(copilot_path) => {
-                        let copilot_ver = Command::new(copilot_path)
-                            .arg("--version")
-                            .output()
-                            .await
-                            .ok()
-                            .and_then(|o| String::from_utf8(o.stdout).ok())
-                            .and_then(|s| s.lines().next().map(|l| l.trim().to_string()));
-                        
-                        ProviderStatus {
-                            kind,
-                            label: label.to_string(),
-                            installed: true,
-                            authenticated: true,
-                            version: copilot_ver,
-                            status: ProviderStatusLevel::Ready,
-                            message: Some(format!(
-                                "Node.js: {}, Copilot CLI found at {}",
-                                version,
-                                copilot_path
-                            )),
-                        }
-                    }
-                    None => ProviderStatus {
-                        kind,
-                        label: label.to_string(),
-                        installed: true,
-                        authenticated: false,
-                        version: Some(version),
-                        status: ProviderStatusLevel::Warning,
-                        message: Some(
-                            "Node.js available but Copilot CLI not found. Install with: gh extension install github/gh-copilot".to_string(),
-                        ),
-                    },
-                }
             }
-            Err(error) => ProviderStatus {
+        }
+
+        // Check if Copilot CLI binary exists (don't run it, just check file)
+        let copilot_paths = [
+            "/opt/homebrew/bin/copilot",
+            "/usr/local/bin/copilot",
+            "/home/linuxbrew/.linuxbrew/bin/copilot",
+        ];
+        
+        let copilot_found = copilot_paths.iter().find(|p| std::path::Path::new(p).exists());
+        
+        match copilot_found {
+            Some(path) => ProviderStatus {
                 kind,
                 label: label.to_string(),
-                installed: false,
+                installed: true,
+                authenticated: true,
+                version: None,
+                status: ProviderStatusLevel::Ready,
+                message: Some(format!("Copilot SDK ready (found at {})", path)),
+            },
+            None => ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: true,
                 authenticated: false,
                 version: None,
-                status: ProviderStatusLevel::Error,
-                message: Some(format!("Node.js is unavailable: {error}")),
+                status: ProviderStatusLevel::Warning,
+                message: Some("Copilot CLI not found. Run: gh extension install github/gh-copilot".to_string()),
             },
         }
     }
