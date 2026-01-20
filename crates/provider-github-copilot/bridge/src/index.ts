@@ -2,32 +2,12 @@
 /**
  * GitHub Copilot SDK Bridge for ZenUI
  * 
- * This bridge spawns the GitHub Copilot CLI in ACP (Agent Client Protocol) server mode
- * and translates between the ZenUI protocol and Copilot's JSON-RPC protocol.
+ * This bridge uses the official @github/copilot-sdk to communicate
+ * with the GitHub Copilot CLI.
  */
 
-import { spawn } from 'child_process';
-import { readFileSync } from 'fs';
+import { CopilotClient, approveAll } from '@github/copilot-sdk';
 import { createInterface } from 'readline';
-
-// Protocol types
-interface JsonRpcRequest {
-  jsonrpc: '2.0';
-  id: number | string;
-  method: string;
-  params?: unknown;
-}
-
-interface JsonRpcResponse {
-  jsonrpc: '2.0';
-  id: number | string;
-  result?: unknown;
-  error?: {
-    code: number;
-    message: string;
-    data?: unknown;
-  };
-}
 
 // ZenUI protocol types
 interface ZenUiMessage {
@@ -36,209 +16,103 @@ interface ZenUiMessage {
 }
 
 class CopilotBridge {
-  private copilotProcess: ReturnType<typeof spawn> | null = null;
-  private requestId = 1;
-  private pendingRequests = new Map<number | string, (response: JsonRpcResponse) => void>();
-  private sessionId: string | null = null;
+  private client: CopilotClient | null = null;
+  private session: any = null;
 
   async start(): Promise<void> {
-    console.error('[bridge] Starting GitHub Copilot bridge...');
+    console.error('[bridge] Starting GitHub Copilot SDK Bridge...');
     
-    // Find copilot binary in common locations
-    const copilotPaths = [
-      '/opt/homebrew/bin/copilot',
-      '/usr/local/bin/copilot',
-      '/home/linuxbrew/.linuxbrew/bin/copilot',
-      'copilot',
-    ];
-    
-    let copilotPath: string | null = null;
-    for (const path of copilotPaths) {
-      try {
-        // Check if path exists and is executable
-        const { execSync } = await import('child_process');
-        execSync(`${path} --version`, { stdio: 'ignore' });
-        copilotPath = path;
-        console.error(`[bridge] Found copilot at: ${path}`);
-        break;
-      } catch {
-        console.error(`[bridge] Copilot not found at: ${path}`);
-      }
-    }
-    
-    if (!copilotPath) {
-      console.error('[bridge] ERROR: Copilot CLI not found. Install with: gh extension install github/gh-copilot');
-      process.exit(1);
-    }
-
-    // Spawn Copilot CLI in ACP server mode
-    console.error(`[bridge] Spawning: ${copilotPath} --acp --stdio`);
-    this.copilotProcess = spawn(copilotPath, ['--acp', '--stdio'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        // Ensure Copilot CLI uses the correct authentication
-        COPILOT_ALLOW_ALL: 'true',
-      },
+    // Create client with stdio mode
+    this.client = new CopilotClient({
+      useStdio: true,
+      logLevel: 'info',
     });
 
-    // Handle stdout (JSON-RPC responses)
-    const rl = createInterface({
-      input: this.copilotProcess.stdout!,
-      crlfDelay: Infinity,
-    });
-
-    rl.on('line', (line) => {
-      this.handleLine(line);
-    });
-
-    // Handle stderr (logging)
-    this.copilotProcess.stderr!.on('data', (data) => {
-      const msg = data.toString().trim();
-      if (msg) {
-        console.error(`[copilot-stderr] ${msg}`);
-      }
-    });
-
-    // Handle process exit
-    this.copilotProcess.on('exit', (code) => {
-      console.error(`[bridge] Copilot CLI exited with code ${code}`);
-      process.exit(code ?? 1);
-    });
-
-    // Initialize the connection
-    await this.initialize();
-  }
-
-  private async handleLine(line: string): Promise<void> {
-    try {
-      const msg = JSON.parse(line) as JsonRpcResponse | JsonRpcRequest;
-      
-      if ('id' in msg && 'result' in msg) {
-        // This is a response
-        const handler = this.pendingRequests.get(msg.id);
-        if (handler) {
-          handler(msg);
-          this.pendingRequests.delete(msg.id);
-        }
-      } else if ('method' in msg) {
-        // This is a request from Copilot (server -> client)
-        await this.handleServerRequest(msg as JsonRpcRequest);
-      }
-    } catch (err) {
-      console.error(`[bridge] Failed to parse line: ${line}`, err);
-    }
-  }
-
-  private async handleServerRequest(req: JsonRpcRequest): Promise<void> {
-    // Handle server requests (like tool confirmations)
-    // For now, auto-accept all tool requests
-    const response: JsonRpcResponse = {
-      jsonrpc: '2.0',
-      id: req.id,
-      result: { accepted: true },
-    };
-    this.send(response);
-  }
-
-  private async initialize(): Promise<void> {
-    // Send initialize request per JSON-RPC spec
-    // Note: protocolVersion must be a NUMBER (1 works with current Copilot CLI)
-    const initRequest: JsonRpcRequest = {
-      jsonrpc: '2.0',
-      id: this.requestId++,
-      method: 'initialize',
-      params: {
-        protocolVersion: 1,
-        capabilities: {},
-        clientInfo: {
-          name: 'zenui-copilot-bridge',
-          version: '0.1.0',
-        },
-      },
-    };
-
-    const response = await this.request(initRequest);
-    if (response.error) {
-      throw new Error(`Initialize failed: ${response.error.message}`);
-    }
+    console.error('[bridge] Connecting to Copilot CLI...');
+    await this.client.start();
     console.error('[bridge] Connected to Copilot CLI');
   }
 
-  private request(req: JsonRpcRequest): Promise<JsonRpcResponse> {
-    return new Promise((resolve) => {
-      this.pendingRequests.set(req.id, resolve);
-      this.send(req);
-    });
-  }
-
-  private send(msg: JsonRpcRequest | JsonRpcResponse): void {
-    const line = JSON.stringify(msg);
-    this.copilotProcess!.stdin!.write(line + '\n');
-  }
-
   async createSession(cwd: string): Promise<string> {
-    const req: JsonRpcRequest = {
-      jsonrpc: '2.0',
-      id: this.requestId++,
-      method: 'session/create',
-      params: {
-        clientName: 'zenui',
-        cwd,
-      },
-    };
-
-    const response = await this.request(req);
-    if (response.error) {
-      throw new Error(`Create session failed: ${response.error.message}`);
+    if (!this.client) {
+      throw new Error('Client not started');
     }
 
-    const result = response.result as { session?: { id: string } };
-    this.sessionId = result.session?.id ?? null;
-    if (!this.sessionId) {
-      throw new Error('No session ID returned');
-    }
-    return this.sessionId;
+    console.error(`[bridge] Creating session in: ${cwd}`);
+    
+    this.session = await this.client.createSession({
+      model: 'gpt-5',
+      onPermissionRequest: approveAll, // Required: handle tool permissions
+    });
+
+    // Get session ID from session object
+    const sessionId = this.session.id || 'default-session';
+    console.error(`[bridge] Session created: ${sessionId}`);
+    
+    return sessionId;
   }
 
   async sendPrompt(prompt: string): Promise<string> {
-    if (!this.sessionId) {
+    if (!this.session) {
       throw new Error('No active session');
     }
 
-    const req: JsonRpcRequest = {
-      jsonrpc: '2.0',
-      id: this.requestId++,
-      method: 'session/send',
-      params: {
-        sessionId: this.sessionId,
-        prompt,
-        streaming: false,
-      },
-    };
+    console.error(`[bridge] Sending prompt: ${prompt.slice(0, 50)}...`);
+    
+    return new Promise((resolve, reject) => {
+      let output = '';
+      let done = false;
 
-    const response = await this.request(req);
-    if (response.error) {
-      throw new Error(`Send failed: ${response.error.message}`);
-    }
+      // Set timeout
+      const timeout = setTimeout(() => {
+        if (!done) {
+          done = true;
+          resolve(output || '[No response from Copilot]');
+        }
+      }, 60000); // 60 second timeout
 
-    const result = response.result as { response?: { content?: string } };
-    return result.response?.content ?? '';
+      // Listen for messages using typed events
+      this.session!.on('assistant.message', (event: { data?: { content?: string } }) => {
+        if (event.data?.content) {
+          output += event.data.content;
+        }
+      });
+
+      // Listen for completion
+      this.session!.on('session.idle', () => {
+        if (!done) {
+          done = true;
+          clearTimeout(timeout);
+          resolve(output || '[Copilot returned empty response]');
+        }
+      });
+
+      // Send the prompt
+      this.session!.send({ prompt }).catch((err: Error) => {
+        if (!done) {
+          done = true;
+          clearTimeout(timeout);
+          reject(err);
+        }
+      });
+    });
   }
 
   async interrupt(): Promise<void> {
-    if (!this.sessionId) return;
+    if (!this.session) return;
+    console.error('[bridge] Interrupting session...');
+    await this.session.interrupt();
+  }
 
-    const req: JsonRpcRequest = {
-      jsonrpc: '2.0',
-      id: this.requestId++,
-      method: 'session/interrupt',
-      params: {
-        sessionId: this.sessionId,
-      },
-    };
-
-    await this.request(req);
+  async stop(): Promise<void> {
+    if (this.session) {
+      await this.session.disconnect();
+      this.session = null;
+    }
+    if (this.client) {
+      await this.client.stop();
+      this.client = null;
+    }
   }
 }
 
@@ -246,62 +120,73 @@ class CopilotBridge {
 async function main(): Promise<void> {
   const bridge = new CopilotBridge();
   
-  // Read and process ZenUI messages from stdin
+  // Read ZenUI messages from stdin
   const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
     terminal: false,
   });
 
-  // Start the bridge
-  await bridge.start();
+  try {
+    // Start the bridge
+    await bridge.start();
 
-  // Send ready signal
-  console.log(JSON.stringify({ type: 'ready' }));
+    // Send ready signal
+    console.log(JSON.stringify({ type: 'ready' }));
+    console.error('[bridge] Ready for commands');
 
-  // Process incoming messages
-  for await (const line of rl) {
-    try {
-      const msg = JSON.parse(line) as ZenUiMessage;
-      
-      switch (msg.type) {
-        case 'create_session': {
-          const cwd = msg.cwd as string;
-          const sessionId = await bridge.createSession(cwd);
-          console.log(JSON.stringify({
-            type: 'session_created',
-            sessionId,
-          }));
-          break;
+    // Process incoming messages
+    for await (const line of rl) {
+      try {
+        const msg = JSON.parse(line) as ZenUiMessage;
+        console.error(`[bridge] Received: ${msg.type}`);
+        
+        switch (msg.type) {
+          case 'create_session': {
+            const cwd = msg.cwd as string;
+            const sessionId = await bridge.createSession(cwd);
+            console.log(JSON.stringify({
+              type: 'session_created',
+              sessionId,
+            }));
+            break;
+          }
+
+          case 'send_prompt': {
+            const prompt = msg.prompt as string;
+            const output = await bridge.sendPrompt(prompt);
+            console.log(JSON.stringify({
+              type: 'response',
+              output,
+            }));
+            break;
+          }
+
+          case 'interrupt': {
+            await bridge.interrupt();
+            console.log(JSON.stringify({
+              type: 'interrupted',
+            }));
+            break;
+          }
+
+          default:
+            console.error(`[bridge] Unknown message type: ${msg.type}`);
+            console.log(JSON.stringify({
+              type: 'error',
+              error: `Unknown type: ${msg.type}`,
+            }));
         }
-
-        case 'send_prompt': {
-          const prompt = msg.prompt as string;
-          const output = await bridge.sendPrompt(prompt);
-          console.log(JSON.stringify({
-            type: 'response',
-            output,
-          }));
-          break;
-        }
-
-        case 'interrupt': {
-          await bridge.interrupt();
-          console.log(JSON.stringify({
-            type: 'interrupted',
-          }));
-          break;
-        }
-
-        default:
-          console.error(`[bridge] Unknown message type: ${msg.type}`);
+      } catch (err) {
+        console.error('[bridge] Error processing message:', err);
+        console.log(JSON.stringify({
+          type: 'error',
+          error: err instanceof Error ? err.message : String(err),
+        }));
       }
-    } catch (err) {
-      console.log(JSON.stringify({
-        type: 'error',
-        error: err instanceof Error ? err.message : String(err),
-      }));
     }
+  } finally {
+    await bridge.stop();
   }
 }
 
