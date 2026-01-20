@@ -119,24 +119,41 @@ impl GitHubCopilotAdapter {
 
         info!("Using bridge at: {}", bridge_path.display());
 
-        // Find Node.js binary
-        let node_paths = [
-            "/opt/homebrew/bin/node",
-            "/usr/local/bin/node",
-            "/usr/bin/node",
-            "/home/linuxbrew/.linuxbrew/bin/node",
-            "node",
-        ];
+        // Find Node.js binary - first try embedded, then system
+        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        
+        let mut node_paths: Vec<PathBuf> = vec![];
+        
+        // Embedded Node.js (downloaded by build.rs)
+        if let Some(ref dir) = out_dir {
+            node_paths.push(dir.join("node/bin/node"));
+        }
+        if let Some(ref dir) = exe_dir {
+            node_paths.push(dir.join("node/bin/node"));
+        }
+        
+        // System Node.js
+        node_paths.push(PathBuf::from("/opt/homebrew/bin/node"));
+        node_paths.push(PathBuf::from("/usr/local/bin/node"));
+        node_paths.push(PathBuf::from("/usr/bin/node"));
+        node_paths.push(PathBuf::from("node"));
         
         let node_path = node_paths
             .iter()
-            .find(|p| *p == &"node" || std::path::Path::new(p).exists())
-            .copied()
+            .find(|p| p.to_string_lossy() == "node" || p.exists())
+            .cloned()
             .ok_or_else(|| "Node.js not found. Install from https://nodejs.org".to_string())?;
 
+        // Run bridge from the directory containing package.json (for ES module support)
+        let bridge_dir = bridge_path.parent().unwrap_or(&self.working_directory);
+        let bridge_file = bridge_path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "Invalid bridge path".to_string())?;
+
         let mut child = Command::new(node_path)
-            .arg(&bridge_path)
-            .current_dir(&self.working_directory)
+            .arg(bridge_file)
+            .current_dir(bridge_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -277,15 +294,26 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         
         info!("Checking GitHub Copilot health...");
 
-        // Simple file existence check for Node.js
-        let node_paths = [
-            "/opt/homebrew/bin/node",
-            "/usr/local/bin/node",
-            "/usr/bin/node",
-            "/home/linuxbrew/.linuxbrew/bin/node",
-        ];
+        // Check for embedded or system Node.js
+        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|p| p.to_path_buf()));
         
-        let node_found = node_paths.iter().find(|p| std::path::Path::new(p).exists());
+        let mut node_paths: Vec<PathBuf> = vec![];
+        
+        // Embedded Node.js (downloaded by build.rs)
+        if let Some(ref dir) = out_dir {
+            node_paths.push(dir.join("node/bin/node"));
+        }
+        if let Some(ref dir) = exe_dir {
+            node_paths.push(dir.join("node/bin/node"));
+        }
+        
+        // System Node.js
+        node_paths.push(PathBuf::from("/opt/homebrew/bin/node"));
+        node_paths.push(PathBuf::from("/usr/local/bin/node"));
+        node_paths.push(PathBuf::from("/usr/bin/node"));
+        
+        let node_found = node_paths.iter().find(|p| p.exists());
         
         if node_found.is_none() {
             // Try 'which node' as fallback

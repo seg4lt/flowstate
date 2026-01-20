@@ -42,15 +42,17 @@ class CopilotBridge {
   private sessionId: string | null = null;
 
   async start(): Promise<void> {
+    console.error('[bridge] Starting GitHub Copilot bridge...');
+    
     // Find copilot binary in common locations
     const copilotPaths = [
-      'copilot',
       '/opt/homebrew/bin/copilot',
       '/usr/local/bin/copilot',
       '/home/linuxbrew/.linuxbrew/bin/copilot',
+      'copilot',
     ];
     
-    let copilotPath = 'copilot';
+    let copilotPath: string | null = null;
     for (const path of copilotPaths) {
       try {
         // Check if path exists and is executable
@@ -60,11 +62,17 @@ class CopilotBridge {
         console.error(`[bridge] Found copilot at: ${path}`);
         break;
       } catch {
-        // Continue to next path
+        console.error(`[bridge] Copilot not found at: ${path}`);
       }
+    }
+    
+    if (!copilotPath) {
+      console.error('[bridge] ERROR: Copilot CLI not found. Install with: gh extension install github/gh-copilot');
+      process.exit(1);
     }
 
     // Spawn Copilot CLI in ACP server mode
+    console.error(`[bridge] Spawning: ${copilotPath} --acp --stdio`);
     this.copilotProcess = spawn(copilotPath, ['--acp', '--stdio'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
@@ -135,12 +143,13 @@ class CopilotBridge {
 
   private async initialize(): Promise<void> {
     // Send initialize request per JSON-RPC spec
+    // Note: protocolVersion must be a NUMBER (1 works with current Copilot CLI)
     const initRequest: JsonRpcRequest = {
       jsonrpc: '2.0',
       id: this.requestId++,
       method: 'initialize',
       params: {
-        protocolVersion: '2024-11-05',
+        protocolVersion: 1,
         capabilities: {},
         clientInfo: {
           name: 'zenui-copilot-bridge',
