@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use zenui_provider_api::{
     ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderStatusLevel,
     ProviderTurnOutput, SessionDetail,
@@ -24,6 +24,7 @@ struct CopilotBridgeProcess {
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     next_request_id: u64,
+    bridge_session_id: String,
 }
 
 /// ZenUI Bridge Protocol Messages
@@ -57,7 +58,7 @@ enum BridgeResponse {
 #[derive(Debug, Clone)]
 pub struct GitHubCopilotAdapter {
     working_directory: PathBuf,
-    sessions: Arc<Mutex<HashMap<String, String>>>, // session_id -> bridge_session_id
+    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CopilotBridgeProcess>>>>>,
 }
 
 impl GitHubCopilotAdapter {
@@ -187,6 +188,7 @@ impl GitHubCopilotAdapter {
             stdin,
             stdout: BufReader::new(stdout).lines(),
             next_request_id: 1,
+            bridge_session_id: String::new(),
         };
 
         // Wait for ready signal
@@ -254,6 +256,62 @@ impl GitHubCopilotAdapter {
             }
             Ok(Err(e)) => Err(format!("Bridge read error: {e}")),
             Err(_) => Err("Bridge request timeout".to_string()),
+        }
+    }
+
+    /// Return the cached bridge for this session, spawning one if none exists yet.
+    async fn ensure_session_process(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<Arc<Mutex<CopilotBridgeProcess>>, String> {
+        if let Some(existing) = self
+            .sessions
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+
+        let mut bridge = self.spawn_bridge().await?;
+
+        let response = self
+            .bridge_request(
+                &mut bridge,
+                BridgeRequest::CreateSession {
+                    cwd: self.working_directory.display().to_string(),
+                },
+            )
+            .await?;
+
+        match response {
+            BridgeResponse::SessionCreated { session_id } => {
+                info!("Session created with bridge ID: {}", session_id);
+                bridge.bridge_session_id = session_id;
+            }
+            BridgeResponse::Error { error } => {
+                return Err(format!("Failed to create session: {error}"));
+            }
+            other => {
+                return Err(format!("Unexpected bridge response: {:?}", other));
+            }
+        }
+
+        let bridge = Arc::new(Mutex::new(bridge));
+        let mut sessions = self.sessions.lock().await;
+        Ok(sessions
+            .entry(session.summary.session_id.clone())
+            .or_insert_with(|| bridge.clone())
+            .clone())
+    }
+
+    /// Remove a session's bridge from the cache and kill its process.
+    async fn invalidate_session(&self, session_id: &str) {
+        let process = self.sessions.lock().await.remove(session_id);
+        if let Some(process) = process {
+            let mut process = process.lock().await;
+            let _ = process.child.start_kill();
         }
     }
 }
@@ -369,38 +427,13 @@ impl ProviderAdapter for GitHubCopilotAdapter {
     ) -> Result<Option<ProviderSessionState>, String> {
         info!("Starting GitHub Copilot session...");
 
-        let mut bridge = self.spawn_bridge().await?;
+        let process = self.ensure_session_process(session).await?;
+        let process = process.lock().await;
 
-        // Create session via bridge
-        let response = self
-            .bridge_request(
-                &mut bridge,
-                BridgeRequest::CreateSession {
-                    cwd: self.working_directory.display().to_string(),
-                },
-            )
-            .await?;
-
-        match response {
-            BridgeResponse::SessionCreated { session_id } => {
-                info!("Session created with ID: {}", session_id);
-                
-                // Store session mapping
-                self.sessions
-                    .lock()
-                    .await
-                    .insert(session.summary.session_id.clone(), session_id);
-
-                Ok(Some(ProviderSessionState {
-                    native_thread_id: Some(session.summary.session_id.clone()),
-                    metadata: None,
-                }))
-            }
-            BridgeResponse::Error { error } => {
-                Err(format!("Failed to create session: {error}"))
-            }
-            _ => Err(format!("Unexpected bridge response: {:?}", response)),
-        }
+        Ok(Some(ProviderSessionState {
+            native_thread_id: Some(process.bridge_session_id.clone()),
+            metadata: None,
+        }))
     }
 
     async fn execute_turn(
@@ -410,58 +443,41 @@ impl ProviderAdapter for GitHubCopilotAdapter {
     ) -> Result<ProviderTurnOutput, String> {
         info!("Executing turn with GitHub Copilot...");
 
-        // Get the bridge session ID
-        let bridge_session_id = self
-            .sessions
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned()
-            .ok_or_else(|| "Session not found".to_string())?;
+        let process = self.ensure_session_process(session).await?;
+        let result = {
+            let mut process = process.lock().await;
+            let response = self
+                .bridge_request(
+                    &mut process,
+                    BridgeRequest::SendPrompt {
+                        prompt: input.to_string(),
+                    },
+                )
+                .await?;
 
-        // Spawn a new bridge for this turn (bridges are stateless per request)
-        let mut bridge = self.spawn_bridge().await?;
-
-        // We need to re-create the session context for the bridge
-        // In a full implementation, we'd maintain persistent bridge connections
-        let _ = self
-            .bridge_request(
-                &mut bridge,
-                BridgeRequest::CreateSession {
-                    cwd: self.working_directory.display().to_string(),
-                },
-            )
-            .await?;
-
-        // Send the prompt
-        let response = self
-            .bridge_request(
-                &mut bridge,
-                BridgeRequest::SendPrompt {
-                    prompt: input.to_string(),
-                },
-            )
-            .await?;
-
-        match response {
-            BridgeResponse::Response { output } => {
-                Ok(ProviderTurnOutput {
+            match response {
+                BridgeResponse::Response { output } => Ok(ProviderTurnOutput {
                     output,
                     provider_state: session.provider_state.clone(),
-                })
+                }),
+                BridgeResponse::Error { error } => Err(format!("Copilot error: {error}")),
+                other => Err(format!("Unexpected response: {:?}", other)),
             }
-            BridgeResponse::Error { error } => {
-                Err(format!("Copilot error: {error}"))
-            }
-            _ => Err(format!("Unexpected response: {:?}", response)),
+        };
+
+        if result.is_err() {
+            self.invalidate_session(&session.summary.session_id).await;
         }
+
+        result
     }
 
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
         info!("Interrupting GitHub Copilot session...");
 
-        // In a full implementation, we'd send interrupt to active bridge
-        // For now, just acknowledge
+        // TODO: interrupt is not functional — the TS bridge's readline loop (bridge/src/index.ts:161)
+        // awaits sendPrompt() inline and cannot receive an interrupt message while a prompt is in
+        // flight. Fixing this requires making that loop handle new stdin messages concurrently.
         Ok(format!(
             "GitHub Copilot interrupt requested for session '{}'.",
             session.summary.title
