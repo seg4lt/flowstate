@@ -10,8 +10,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use zenui_provider_api::{
-    ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderStatusLevel,
-    ProviderTurnOutput, SessionDetail,
+    PermissionMode, ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus,
+    ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail, TurnEventSink,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -145,12 +145,17 @@ impl CodexAdapter {
             .as_ref()
             .and_then(|state| state.native_thread_id.as_deref());
 
-        let base_params = json!({
+        let mut base_params = json!({
             "approvalPolicy": "never",
             "cwd": self.working_directory.display().to_string(),
             "personality": "pragmatic",
             "sandbox": "workspace-write",
         });
+        if let Some(model) = session.summary.model.as_deref() {
+            if let Some(obj) = base_params.as_object_mut() {
+                obj.insert("model".to_string(), Value::String(model.to_string()));
+            }
+        }
 
         let thread_result = if let Some(thread_id) = resume_thread_id {
             match process
@@ -215,7 +220,10 @@ impl ProviderAdapter for CodexAdapter {
         &self,
         session: &SessionDetail,
         input: &str,
+        permission_mode: PermissionMode,
+        events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
+        let _ = permission_mode;
         let process = self.ensure_session_process(session).await?;
         let result = {
             let mut process = process.lock().await;
@@ -235,7 +243,7 @@ impl ProviderAdapter for CodexAdapter {
                 .await?;
             let turn_id = extract_turn_id(&response)
                 .ok_or_else(|| "Codex turn start did not return a turn id.".to_string())?;
-            let completion = process.wait_for_turn_completion(&turn_id).await?;
+            let completion = process.wait_for_turn_completion(&turn_id, &events).await?;
             match completion.status.as_str() {
                 "completed" => {
                     let output = process.read_turn_output(&turn_id).await?;
@@ -263,6 +271,11 @@ impl ProviderAdapter for CodexAdapter {
         }
 
         result
+    }
+
+    async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
+        self.invalidate_session(&session.summary.session_id).await;
+        Ok(())
     }
 
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
@@ -356,7 +369,13 @@ impl CodexSessionProcess {
         self.write_message(json!({ "method": method })).await
     }
 
-    async fn wait_for_turn_completion(&mut self, turn_id: &str) -> Result<TurnCompletion, String> {
+    async fn wait_for_turn_completion(
+        &mut self,
+        turn_id: &str,
+        events: &TurnEventSink,
+    ) -> Result<TurnCompletion, String> {
+        let mut last_agent_text_len = 0usize;
+        let mut last_reasoning_len = 0usize;
         loop {
             match self.read_message().await? {
                 ProtocolMessage::Notification { method, params }
@@ -369,12 +388,21 @@ impl CodexSessionProcess {
                         error_message: notification_turn_error(&params),
                     });
                 }
+                ProtocolMessage::Notification { method, params } => {
+                    tracing::warn!(method = %method, params = %params, "codex: notification received");
+                    map_codex_notification(
+                        &method,
+                        &params,
+                        &mut last_agent_text_len,
+                        &mut last_reasoning_len,
+                        events,
+                    )
+                    .await;
+                }
                 ProtocolMessage::ServerRequest { id, method } => {
                     self.respond_unsupported(id, &method).await?;
                 }
-                ProtocolMessage::Notification { .. }
-                | ProtocolMessage::Response { .. }
-                | ProtocolMessage::ResponseError { .. } => {}
+                ProtocolMessage::Response { .. } | ProtocolMessage::ResponseError { .. } => {}
             }
         }
     }
@@ -670,6 +698,109 @@ fn spawn_stderr_drain(stderr: ChildStderr) -> JoinHandle<()> {
             }
         }
     })
+}
+
+/// Map a codex app-server notification into a streaming event and forward it.
+/// Handles text accumulation: codex sends the growing full text on each update, so we diff
+/// against the previous length to produce a true delta.
+async fn map_codex_notification(
+    method: &str,
+    params: &Value,
+    last_agent_text_len: &mut usize,
+    last_reasoning_len: &mut usize,
+    events: &TurnEventSink,
+) {
+    match method {
+        // Item-level streaming updates: codex sends the full accumulated text each time.
+        "item/update" | "item/append" | "item/created" | "item/updated" => {
+            let item = match params.get("item") {
+                Some(v) => v,
+                None => return,
+            };
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            match item_type {
+                "agentMessage" | "agent_message" => {
+                    let text = item
+                        .get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if text.len() > *last_agent_text_len {
+                        let delta = text[*last_agent_text_len..].to_string();
+                        *last_agent_text_len = text.len();
+                        events.send(ProviderTurnEvent::AssistantTextDelta { delta }).await;
+                    }
+                }
+                "reasoning" => {
+                    let text = item
+                        .get("text")
+                        .or_else(|| item.get("content"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if text.len() > *last_reasoning_len {
+                        let delta = text[*last_reasoning_len..].to_string();
+                        *last_reasoning_len = text.len();
+                        events.send(ProviderTurnEvent::ReasoningDelta { delta }).await;
+                    }
+                }
+                "toolCall" | "tool_call" => {
+                    let call_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .or_else(|| item.get("toolName"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let args = item
+                        .get("args")
+                        .or_else(|| item.get("params"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if !call_id.is_empty() && !name.is_empty() {
+                        events
+                            .send(ProviderTurnEvent::ToolCallStarted { call_id, name, args })
+                            .await;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Tool execution completion events.
+        "item/complete" | "item/completed" => {
+            let item = match params.get("item") {
+                Some(v) => v,
+                None => return,
+            };
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+            if matches!(item_type, "toolCall" | "tool_call") {
+                let call_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let output = item
+                    .get("result")
+                    .or_else(|| item.get("output"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let error = item
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if !call_id.is_empty() {
+                    events
+                        .send(ProviderTurnEvent::ToolCallCompleted { call_id, output, error })
+                        .await;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn first_non_empty_line(bytes: &[u8]) -> Option<String> {

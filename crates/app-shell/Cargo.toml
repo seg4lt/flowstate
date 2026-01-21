@@ -18,7 +18,7 @@ zenui-http-api = { path = "../http-api" }
 zenui-orchestration = { path = "../orchestration" }
 zenui-persistence = { path = "../persistence" }
 zenui-provider-api = { path = "../provider-api" }
-zenui-provider-claude-bridge = { path = "../provider-claude-bridge" }
+zenui-provider-claude-sdk = { path = "../provider-claude-sdk" }
 zenui-provider-codex = { path = "../provider-codex" }
 zenui-provider-github-copilot = { path = "../provider-github-copilot" }
 zenui-runtime-core = { path = "../runtime-core" }

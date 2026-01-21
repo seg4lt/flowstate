@@ -1,6 +1,10 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,6 +50,121 @@ pub enum TurnStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallStatus {
+    Pending,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Allow,
+    AllowAlways,
+    Deny,
+    DenyAlways,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Default,
+    AcceptEdits,
+    Plan,
+    Bypass,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        PermissionMode::AcceptEdits
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOperation {
+    Write,
+    Edit,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Proposed,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStep {
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRecord {
+    pub plan_id: String,
+    pub title: String,
+    pub steps: Vec<PlanStep>,
+    pub raw: String,
+    pub status: PlanStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangeRecord {
+    pub call_id: String,
+    pub path: String,
+    pub operation: FileOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRecord {
+    pub agent_id: String,
+    pub parent_call_id: String,
+    pub agent_type: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub status: SubagentStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub args: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub status: ToolCallStatus,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
@@ -67,6 +186,18 @@ pub struct TurnRecord {
     pub status: TurnStatus,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_changes: Vec<FileChangeRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +211,8 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub last_turn_preview: Option<String>,
     pub turn_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +291,175 @@ pub struct ProviderTurnOutput {
     pub provider_state: Option<ProviderSessionState>,
 }
 
+/// Events that a provider adapter can push during a turn for streaming display.
+#[derive(Debug, Clone)]
+pub enum ProviderTurnEvent {
+    AssistantTextDelta {
+        delta: String,
+    },
+    ReasoningDelta {
+        delta: String,
+    },
+    ToolCallStarted {
+        call_id: String,
+        name: String,
+        args: Value,
+    },
+    ToolCallCompleted {
+        call_id: String,
+        output: String,
+        error: Option<String>,
+    },
+    Info {
+        message: String,
+    },
+    PermissionRequest {
+        request_id: String,
+        tool_name: String,
+        input: Value,
+        suggested_decision: PermissionDecision,
+    },
+    UserQuestion {
+        request_id: String,
+        question: String,
+    },
+    FileChange {
+        call_id: String,
+        path: String,
+        operation: FileOperation,
+        before: Option<String>,
+        after: Option<String>,
+    },
+    SubagentStarted {
+        parent_call_id: String,
+        agent_id: String,
+        agent_type: String,
+        prompt: String,
+    },
+    SubagentEvent {
+        agent_id: String,
+        event: Value,
+    },
+    SubagentCompleted {
+        agent_id: String,
+        output: String,
+        error: Option<String>,
+    },
+    PlanProposed {
+        plan_id: String,
+        title: String,
+        steps: Vec<PlanStep>,
+        raw: String,
+    },
+}
+
+/// A handle for adapters to push streaming events during `execute_turn`.
+/// Dropping the sink closes the channel, signalling to the runtime that the turn is complete.
+#[derive(Clone)]
+pub struct TurnEventSink {
+    tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
+    permission_pending: Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>,
+    question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+}
+
+impl TurnEventSink {
+    pub fn new(tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>) -> Self {
+        Self {
+            tx,
+            permission_pending: Arc::new(Mutex::new(HashMap::new())),
+            question_pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Send a streaming event. Silently drops if the channel is closed.
+    pub async fn send(&self, event: ProviderTurnEvent) {
+        let _ = self.tx.send(event).await;
+    }
+
+    /// Ask the host to decide on a tool invocation. Emits a PermissionRequest event
+    /// and awaits the host's answer. Returns Deny if the channel closes.
+    pub async fn request_permission(
+        &self,
+        tool_name: String,
+        input: Value,
+        suggested: PermissionDecision,
+    ) -> PermissionDecision {
+        let request_id = next_request_id("perm");
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut guard = self.permission_pending.lock().await;
+            guard.insert(request_id.clone(), sender);
+        }
+        self.send(ProviderTurnEvent::PermissionRequest {
+            request_id: request_id.clone(),
+            tool_name,
+            input,
+            suggested_decision: suggested,
+        })
+        .await;
+        match receiver.await {
+            Ok(decision) => decision,
+            Err(_) => {
+                let mut guard = self.permission_pending.lock().await;
+                guard.remove(&request_id);
+                PermissionDecision::Deny
+            }
+        }
+    }
+
+    /// Ask the user a free-text question and await their typed answer.
+    /// Returns None if the channel closes before the user answers.
+    pub async fn ask_user(&self, question: String) -> Option<String> {
+        let request_id = next_request_id("q");
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut guard = self.question_pending.lock().await;
+            guard.insert(request_id.clone(), sender);
+        }
+        self.send(ProviderTurnEvent::UserQuestion {
+            request_id: request_id.clone(),
+            question,
+        })
+        .await;
+        match receiver.await {
+            Ok(answer) => Some(answer),
+            Err(_) => {
+                let mut guard = self.question_pending.lock().await;
+                guard.remove(&request_id);
+                None
+            }
+        }
+    }
+
+    /// Host-side: called by the runtime when the user answers a permission request.
+    pub async fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) {
+        let mut guard = self.permission_pending.lock().await;
+        if let Some(sender) = guard.remove(request_id) {
+            let _ = sender.send(decision);
+        }
+    }
+
+    /// Host-side: called by the runtime when the user answers a question.
+    pub async fn resolve_question(&self, request_id: &str, answer: String) {
+        let mut guard = self.question_pending.lock().await;
+        if let Some(sender) = guard.remove(request_id) {
+            let _ = sender.send(answer);
+        }
+    }
+}
+
+fn next_request_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_default();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{nanos:x}-{n:x}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
@@ -177,6 +479,25 @@ pub enum RuntimeEvent {
         delta: String,
         accumulated_output: String,
     },
+    ReasoningDelta {
+        session_id: String,
+        turn_id: String,
+        delta: String,
+    },
+    ToolCallStarted {
+        session_id: String,
+        turn_id: String,
+        call_id: String,
+        name: String,
+        args: Value,
+    },
+    ToolCallCompleted {
+        session_id: String,
+        turn_id: String,
+        call_id: String,
+        output: String,
+        error: Option<String>,
+    },
     TurnCompleted {
         session_id: String,
         session: SessionSummary,
@@ -185,6 +506,61 @@ pub enum RuntimeEvent {
     SessionInterrupted {
         session: SessionSummary,
         message: String,
+    },
+    SessionDeleted {
+        session_id: String,
+    },
+    PermissionRequested {
+        session_id: String,
+        turn_id: String,
+        request_id: String,
+        tool_name: String,
+        input: Value,
+        suggested: PermissionDecision,
+    },
+    UserQuestionAsked {
+        session_id: String,
+        turn_id: String,
+        request_id: String,
+        question: String,
+    },
+    FileChanged {
+        session_id: String,
+        turn_id: String,
+        call_id: String,
+        path: String,
+        operation: FileOperation,
+        before: Option<String>,
+        after: Option<String>,
+    },
+    SubagentStarted {
+        session_id: String,
+        turn_id: String,
+        parent_call_id: String,
+        agent_id: String,
+        agent_type: String,
+        prompt: String,
+    },
+    SubagentEvent {
+        session_id: String,
+        turn_id: String,
+        agent_id: String,
+        event: Value,
+    },
+    SubagentCompleted {
+        session_id: String,
+        turn_id: String,
+        agent_id: String,
+        output: String,
+        error: Option<String>,
+    },
+    PlanProposed {
+        session_id: String,
+        turn_id: String,
+        plan_id: String,
+        title: String,
+        steps: Vec<PlanStep>,
+        raw: String,
     },
     Error {
         message: String,
@@ -202,13 +578,38 @@ pub enum ClientMessage {
     StartSession {
         provider: ProviderKind,
         title: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     SendTurn {
         session_id: String,
         input: String,
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
     },
     InterruptTurn {
         session_id: String,
+    },
+    DeleteSession {
+        session_id: String,
+    },
+    AnswerPermission {
+        session_id: String,
+        request_id: String,
+        decision: PermissionDecision,
+    },
+    AnswerQuestion {
+        session_id: String,
+        request_id: String,
+        answer: String,
+    },
+    AcceptPlan {
+        session_id: String,
+        plan_id: String,
+    },
+    RejectPlan {
+        session_id: String,
+        plan_id: String,
     },
 }
 
@@ -237,13 +638,23 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Execute a turn. Push streaming events on `events`; return the canonical final output.
+    /// The runtime reconciles: if the returned `output` is non-empty it wins; otherwise the
+    /// accumulated text from `AssistantTextDelta` events is used.
     async fn execute_turn(
         &self,
         session: &SessionDetail,
         input: &str,
+        permission_mode: PermissionMode,
+        events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String>;
 
     async fn interrupt_turn(&self, _session: &SessionDetail) -> Result<String, String> {
         Ok("Interrupt recorded.".to_string())
+    }
+
+    /// Tear down any long-lived resources held for this session (subprocesses, connections).
+    async fn end_session(&self, _session: &SessionDetail) -> Result<(), String> {
+        Ok(())
     }
 }

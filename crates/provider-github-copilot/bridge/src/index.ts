@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * GitHub Copilot SDK Bridge for ZenUI
- * 
+ *
  * This bridge uses the official @github/copilot-sdk to communicate
- * with the GitHub Copilot CLI.
+ * with the GitHub Copilot CLI, forwarding streaming events as JSON lines.
  */
 
 import { CopilotClient, approveAll } from '@github/copilot-sdk';
@@ -15,13 +15,18 @@ interface ZenUiMessage {
   [key: string]: unknown;
 }
 
+/** Write a stream event JSON line to stdout. */
+function writeStream(payload: Record<string, unknown>): void {
+  process.stdout.write(JSON.stringify({ type: 'stream', ...payload }) + '\n');
+}
+
 class CopilotBridge {
   private client: CopilotClient | null = null;
   private session: any = null;
 
   async start(): Promise<void> {
     console.error('[bridge] Starting GitHub Copilot SDK Bridge...');
-    
+
     // Find system copilot CLI
     const copilotPaths = [
       '/opt/homebrew/bin/copilot',
@@ -29,7 +34,7 @@ class CopilotBridge {
       '/home/linuxbrew/.linuxbrew/bin/copilot',
       'copilot',
     ];
-    
+
     let copilotPath = 'copilot';
     for (const path of copilotPaths) {
       try {
@@ -42,7 +47,7 @@ class CopilotBridge {
         // Continue
       }
     }
-    
+
     // Create client with system CLI
     this.client = new CopilotClient({
       useStdio: true,
@@ -55,22 +60,22 @@ class CopilotBridge {
     console.error('[bridge] Connected to Copilot CLI');
   }
 
-  async createSession(cwd: string): Promise<string> {
+  async createSession(cwd: string, model?: string): Promise<string> {
     if (!this.client) {
       throw new Error('Client not started');
     }
 
-    console.error(`[bridge] Creating session in: ${cwd}`);
-    
+    const selectedModel = model ?? 'gpt-4o';
+    console.error(`[bridge] Creating session in: ${cwd} (model: ${selectedModel})`);
+
     this.session = await this.client.createSession({
-      model: 'gpt-5',
-      onPermissionRequest: approveAll, // Required: handle tool permissions
+      model: selectedModel,
+      onPermissionRequest: approveAll,
     });
 
-    // Get session ID from session object
-    const sessionId = this.session.id || 'default-session';
+    const sessionId = this.session.id ?? this.session.sessionId ?? 'default-session';
     console.error(`[bridge] Session created: ${sessionId}`);
-    
+
     return sessionId;
   }
 
@@ -79,60 +84,127 @@ class CopilotBridge {
       throw new Error('No active session');
     }
 
-    console.error(`[bridge] Sending prompt: ${prompt.slice(0, 50)}...`);
-    
-    return new Promise((resolve, reject) => {
-      let output = '';
-      let done = false;
+    console.error(`[bridge] Sending prompt (${prompt.length} chars)`);
 
-      // Set timeout
-      const timeout = setTimeout(() => {
-        if (!done) {
-          done = true;
-          resolve(output || '[No response from Copilot]');
-        }
-      }, 60000); // 60 second timeout
+    // Subscribe to streaming events. Each returns an unsubscribe fn.
+    const unsubs: Array<() => void> = [];
+    let deltasSeen = 0;
 
-      // Listen for messages using typed events
-      this.session!.on('assistant.message', (event: { data?: { content?: string } }) => {
-        if (event.data?.content) {
-          output += event.data.content;
+    // Text deltas
+    unsubs.push(
+      this.session.on('assistant.message_delta', (event: any) => {
+        const delta: string = event?.data?.deltaContent ?? '';
+        if (delta) {
+          deltasSeen++;
+          writeStream({ event: 'text_delta', delta });
         }
-      });
+      }),
+    );
 
-      // Listen for completion
-      this.session!.on('session.idle', () => {
-        if (!done) {
-          done = true;
-          clearTimeout(timeout);
-          resolve(output || '[Copilot returned empty response]');
+    // Fallback: some models (e.g. gpt-4o) emit only the final assistant.message
+    // without per-token deltas. If no deltas fired, emit the full content as one delta.
+    unsubs.push(
+      this.session.on('assistant.message', (event: any) => {
+        if (deltasSeen === 0) {
+          const content: string = event?.data?.content ?? '';
+          if (content) {
+            writeStream({ event: 'text_delta', delta: content });
+          }
         }
-      });
+        deltasSeen = 0;
+      }),
+    );
 
-      // Send the prompt
-      this.session!.send({ prompt }).catch((err: Error) => {
-        if (!done) {
-          done = true;
-          clearTimeout(timeout);
-          reject(err);
+    // Reasoning deltas
+    unsubs.push(
+      this.session.on('assistant.reasoning_delta', (event: any) => {
+        const delta: string = event?.data?.deltaContent ?? '';
+        if (delta) {
+          writeStream({ event: 'reasoning_delta', delta });
         }
-      });
-    });
+      }),
+    );
+
+    // Tool execution start
+    unsubs.push(
+      this.session.on('tool.execution_start', (event: any) => {
+        const d = event?.data ?? {};
+        writeStream({
+          event: 'tool_started',
+          call_id: d.toolCallId ?? '',
+          name: d.toolName ?? '',
+          args: d.arguments ?? {},
+        });
+      }),
+    );
+
+    // Tool execution complete
+    unsubs.push(
+      this.session.on('tool.execution_complete', (event: any) => {
+        const d = event?.data ?? {};
+        const success: boolean = d.success ?? true;
+        const output: string =
+          d.result?.detailedContent ?? d.result?.content ?? '';
+        // error info: look for nested error object
+        const errMsg: string | undefined = !success
+          ? (d.error?.message ?? d.error?.text ?? 'Tool failed')
+          : undefined;
+        writeStream({
+          event: 'tool_completed',
+          call_id: d.toolCallId ?? '',
+          output,
+          ...(errMsg !== undefined ? { error: errMsg } : {}),
+        });
+      }),
+    );
+
+    // Session error
+    unsubs.push(
+      this.session.on('session.error', (event: any) => {
+        const msg: string = event?.data?.message ?? 'Unknown Copilot error';
+        console.error(`[bridge] Session error: ${msg}`);
+        writeStream({ event: 'info', message: `Copilot error: ${msg}` });
+      }),
+    );
+
+    try {
+      // sendAndWait blocks until session.idle, streaming events fire via the handlers above.
+      const response = await this.session.sendAndWait({ prompt }, 120_000);
+      const content: string =
+        response?.data?.content ?? '[No response from Copilot]';
+      console.error('[bridge] Turn complete');
+      return content;
+    } finally {
+      // Always unsubscribe so handlers from this turn don't leak into the next.
+      unsubs.forEach((fn) => fn());
+    }
   }
 
   async interrupt(): Promise<void> {
     if (!this.session) return;
     console.error('[bridge] Interrupting session...');
-    await this.session.interrupt();
+    try {
+      await this.session.interrupt();
+    } catch {
+      // interrupt may throw if not in-flight; ignore
+    }
   }
 
   async stop(): Promise<void> {
     if (this.session) {
-      await this.session.disconnect();
+      try {
+        await this.session.disconnect();
+      } catch {
+        // ignore
+      }
       this.session = null;
     }
     if (this.client) {
-      await this.client.stop();
+      try {
+        await this.client.stop();
+      } catch {
+        // ignore
+      }
       this.client = null;
     }
   }
@@ -141,8 +213,7 @@ class CopilotBridge {
 // Main entry point
 async function main(): Promise<void> {
   const bridge = new CopilotBridge();
-  
-  // Read ZenUI messages from stdin
+
   const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -150,11 +221,10 @@ async function main(): Promise<void> {
   });
 
   try {
-    // Start the bridge
     await bridge.start();
 
     // Send ready signal
-    console.log(JSON.stringify({ type: 'ready' }));
+    process.stdout.write(JSON.stringify({ type: 'ready' }) + '\n');
     console.error('[bridge] Ready for commands');
 
     // Process incoming messages
@@ -162,49 +232,67 @@ async function main(): Promise<void> {
       try {
         const msg = JSON.parse(line) as ZenUiMessage;
         console.error(`[bridge] Received: ${msg.type}`);
-        
+
         switch (msg.type) {
           case 'create_session': {
-            const cwd = msg.cwd as string;
-            const sessionId = await bridge.createSession(cwd);
-            console.log(JSON.stringify({
-              type: 'session_created',
-              session_id: sessionId,
-            }));
+            const cwd = (msg.cwd as string) ?? process.cwd();
+            const model = msg.model as string | undefined;
+            const sessionId = await bridge.createSession(cwd, model);
+            process.stdout.write(
+              JSON.stringify({ type: 'session_created', session_id: sessionId }) + '\n',
+            );
             break;
           }
 
           case 'send_prompt': {
             const prompt = msg.prompt as string;
-            const output = await bridge.sendPrompt(prompt);
-            console.log(JSON.stringify({
-              type: 'response',
-              output,
-            }));
+            try {
+              const output = await bridge.sendPrompt(prompt);
+              process.stdout.write(
+                JSON.stringify({ type: 'response', output }) + '\n',
+              );
+            } catch (err) {
+              process.stdout.write(
+                JSON.stringify({
+                  type: 'error',
+                  error: err instanceof Error ? err.message : String(err),
+                }) + '\n',
+              );
+            }
             break;
           }
 
           case 'interrupt': {
             await bridge.interrupt();
-            console.log(JSON.stringify({
-              type: 'interrupted',
-            }));
+            process.stdout.write(
+              JSON.stringify({ type: 'interrupted' }) + '\n',
+            );
             break;
+          }
+
+          case 'shutdown': {
+            console.error('[bridge] Shutdown requested');
+            await bridge.stop();
+            process.exit(0);
           }
 
           default:
             console.error(`[bridge] Unknown message type: ${msg.type}`);
-            console.log(JSON.stringify({
-              type: 'error',
-              error: `Unknown type: ${msg.type}`,
-            }));
+            process.stdout.write(
+              JSON.stringify({
+                type: 'error',
+                error: `Unknown type: ${msg.type}`,
+              }) + '\n',
+            );
         }
       } catch (err) {
         console.error('[bridge] Error processing message:', err);
-        console.log(JSON.stringify({
-          type: 'error',
-          error: err instanceof Error ? err.message : String(err),
-        }));
+        process.stdout.write(
+          JSON.stringify({
+            type: 'error',
+            error: err instanceof Error ? err.message : String(err),
+          }) + '\n',
+        );
       }
     }
   } finally {

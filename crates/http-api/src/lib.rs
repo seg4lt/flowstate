@@ -123,76 +123,75 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl
 }
 
 async fn handle_socket(socket: WebSocket, state: ApiState) {
+    // Three concurrent halves share a single outbound mpsc that feeds the writer
+    // task. Otherwise, awaiting `handle_client_message` (which streams runtime
+    // events through the broadcast channel) would block subscription draining,
+    // and the UI would only see events after each turn finishes.
     let (mut sender, mut receiver) = socket.split();
     let mut subscription = state.runtime.subscribe();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
 
-    if let Err(send_error) = send_server_message(
-        &mut sender,
-        ServerMessage::Welcome {
-            bootstrap: state.runtime.bootstrap(state.ws_url.clone()).await,
-        },
-    )
-    .await
-    {
-        warn!("failed to send welcome message: {send_error}");
+    let welcome = ServerMessage::Welcome {
+        bootstrap: state.runtime.bootstrap(state.ws_url.clone()).await,
+    };
+    if out_tx.send(welcome).is_err() {
         return;
     }
 
-    loop {
-        tokio::select! {
-            inbound = receiver.next() => {
-                match inbound {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(text.as_str()) {
-                            Ok(client_message) => {
-                                if let Some(response) = state.runtime.handle_client_message(client_message).await
-                                    && let Err(send_error) = send_server_message(&mut sender, response).await {
-                                    warn!("failed to send response over websocket: {send_error}");
-                                    break;
-                                }
-                            }
-                            Err(parse_error) => {
-                                if let Err(send_error) = send_server_message(
-                                    &mut sender,
-                                    ServerMessage::Error {
-                                        message: format!("Invalid websocket payload: {parse_error}"),
-                                    },
-                                ).await {
-                                    warn!("failed to send websocket error: {send_error}");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        if sender.send(Message::Pong(payload)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(socket_error)) => {
-                        warn!("websocket receive error: {socket_error}");
+    let writer = tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            if let Err(send_error) = send_server_message(&mut sender, message).await {
+                warn!("failed to write websocket payload: {send_error}");
+                break;
+            }
+        }
+    });
+
+    let sub_tx = out_tx.clone();
+    let subscriber = tokio::spawn(async move {
+        loop {
+            match subscription.recv().await {
+                Ok(event) => {
+                    if sub_tx.send(ServerMessage::Event { event }).is_err() {
                         break;
                     }
                 }
-            }
-            runtime_event = subscription.recv() => {
-                match runtime_event {
-                    Ok(event) => {
-                        if let Err(send_error) = send_server_message(&mut sender, ServerMessage::Event { event }).await {
-                            warn!("failed to forward runtime event: {send_error}");
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!("websocket subscriber lagged behind by {skipped} messages");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("websocket subscriber lagged behind by {skipped} messages");
                 }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+    });
+
+    while let Some(inbound) = receiver.next().await {
+        match inbound {
+            Ok(Message::Text(text)) => match serde_json::from_str::<ClientMessage>(text.as_str()) {
+                Ok(client_message) => {
+                    let runtime = state.runtime.clone();
+                    let tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(response) = runtime.handle_client_message(client_message).await
+                        {
+                            let _ = tx.send(response);
+                        }
+                    });
+                }
+                Err(parse_error) => {
+                    let _ = out_tx.send(ServerMessage::Error {
+                        message: format!("Invalid websocket payload: {parse_error}"),
+                    });
+                }
+            },
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(_) => {}
+        }
     }
+
+    drop(out_tx);
+    subscriber.abort();
+    let _ = writer.await;
 }
 
 async fn send_server_message(

@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use zenui_provider_api::{
-    ProviderKind, SessionDetail, SessionStatus, SessionSummary, TurnRecord, TurnStatus,
+    FileChangeRecord, PermissionMode, PlanRecord, ProviderKind, SessionDetail, SessionStatus,
+    SessionSummary, SubagentRecord, ToolCall, TurnRecord, TurnStatus,
 };
 
 #[derive(Debug)]
@@ -45,8 +46,8 @@ impl PersistenceService {
         if transaction
             .execute(
                 "INSERT INTO sessions (
-                    session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(session_id) DO UPDATE SET
                     provider = excluded.provider,
                     title = excluded.title,
@@ -55,7 +56,8 @@ impl PersistenceService {
                     updated_at = excluded.updated_at,
                     last_turn_preview = excluded.last_turn_preview,
                     turn_count = excluded.turn_count,
-                    provider_state_json = excluded.provider_state_json",
+                    provider_state_json = excluded.provider_state_json,
+                    model = excluded.model",
                 params![
                     session.summary.session_id,
                     provider_kind_to_str(session.summary.provider),
@@ -69,6 +71,7 @@ impl PersistenceService {
                         .provider_state
                         .as_ref()
                         .and_then(|state| serde_json::to_string(state).ok()),
+                    session.summary.model,
                 ],
             )
             .is_err()
@@ -87,11 +90,35 @@ impl PersistenceService {
         }
 
         for turn in session.turns {
+            let reasoning_json: Option<String> = turn.reasoning.clone();
+            let tool_calls_json: Option<String> = if turn.tool_calls.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&turn.tool_calls).ok()
+            };
+            let file_changes_json: Option<String> = if turn.file_changes.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&turn.file_changes).ok()
+            };
+            let subagents_json: Option<String> = if turn.subagents.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&turn.subagents).ok()
+            };
+            let plan_json: Option<String> = turn
+                .plan
+                .as_ref()
+                .and_then(|plan| serde_json::to_string(plan).ok());
+            let permission_mode_str: Option<String> =
+                turn.permission_mode.map(permission_mode_to_str);
             if transaction
                 .execute(
                     "INSERT INTO turns (
-                        turn_id, session_id, input, output, status, created_at, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        turn_id, session_id, input, output, status, created_at, updated_at,
+                        reasoning_json, tool_calls_json, file_changes_json, subagents_json,
+                        plan_json, permission_mode
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         turn.turn_id,
                         session.summary.session_id,
@@ -100,6 +127,12 @@ impl PersistenceService {
                         turn_status_to_str(turn.status),
                         turn.created_at,
                         turn.updated_at,
+                        reasoning_json,
+                        tool_calls_json,
+                        file_changes_json,
+                        subagents_json,
+                        plan_json,
+                        permission_mode_str,
                     ],
                 )
                 .is_err()
@@ -127,6 +160,14 @@ impl PersistenceService {
             .into_iter()
             .filter_map(|session_id| load_session(&connection, &session_id).ok().flatten())
             .collect()
+    }
+
+    pub fn delete_session(&self, session_id: &str) -> bool {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])
+            .map(|affected| affected > 0)
+            .unwrap_or(false)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -163,10 +204,17 @@ impl PersistenceService {
             ",
             )
             .context("failed to run sqlite migrations")?;
-        let _ = connection.execute(
-            "ALTER TABLE sessions ADD COLUMN provider_state_json TEXT",
-            [],
-        );
+
+        // Idempotent column additions — ignore errors if the column already exists.
+        let _ = connection.execute("ALTER TABLE sessions ADD COLUMN provider_state_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN tool_calls_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN file_changes_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN subagents_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN plan_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN permission_mode TEXT", []);
+
         Ok(())
     }
 }
@@ -186,7 +234,7 @@ fn list_session_ids(connection: &Connection) -> Result<Vec<String>> {
 fn load_session(connection: &Connection, session_id: &str) -> Result<Option<SessionDetail>> {
     let summary = connection
         .query_row(
-            "SELECT session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json
+            "SELECT session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             |row| {
@@ -199,6 +247,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                     updated_at: row.get(5)?,
                     last_turn_preview: row.get(6)?,
                     turn_count: row.get::<_, i64>(7)? as usize,
+                    model: row.get(9)?,
                 })
             },
         )
@@ -211,12 +260,32 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
 
     let mut statement = connection
         .prepare(
-            "SELECT turn_id, input, output, status, created_at, updated_at
+            "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
+                    tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode
              FROM turns WHERE session_id = ?1 ORDER BY created_at ASC",
         )
         .context("failed to prepare turn query")?;
     let turns = statement
         .query_map(params![session_id], |row| {
+            let reasoning: Option<String> = row.get(6)?;
+            let tool_calls_json: Option<String> = row.get(7)?;
+            let file_changes_json: Option<String> = row.get(8)?;
+            let subagents_json: Option<String> = row.get(9)?;
+            let plan_json: Option<String> = row.get(10)?;
+            let permission_mode_str: Option<String> = row.get(11)?;
+            let tool_calls: Vec<ToolCall> = tool_calls_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let file_changes: Vec<FileChangeRecord> = file_changes_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let subagents: Vec<SubagentRecord> = subagents_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_default();
+            let plan: Option<PlanRecord> =
+                plan_json.and_then(|j| serde_json::from_str(&j).ok());
+            let permission_mode: Option<PermissionMode> =
+                permission_mode_str.as_deref().map(permission_mode_from_str);
             Ok(TurnRecord {
                 turn_id: row.get(0)?,
                 input: row.get(1)?,
@@ -224,6 +293,12 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                 status: turn_status_from_str(&row.get::<_, String>(3)?),
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
+                reasoning,
+                tool_calls,
+                file_changes,
+                subagents,
+                plan,
+                permission_mode,
             })
         })
         .context("failed to query turns")?
@@ -295,5 +370,24 @@ fn turn_status_from_str(value: &str) -> TurnStatus {
         "interrupted" => TurnStatus::Interrupted,
         "failed" => TurnStatus::Failed,
         _ => TurnStatus::Completed,
+    }
+}
+
+fn permission_mode_to_str(mode: PermissionMode) -> String {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "accept_edits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Bypass => "bypass",
+    }
+    .to_string()
+}
+
+fn permission_mode_from_str(value: &str) -> PermissionMode {
+    match value {
+        "default" => PermissionMode::Default,
+        "plan" => PermissionMode::Plan,
+        "bypass" => PermissionMode::Bypass,
+        _ => PermissionMode::AcceptEdits,
     }
 }

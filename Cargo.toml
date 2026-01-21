@@ -4,7 +4,7 @@ members = [
   "crates/runtime-core",
   "crates/provider-api",
   "crates/provider-codex",
-  "crates/provider-claude-bridge",
+  "crates/provider-claude-sdk",
   "crates/provider-github-copilot",
   "crates/orchestration",
   "crates/persistence",

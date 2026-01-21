@@ -6,7 +6,8 @@ use tao::dpi::LogicalSize;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
-use wry::WebViewBuilder;
+use wry::{Rect, WebViewBuilder};
+use wry::dpi::{LogicalPosition, LogicalSize as WryLogicalSize};
 use zenui_app_shell::bootstrap;
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,17 @@ fn run() -> Result<()> {
                 ..
             } if event_window_id == window_id => {
                 *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent {
+                window_id: event_window_id,
+                event: WindowEvent::Resized(_),
+                ..
+            } if event_window_id == window_id => {
+                let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+                let _ = webview.set_bounds(Rect {
+                    position: LogicalPosition::new(0.0, 0.0).into(),
+                    size: WryLogicalSize::new(size.width, size.height).into(),
+                });
             }
             _ => {}
         }
