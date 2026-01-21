@@ -73,17 +73,45 @@ fn main() {
         println!("cargo:warning=Node.js downloaded to {:?}", node_bin);
     }
 
-    // Copy bridge and create package.json for ES modules
+    // Copy bridge and node_modules to output
     let bridge_src = PathBuf::from("bridge/dist/index.js");
+    let node_modules = PathBuf::from("bridge/node_modules");
+
     if bridge_src.exists() {
+        // Copy bridge
         let bridge_dest = out_dir.join("copilot-bridge.js");
         fs::copy(&bridge_src, &bridge_dest).expect("Failed to copy bridge");
 
-        // Create package.json for ES module support
-        let pkg_json = r#"{"type": "module"}"#;
-        fs::write(out_dir.join("package.json"), pkg_json).expect("Failed to write package.json");
+        // Copy package.json
+        let pkg_src = PathBuf::from("bridge/package.json");
+        if pkg_src.exists() {
+            fs::copy(&pkg_src, out_dir.join("package.json")).expect("Failed to copy package.json");
+        }
+
+        // Copy node_modules if they exist
+        if node_modules.exists() {
+            println!("cargo:warning=Copying node_modules (this may take a moment)...");
+            copy_dir_all(&node_modules, &out_dir.join("node_modules"))
+                .expect("Failed to copy node_modules");
+        }
 
         println!("cargo:rerun-if-changed=bridge/dist/index.js");
         println!("cargo:rerun-if-changed=bridge/src/index.ts");
+        println!("cargo:rerun-if-changed=bridge/package.json");
     }
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_all(&path, &dest_path)?;
+        } else {
+            fs::copy(&path, &dest_path)?;
+        }
+    }
+    Ok(())
 }

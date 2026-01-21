@@ -22,9 +22,31 @@ class CopilotBridge {
   async start(): Promise<void> {
     console.error('[bridge] Starting GitHub Copilot SDK Bridge...');
     
-    // Create client with stdio mode
+    // Find system copilot CLI
+    const copilotPaths = [
+      '/opt/homebrew/bin/copilot',
+      '/usr/local/bin/copilot',
+      '/home/linuxbrew/.linuxbrew/bin/copilot',
+      'copilot',
+    ];
+    
+    let copilotPath = 'copilot';
+    for (const path of copilotPaths) {
+      try {
+        const { execSync } = await import('child_process');
+        execSync(`${path} --version`, { stdio: 'ignore' });
+        copilotPath = path;
+        console.error(`[bridge] Found copilot at: ${path}`);
+        break;
+      } catch {
+        // Continue
+      }
+    }
+    
+    // Create client with system CLI
     this.client = new CopilotClient({
       useStdio: true,
+      cliPath: copilotPath,
       logLevel: 'info',
     });
 
