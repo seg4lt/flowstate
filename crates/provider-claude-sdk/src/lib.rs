@@ -11,9 +11,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderSessionState,
-    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail,
-    TurnEventSink,
+    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
+    ProviderTurnOutput, SessionDetail, TurnEventSink,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 600_000;
@@ -565,6 +565,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                         message: Some(
                             "Node.js not found. Install from https://nodejs.org".to_string(),
                         ),
+                        models: claude_models(),
                     };
                 }
             }
@@ -578,6 +579,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             version: None,
             status: ProviderStatusLevel::Ready,
             message: Some("Claude Agent SDK bridge ready".to_string()),
+            models: claude_models(),
         }
     }
 
@@ -839,4 +841,21 @@ async fn forward_stream(
             debug!("Unknown bridge stream event: {event}");
         }
     }
+}
+
+fn claude_models() -> Vec<ProviderModel> {
+    vec![
+        ProviderModel {
+            value: "sonnet".to_string(),
+            label: "Claude Sonnet".to_string(),
+        },
+        ProviderModel {
+            value: "opus".to_string(),
+            label: "Claude Opus".to_string(),
+        },
+        ProviderModel {
+            value: "haiku".to_string(),
+            label: "Claude Haiku".to_string(),
+        },
+    ]
 }

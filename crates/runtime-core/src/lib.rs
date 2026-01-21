@@ -695,6 +695,7 @@ mod tests {
                 version: Some("test".to_string()),
                 status: ProviderStatusLevel::Ready,
                 message: None,
+                models: vec![],
             }
         }
 

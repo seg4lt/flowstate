@@ -11,8 +11,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 use zenui_provider_api::{
-    PermissionMode, ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus,
-    ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail, TurnEventSink,
+    PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
+    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail,
+    TurnEventSink,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 120_000;
@@ -516,6 +517,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                         message: Some(
                             "Node.js not found. Install from https://nodejs.org".to_string(),
                         ),
+                        models: copilot_models(),
                     };
                 }
             }
@@ -540,6 +542,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 version: None,
                 status: ProviderStatusLevel::Ready,
                 message: Some(format!("Copilot SDK ready (found at {})", path)),
+                models: copilot_models(),
             },
             None => ProviderStatus {
                 kind,
@@ -552,6 +555,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                     "Copilot CLI not found. Run: gh extension install github/gh-copilot"
                         .to_string(),
                 ),
+                models: copilot_models(),
             },
         }
     }
@@ -616,4 +620,25 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             session.summary.title
         ))
     }
+}
+
+fn copilot_models() -> Vec<ProviderModel> {
+    vec![
+        ProviderModel {
+            value: "gpt-4.1".to_string(),
+            label: "GPT-4.1".to_string(),
+        },
+        ProviderModel {
+            value: "gpt-4o".to_string(),
+            label: "GPT-4o".to_string(),
+        },
+        ProviderModel {
+            value: "gpt-5".to_string(),
+            label: "GPT-5".to_string(),
+        },
+        ProviderModel {
+            value: "claude-sonnet-4-5".to_string(),
+            label: "Claude Sonnet 4.5".to_string(),
+        },
+    ]
 }

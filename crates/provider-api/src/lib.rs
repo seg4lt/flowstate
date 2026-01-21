@@ -167,6 +167,13 @@ pub struct ToolCall {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProviderModel {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
     pub kind: ProviderKind,
     pub label: String,
@@ -175,6 +182,8 @@ pub struct ProviderStatus {
     pub version: Option<String>,
     pub status: ProviderStatusLevel,
     pub message: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ProviderModel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

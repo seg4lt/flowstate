@@ -10,8 +10,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use zenui_provider_api::{
-    PermissionMode, ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus,
-    ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail, TurnEventSink,
+    PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
+    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail,
+    TurnEventSink,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -203,6 +204,7 @@ impl ProviderAdapter for CodexAdapter {
             ProviderKind::Codex,
             &["--version"],
             &["login", "status"],
+            codex_models(),
         )
         .await
     }
@@ -541,6 +543,7 @@ async fn probe_cli(
     kind: ProviderKind,
     version_args: &[&str],
     auth_args: &[&str],
+    models: Vec<ProviderModel>,
 ) -> ProviderStatus {
     let label = kind.label();
     match Command::new(binary).args(version_args).output().await {
@@ -573,6 +576,7 @@ async fn probe_cli(
                             ProviderStatusLevel::Warning
                         },
                         message,
+                        models,
                     }
                 }
                 Err(error) => ProviderStatus {
@@ -585,6 +589,7 @@ async fn probe_cli(
                     message: Some(format!(
                         "{label} CLI is installed, but auth probing failed: {error}"
                     )),
+                    models,
                 },
             }
         }
@@ -596,8 +601,26 @@ async fn probe_cli(
             version: None,
             status: ProviderStatusLevel::Error,
             message: Some(format!("{label} CLI is unavailable: {error}")),
+            models,
         },
     }
+}
+
+fn codex_models() -> Vec<ProviderModel> {
+    vec![
+        ProviderModel {
+            value: "gpt-5".to_string(),
+            label: "GPT-5 (Codex)".to_string(),
+        },
+        ProviderModel {
+            value: "o3".to_string(),
+            label: "o3".to_string(),
+        },
+        ProviderModel {
+            value: "gpt-4o".to_string(),
+            label: "GPT-4o".to_string(),
+        },
+    ]
 }
 
 fn initialize_params() -> Value {

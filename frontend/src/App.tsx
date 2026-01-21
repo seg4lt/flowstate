@@ -87,6 +87,11 @@ interface PendingQuestion {
   question: string;
 }
 
+interface ProviderModel {
+  value: string;
+  label: string;
+}
+
 interface ProviderStatus {
   kind: ProviderKind;
   label: string;
@@ -95,6 +100,7 @@ interface ProviderStatus {
   version: string | null;
   status: ProviderStatusLevel;
   message: string | null;
+  models: ProviderModel[];
 }
 
 interface TurnRecord {
@@ -244,24 +250,6 @@ const PROVIDER_LABELS: Record<ProviderKind, string> = {
   github_copilot: "GitHub Copilot",
 };
 
-const PROVIDER_MODELS: Record<ProviderKind, { value: string; label: string }[]> = {
-  codex: [
-    { value: "gpt-5", label: "GPT-5 (Codex)" },
-    { value: "o3", label: "o3" },
-    { value: "gpt-4o", label: "GPT-4o" },
-  ],
-  claude: [
-    { value: "sonnet", label: "Claude Sonnet" },
-    { value: "opus", label: "Claude Opus" },
-    { value: "haiku", label: "Claude Haiku" },
-  ],
-  github_copilot: [
-    { value: "gpt-4.1", label: "GPT-4.1" },
-    { value: "gpt-4o", label: "GPT-4o" },
-    { value: "gpt-5", label: "GPT-5" },
-    { value: "claude-sonnet-4-5", label: "Claude Sonnet 4.5" },
-  ],
-};
 
 // Traffic light component
 function TrafficLights() {
@@ -970,17 +958,17 @@ export default function App() {
                       <TooltipContent>New Thread</TooltipContent>
                     </Tooltip>
                     <DropdownMenuContent align="start" className="w-56">
-                      {(["codex", "claude", "github_copilot"] as ProviderKind[]).map((provider) => (
-                        <DropdownMenuSub key={provider}>
+                      {(bootstrap?.providers ?? []).map((p) => (
+                        <DropdownMenuSub key={p.kind}>
                           <DropdownMenuSubTrigger className="gap-2">
-                            <div className={`w-2 h-2 rounded-full ${PROVIDER_COLORS[provider]}`} />
-                            New {PROVIDER_LABELS[provider]} Thread
+                            <div className={`w-2 h-2 rounded-full ${PROVIDER_COLORS[p.kind]}`} />
+                            New {PROVIDER_LABELS[p.kind]} Thread
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
-                            {PROVIDER_MODELS[provider].map(({ value, label }) => (
+                            {p.models.map(({ value, label }) => (
                               <DropdownMenuItem
                                 key={value}
-                                onClick={() => startSession(provider, value)}
+                                onClick={() => startSession(p.kind, value)}
                                 className="gap-2"
                               >
                                 {label}
