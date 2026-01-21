@@ -169,7 +169,7 @@ async function main(): Promise<void> {
             const sessionId = await bridge.createSession(cwd);
             console.log(JSON.stringify({
               type: 'session_created',
-              sessionId,
+              session_id: sessionId,
             }));
             break;
           }
