@@ -481,8 +481,6 @@ impl CodexSessionProcess {
         turn_id: &str,
         events: &TurnEventSink,
     ) -> Result<TurnCompletion, String> {
-        let mut last_agent_text_len = 0usize;
-        let mut last_reasoning_len = 0usize;
         loop {
             match self.read_message().await? {
                 ProtocolMessage::Notification { method, params }
@@ -496,15 +494,8 @@ impl CodexSessionProcess {
                     });
                 }
                 ProtocolMessage::Notification { method, params } => {
-                    tracing::warn!(method = %method, params = %params, "codex: notification received");
-                    map_codex_notification(
-                        &method,
-                        &params,
-                        &mut last_agent_text_len,
-                        &mut last_reasoning_len,
-                        events,
-                    )
-                    .await;
+                    tracing::debug!(method = %method, "codex: notification received");
+                    map_codex_notification(&method, &params, events).await;
                 }
                 ProtocolMessage::ServerRequest { id, method, params } => {
                     if method == "item/tool/requestUserInput" {
@@ -941,108 +932,128 @@ fn spawn_stderr_drain(stderr: ChildStderr) -> JoinHandle<()> {
     })
 }
 
-/// Map a codex app-server notification into a streaming event and forward it.
-/// Handles text accumulation: codex sends the growing full text on each update, so we diff
-/// against the previous length to produce a true delta.
-async fn map_codex_notification(
-    method: &str,
-    params: &Value,
-    last_agent_text_len: &mut usize,
-    last_reasoning_len: &mut usize,
-    events: &TurnEventSink,
-) {
+/// Map a codex app-server notification into zenui streaming events.
+///
+/// Uses the actual Codex app-server JSON-RPC method names documented at
+/// <https://developers.openai.com/codex/app-server>. The delta events
+/// already carry incremental chunks (not accumulated text), so no diffing
+/// is needed here — we forward each chunk directly.
+async fn map_codex_notification(method: &str, params: &Value, events: &TurnEventSink) {
     match method {
-        // Item-level streaming updates: codex sends the full accumulated text each time.
-        "item/update" | "item/append" | "item/created" | "item/updated" => {
-            let item = match params.get("item") {
-                Some(v) => v,
-                None => return,
-            };
-            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-            match item_type {
-                "agentMessage" | "agent_message" => {
-                    let text = item
-                        .get("text")
-                        .or_else(|| item.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if text.len() > *last_agent_text_len {
-                        let delta = text[*last_agent_text_len..].to_string();
-                        *last_agent_text_len = text.len();
-                        events.send(ProviderTurnEvent::AssistantTextDelta { delta }).await;
-                    }
+        // Agent message streaming: params.delta is an incremental text chunk.
+        "item/agentMessage/delta" => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                if !delta.is_empty() {
+                    events
+                        .send(ProviderTurnEvent::AssistantTextDelta {
+                            delta: delta.to_string(),
+                        })
+                        .await;
                 }
-                "reasoning" => {
-                    let text = item
-                        .get("text")
-                        .or_else(|| item.get("content"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    if text.len() > *last_reasoning_len {
-                        let delta = text[*last_reasoning_len..].to_string();
-                        *last_reasoning_len = text.len();
-                        events.send(ProviderTurnEvent::ReasoningDelta { delta }).await;
-                    }
-                }
-                "toolCall" | "tool_call" => {
-                    let call_id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .or_else(|| item.get("toolName"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let args = item
-                        .get("args")
-                        .or_else(|| item.get("params"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    if !call_id.is_empty() && !name.is_empty() {
-                        events
-                            .send(ProviderTurnEvent::ToolCallStarted { call_id, name, args })
-                            .await;
-                    }
-                }
-                _ => {}
             }
         }
-        // Tool execution completion events.
-        "item/complete" | "item/completed" => {
-            let item = match params.get("item") {
-                Some(v) => v,
-                None => return,
-            };
+
+        // Reasoning streaming: raw chain-of-thought chunks in params.textDelta.
+        "item/reasoning/textDelta" => {
+            let delta = params
+                .get("textDelta")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("delta").and_then(Value::as_str))
+                .unwrap_or("");
+            if !delta.is_empty() {
+                events
+                    .send(ProviderTurnEvent::ReasoningDelta {
+                        delta: delta.to_string(),
+                    })
+                    .await;
+            }
+        }
+
+        // Reasoning summary streaming: readable chain-of-thought summaries.
+        "item/reasoning/summaryTextDelta" => {
+            let delta = params
+                .get("delta")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("textDelta").and_then(Value::as_str))
+                .unwrap_or("");
+            if !delta.is_empty() {
+                events
+                    .send(ProviderTurnEvent::ReasoningDelta {
+                        delta: delta.to_string(),
+                    })
+                    .await;
+            }
+        }
+
+        // Item lifecycle: `item/started` fires for tool-call-ish items as well as
+        // agent messages / reasoning. We emit ToolCallStarted only for the tool-ish
+        // item types so the UI can track them.
+        "item/started" => {
+            let Some(item) = params.get("item") else { return };
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-            if matches!(item_type, "toolCall" | "tool_call") {
+            if is_tool_like_item_type(item_type) {
+                let call_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = tool_item_display_name(item, item_type);
+                let args = tool_item_args(item).unwrap_or(Value::Null);
+                if !call_id.is_empty() {
+                    events
+                        .send(ProviderTurnEvent::ToolCallStarted { call_id, name, args })
+                        .await;
+                }
+            }
+        }
+
+        // `item/completed` is authoritative final state for all item types.
+        // For tool-like items → emit ToolCallCompleted. For fileChange items →
+        // emit FileChange.
+        "item/completed" => {
+            let Some(item) = params.get("item") else { return };
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+
+            if is_tool_like_item_type(item_type) {
                 let call_id = item
                     .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
                 let output = item
-                    .get("result")
-                    .or_else(|| item.get("output"))
-                    .map(|v| v.to_string())
+                    .get("output")
+                    .or_else(|| item.get("result"))
+                    .or_else(|| item.get("stdout"))
+                    .map(|v| match v.as_str() {
+                        Some(s) => s.to_string(),
+                        None => v.to_string(),
+                    })
                     .unwrap_or_default();
                 let error = item
                     .get("error")
-                    .and_then(|e| e.get("message"))
+                    .and_then(|e| e.get("message").or(Some(e)))
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 if !call_id.is_empty() {
                     events
-                        .send(ProviderTurnEvent::ToolCallCompleted { call_id, output, error })
+                        .send(ProviderTurnEvent::ToolCallCompleted {
+                            call_id: call_id.clone(),
+                            output,
+                            error,
+                        })
                         .await;
                 }
             }
+
+            if item_type == "fileChange" {
+                if let Some(fc) = extract_file_change(item) {
+                    events.send(fc).await;
+                }
+            }
         }
-        // Plan-mode notifications. Codex sends turn/plan/updated with the full
-        // plan and item/plan/delta with incremental step updates. Both carry a
-        // `plan` array of { step: string, status: "pending"|"inProgress"|"completed" }.
+
+        // Plan updates. `turn/plan/updated` carries the full plan; `item/plan/delta`
+        // carries incremental step text.
         "turn/plan/updated" | "item/plan/delta" => {
             let plan_steps = params
                 .get("plan")
@@ -1082,8 +1093,99 @@ async fn map_codex_notification(
                 })
                 .await;
         }
+
         _ => {}
     }
+}
+
+/// Returns true for Codex item types that map to a tool-call-style entry
+/// in the UI's work log (commands, file changes, MCP tool invocations, etc).
+fn is_tool_like_item_type(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "commandExecution"
+            | "fileChange"
+            | "mcpToolCall"
+            | "dynamicToolCall"
+            | "collabToolCall"
+            | "webSearch"
+    )
+}
+
+/// Pick the best display name for a tool-call item (e.g., `Bash`, `Write`,
+/// or the raw item type if nothing more specific is available).
+fn tool_item_display_name(item: &Value, item_type: &str) -> String {
+    match item_type {
+        "commandExecution" => "Bash".to_string(),
+        "fileChange" => "File change".to_string(),
+        "mcpToolCall" | "dynamicToolCall" | "collabToolCall" => item
+            .get("toolName")
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| item_type.to_string()),
+        "webSearch" => "Web search".to_string(),
+        _ => item_type.to_string(),
+    }
+}
+
+/// Extract the raw args payload from a tool-like item. For commandExecution
+/// we surface `{ command: "..." }` so the UI's "Ran command" renderer picks
+/// it up; for other types we forward the whole item as args.
+fn tool_item_args(item: &Value) -> Option<Value> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+    match item_type {
+        "commandExecution" => {
+            let command = item
+                .get("command")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    item.get("argv")
+                        .and_then(Value::as_array)
+                        .and_then(|arr| arr.first())
+                        .and_then(Value::as_str)
+                });
+            command.map(|c| json!({ "command": c }))
+        }
+        _ => item.get("args").cloned().or_else(|| Some(item.clone())),
+    }
+}
+
+/// Translate a Codex `fileChange` item into a zenui FileChange event. Codex
+/// file change items carry `path`, an operation kind, and before/after text.
+fn extract_file_change(item: &Value) -> Option<ProviderTurnEvent> {
+    let call_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let path = item.get("path").and_then(Value::as_str)?.to_string();
+    let operation = match item
+        .get("operation")
+        .or_else(|| item.get("kind"))
+        .and_then(Value::as_str)
+    {
+        Some("write") | Some("create") | Some("add") => zenui_provider_api::FileOperation::Write,
+        Some("delete") | Some("remove") => zenui_provider_api::FileOperation::Delete,
+        _ => zenui_provider_api::FileOperation::Edit,
+    };
+    let before = item
+        .get("before")
+        .or_else(|| item.get("originalContent"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let after = item
+        .get("after")
+        .or_else(|| item.get("newContent"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(ProviderTurnEvent::FileChange {
+        call_id,
+        path,
+        operation,
+        before,
+        after,
+    })
 }
 
 fn first_non_empty_line(bytes: &[u8]) -> Option<String> {

@@ -179,11 +179,18 @@ class CopilotBridge {
       });
     };
 
+    // `streaming: true` is REQUIRED for the SDK to emit incremental
+    // `assistant.message_delta` / `assistant.reasoning_delta` events.
+    // Without it, the SDK only fires the final `assistant.message` /
+    // `assistant.reasoning` events and the UI sees only the complete
+    // response in one shot. See
+    // https://github.com/github/copilot-sdk README.
     this.session = await this.client.createSession({
       model: selectedModel,
+      streaming: true,
       onPermissionRequest: permissionHandler,
       onUserInputRequest: userInputHandler,
-    });
+    } as Parameters<typeof this.client.createSession>[0]);
 
     // Plan-mode visibility: when the model decides to exit plan mode, surface
     // the proposed plan to ZenUI as a read-only plan card. NOTE: the SDK
