@@ -11,9 +11,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 use zenui_provider_api::{
-    PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
-    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail,
-    TurnEventSink,
+    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
+    ProviderTurnOutput, SessionDetail, TurnEventSink,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 120_000;
@@ -22,7 +22,10 @@ const BRIDGE_TIMEOUT_MS: u64 = 120_000;
 #[derive(Debug)]
 struct CopilotBridgeProcess {
     child: Child,
-    stdin: ChildStdin,
+    // Wrapped in Arc<Mutex> so a background writer task can forward
+    // permission/user-input answers back to the bridge concurrently with the
+    // main read loop. Mirrors the pattern in provider-claude-sdk/src/lib.rs.
+    stdin: Arc<Mutex<ChildStdin>>,
     stdout: Lines<BufReader<ChildStdout>>,
     next_request_id: u64,
     bridge_session_id: String,
@@ -39,8 +42,24 @@ enum BridgeRequest {
         model: Option<String>,
     },
     #[serde(rename = "send_prompt")]
-    SendPrompt { prompt: String },
+    SendPrompt {
+        prompt: String,
+        permission_mode: String,
+    },
+    #[serde(rename = "answer_permission")]
+    AnswerPermission {
+        request_id: String,
+        decision: String,
+    },
+    #[serde(rename = "answer_user_input")]
+    AnswerUserInput {
+        request_id: String,
+        answer: String,
+    },
+    #[serde(rename = "list_models")]
+    ListModels,
     #[serde(rename = "interrupt")]
+    #[allow(dead_code)]
     Interrupt,
 }
 
@@ -52,9 +71,12 @@ enum BridgeResponse {
     Ready,
     #[serde(rename = "session_created")]
     SessionCreated { session_id: String },
+    #[serde(rename = "models")]
+    Models { models: Vec<ProviderModel> },
     #[serde(rename = "response")]
     Response { output: String },
     #[serde(rename = "interrupted")]
+    #[allow(dead_code)]
     Interrupted,
     #[serde(rename = "error")]
     Error { error: String },
@@ -76,6 +98,25 @@ enum BridgeResponse {
         error: Option<String>,
         #[serde(default)]
         message: Option<String>,
+        // Round-trip / plan-mode fields
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        tool_name: Option<String>,
+        #[serde(default)]
+        input: Option<serde_json::Value>,
+        #[serde(default)]
+        suggested: Option<String>,
+        #[serde(default)]
+        question: Option<String>,
+        #[serde(default)]
+        plan_id: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        steps: Option<serde_json::Value>,
+        #[serde(default)]
+        raw: Option<String>,
     },
 }
 
@@ -202,7 +243,7 @@ impl GitHubCopilotAdapter {
 
         let mut process = CopilotBridgeProcess {
             child,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
             next_request_id: 1,
             bridge_session_id: String::new(),
@@ -238,26 +279,7 @@ impl GitHubCopilotAdapter {
         process: &mut CopilotBridgeProcess,
         request: BridgeRequest,
     ) -> Result<BridgeResponse, String> {
-        let request_json = serde_json::to_string(&request)
-            .map_err(|e| format!("Failed to serialize request: {e}"))?;
-
-        debug!("Sending to bridge: {}", request_json);
-
-        process
-            .stdin
-            .write_all(request_json.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write to bridge: {e}"))?;
-        process
-            .stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("Failed to write newline: {e}"))?;
-        process
-            .stdin
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush: {e}"))?;
+        write_request(&process.stdin, &request).await?;
 
         match tokio::time::timeout(
             std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS),
@@ -275,53 +297,76 @@ impl GitHubCopilotAdapter {
     }
 
     /// Send a send_prompt request, forwarding streaming events to the sink while awaiting
-    /// the final response line. Turns are serialized per session (one at a time), so we can
-    /// safely read stdout inline without a background reader.
+    /// the final response line. Spawns a writer task so permission/user-input answers can
+    /// be forwarded back to the bridge concurrently with the read loop.
     async fn bridge_request_streaming(
         &self,
         process: &mut CopilotBridgeProcess,
         prompt: String,
+        permission_mode: PermissionMode,
         events: &TurnEventSink,
     ) -> Result<String, String> {
-        let request_json = serde_json::to_string(&BridgeRequest::SendPrompt { prompt })
-            .map_err(|e| format!("Failed to serialize send_prompt: {e}"))?;
+        write_request(
+            &process.stdin,
+            &BridgeRequest::SendPrompt {
+                prompt,
+                permission_mode: permission_mode_to_str(permission_mode).to_string(),
+            },
+        )
+        .await?;
 
-        debug!("Sending streaming prompt to bridge");
+        debug!("Sent streaming prompt to copilot bridge");
 
-        process
-            .stdin
-            .write_all(request_json.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write to bridge: {e}"))?;
-        process
-            .stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|e| format!("Failed to write newline: {e}"))?;
-        process
-            .stdin
-            .flush()
-            .await
-            .map_err(|e| format!("Failed to flush: {e}"))?;
+        // Writer task: forwards permission/user-input answers from spawned
+        // ask_user / request_permission tasks back into bridge stdin while the
+        // turn is in flight. Mirrors provider-claude-sdk/src/lib.rs writer task.
+        let stdin = process.stdin.clone();
+        let (perm_tx, mut perm_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, PermissionDecision)>();
+        let (q_tx, mut q_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let stdin_for_writer = stdin.clone();
+        let writer_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some((request_id, decision)) = perm_rx.recv() => {
+                        let req = BridgeRequest::AnswerPermission {
+                            request_id,
+                            decision: permission_decision_to_str(decision).to_string(),
+                        };
+                        if let Err(e) = write_request(&stdin_for_writer, &req).await {
+                            debug!("failed to forward permission answer: {e}");
+                            break;
+                        }
+                    }
+                    Some((request_id, answer)) = q_rx.recv() => {
+                        let req = BridgeRequest::AnswerUserInput { request_id, answer };
+                        if let Err(e) = write_request(&stdin_for_writer, &req).await {
+                            debug!("failed to forward user input answer: {e}");
+                            break;
+                        }
+                    }
+                    else => break,
+                }
+            }
+        });
 
-        // Read responses until we get a final `response` or `error`, forwarding stream events.
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS);
 
-        loop {
+        let result = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                return Err("Bridge streaming timeout".to_string());
+                break Err("Bridge streaming timeout".to_string());
             }
             let line = match tokio::time::timeout(remaining, process.read_response()).await {
                 Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => return Err(format!("Bridge read error: {e}")),
-                Err(_) => return Err("Bridge streaming timeout".to_string()),
+                Ok(Err(e)) => break Err(format!("Bridge read error: {e}")),
+                Err(_) => break Err("Bridge streaming timeout".to_string()),
             };
 
             match line {
-                BridgeResponse::Response { output } => return Ok(output),
-                BridgeResponse::Error { error } => return Err(format!("Copilot error: {error}")),
+                BridgeResponse::Response { output } => break Ok(output),
+                BridgeResponse::Error { error } => break Err(format!("Copilot error: {error}")),
                 BridgeResponse::Stream {
                     event,
                     delta,
@@ -331,63 +376,140 @@ impl GitHubCopilotAdapter {
                     output,
                     error,
                     message,
-                } => {
-                    match event.as_str() {
-                        "text_delta" => {
-                            if let Some(d) = delta {
-                                if !d.is_empty() {
-                                    events
-                                        .send(ProviderTurnEvent::AssistantTextDelta { delta: d })
-                                        .await;
-                                }
-                            }
-                        }
-                        "reasoning_delta" => {
-                            if let Some(d) = delta {
-                                if !d.is_empty() {
-                                    events
-                                        .send(ProviderTurnEvent::ReasoningDelta { delta: d })
-                                        .await;
-                                }
-                            }
-                        }
-                        "tool_started" => {
-                            if let (Some(cid), Some(n)) = (call_id, name) {
+                    request_id,
+                    tool_name,
+                    input,
+                    suggested,
+                    question,
+                    plan_id,
+                    title,
+                    steps,
+                    raw,
+                } => match event.as_str() {
+                    "text_delta" => {
+                        if let Some(d) = delta {
+                            if !d.is_empty() {
                                 events
-                                    .send(ProviderTurnEvent::ToolCallStarted {
-                                        call_id: cid,
-                                        name: n,
-                                        args: args.unwrap_or(serde_json::Value::Null),
-                                    })
+                                    .send(ProviderTurnEvent::AssistantTextDelta { delta: d })
                                     .await;
                             }
-                        }
-                        "tool_completed" => {
-                            if let Some(cid) = call_id {
-                                events
-                                    .send(ProviderTurnEvent::ToolCallCompleted {
-                                        call_id: cid,
-                                        output: output.unwrap_or_default(),
-                                        error,
-                                    })
-                                    .await;
-                            }
-                        }
-                        "info" | "warning" => {
-                            if let Some(msg) = message {
-                                events.send(ProviderTurnEvent::Info { message: msg }).await;
-                            }
-                        }
-                        _ => {
-                            debug!("Unknown bridge stream event: {event}");
                         }
                     }
-                }
+                    "reasoning_delta" => {
+                        if let Some(d) = delta {
+                            if !d.is_empty() {
+                                events
+                                    .send(ProviderTurnEvent::ReasoningDelta { delta: d })
+                                    .await;
+                            }
+                        }
+                    }
+                    "tool_started" => {
+                        if let (Some(cid), Some(n)) = (call_id, name) {
+                            events
+                                .send(ProviderTurnEvent::ToolCallStarted {
+                                    call_id: cid,
+                                    name: n,
+                                    args: args.unwrap_or(serde_json::Value::Null),
+                                })
+                                .await;
+                        }
+                    }
+                    "tool_completed" => {
+                        if let Some(cid) = call_id {
+                            events
+                                .send(ProviderTurnEvent::ToolCallCompleted {
+                                    call_id: cid,
+                                    output: output.unwrap_or_default(),
+                                    error,
+                                })
+                                .await;
+                        }
+                    }
+                    "info" | "warning" => {
+                        if let Some(msg) = message {
+                            events.send(ProviderTurnEvent::Info { message: msg }).await;
+                        }
+                    }
+                    "permission_request" => {
+                        let request_id = request_id.unwrap_or_default();
+                        let tool_name = tool_name.unwrap_or_default();
+                        let input = input.unwrap_or(serde_json::Value::Null);
+                        let suggested = suggested
+                            .as_deref()
+                            .map(parse_decision)
+                            .unwrap_or(PermissionDecision::Allow);
+
+                        let events_clone = events.clone();
+                        let perm_tx = perm_tx.clone();
+                        let req_id_for_writer = request_id.clone();
+                        let tool_name_clone = tool_name.clone();
+                        let input_clone = input.clone();
+                        tokio::spawn(async move {
+                            let decision = events_clone
+                                .request_permission(tool_name_clone, input_clone, suggested)
+                                .await;
+                            let _ = perm_tx.send((req_id_for_writer, decision));
+                        });
+                        events
+                            .send(ProviderTurnEvent::PermissionRequest {
+                                request_id,
+                                tool_name,
+                                input,
+                                suggested_decision: suggested,
+                            })
+                            .await;
+                    }
+                    "user_question" => {
+                        let request_id = request_id.unwrap_or_default();
+                        let question = question.unwrap_or_default();
+                        let events_clone = events.clone();
+                        let q_tx = q_tx.clone();
+                        let req_id_for_writer = request_id.clone();
+                        let question_clone = question.clone();
+                        tokio::spawn(async move {
+                            if let Some(answer) = events_clone.ask_user(question_clone).await {
+                                let _ = q_tx.send((req_id_for_writer, answer));
+                            }
+                        });
+                        events
+                            .send(ProviderTurnEvent::UserQuestion {
+                                request_id,
+                                question,
+                            })
+                            .await;
+                    }
+                    "plan_proposed" => {
+                        if let (Some(pid), Some(t)) = (plan_id, title) {
+                            let parsed_steps: Vec<zenui_provider_api::PlanStep> = steps
+                                .and_then(|v| serde_json::from_value(v).ok())
+                                .unwrap_or_default();
+                            events
+                                .send(ProviderTurnEvent::PlanProposed {
+                                    plan_id: pid,
+                                    title: t,
+                                    steps: parsed_steps,
+                                    raw: raw.unwrap_or_default(),
+                                })
+                                .await;
+                        }
+                    }
+                    _ => {
+                        debug!("Unknown bridge stream event: {event}");
+                    }
+                },
                 other => {
                     debug!("Unexpected mid-stream bridge message: {:?}", other);
                 }
             }
-        }
+        };
+
+        // Drain the writer task. Dropping the senders closes the channels and lets it exit.
+        drop(perm_tx);
+        drop(q_tx);
+        let _ = writer_task.await;
+
+        result
     }
 
     /// Return the cached bridge for this session, spawning one if none exists yet.
@@ -582,14 +704,18 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         permission_mode: PermissionMode,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
-        let _ = permission_mode;
-        info!("Executing turn with GitHub Copilot...");
+        info!("Executing turn with GitHub Copilot (mode={:?})", permission_mode);
 
         let process = self.ensure_session_process(session).await?;
         let result = {
             let mut process = process.lock().await;
             let output = self
-                .bridge_request_streaming(&mut process, input.to_string(), &events)
+                .bridge_request_streaming(
+                    &mut process,
+                    input.to_string(),
+                    permission_mode,
+                    &events,
+                )
                 .await?;
             Ok(ProviderTurnOutput {
                 output,
@@ -609,6 +735,36 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         Ok(())
     }
 
+    async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
+        // Spawn an ephemeral bridge so we don't disturb any active session,
+        // call client.listModels(), kill the process.
+        let mut bridge = self.spawn_bridge().await?;
+        write_request(&bridge.stdin, &BridgeRequest::ListModels).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            bridge.read_response(),
+        )
+        .await
+        .map_err(|_| "Timeout fetching Copilot models".to_string())?
+        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let _ = bridge.child.start_kill();
+
+        match response {
+            BridgeResponse::Models { models } => {
+                if models.is_empty() {
+                    Err("Copilot bridge returned no models".to_string())
+                } else {
+                    Ok(models)
+                }
+            }
+            BridgeResponse::Error { error } => Err(format!("Copilot list_models error: {error}")),
+            other => Err(format!(
+                "Unexpected bridge response for list_models: {:?}",
+                other
+            )),
+        }
+    }
+
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
         info!("Interrupting GitHub Copilot session...");
 
@@ -619,6 +775,54 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             "GitHub Copilot interrupt requested for session '{}'.",
             session.summary.title
         ))
+    }
+}
+
+async fn write_request(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    request: &BridgeRequest,
+) -> Result<(), String> {
+    let json = serde_json::to_string(request)
+        .map_err(|e| format!("Failed to serialize bridge request: {e}"))?;
+    let mut guard = stdin.lock().await;
+    guard
+        .write_all(json.as_bytes())
+        .await
+        .map_err(|e| format!("Failed to write to bridge: {e}"))?;
+    guard
+        .write_all(b"\n")
+        .await
+        .map_err(|e| format!("Failed to write to bridge: {e}"))?;
+    guard
+        .flush()
+        .await
+        .map_err(|e| format!("Failed to flush bridge stdin: {e}"))
+}
+
+fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "accept_edits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Bypass => "bypass",
+    }
+}
+
+fn permission_decision_to_str(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "allow",
+        PermissionDecision::AllowAlways => "allow_always",
+        PermissionDecision::Deny => "deny",
+        PermissionDecision::DenyAlways => "deny_always",
+    }
+}
+
+fn parse_decision(value: &str) -> PermissionDecision {
+    match value {
+        "allow_always" => PermissionDecision::AllowAlways,
+        "deny" => PermissionDecision::Deny,
+        "deny_always" => PermissionDecision::DenyAlways,
+        _ => PermissionDecision::Allow,
     }
 }
 

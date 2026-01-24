@@ -6,8 +6,13 @@
  * with the GitHub Copilot CLI, forwarding streaming events as JSON lines.
  */
 
-import { CopilotClient, approveAll } from '@github/copilot-sdk';
+import {
+  CopilotClient,
+  type PermissionRequest,
+  type PermissionRequestResult,
+} from '@github/copilot-sdk';
 import { createInterface } from 'readline';
+import { randomUUID } from 'crypto';
 
 // ZenUI protocol types
 interface ZenUiMessage {
@@ -15,14 +20,81 @@ interface ZenUiMessage {
   [key: string]: unknown;
 }
 
+type ZenUiPermissionMode = 'default' | 'accept_edits' | 'plan' | 'bypass';
+
+// `UserInputRequest` / `UserInputResponse` are defined in @github/copilot-sdk's
+// types.d.ts but the package's index.d.ts does not re-export them, so we
+// mirror the structural shape locally. Keep in sync with
+// node_modules/@github/copilot-sdk/dist/types.d.ts:550-577.
+interface UserInputRequest {
+  question: string;
+  choices?: string[];
+  allowFreeform?: boolean;
+}
+interface UserInputResponse {
+  answer: string;
+  wasFreeform: boolean;
+}
+
+// Pending round-trip resolvers keyed by request_id. Populated when the SDK
+// asks the host (via permission/user-input handler), drained when an
+// `answer_*` message arrives on stdin.
+const pendingUserInputs = new Map<string, (resp: UserInputResponse) => void>();
+const pendingPermissions = new Map<
+  string,
+  (result: PermissionRequestResult) => void
+>();
+
 /** Write a stream event JSON line to stdout. */
 function writeStream(payload: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify({ type: 'stream', ...payload }) + '\n');
 }
 
+/** Best-effort markdown bullet/numbered-list parser for plan content. */
+function parsePlanSteps(raw: string): Array<{ title: string; detail?: string }> {
+  if (!raw) return [];
+  const steps: Array<{ title: string; detail?: string }> = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    const match = trimmed.match(/^(?:[-*]|\d+\.)\s+(.*)$/);
+    if (match) {
+      steps.push({ title: match[1] });
+    }
+  }
+  return steps;
+}
+
 class CopilotBridge {
   private client: CopilotClient | null = null;
   private session: any = null;
+  // Closures registered at session creation read this field on every callback,
+  // so a per-turn `permission_mode` from sendPrompt can change handler behavior
+  // without re-registering anything on the SDK.
+  private currentPermissionMode: ZenUiPermissionMode = 'accept_edits';
+
+  /**
+   * Permission decision policy. Returns either an immediate
+   * PermissionRequestResult, or `null` to indicate "forward this request to
+   * ZenUI and wait for the user to decide via answer_permission".
+   */
+  private decidePermissionLocally(
+    req: PermissionRequest,
+  ): PermissionRequestResult | null {
+    const mode = this.currentPermissionMode;
+    if (mode === 'bypass') {
+      return { kind: 'approved' };
+    }
+    if (mode === 'accept_edits' || mode === 'plan') {
+      // Auto-approve read/write file ops; route shell/mcp/url/custom-tool
+      // through the user.
+      if (req.kind === 'read' || req.kind === 'write') {
+        return { kind: 'approved' };
+      }
+      return null;
+    }
+    // 'default' — ask the user about everything.
+    return null;
+  }
 
   async start(): Promise<void> {
     console.error('[bridge] Starting GitHub Copilot SDK Bridge...');
@@ -68,9 +140,66 @@ class CopilotBridge {
     const selectedModel = model ?? 'gpt-4o';
     console.error(`[bridge] Creating session in: ${cwd} (model: ${selectedModel})`);
 
+    const permissionHandler = async (
+      req: PermissionRequest,
+      _invocation: { sessionId: string },
+    ): Promise<PermissionRequestResult> => {
+      const local = this.decidePermissionLocally(req);
+      if (local !== null) {
+        return local;
+      }
+      // Forward to ZenUI and wait for the user to answer.
+      const requestId = randomUUID();
+      writeStream({
+        event: 'permission_request',
+        request_id: requestId,
+        tool_name: req.kind,
+        input: req,
+        suggested: 'allow',
+      });
+      return await new Promise<PermissionRequestResult>((resolve) => {
+        pendingPermissions.set(requestId, resolve);
+      });
+    };
+
+    const userInputHandler = async (
+      req: UserInputRequest,
+      _invocation: { sessionId: string },
+    ): Promise<UserInputResponse> => {
+      const requestId = randomUUID();
+      writeStream({
+        event: 'user_question',
+        request_id: requestId,
+        question: req.question,
+        choices: req.choices ?? null,
+        allow_freeform: req.allowFreeform ?? true,
+      });
+      return await new Promise<UserInputResponse>((resolve) => {
+        pendingUserInputs.set(requestId, resolve);
+      });
+    };
+
     this.session = await this.client.createSession({
       model: selectedModel,
-      onPermissionRequest: approveAll,
+      onPermissionRequest: permissionHandler,
+      onUserInputRequest: userInputHandler,
+    });
+
+    // Plan-mode visibility: when the model decides to exit plan mode, surface
+    // the proposed plan to ZenUI as a read-only plan card. NOTE: the SDK
+    // documents `session.respondToExitPlanMode()` in the event docstring but
+    // no such method is exposed in the public API, so this is observe-only —
+    // we cannot currently route an accept/reject decision back to the model.
+    this.session.on('exit_plan_mode.requested', (event: any) => {
+      const data = event?.data ?? {};
+      const raw: string = data.planContent ?? data.summary ?? '';
+      writeStream({
+        event: 'plan_proposed',
+        plan_id: data.requestId ?? randomUUID(),
+        title: 'Copilot plan',
+        steps: parsePlanSteps(raw),
+        raw,
+      });
     });
 
     const sessionId = this.session.id ?? this.session.sessionId ?? 'default-session';
@@ -79,12 +208,15 @@ class CopilotBridge {
     return sessionId;
   }
 
-  async sendPrompt(prompt: string): Promise<string> {
+  async sendPrompt(prompt: string, permissionMode: ZenUiPermissionMode): Promise<string> {
     if (!this.session) {
       throw new Error('No active session');
     }
 
-    console.error(`[bridge] Sending prompt (${prompt.length} chars)`);
+    // Stash the per-turn mode so the closures registered at session creation
+    // (permissionHandler / userInputHandler) read the right policy on this turn.
+    this.currentPermissionMode = permissionMode;
+    console.error(`[bridge] Sending prompt (${prompt.length} chars, mode=${permissionMode})`);
 
     // Subscribe to streaming events. Each returns an unsubscribe fn.
     const unsubs: Array<() => void> = [];
@@ -190,6 +322,17 @@ class CopilotBridge {
     }
   }
 
+  async listModels(): Promise<Array<{ value: string; label: string }>> {
+    if (!this.client) {
+      throw new Error('Client not started');
+    }
+    const models = await this.client.listModels();
+    return models.map((m: any) => ({
+      value: (m.id ?? m.value ?? '') as string,
+      label: (m.name ?? m.displayName ?? m.id ?? '') as string,
+    }));
+  }
+
   async stop(): Promise<void> {
     if (this.session) {
       try {
@@ -246,8 +389,10 @@ async function main(): Promise<void> {
 
           case 'send_prompt': {
             const prompt = msg.prompt as string;
+            const permissionMode =
+              ((msg.permission_mode as ZenUiPermissionMode) ?? 'accept_edits');
             try {
-              const output = await bridge.sendPrompt(prompt);
+              const output = await bridge.sendPrompt(prompt, permissionMode);
               process.stdout.write(
                 JSON.stringify({ type: 'response', output }) + '\n',
               );
@@ -262,11 +407,58 @@ async function main(): Promise<void> {
             break;
           }
 
+          case 'answer_user_input': {
+            const reqId = msg.request_id as string;
+            const resolver = pendingUserInputs.get(reqId);
+            if (resolver) {
+              pendingUserInputs.delete(reqId);
+              resolver({
+                answer: (msg.answer as string) ?? '',
+                wasFreeform: true,
+              });
+            }
+            break;
+          }
+
+          case 'answer_permission': {
+            const reqId = msg.request_id as string;
+            const decision = msg.decision as string;
+            const resolver = pendingPermissions.get(reqId);
+            if (resolver) {
+              pendingPermissions.delete(reqId);
+              const approved =
+                decision === 'allow' || decision === 'allow_always';
+              resolver(
+                approved
+                  ? { kind: 'approved' }
+                  : { kind: 'denied-interactively-by-user' },
+              );
+            }
+            break;
+          }
+
           case 'interrupt': {
             await bridge.interrupt();
             process.stdout.write(
               JSON.stringify({ type: 'interrupted' }) + '\n',
             );
+            break;
+          }
+
+          case 'list_models': {
+            try {
+              const models = await bridge.listModels();
+              process.stdout.write(
+                JSON.stringify({ type: 'models', models }) + '\n',
+              );
+            } catch (err) {
+              process.stdout.write(
+                JSON.stringify({
+                  type: 'error',
+                  error: `list_models failed: ${err instanceof Error ? err.message : String(err)}`,
+                }) + '\n',
+              );
+            }
             break;
           }
 

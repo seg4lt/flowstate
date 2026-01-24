@@ -577,6 +577,10 @@ pub enum RuntimeEvent {
     Info {
         message: String,
     },
+    ProviderModelsUpdated {
+        provider: ProviderKind,
+        models: Vec<ProviderModel>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,6 +624,9 @@ pub enum ClientMessage {
         session_id: String,
         plan_id: String,
     },
+    RefreshModels {
+        provider: ProviderKind,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -639,6 +646,13 @@ pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
     async fn health(&self) -> ProviderStatus;
+
+    /// Fetch the live model catalog from the upstream CLI / SDK.
+    /// Adapters override this; the default returns an empty list (which the
+    /// runtime treats as "use the cached or hardcoded fallback").
+    async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
+        Ok(Vec::new())
+    }
 
     async fn start_session(
         &self,

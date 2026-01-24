@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use zenui_provider_api::{
-    FileChangeRecord, PermissionMode, PlanRecord, ProviderKind, SessionDetail, SessionStatus,
-    SessionSummary, SubagentRecord, ToolCall, TurnRecord, TurnStatus,
+    FileChangeRecord, PermissionMode, PlanRecord, ProviderKind, ProviderModel, SessionDetail,
+    SessionStatus, SessionSummary, SubagentRecord, ToolCall, TurnRecord, TurnStatus,
 };
 
 #[derive(Debug)]
@@ -170,6 +170,51 @@ impl PersistenceService {
             .unwrap_or(false)
     }
 
+    /// Returns the cached models for a provider along with the ISO-8601 timestamp
+    /// they were fetched at, or None if no entry exists.
+    pub async fn get_cached_models(
+        &self,
+        kind: ProviderKind,
+    ) -> Option<(String, Vec<ProviderModel>)> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT fetched_at, models_json FROM provider_model_cache WHERE provider = ?1",
+                params![provider_kind_to_str(kind)],
+                |row| {
+                    let fetched_at: String = row.get(0)?;
+                    let models_json: String = row.get(1)?;
+                    Ok((fetched_at, models_json))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|(fetched_at, json)| {
+                serde_json::from_str::<Vec<ProviderModel>>(&json)
+                    .ok()
+                    .map(|models| (fetched_at, models))
+            })
+    }
+
+    /// Persist the model list for a provider with `now` as the fetched_at timestamp.
+    pub async fn set_cached_models(&self, kind: ProviderKind, models: &[ProviderModel]) {
+        let json = match serde_json::to_string(models) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let _ = connection.execute(
+            "INSERT INTO provider_model_cache (provider, fetched_at, models_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(provider) DO UPDATE SET
+                fetched_at = excluded.fetched_at,
+                models_json = excluded.models_json",
+            params![provider_kind_to_str(kind), now, json],
+        );
+    }
+
     fn migrate(&self) -> Result<()> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
@@ -201,6 +246,12 @@ impl PersistenceService {
             );
 
             CREATE INDEX IF NOT EXISTS idx_turns_session_id ON turns(session_id);
+
+            CREATE TABLE IF NOT EXISTS provider_model_cache (
+                provider TEXT PRIMARY KEY,
+                fetched_at TEXT NOT NULL,
+                models_json TEXT NOT NULL
+            );
             ",
             )
             .context("failed to run sqlite migrations")?;

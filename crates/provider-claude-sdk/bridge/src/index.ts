@@ -301,6 +301,35 @@ class ClaudeBridge {
       }
     }
   }
+
+  /**
+   * List the models the Claude Agent SDK reports as supported. Cheapest path:
+   * call query() with a noop prompt, abort immediately, then read
+   * supportedModels() — internally that just returns the cached init response.
+   */
+  async listModels(): Promise<Array<{ value: string; label: string }>> {
+    const abortController = new AbortController();
+    const q = query({
+      prompt: 'noop',
+      options: {
+        cwd: this.cwd,
+        abortController,
+      },
+    });
+    try {
+      const models = await q.supportedModels();
+      return models.map((m) => ({
+        value: m.value,
+        label: m.displayName ?? m.value,
+      }));
+    } finally {
+      try {
+        abortController.abort();
+      } catch {
+        // ignore
+      }
+    }
+  }
 }
 
 function parsePlanSteps(raw: string): Array<{ title: string; detail?: string }> {
@@ -404,6 +433,21 @@ async function main(): Promise<void> {
       case 'interrupt': {
         bridge.interrupt();
         writeJson({ type: 'interrupted' });
+        break;
+      }
+
+      case 'list_models': {
+        (async () => {
+          try {
+            const models = await bridge.listModels();
+            writeJson({ type: 'models', models });
+          } catch (err) {
+            writeJson({
+              type: 'error',
+              error: `list_models failed: ${(err as Error).message}`,
+            });
+          }
+        })();
         break;
       }
 

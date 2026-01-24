@@ -50,6 +50,8 @@ enum BridgeRequest {
         request_id: String,
         answer: String,
     },
+    #[serde(rename = "list_models")]
+    ListModels,
     #[serde(rename = "interrupt")]
     #[allow(dead_code)]
     Interrupt,
@@ -62,6 +64,8 @@ enum BridgeResponse {
     Ready,
     #[serde(rename = "session_created")]
     SessionCreated { session_id: String },
+    #[serde(rename = "models")]
+    Models { models: Vec<ProviderModel> },
     #[serde(rename = "response")]
     Response { output: String },
     #[serde(rename = "interrupted")]
@@ -622,6 +626,37 @@ impl ProviderAdapter for ClaudeSdkAdapter {
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
         self.invalidate_session(&session.summary.session_id).await;
         Ok(())
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
+        // Spawn an ephemeral bridge process, ask it for the model list, kill it.
+        // The bridge calls query() with a noop prompt and reads supportedModels()
+        // off the init response — no actual SDK call is made.
+        let mut bridge = self.spawn_bridge().await?;
+        write_request(&bridge.stdin, &BridgeRequest::ListModels).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            bridge.read_response(),
+        )
+        .await
+        .map_err(|_| "Timeout fetching Claude models".to_string())?
+        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let _ = bridge.child.start_kill();
+
+        match response {
+            BridgeResponse::Models { models } => {
+                if models.is_empty() {
+                    Err("Claude bridge returned no models".to_string())
+                } else {
+                    Ok(models)
+                }
+            }
+            BridgeResponse::Error { error } => Err(format!("Claude list_models error: {error}")),
+            other => Err(format!(
+                "Unexpected bridge response for list_models: {:?}",
+                other
+            )),
+        }
     }
 }
 

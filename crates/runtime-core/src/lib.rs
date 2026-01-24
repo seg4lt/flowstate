@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -8,10 +8,12 @@ use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, FileChangeRecord, PermissionDecision,
-    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderTurnEvent,
-    RuntimeEvent, ServerMessage, SessionDetail, SubagentRecord, SubagentStatus, ToolCall,
-    ToolCallStatus, TurnEventSink, TurnStatus,
+    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
+    ProviderTurnEvent, RuntimeEvent, ServerMessage, SessionDetail, SubagentRecord, SubagentStatus,
+    ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
 };
+
+const MODEL_CACHE_TTL_HOURS: i64 = 24;
 
 pub struct RuntimeCore {
     adapters: HashMap<ProviderKind, Arc<dyn ProviderAdapter>>,
@@ -19,6 +21,10 @@ pub struct RuntimeCore {
     orchestration: Arc<OrchestrationService>,
     persistence: Arc<PersistenceService>,
     active_sinks: Arc<Mutex<HashMap<String, TurnEventSink>>>,
+    /// Providers with an in-flight model fetch. Prevents the dual bootstrap
+    /// path (HTTP + WebSocket) from spawning two parallel fetches per provider
+    /// on a fresh connection.
+    in_flight_model_fetches: Arc<Mutex<HashSet<ProviderKind>>>,
 }
 
 impl RuntimeCore {
@@ -42,6 +48,7 @@ impl RuntimeCore {
             orchestration,
             persistence,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -61,7 +68,38 @@ impl RuntimeCore {
     }
 
     pub async fn bootstrap(&self, ws_url: String) -> BootstrapPayload {
-        let providers = join_all(self.adapters.values().map(|adapter| adapter.health())).await;
+        let mut providers: Vec<ProviderStatus> =
+            join_all(self.adapters.values().map(|adapter| adapter.health())).await;
+
+        // Merge cached models into ProviderStatus.models. If a provider has no
+        // cache or the cache is stale, kick off a background refresh that will
+        // broadcast a ProviderModelsUpdated event when it completes.
+        for status in providers.iter_mut() {
+            let kind = status.kind;
+            match self.persistence.get_cached_models(kind).await {
+                Some((fetched_at, cached)) => {
+                    tracing::info!(
+                        ?kind,
+                        cached_count = cached.len(),
+                        ?fetched_at,
+                        "loaded cached provider models"
+                    );
+                    status.models = cached;
+                    if is_cache_stale(&fetched_at) {
+                        tracing::info!(?kind, "model cache stale, refreshing in background");
+                        self.spawn_model_refresh(kind);
+                    }
+                }
+                None => {
+                    tracing::info!(
+                        ?kind,
+                        fallback_count = status.models.len(),
+                        "no cached models, using hardcoded fallback and refreshing"
+                    );
+                    self.spawn_model_refresh(kind);
+                }
+            }
+        }
 
         BootstrapPayload {
             app_name: "zenui".to_string(),
@@ -70,6 +108,60 @@ impl RuntimeCore {
             providers,
             snapshot: self.snapshot().await,
         }
+    }
+
+    /// Background-fetch the model list for one provider, persist it, and
+    /// broadcast a ProviderModelsUpdated event so connected clients can update.
+    /// Deduped per provider — repeated calls while a fetch is in flight are
+    /// ignored. Errors are logged and swallowed (cached/hardcoded list stays).
+    fn spawn_model_refresh(self: &Self, kind: ProviderKind) {
+        let Some(adapter) = self.adapters.get(&kind).cloned() else {
+            return;
+        };
+        let persistence = self.persistence.clone();
+        let event_tx = self.event_tx.clone();
+        let in_flight = self.in_flight_model_fetches.clone();
+
+        tokio::spawn(async move {
+            // Dedupe: skip if another refresh for this provider is already running.
+            {
+                let mut guard = in_flight.lock().await;
+                if guard.contains(&kind) {
+                    tracing::debug!(?kind, "skipping duplicate model refresh");
+                    return;
+                }
+                guard.insert(kind);
+            }
+
+            let result = adapter.fetch_models().await;
+
+            // Always release the in-flight slot, regardless of outcome.
+            {
+                let mut guard = in_flight.lock().await;
+                guard.remove(&kind);
+            }
+
+            match result {
+                Ok(models) if !models.is_empty() => {
+                    tracing::info!(
+                        ?kind,
+                        count = models.len(),
+                        "fetched provider models, persisting and broadcasting"
+                    );
+                    persistence.set_cached_models(kind, &models).await;
+                    let _ = event_tx.send(RuntimeEvent::ProviderModelsUpdated {
+                        provider: kind,
+                        models,
+                    });
+                }
+                Ok(_) => {
+                    tracing::debug!(?kind, "fetch_models returned empty list");
+                }
+                Err(e) => {
+                    tracing::warn!(?kind, "fetch_models failed: {e}");
+                }
+            }
+        });
     }
 
     pub async fn handle_client_message(&self, message: ClientMessage) -> Option<ServerMessage> {
@@ -145,6 +237,12 @@ impl RuntimeCore {
                 Ok(message) => Some(ServerMessage::Ack { message }),
                 Err(error) => Some(ServerMessage::Error { message: error }),
             },
+            ClientMessage::RefreshModels { provider } => {
+                self.spawn_model_refresh(provider);
+                Some(ServerMessage::Ack {
+                    message: format!("Refreshing models for {}.", provider.label()),
+                })
+            }
         }
     }
 
@@ -661,6 +759,18 @@ impl RuntimeCore {
         });
 
         Ok(format!("Session {session_id} deleted."))
+    }
+}
+
+/// Returns true if the ISO-8601 `fetched_at` timestamp is older than the model
+/// cache TTL. Unparseable timestamps are treated as stale so we'll re-fetch.
+fn is_cache_stale(fetched_at: &str) -> bool {
+    match chrono::DateTime::parse_from_rfc3339(fetched_at) {
+        Ok(parsed) => {
+            let age = Utc::now().signed_duration_since(parsed.with_timezone(&Utc));
+            age > chrono::Duration::hours(MODEL_CACHE_TTL_HOURS)
+        }
+        Err(_) => true,
     }
 }
 

@@ -39,6 +39,7 @@ struct CodexSessionProcess {
     stderr_task: JoinHandle<()>,
     next_request_id: u64,
     provider_thread_id: String,
+    active_mode: PermissionMode,
 }
 
 #[derive(Debug)]
@@ -58,6 +59,7 @@ enum ProtocolMessage {
     ServerRequest {
         id: Value,
         method: String,
+        params: Value,
     },
 }
 
@@ -79,6 +81,7 @@ impl CodexAdapter {
     async fn ensure_session_process(
         &self,
         session: &SessionDetail,
+        permission_mode: PermissionMode,
     ) -> Result<Arc<Mutex<CodexSessionProcess>>, String> {
         if let Some(existing) = self
             .sessions
@@ -90,7 +93,7 @@ impl CodexAdapter {
             return Ok(existing);
         }
 
-        let process = self.create_session_process(session).await?;
+        let process = self.create_session_process(session, permission_mode).await?;
         let process = Arc::new(Mutex::new(process));
         let mut sessions = self.sessions.lock().await;
         Ok(sessions
@@ -102,6 +105,7 @@ impl CodexAdapter {
     async fn create_session_process(
         &self,
         session: &SessionDetail,
+        permission_mode: PermissionMode,
     ) -> Result<CodexSessionProcess, String> {
         let mut child = Command::new(&self.binary_path)
             .arg("app-server")
@@ -134,6 +138,7 @@ impl CodexAdapter {
             stderr_task,
             next_request_id: 1,
             provider_thread_id: String::new(),
+            active_mode: permission_mode,
         };
 
         process
@@ -146,11 +151,12 @@ impl CodexAdapter {
             .as_ref()
             .and_then(|state| state.native_thread_id.as_deref());
 
+        let (approval_policy, sandbox) = map_permission_mode(permission_mode);
         let mut base_params = json!({
-            "approvalPolicy": "never",
+            "approvalPolicy": approval_policy,
             "cwd": self.working_directory.display().to_string(),
             "personality": "pragmatic",
-            "sandbox": "workspace-write",
+            "sandbox": sandbox,
         });
         if let Some(model) = session.summary.model.as_deref() {
             if let Some(obj) = base_params.as_object_mut() {
@@ -209,11 +215,77 @@ impl ProviderAdapter for CodexAdapter {
         .await
     }
 
+    async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
+        // Spawn an ephemeral codex app-server, run the JSON-RPC handshake, send
+        // model/list, parse, and kill the process. The response shape isn't
+        // documented anywhere we can audit, so we're defensive: any parsing
+        // failure falls back to the hardcoded list.
+        let mut child = Command::new(&self.binary_path)
+            .arg("app-server")
+            .current_dir(&self.working_directory)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("failed to launch codex app-server for model list: {e}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "codex stdin unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "codex stdout unavailable".to_string())?;
+        let _stderr_drain = child.stderr.take().map(spawn_stderr_drain);
+
+        let mut process = CodexSessionProcess {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout).lines(),
+            stderr_task: tokio::spawn(async {}),
+            next_request_id: 1,
+            provider_thread_id: String::new(),
+            active_mode: PermissionMode::default(),
+        };
+
+        process
+            .send_request("initialize", initialize_params())
+            .await
+            .map_err(|e| format!("codex initialize failed: {e}"))?;
+        process.send_notification("initialized").await.ok();
+        let response = process
+            .send_request("model/list", json!({}))
+            .await
+            .map_err(|e| format!("codex model/list failed: {e}"))?;
+        let _ = process.child.start_kill();
+
+        tracing::info!(
+            "codex model/list raw response: {}",
+            serde_json::to_string(&response).unwrap_or_else(|_| "<unserializable>".to_string())
+        );
+
+        let models = parse_codex_model_list(&response);
+        if models.is_empty() {
+            Err(format!(
+                "codex model/list returned no parseable models from: {}",
+                serde_json::to_string(&response).unwrap_or_else(|_| "<unserializable>".to_string())
+            ))
+        } else {
+            Ok(models)
+        }
+    }
+
     async fn start_session(
         &self,
         session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        let process = self.ensure_session_process(session).await?;
+        // We don't know the permission mode at session-creation time (the user
+        // picks it per turn), so seed with the default. execute_turn will tear
+        // down and recreate the thread if a different mode is requested.
+        let process = self
+            .ensure_session_process(session, PermissionMode::default())
+            .await?;
         let process = process.lock().await;
         Ok(Some(provider_state(process.provider_thread_id.clone())))
     }
@@ -225,24 +297,48 @@ impl ProviderAdapter for CodexAdapter {
         permission_mode: PermissionMode,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
-        let _ = permission_mode;
-        let process = self.ensure_session_process(session).await?;
+        // Codex's approvalPolicy/sandbox are bound at thread/start, so a mid-session
+        // mode switch requires tearing down and recreating the thread. The runtime's
+        // provider_state round-trips native_thread_id, so the recreated process
+        // can call thread/resume and conversation history is preserved.
+        let process = self.ensure_session_process(session, permission_mode).await?;
+        {
+            let current_mode = process.lock().await.active_mode;
+            if current_mode != permission_mode {
+                drop(process);
+                self.invalidate_session(&session.summary.session_id).await;
+            }
+        }
+        let process = self.ensure_session_process(session, permission_mode).await?;
+
         let result = {
             let mut process = process.lock().await;
             let provider_thread_id = process.provider_thread_id.clone();
-            let response = process
-                .send_request(
-                    "turn/start",
-                    json!({
-                        "input": [{
-                            "text": input,
-                            "text_elements": [],
-                            "type": "text",
-                        }],
-                        "threadId": provider_thread_id,
-                    }),
-                )
-                .await?;
+            let mut turn_params = json!({
+                "input": [{
+                    "text": input,
+                    "text_elements": [],
+                    "type": "text",
+                }],
+                "threadId": provider_thread_id,
+            });
+            if permission_mode == PermissionMode::Plan {
+                if let Some(obj) = turn_params.as_object_mut() {
+                    let model = session.summary.model.clone().unwrap_or_default();
+                    obj.insert(
+                        "collaborationMode".to_string(),
+                        json!({
+                            "mode": "plan",
+                            "settings": {
+                                "model": model,
+                                "reasoning_effort": "medium",
+                                "developer_instructions": "",
+                            },
+                        }),
+                    );
+                }
+            }
+            let response = process.send_request("turn/start", turn_params).await?;
             let turn_id = extract_turn_id(&response)
                 .ok_or_else(|| "Codex turn start did not return a turn id.".to_string())?;
             let completion = process.wait_for_turn_completion(&turn_id, &events).await?;
@@ -351,7 +447,7 @@ impl CodexSessionProcess {
                         ProtocolMessage::ResponseError { id, message } if id == request_id => {
                             return Err(format!("{method} failed: {message}"));
                         }
-                        ProtocolMessage::ServerRequest { id, method } => {
+                        ProtocolMessage::ServerRequest { id, method, .. } => {
                             self.respond_unsupported(id, &method).await?;
                         }
                         ProtocolMessage::Notification { .. }
@@ -401,8 +497,41 @@ impl CodexSessionProcess {
                     )
                     .await;
                 }
-                ProtocolMessage::ServerRequest { id, method } => {
-                    self.respond_unsupported(id, &method).await?;
+                ProtocolMessage::ServerRequest { id, method, params } => {
+                    if method == "item/tool/requestUserInput" {
+                        // Codex's ask_user tool: extract the question, ask the user
+                        // via the runtime, then send a JSON-RPC response back to codex
+                        // carrying the typed answer. While we're awaiting ask_user(),
+                        // codex is blocked waiting for our response, so no other
+                        // messages will arrive on this stream.
+                        let question = params
+                            .get("question")
+                            .or_else(|| params.get("prompt"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex needs your input.")
+                            .to_string();
+                        match events.ask_user(question).await {
+                            Some(answer) => {
+                                self.write_message(json!({
+                                    "id": id,
+                                    "result": { "answer": answer },
+                                }))
+                                .await?;
+                            }
+                            None => {
+                                self.write_message(json!({
+                                    "id": id,
+                                    "error": {
+                                        "code": -32000,
+                                        "message": "User did not provide an answer.",
+                                    },
+                                }))
+                                .await?;
+                            }
+                        }
+                    } else {
+                        self.respond_unsupported(id, &method).await?;
+                    }
                 }
                 ProtocolMessage::Response { .. } | ProtocolMessage::ResponseError { .. } => {}
             }
@@ -507,6 +636,7 @@ impl CodexSessionProcess {
                     return Ok(ProtocolMessage::ServerRequest {
                         id: value.get("id").cloned().unwrap_or(Value::Null),
                         method: method.to_string(),
+                        params: value.get("params").cloned().unwrap_or(Value::Null),
                     });
                 }
 
@@ -603,6 +733,85 @@ async fn probe_cli(
             message: Some(format!("{label} CLI is unavailable: {error}")),
             models,
         },
+    }
+}
+
+/// Heuristic parser for the codex `model/list` response. The shape isn't
+/// formally documented, so we recursively walk the response looking for any
+/// JSON array whose objects have a model-identifier-shaped field. Accepts:
+///   - id / value / slug / model / name (for the identifier)
+///   - displayName / display_name / label / name / title (for the label)
+fn parse_codex_model_list(response: &Value) -> Vec<ProviderModel> {
+    let mut out = Vec::new();
+    walk_for_models(response, &mut out);
+    out
+}
+
+fn walk_for_models(value: &Value, out: &mut Vec<ProviderModel>) {
+    match value {
+        Value::Array(arr) => {
+            // If every entry looks like a model object, harvest the array.
+            let parsed: Vec<ProviderModel> = arr
+                .iter()
+                .filter_map(extract_model_entry)
+                .collect();
+            if !parsed.is_empty() && parsed.len() >= arr.len() / 2 {
+                out.extend(parsed);
+                return;
+            }
+            // Otherwise recurse into each element (in case it's nested).
+            for v in arr {
+                walk_for_models(v, out);
+            }
+        }
+        Value::Object(obj) => {
+            for (_k, v) in obj {
+                walk_for_models(v, out);
+                if !out.is_empty() {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_model_entry(entry: &Value) -> Option<ProviderModel> {
+    let obj = entry.as_object()?;
+    // Codex marks deprecated/private models with hidden: true. Skip them so
+    // the dropdown only lists models the user can actually pick.
+    if obj.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    let value = obj
+        .get("id")
+        .or_else(|| obj.get("value"))
+        .or_else(|| obj.get("slug"))
+        .or_else(|| obj.get("model"))
+        .or_else(|| obj.get("name"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let label = obj
+        .get("displayName")
+        .or_else(|| obj.get("display_name"))
+        .or_else(|| obj.get("label"))
+        .or_else(|| obj.get("title"))
+        .or_else(|| obj.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or(&value)
+        .to_string();
+    Some(ProviderModel { value, label })
+}
+
+/// Map zenui's PermissionMode → codex's (approvalPolicy, sandbox) tuple at thread/start.
+fn map_permission_mode(mode: PermissionMode) -> (&'static str, &'static str) {
+    match mode {
+        PermissionMode::Default => ("untrusted", "read-only"),
+        PermissionMode::AcceptEdits => ("on-request", "workspace-write"),
+        // Plan mode reuses AcceptEdits's policy; the actual plan-mode toggle
+        // happens per turn via `collaborationMode.mode = "plan"` in turn/start.
+        PermissionMode::Plan => ("on-request", "workspace-write"),
+        PermissionMode::Bypass => ("never", "danger-full-access"),
     }
 }
 
@@ -821,6 +1030,48 @@ async fn map_codex_notification(
                         .await;
                 }
             }
+        }
+        // Plan-mode notifications. Codex sends turn/plan/updated with the full
+        // plan and item/plan/delta with incremental step updates. Both carry a
+        // `plan` array of { step: string, status: "pending"|"inProgress"|"completed" }.
+        "turn/plan/updated" | "item/plan/delta" => {
+            let plan_steps = params
+                .get("plan")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|entry| {
+                            entry
+                                .get("step")
+                                .and_then(Value::as_str)
+                                .map(|s| zenui_provider_api::PlanStep {
+                                    title: s.to_string(),
+                                    detail: entry
+                                        .get("status")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string),
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if plan_steps.is_empty() {
+                return;
+            }
+            let plan_id = notification_turn_id(params).unwrap_or_else(|| "codex-plan".to_string());
+            let raw = params
+                .get("explanation")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default();
+            events
+                .send(ProviderTurnEvent::PlanProposed {
+                    plan_id,
+                    title: "Codex plan".to_string(),
+                    steps: plan_steps,
+                    raw,
+                })
+                .await;
         }
         _ => {}
     }

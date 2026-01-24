@@ -7,6 +7,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
@@ -222,7 +223,12 @@ type RuntimeEvent =
       raw: string;
     }
   | { type: "error"; message: string }
-  | { type: "info"; message: string };
+  | { type: "info"; message: string }
+  | {
+      type: "provider_models_updated";
+      provider: ProviderKind;
+      models: ProviderModel[];
+    };
 
 type ServerMessage =
   | { type: "welcome"; bootstrap: BootstrapPayload }
@@ -786,6 +792,25 @@ export default function App() {
                 );
               } else if (ev.type === "error") {
                 setLastAction(`Error: ${ev.message}`);
+              } else if (ev.type === "provider_models_updated") {
+                // eslint-disable-next-line no-console
+                console.log("[zenui] provider_models_updated", ev.provider, ev.models);
+                setBootstrap((prev) => {
+                  if (!prev) {
+                    // eslint-disable-next-line no-console
+                    console.warn("[zenui] provider_models_updated arrived before bootstrap was set; dropping event");
+                    return prev;
+                  }
+                  return {
+                    ...prev,
+                    providers: prev.providers.map((p) =>
+                      p.kind === ev.provider ? { ...p, models: ev.models } : p
+                    ),
+                  };
+                });
+                setLastAction(
+                  `Refreshed ${PROVIDER_LABELS[ev.provider]} models (${ev.models.length})`
+                );
               }
               break;
             }
@@ -974,6 +999,19 @@ export default function App() {
                                 {label}
                               </DropdownMenuItem>
                             ))}
+                            {p.models.length > 0 && <DropdownMenuSeparator />}
+                            <DropdownMenuItem
+                              onClick={() => {
+                                send({ type: "refresh_models", provider: p.kind });
+                                setLastAction(
+                                  `Refreshing ${PROVIDER_LABELS[p.kind]} models...`
+                                );
+                              }}
+                              className="gap-2 text-muted-foreground"
+                            >
+                              <RefreshCw className="h-3.5 w-3.5" />
+                              Refresh models
+                            </DropdownMenuItem>
                           </DropdownMenuSubContent>
                         </DropdownMenuSub>
                       ))}
