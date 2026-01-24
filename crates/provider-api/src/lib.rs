@@ -84,6 +84,32 @@ impl Default for PermissionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for ReasoningEffort {
+    fn default() -> Self {
+        ReasoningEffort::Medium
+    }
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FileOperation {
     Write,
     Edit,
@@ -207,6 +233,18 @@ pub struct TurnRecord {
     pub plan: Option<PlanRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecord {
+    pub project_id: String,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub sort_order: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +260,8 @@ pub struct SessionSummary {
     pub turn_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,6 +313,8 @@ impl SessionDetail {
 pub struct AppSnapshot {
     pub generated_at: String,
     pub sessions: Vec<SessionDetail>,
+    #[serde(default)]
+    pub projects: Vec<ProjectRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,6 +623,22 @@ pub enum RuntimeEvent {
         provider: ProviderKind,
         models: Vec<ProviderModel>,
     },
+    ProjectCreated {
+        project: ProjectRecord,
+    },
+    ProjectRenamed {
+        project_id: String,
+        name: String,
+        updated_at: String,
+    },
+    ProjectDeleted {
+        project_id: String,
+        reassigned_session_ids: Vec<String>,
+    },
+    SessionProjectAssigned {
+        session_id: String,
+        project_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,12 +651,16 @@ pub enum ClientMessage {
         title: Option<String>,
         #[serde(default)]
         model: Option<String>,
+        #[serde(default)]
+        project_id: Option<String>,
     },
     SendTurn {
         session_id: String,
         input: String,
         #[serde(default)]
         permission_mode: Option<PermissionMode>,
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     InterruptTurn {
         session_id: String,
@@ -626,6 +688,21 @@ pub enum ClientMessage {
     },
     RefreshModels {
         provider: ProviderKind,
+    },
+    CreateProject {
+        name: String,
+    },
+    RenameProject {
+        project_id: String,
+        name: String,
+    },
+    DeleteProject {
+        project_id: String,
+    },
+    AssignSessionToProject {
+        session_id: String,
+        #[serde(default)]
+        project_id: Option<String>,
     },
 }
 
@@ -669,6 +746,7 @@ pub trait ProviderAdapter: Send + Sync {
         session: &SessionDetail,
         input: &str,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String>;
 

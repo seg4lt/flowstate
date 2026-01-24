@@ -9,8 +9,8 @@ use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, FileChangeRecord, PermissionDecision,
     PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
-    ProviderTurnEvent, RuntimeEvent, ServerMessage, SessionDetail, SubagentRecord, SubagentStatus,
-    ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
+    ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail,
+    SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -64,6 +64,7 @@ impl RuntimeCore {
         AppSnapshot {
             generated_at: Utc::now().to_rfc3339(),
             sessions: self.persistence.list_sessions().await,
+            projects: self.persistence.list_projects().await,
         }
     }
 
@@ -171,9 +172,14 @@ impl RuntimeCore {
             ClientMessage::LoadSnapshot => Some(ServerMessage::Snapshot {
                 snapshot: self.snapshot().await,
             }),
-            ClientMessage::StartSession { provider, title, model } => {
-                tracing::info!(?provider, ?model, "Starting session");
-                match self.start_session(provider, title, model).await {
+            ClientMessage::StartSession {
+                provider,
+                title,
+                model,
+                project_id,
+            } => {
+                tracing::info!(?provider, ?model, ?project_id, "Starting session");
+                match self.start_session(provider, title, model, project_id).await {
                     Ok(session) => Some(ServerMessage::SessionCreated {
                         session: session.summary,
                     }),
@@ -184,9 +190,10 @@ impl RuntimeCore {
                 session_id,
                 input,
                 permission_mode,
+                reasoning_effort,
             } => {
                 let mode = permission_mode.unwrap_or_default();
-                match self.send_turn(session_id, input, mode).await {
+                match self.send_turn(session_id, input, mode, reasoning_effort).await {
                     Ok(message) => Some(ServerMessage::Ack { message }),
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
@@ -243,6 +250,77 @@ impl RuntimeCore {
                     message: format!("Refreshing models for {}.", provider.label()),
                 })
             }
+            ClientMessage::CreateProject { name } => {
+                match self.persistence.create_project(name).await {
+                    Some(project) => {
+                        self.publish(RuntimeEvent::ProjectCreated {
+                            project: project.clone(),
+                        });
+                        Some(ServerMessage::Ack {
+                            message: format!("Project `{}` created.", project.name),
+                        })
+                    }
+                    None => Some(ServerMessage::Error {
+                        message: "Project name cannot be empty.".to_string(),
+                    }),
+                }
+            }
+            ClientMessage::RenameProject { project_id, name } => {
+                match self.persistence.rename_project(&project_id, name.clone()).await {
+                    Some(updated_at) => {
+                        let trimmed = name.trim().to_string();
+                        self.publish(RuntimeEvent::ProjectRenamed {
+                            project_id,
+                            name: trimmed,
+                            updated_at,
+                        });
+                        Some(ServerMessage::Ack {
+                            message: "Project renamed.".to_string(),
+                        })
+                    }
+                    None => Some(ServerMessage::Error {
+                        message: "Rename failed — project not found or name empty.".to_string(),
+                    }),
+                }
+            }
+            ClientMessage::DeleteProject { project_id } => {
+                match self.persistence.delete_project(&project_id).await {
+                    Some(reassigned_session_ids) => {
+                        self.publish(RuntimeEvent::ProjectDeleted {
+                            project_id,
+                            reassigned_session_ids,
+                        });
+                        Some(ServerMessage::Ack {
+                            message: "Project deleted.".to_string(),
+                        })
+                    }
+                    None => Some(ServerMessage::Error {
+                        message: "Delete failed — project not found.".to_string(),
+                    }),
+                }
+            }
+            ClientMessage::AssignSessionToProject {
+                session_id,
+                project_id,
+            } => {
+                let updated = self
+                    .persistence
+                    .assign_session_to_project(&session_id, project_id.as_deref())
+                    .await;
+                if updated {
+                    self.publish(RuntimeEvent::SessionProjectAssigned {
+                        session_id,
+                        project_id,
+                    });
+                    Some(ServerMessage::Ack {
+                        message: "Session assignment updated.".to_string(),
+                    })
+                } else {
+                    Some(ServerMessage::Error {
+                        message: "Session not found.".to_string(),
+                    })
+                }
+            }
         }
     }
 
@@ -292,7 +370,7 @@ impl RuntimeCore {
         self.persistence.upsert_session(session.clone()).await;
 
         let follow_up = format!("Proceed with the plan above.\n\nPlan:\n{plan_raw}");
-        self.send_turn(session_id, follow_up, PermissionMode::AcceptEdits)
+        self.send_turn(session_id, follow_up, PermissionMode::AcceptEdits, None)
             .await
     }
 
@@ -320,6 +398,7 @@ impl RuntimeCore {
         provider: ProviderKind,
         title: Option<String>,
         model: Option<String>,
+        project_id: Option<String>,
     ) -> Result<SessionDetail, String> {
         tracing::info!(?provider, "Looking up adapter for provider");
         let available: Vec<_> = self.adapters.keys().map(|k| k.label()).collect();
@@ -334,7 +413,9 @@ impl RuntimeCore {
             })?
             .clone();
 
-        let mut session = self.orchestration.create_session(provider, title, model);
+        let mut session = self
+            .orchestration
+            .create_session(provider, title, model, project_id);
         tracing::info!("Session created in orchestration, calling adapter.start_session");
 
         match adapter.start_session(&session).await {
@@ -360,6 +441,7 @@ impl RuntimeCore {
         session_id: String,
         input: String,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<String, String> {
         let trimmed = input.trim().to_string();
         if trimmed.is_empty() {
@@ -382,9 +464,12 @@ impl RuntimeCore {
             })?
             .clone();
 
-        let turn =
-            self.orchestration
-                .start_turn(&mut session, trimmed.clone(), Some(permission_mode));
+        let turn = self.orchestration.start_turn(
+            &mut session,
+            trimmed.clone(),
+            Some(permission_mode),
+            reasoning_effort,
+        );
         self.persistence.upsert_session(session.clone()).await;
         self.publish(RuntimeEvent::TurnStarted {
             session_id: session.summary.session_id.clone(),
@@ -406,15 +491,28 @@ impl RuntimeCore {
         let session_clone = session.clone();
         let trimmed_clone = trimmed.clone();
         let adapter_sink = sink.clone();
+        let active_sinks_for_cleanup = self.active_sinks.clone();
+        let sid_for_cleanup = session.summary.session_id.clone();
         let adapter_fut = tokio::spawn(async move {
-            adapter_clone
+            let result = adapter_clone
                 .execute_turn(
                     &session_clone,
                     &trimmed_clone,
                     permission_mode,
+                    reasoning_effort,
                     adapter_sink,
                 )
+                .await;
+            // Drop the sink clone held in `active_sinks` from inside the task so
+            // the mpsc channel closes as soon as this task finishes (the task's
+            // own `adapter_sink` goes out of scope at return). Without this,
+            // the `event_rx.recv()` drain loop would wait forever on the
+            // lingering `active_sinks` clone.
+            active_sinks_for_cleanup
+                .lock()
                 .await
+                .remove(&sid_for_cleanup);
+            result
         });
         // Drop our local sink reference so the channel closes once the adapter task exits.
         drop(sink);
@@ -783,7 +881,7 @@ mod tests {
     use zenui_persistence::PersistenceService;
     use zenui_provider_api::{
         ClientMessage, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
-        ProviderStatusLevel, ProviderTurnOutput, SessionDetail, TurnEventSink,
+        ProviderStatusLevel, ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
     };
 
     use super::RuntimeCore;
@@ -814,6 +912,7 @@ mod tests {
             _session: &SessionDetail,
             input: &str,
             _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
             _events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             Ok(ProviderTurnOutput {
@@ -836,6 +935,7 @@ mod tests {
                 provider: ProviderKind::Codex,
                 title: Some("Test Session".to_string()),
                 model: None,
+                project_id: None,
             })
             .await;
         assert!(matches!(
@@ -852,6 +952,7 @@ mod tests {
                 session_id: session.summary.session_id.clone(),
                 input: "hello".to_string(),
                 permission_mode: None,
+                reasoning_effort: None,
             })
             .await;
         assert!(matches!(

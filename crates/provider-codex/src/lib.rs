@@ -11,8 +11,8 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 use zenui_provider_api::{
     PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
-    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, SessionDetail,
-    TurnEventSink,
+    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
+    SessionDetail, TurnEventSink,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -295,6 +295,7 @@ impl ProviderAdapter for CodexAdapter {
         session: &SessionDetail,
         input: &str,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         // Codex's approvalPolicy/sandbox are bound at thread/start, so a mid-session
@@ -314,6 +315,9 @@ impl ProviderAdapter for CodexAdapter {
         let result = {
             let mut process = process.lock().await;
             let provider_thread_id = process.provider_thread_id.clone();
+            let effort_str = reasoning_effort
+                .unwrap_or(ReasoningEffort::Medium)
+                .as_str();
             let mut turn_params = json!({
                 "input": [{
                     "text": input,
@@ -322,6 +326,11 @@ impl ProviderAdapter for CodexAdapter {
                 }],
                 "threadId": provider_thread_id,
             });
+            // Codex accepts reasoning_effort as a turn-level hint on every turn.
+            // Unknown fields are ignored by the server, so this is safe on older CLIs.
+            if let Some(obj) = turn_params.as_object_mut() {
+                obj.insert("reasoning_effort".to_string(), json!(effort_str));
+            }
             if permission_mode == PermissionMode::Plan {
                 if let Some(obj) = turn_params.as_object_mut() {
                     let model = session.summary.model.clone().unwrap_or_default();
@@ -331,7 +340,7 @@ impl ProviderAdapter for CodexAdapter {
                             "mode": "plan",
                             "settings": {
                                 "model": model,
-                                "reasoning_effort": "medium",
+                                "reasoning_effort": effort_str,
                                 "developer_instructions": "",
                             },
                         }),

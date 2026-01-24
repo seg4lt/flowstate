@@ -208,7 +208,11 @@ class CopilotBridge {
     return sessionId;
   }
 
-  async sendPrompt(prompt: string, permissionMode: ZenUiPermissionMode): Promise<string> {
+  async sendPrompt(
+    prompt: string,
+    permissionMode: ZenUiPermissionMode,
+    reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high',
+  ): Promise<string> {
     if (!this.session) {
       throw new Error('No active session');
     }
@@ -216,7 +220,9 @@ class CopilotBridge {
     // Stash the per-turn mode so the closures registered at session creation
     // (permissionHandler / userInputHandler) read the right policy on this turn.
     this.currentPermissionMode = permissionMode;
-    console.error(`[bridge] Sending prompt (${prompt.length} chars, mode=${permissionMode})`);
+    console.error(
+      `[bridge] Sending prompt (${prompt.length} chars, mode=${permissionMode}, effort=${reasoningEffort ?? 'unset'})`,
+    );
 
     // Subscribe to streaming events. Each returns an unsubscribe fn.
     const unsubs: Array<() => void> = [];
@@ -301,7 +307,14 @@ class CopilotBridge {
 
     try {
       // sendAndWait blocks until session.idle, streaming events fire via the handlers above.
-      const response = await this.session.sendAndWait({ prompt }, 120_000);
+      // The Copilot SDK does not have a documented `reasoning_effort` field; we forward it
+      // alongside the prompt so the SDK can pick it up if a future version supports it, and
+      // ignore it silently otherwise.
+      const sendPayload: Record<string, unknown> = { prompt };
+      if (reasoningEffort !== undefined) {
+        sendPayload.reasoning_effort = reasoningEffort;
+      }
+      const response = await this.session.sendAndWait(sendPayload as { prompt: string }, 120_000);
       const content: string =
         response?.data?.content ?? '[No response from Copilot]';
       console.error('[bridge] Turn complete');
@@ -391,8 +404,14 @@ async function main(): Promise<void> {
             const prompt = msg.prompt as string;
             const permissionMode =
               ((msg.permission_mode as ZenUiPermissionMode) ?? 'accept_edits');
+            const effort = msg.reasoning_effort as
+              | 'minimal'
+              | 'low'
+              | 'medium'
+              | 'high'
+              | undefined;
             try {
-              const output = await bridge.sendPrompt(prompt, permissionMode);
+              const output = await bridge.sendPrompt(prompt, permissionMode, effort);
               process.stdout.write(
                 JSON.stringify({ type: 'response', output }) + '\n',
               );

@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, SessionDetail, TurnEventSink,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 600_000;
@@ -39,6 +39,8 @@ enum BridgeRequest {
     SendPrompt {
         prompt: String,
         permission_mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     #[serde(rename = "answer_permission")]
     AnswerPermission {
@@ -350,6 +352,7 @@ impl ClaudeSdkAdapter {
         process: Arc<Mutex<ClaudeBridgeProcess>>,
         prompt: String,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<String, String> {
         let mut process = process.lock().await;
@@ -358,6 +361,7 @@ impl ClaudeSdkAdapter {
         let request = BridgeRequest::SendPrompt {
             prompt,
             permission_mode: mode_str.to_string(),
+            reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
         };
         write_request(&process.stdin, &request).await?;
 
@@ -604,11 +608,18 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         session: &SessionDetail,
         input: &str,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         let process = self.ensure_session_process(session).await?;
         let result = self
-            .run_turn(process, input.to_string(), permission_mode, events)
+            .run_turn(
+                process,
+                input.to_string(),
+                permission_mode,
+                reasoning_effort,
+                events,
+            )
             .await;
 
         match result {

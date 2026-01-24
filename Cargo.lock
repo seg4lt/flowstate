@@ -3972,6 +3972,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tokio",
+ "uuid",
  "zenui-provider-api",
 ]
 

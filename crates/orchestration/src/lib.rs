@@ -1,7 +1,8 @@
 use chrono::Utc;
 use uuid::Uuid;
 use zenui_provider_api::{
-    ProviderKind, SessionDetail, SessionStatus, SessionSummary, TurnRecord, TurnStatus,
+    ProviderKind, ReasoningEffort, SessionDetail, SessionStatus, SessionSummary, TurnRecord,
+    TurnStatus,
 };
 
 #[derive(Debug, Default)]
@@ -17,6 +18,7 @@ impl OrchestrationService {
         provider: ProviderKind,
         title: Option<String>,
         model: Option<String>,
+        project_id: Option<String>,
     ) -> SessionDetail {
         let created_at = Utc::now().to_rfc3339();
         let session_id = Uuid::new_v4().to_string();
@@ -36,6 +38,7 @@ impl OrchestrationService {
                 last_turn_preview: None,
                 turn_count: 0,
                 model,
+                project_id,
             },
             turns: Vec::new(),
             provider_state: None,
@@ -47,6 +50,7 @@ impl OrchestrationService {
         session: &mut SessionDetail,
         input: String,
         permission_mode: Option<zenui_provider_api::PermissionMode>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> TurnRecord {
         let now = Utc::now().to_rfc3339();
         let turn = TurnRecord {
@@ -62,6 +66,7 @@ impl OrchestrationService {
             subagents: Vec::new(),
             plan: None,
             permission_mode,
+            reasoning_effort,
         };
 
         session.summary.status = SessionStatus::Running;

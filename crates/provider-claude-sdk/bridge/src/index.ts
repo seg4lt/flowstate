@@ -54,6 +54,7 @@ class ClaudeBridge {
   async sendPrompt(
     prompt: string,
     permissionMode: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions',
+    reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high',
   ): Promise<string> {
     if (this.inFlight) {
       throw new Error('Another turn is already in flight');
@@ -78,6 +79,24 @@ class ClaudeBridge {
       });
     };
 
+    // Claude SDK Options accepts `maxThinkingTokens` (a numeric budget), not an
+    // effort string. Map the runtime's reasoning_effort to a rough token budget;
+    // `minimal` disables thinking entirely by omitting the field.
+    const thinkingBudget: number | null = (() => {
+      switch (reasoningEffort) {
+        case 'minimal':
+          return 0;
+        case 'low':
+          return 2048;
+        case 'medium':
+          return 8000;
+        case 'high':
+          return 32000;
+        default:
+          return null;
+      }
+    })();
+
     const options: Options = {
       cwd: this.cwd,
       permissionMode,
@@ -86,6 +105,9 @@ class ClaudeBridge {
       includePartialMessages: true,
       ...(this.model ? { model: this.model } : {}),
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
+      ...(thinkingBudget !== null && thinkingBudget > 0
+        ? { maxThinkingTokens: thinkingBudget }
+        : {}),
     };
 
     let finalText = '';
@@ -398,9 +420,15 @@ async function main(): Promise<void> {
           | 'acceptEdits'
           | 'plan'
           | 'bypassPermissions') ?? 'acceptEdits';
+        const effort = msg.reasoning_effort as
+          | 'minimal'
+          | 'low'
+          | 'medium'
+          | 'high'
+          | undefined;
         promptInFlight = (async () => {
           try {
-            const output = await bridge.sendPrompt(prompt, mode);
+            const output = await bridge.sendPrompt(prompt, mode, effort);
             writeJson({ type: 'response', output });
           } catch (err) {
             writeJson({

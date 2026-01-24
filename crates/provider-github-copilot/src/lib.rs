@@ -13,7 +13,7 @@ use tracing::{debug, info};
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, SessionDetail, TurnEventSink,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 120_000;
@@ -45,6 +45,8 @@ enum BridgeRequest {
     SendPrompt {
         prompt: String,
         permission_mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     #[serde(rename = "answer_permission")]
     AnswerPermission {
@@ -304,6 +306,7 @@ impl GitHubCopilotAdapter {
         process: &mut CopilotBridgeProcess,
         prompt: String,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
         events: &TurnEventSink,
     ) -> Result<String, String> {
         write_request(
@@ -311,6 +314,7 @@ impl GitHubCopilotAdapter {
             &BridgeRequest::SendPrompt {
                 prompt,
                 permission_mode: permission_mode_to_str(permission_mode).to_string(),
+                reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
             },
         )
         .await?;
@@ -702,9 +706,13 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         session: &SessionDetail,
         input: &str,
         permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
-        info!("Executing turn with GitHub Copilot (mode={:?})", permission_mode);
+        info!(
+            "Executing turn with GitHub Copilot (mode={:?}, effort={:?})",
+            permission_mode, reasoning_effort
+        );
 
         let process = self.ensure_session_process(session).await?;
         let result = {
@@ -714,6 +722,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                     &mut process,
                     input.to_string(),
                     permission_mode,
+                    reasoning_effort,
                     &events,
                 )
                 .await?;

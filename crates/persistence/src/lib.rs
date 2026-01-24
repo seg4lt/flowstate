@@ -3,9 +3,12 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use chrono::Utc;
+use uuid::Uuid;
 use zenui_provider_api::{
-    FileChangeRecord, PermissionMode, PlanRecord, ProviderKind, ProviderModel, SessionDetail,
-    SessionStatus, SessionSummary, SubagentRecord, ToolCall, TurnRecord, TurnStatus,
+    FileChangeRecord, PermissionMode, PlanRecord, ProjectRecord, ProviderKind, ProviderModel,
+    ReasoningEffort, SessionDetail, SessionStatus, SessionSummary, SubagentRecord, ToolCall,
+    TurnRecord, TurnStatus,
 };
 
 #[derive(Debug)]
@@ -46,8 +49,8 @@ impl PersistenceService {
         if transaction
             .execute(
                 "INSERT INTO sessions (
-                    session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model, project_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(session_id) DO UPDATE SET
                     provider = excluded.provider,
                     title = excluded.title,
@@ -57,7 +60,8 @@ impl PersistenceService {
                     last_turn_preview = excluded.last_turn_preview,
                     turn_count = excluded.turn_count,
                     provider_state_json = excluded.provider_state_json,
-                    model = excluded.model",
+                    model = excluded.model,
+                    project_id = excluded.project_id",
                 params![
                     session.summary.session_id,
                     provider_kind_to_str(session.summary.provider),
@@ -72,6 +76,7 @@ impl PersistenceService {
                         .as_ref()
                         .and_then(|state| serde_json::to_string(state).ok()),
                     session.summary.model,
+                    session.summary.project_id,
                 ],
             )
             .is_err()
@@ -112,13 +117,15 @@ impl PersistenceService {
                 .and_then(|plan| serde_json::to_string(plan).ok());
             let permission_mode_str: Option<String> =
                 turn.permission_mode.map(permission_mode_to_str);
+            let reasoning_effort_str: Option<String> =
+                turn.reasoning_effort.map(|e| e.as_str().to_string());
             if transaction
                 .execute(
                     "INSERT INTO turns (
                         turn_id, session_id, input, output, status, created_at, updated_at,
                         reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                        plan_json, permission_mode
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        plan_json, permission_mode, reasoning_effort
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         turn.turn_id,
                         session.summary.session_id,
@@ -133,6 +140,7 @@ impl PersistenceService {
                         subagents_json,
                         plan_json,
                         permission_mode_str,
+                        reasoning_effort_str,
                     ],
                 )
                 .is_err()
@@ -215,6 +223,128 @@ impl PersistenceService {
         );
     }
 
+    pub async fn list_projects(&self) -> Vec<ProjectRecord> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = match connection.prepare(
+            "SELECT project_id, name, created_at, updated_at, sort_order
+             FROM projects
+             ORDER BY sort_order ASC, created_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectRecord {
+                project_id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
+                sort_order: row.get(4)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub async fn create_project(&self, name: String) -> Option<ProjectRecord> {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let project_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        // Place new projects at the end.
+        let next_order: i32 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM projects",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let result = connection.execute(
+            "INSERT INTO projects (project_id, name, created_at, updated_at, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project_id, trimmed, now, now, next_order],
+        );
+        if result.is_err() {
+            return None;
+        }
+        Some(ProjectRecord {
+            project_id,
+            name: trimmed,
+            created_at: now.clone(),
+            updated_at: now,
+            sort_order: next_order,
+        })
+    }
+
+    pub async fn rename_project(&self, project_id: &str, name: String) -> Option<String> {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        let affected = connection
+            .execute(
+                "UPDATE projects SET name = ?1, updated_at = ?2 WHERE project_id = ?3",
+                params![trimmed, now, project_id],
+            )
+            .unwrap_or(0);
+        if affected == 0 { None } else { Some(now) }
+    }
+
+    /// Deletes a project and null-outs the `project_id` of any session pointing
+    /// at it. Returns the list of session IDs that were re-assigned to "unassigned".
+    pub async fn delete_project(&self, project_id: &str) -> Option<Vec<String>> {
+        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let transaction = connection.transaction().ok()?;
+        let reassigned: Vec<String> = {
+            let mut stmt = transaction
+                .prepare("SELECT session_id FROM sessions WHERE project_id = ?1")
+                .ok()?;
+            let rows = stmt
+                .query_map(params![project_id], |row| row.get::<_, String>(0))
+                .ok()?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        transaction
+            .execute(
+                "UPDATE sessions SET project_id = NULL WHERE project_id = ?1",
+                params![project_id],
+            )
+            .ok()?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM projects WHERE project_id = ?1",
+                params![project_id],
+            )
+            .ok()?;
+        if deleted == 0 {
+            return None;
+        }
+        transaction.commit().ok()?;
+        Some(reassigned)
+    }
+
+    pub async fn assign_session_to_project(
+        &self,
+        session_id: &str,
+        project_id: Option<&str>,
+    ) -> bool {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .execute(
+                "UPDATE sessions SET project_id = ?1 WHERE session_id = ?2",
+                params![project_id, session_id],
+            )
+            .map(|affected| affected > 0)
+            .unwrap_or(false)
+    }
+
     fn migrate(&self) -> Result<()> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
@@ -252,6 +382,14 @@ impl PersistenceService {
                 fetched_at TEXT NOT NULL,
                 models_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                sort_order INTEGER NOT NULL
+            );
             ",
             )
             .context("failed to run sqlite migrations")?;
@@ -259,12 +397,14 @@ impl PersistenceService {
         // Idempotent column additions — ignore errors if the column already exists.
         let _ = connection.execute("ALTER TABLE sessions ADD COLUMN provider_state_json TEXT", []);
         let _ = connection.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
+        let _ = connection.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN tool_calls_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN file_changes_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN subagents_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN plan_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN permission_mode TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_effort TEXT", []);
 
         Ok(())
     }
@@ -285,7 +425,7 @@ fn list_session_ids(connection: &Connection) -> Result<Vec<String>> {
 fn load_session(connection: &Connection, session_id: &str) -> Result<Option<SessionDetail>> {
     let summary = connection
         .query_row(
-            "SELECT session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model
+            "SELECT session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model, project_id
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             |row| {
@@ -299,6 +439,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                     last_turn_preview: row.get(6)?,
                     turn_count: row.get::<_, i64>(7)? as usize,
                     model: row.get(9)?,
+                    project_id: row.get(10)?,
                 })
             },
         )
@@ -312,7 +453,8 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
     let mut statement = connection
         .prepare(
             "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
-                    tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode
+                    tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
+                    reasoning_effort
              FROM turns WHERE session_id = ?1 ORDER BY created_at ASC",
         )
         .context("failed to prepare turn query")?;
@@ -324,6 +466,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
             let subagents_json: Option<String> = row.get(9)?;
             let plan_json: Option<String> = row.get(10)?;
             let permission_mode_str: Option<String> = row.get(11)?;
+            let reasoning_effort_str: Option<String> = row.get(12)?;
             let tool_calls: Vec<ToolCall> = tool_calls_json
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default();
@@ -337,6 +480,8 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                 plan_json.and_then(|j| serde_json::from_str(&j).ok());
             let permission_mode: Option<PermissionMode> =
                 permission_mode_str.as_deref().map(permission_mode_from_str);
+            let reasoning_effort: Option<ReasoningEffort> =
+                reasoning_effort_str.as_deref().and_then(reasoning_effort_from_str);
             Ok(TurnRecord {
                 turn_id: row.get(0)?,
                 input: row.get(1)?,
@@ -350,6 +495,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                 subagents,
                 plan,
                 permission_mode,
+                reasoning_effort,
             })
         })
         .context("failed to query turns")?
@@ -440,5 +586,15 @@ fn permission_mode_from_str(value: &str) -> PermissionMode {
         "plan" => PermissionMode::Plan,
         "bypass" => PermissionMode::Bypass,
         _ => PermissionMode::AcceptEdits,
+    }
+}
+
+fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffort> {
+    match value {
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        _ => None,
     }
 }
