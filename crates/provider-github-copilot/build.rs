@@ -73,6 +73,34 @@ fn main() {
         println!("cargo:warning=Node.js downloaded to {:?}", node_bin);
     }
 
+    // Compile the bridge TypeScript to JS before copying. Without this,
+    // cargo would silently copy the stale dist/index.js compiled from a
+    // prior source revision — we've been bitten by that twice now.
+    let bridge_dir = PathBuf::from("bridge");
+    if bridge_dir.join("src/index.ts").exists() {
+        let tsc_status = Command::new("bun")
+            .args(["run", "build"])
+            .current_dir(&bridge_dir)
+            .status();
+        match tsc_status {
+            Ok(s) if s.success() => {
+                println!("cargo:warning=Copilot bridge TS compiled");
+            }
+            Ok(s) => {
+                println!(
+                    "cargo:warning=Copilot bridge `bun run build` exited with {s}; \
+                    using existing dist/index.js if present"
+                );
+            }
+            Err(e) => {
+                println!(
+                    "cargo:warning=Failed to invoke `bun run build` for copilot bridge ({e}); \
+                    using existing dist/index.js if present"
+                );
+            }
+        }
+    }
+
     // Copy bridge and node_modules to output
     let bridge_src = PathBuf::from("bridge/dist/index.js");
     let node_modules = PathBuf::from("bridge/node_modules");

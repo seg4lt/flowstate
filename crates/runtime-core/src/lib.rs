@@ -231,6 +231,15 @@ impl RuntimeCore {
                     message: "Question answer recorded.".to_string(),
                 })
             }
+            ClientMessage::CancelQuestion {
+                session_id,
+                request_id,
+            } => {
+                self.cancel_question(&session_id, &request_id).await;
+                Some(ServerMessage::Ack {
+                    message: "Question cancelled.".to_string(),
+                })
+            }
             ClientMessage::AcceptPlan {
                 session_id,
                 plan_id,
@@ -350,6 +359,19 @@ impl RuntimeCore {
             sink.resolve_question(request_id, answers).await;
         } else {
             tracing::warn!(session_id, request_id, "no active sink for question answer");
+        }
+    }
+
+    async fn cancel_question(&self, session_id: &str, request_id: &str) {
+        let sink = self.active_sinks.lock().await.get(session_id).cloned();
+        if let Some(sink) = sink {
+            sink.cancel_question(request_id).await;
+        } else {
+            tracing::warn!(
+                session_id,
+                request_id,
+                "no active sink for question cancellation"
+            );
         }
     }
 

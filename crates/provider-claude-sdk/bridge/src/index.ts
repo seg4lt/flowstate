@@ -68,11 +68,26 @@ class ClaudeBridge {
   private abortController?: AbortController;
   private inFlight = false;
 
-  createSession(cwd: string, model?: string): string {
+  createSession(cwd: string, model?: string, resumeSessionId?: string): string {
     this.cwd = cwd;
     this.model = model;
+    // Hydrate the SDK resume id from persisted state when zenui restarts or
+    // this bridge is a fresh respawn. The SDK's `resume:` option on the next
+    // send_prompt picks this up and replays the prior conversation.
+    if (resumeSessionId) {
+      this.resumeSessionId = resumeSessionId;
+    }
     const sessionId = `claude-sdk-${randomUUID()}`;
     return sessionId;
+  }
+
+  /**
+   * Current Claude SDK session id captured from the most recent query, if any.
+   * Round-tripped to the Rust adapter so it can be persisted on
+   * `session.provider_state.native_thread_id` for cross-restart resume.
+   */
+  getResumeSessionId(): string | undefined {
+    return this.resumeSessionId;
   }
 
   async sendPrompt(
@@ -376,6 +391,19 @@ class ClaudeBridge {
     });
   }
 
+  cancelQuestion(requestId: string): void {
+    const pending = pendingQuestions.get(requestId);
+    if (!pending) return;
+    pendingQuestions.delete(requestId);
+    // Resolve the pending canUseTool promise with deny so the SDK reports the
+    // tool call as user-denied. The model sees the message string and can
+    // proceed without the clarifying answer.
+    pending.resolve({
+      behavior: 'deny',
+      message: 'User cancelled the clarifying question',
+    });
+  }
+
   interrupt(): void {
     if (this.abortController) {
       try {
@@ -463,8 +491,9 @@ async function main(): Promise<void> {
       case 'create_session': {
         const cwd = (msg.cwd as string) ?? process.cwd();
         const model = msg.model as string | undefined;
+        const resumeSessionId = msg.resume_session_id as string | undefined;
         try {
-          const sessionId = bridge.createSession(cwd, model);
+          const sessionId = bridge.createSession(cwd, model, resumeSessionId);
           writeJson({ type: 'session_created', session_id: sessionId });
         } catch (err) {
           writeJson({
@@ -491,7 +520,11 @@ async function main(): Promise<void> {
         promptInFlight = (async () => {
           try {
             const output = await bridge.sendPrompt(prompt, mode, effort);
-            writeJson({ type: 'response', output });
+            writeJson({
+              type: 'response',
+              output,
+              session_id: bridge.getResumeSessionId() ?? null,
+            });
           } catch (err) {
             writeJson({
               type: 'error',
@@ -517,6 +550,11 @@ async function main(): Promise<void> {
           msg.request_id as string,
           (msg.answers as StructuredAnswer[]) ?? [],
         );
+        break;
+      }
+
+      case 'cancel_question': {
+        bridge.cancelQuestion(msg.request_id as string);
         break;
       }
 

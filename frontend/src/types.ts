@@ -314,6 +314,11 @@ export type ClientMessage =
       request_id: string;
       answers: UserInputAnswer[];
     }
+  | {
+      type: "cancel_question";
+      session_id: string;
+      request_id: string;
+    }
   | { type: "accept_plan"; session_id: string; plan_id: string }
   | { type: "reject_plan"; session_id: string; plan_id: string }
   | { type: "refresh_models"; provider: ProviderKind }

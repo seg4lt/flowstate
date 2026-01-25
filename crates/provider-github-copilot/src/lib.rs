@@ -19,6 +19,14 @@ use zenui_provider_api::{
 
 const BRIDGE_TIMEOUT_MS: u64 = 120_000;
 
+/// Result of asking the user a question: either they picked / typed, or
+/// dismissed the dialog. Carried over the writer-task channel so the bridge
+/// knows whether to send AnswerUserInput or CancelUserInput.
+enum UserInputOutcome {
+    Answered { answer: String, was_freeform: bool },
+    Cancelled,
+}
+
 /// Bridge process wrapper for GitHub Copilot SDK
 #[derive(Debug)]
 struct CopilotBridgeProcess {
@@ -60,10 +68,11 @@ enum BridgeRequest {
         answer: String,
         was_freeform: bool,
     },
+    #[serde(rename = "cancel_user_input")]
+    CancelUserInput { request_id: String },
     #[serde(rename = "list_models")]
     ListModels,
     #[serde(rename = "interrupt")]
-    #[allow(dead_code)]
     Interrupt,
 }
 
@@ -334,7 +343,7 @@ impl GitHubCopilotAdapter {
         let (perm_tx, mut perm_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, PermissionDecision)>();
         let (q_tx, mut q_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(String, String, bool)>();
+            tokio::sync::mpsc::unbounded_channel::<(String, UserInputOutcome)>();
         let stdin_for_writer = stdin.clone();
         let writer_task = tokio::spawn(async move {
             loop {
@@ -349,14 +358,21 @@ impl GitHubCopilotAdapter {
                             break;
                         }
                     }
-                    Some((request_id, answer, was_freeform)) = q_rx.recv() => {
-                        let req = BridgeRequest::AnswerUserInput {
-                            request_id,
-                            answer,
-                            was_freeform,
+                    Some((request_id, outcome)) = q_rx.recv() => {
+                        let req = match outcome {
+                            UserInputOutcome::Answered { answer, was_freeform } => {
+                                BridgeRequest::AnswerUserInput {
+                                    request_id,
+                                    answer,
+                                    was_freeform,
+                                }
+                            }
+                            UserInputOutcome::Cancelled => {
+                                BridgeRequest::CancelUserInput { request_id }
+                            }
                         };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
-                            debug!("failed to forward user input answer: {e}");
+                            debug!("failed to forward user input outcome: {e}");
                             break;
                         }
                     }
@@ -457,25 +473,20 @@ impl GitHubCopilotAdapter {
                             .map(parse_decision)
                             .unwrap_or(PermissionDecision::Allow);
 
+                        // request_permission() emits its own PermissionRequest event
+                        // with an internal `perm-...` id; don't duplicate it here.
+                        // The writer task forwards the decision to the bridge using
+                        // the bridge's request_id, since the bridge keeps its own
+                        // pending-permissions map keyed by that id.
                         let events_clone = events.clone();
                         let perm_tx = perm_tx.clone();
-                        let req_id_for_writer = request_id.clone();
-                        let tool_name_clone = tool_name.clone();
-                        let input_clone = input.clone();
+                        let req_id_for_writer = request_id;
                         tokio::spawn(async move {
                             let decision = events_clone
-                                .request_permission(tool_name_clone, input_clone, suggested)
+                                .request_permission(tool_name, input, suggested)
                                 .await;
                             let _ = perm_tx.send((req_id_for_writer, decision));
                         });
-                        events
-                            .send(ProviderTurnEvent::PermissionRequest {
-                                request_id,
-                                tool_name,
-                                input,
-                                suggested_decision: suggested,
-                            })
-                            .await;
                     }
                     "user_question" => {
                         let request_id = request_id.unwrap_or_default();
@@ -502,26 +513,27 @@ impl GitHubCopilotAdapter {
                             allow_freeform,
                             is_secret: false,
                         };
+                        // ask_user() emits its own UserQuestion event with an
+                        // internal `q-...` id; don't duplicate it here. The writer
+                        // task forwards the answer back to the bridge using the
+                        // bridge's request_id, since the bridge's pendingUserInputs
+                        // map is keyed by that id.
                         let events_clone = events.clone();
                         let q_tx = q_tx.clone();
-                        let req_id_for_writer = request_id.clone();
-                        let structured_clone = structured.clone();
+                        let req_id_for_writer = request_id;
                         tokio::spawn(async move {
-                            if let Some(answers) =
-                                events_clone.ask_user(vec![structured_clone]).await
-                            {
-                                if let Some(a) = answers.into_iter().next() {
-                                    let was_freeform = a.option_ids.is_empty();
-                                    let _ = q_tx.send((req_id_for_writer, a.answer, was_freeform));
-                                }
-                            }
+                            let outcome = match events_clone.ask_user(vec![structured]).await {
+                                Some(answers) => match answers.into_iter().next() {
+                                    Some(a) => UserInputOutcome::Answered {
+                                        was_freeform: a.option_ids.is_empty(),
+                                        answer: a.answer,
+                                    },
+                                    None => UserInputOutcome::Cancelled,
+                                },
+                                None => UserInputOutcome::Cancelled,
+                            };
+                            let _ = q_tx.send((req_id_for_writer, outcome));
                         });
-                        events
-                            .send(ProviderTurnEvent::UserQuestion {
-                                request_id,
-                                questions: vec![structured],
-                            })
-                            .await;
                     }
                     "plan_proposed" => {
                         if let (Some(pid), Some(t)) = (plan_id, title) {
@@ -817,11 +829,32 @@ impl ProviderAdapter for GitHubCopilotAdapter {
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
         info!("Interrupting GitHub Copilot session...");
 
-        // TODO: interrupt is not functional — the TS bridge's readline loop (bridge/src/index.ts)
-        // awaits sendPrompt() inline and cannot receive an interrupt message while a prompt is in
-        // flight. Fixing this requires making that loop handle new stdin messages concurrently.
+        // Look up the live bridge process for this session. The bridge's
+        // readline loop now runs send_prompt as a background promise (see
+        // bridge/src/index.ts `promptInFlight`), so an `interrupt` message
+        // written to stdin is dispatched concurrently with the in-flight turn
+        // and calls `session.interrupt()` on the Copilot SDK. We deliberately
+        // do NOT drop the session — the bridge's in-memory `this.session`
+        // must survive so the next send_prompt continues the same conversation.
+        let process = self
+            .sessions
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned();
+        let Some(process) = process else {
+            return Ok(format!(
+                "GitHub Copilot interrupt requested for session '{}' (no active bridge).",
+                session.summary.title
+            ));
+        };
+        let stdin = {
+            let guard = process.lock().await;
+            guard.stdin.clone()
+        };
+        write_request(&stdin, &BridgeRequest::Interrupt).await?;
         Ok(format!(
-            "GitHub Copilot interrupt requested for session '{}'.",
+            "GitHub Copilot turn interrupted for session '{}'.",
             session.summary.title
         ))
     }

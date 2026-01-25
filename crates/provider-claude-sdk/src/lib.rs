@@ -19,6 +19,14 @@ use zenui_provider_api::{
 
 const BRIDGE_TIMEOUT_MS: u64 = 600_000;
 
+/// Result of asking the user a question: either they answered or dismissed.
+/// Carried over the writer-task channel so the bridge can be told which
+/// BridgeRequest to emit.
+enum QuestionOutcome {
+    Answered(Vec<UserInputAnswer>),
+    Cancelled,
+}
+
 #[derive(Debug)]
 struct ClaudeBridgeProcess {
     child: Child,
@@ -35,6 +43,11 @@ enum BridgeRequest {
         cwd: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Persisted Claude SDK session id from a prior turn. When present the
+        /// bridge hydrates `resumeSessionId` before the next send_prompt, so a
+        /// zenui restart or bridge crash recovers the conversation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resume_session_id: Option<String>,
     },
     #[serde(rename = "send_prompt")]
     SendPrompt {
@@ -53,10 +66,11 @@ enum BridgeRequest {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    #[serde(rename = "cancel_question")]
+    CancelQuestion { request_id: String },
     #[serde(rename = "list_models")]
     ListModels,
     #[serde(rename = "interrupt")]
-    #[allow(dead_code)]
     Interrupt,
 }
 
@@ -70,7 +84,14 @@ enum BridgeResponse {
     #[serde(rename = "models")]
     Models { models: Vec<ProviderModel> },
     #[serde(rename = "response")]
-    Response { output: String },
+    Response {
+        output: String,
+        /// Claude SDK session id captured from the init/result messages in the
+        /// bridge. Round-tripped back to the Rust side so we can persist it on
+        /// `session.provider_state.native_thread_id` and resume on the next turn.
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     #[serde(rename = "interrupted")]
     #[allow(dead_code)]
     Interrupted,
@@ -307,9 +328,18 @@ impl ClaudeSdkAdapter {
 
         let mut bridge = self.spawn_bridge().await?;
 
+        // If the session was previously resumed on disk, pass the persisted
+        // Claude SDK session id to the bridge so it can set `resume:` on the
+        // first SDK query. This recovers conversation history after a zenui
+        // restart or bridge crash.
+        let resume_session_id = session
+            .provider_state
+            .as_ref()
+            .and_then(|state| state.native_thread_id.clone());
         let request = BridgeRequest::CreateSession {
             cwd: self.working_directory.display().to_string(),
             model: session.summary.model.clone(),
+            resume_session_id,
         };
         write_request(&bridge.stdin, &request).await?;
 
@@ -357,7 +387,7 @@ impl ClaudeSdkAdapter {
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<String>), String> {
         let mut process = process.lock().await;
 
         let mode_str = permission_mode_to_str(permission_mode);
@@ -370,7 +400,7 @@ impl ClaudeSdkAdapter {
 
         let stdin = process.stdin.clone();
         let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, PermissionDecision)>();
-        let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, Vec<UserInputAnswer>)>();
+        let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, QuestionOutcome)>();
 
         // Background task: forwards permission/question answers from the sink helpers back
         // into the bridge stdin while the turn is in flight.
@@ -388,10 +418,17 @@ impl ClaudeSdkAdapter {
                             break;
                         }
                     }
-                    Some((request_id, answers)) = q_rx.recv() => {
-                        let req = BridgeRequest::AnswerQuestion { request_id, answers };
+                    Some((request_id, outcome)) = q_rx.recv() => {
+                        let req = match outcome {
+                            QuestionOutcome::Answered(answers) => {
+                                BridgeRequest::AnswerQuestion { request_id, answers }
+                            }
+                            QuestionOutcome::Cancelled => {
+                                BridgeRequest::CancelQuestion { request_id }
+                            }
+                        };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
-                            warn!("failed to forward question answer: {e}");
+                            warn!("failed to forward question outcome: {e}");
                             break;
                         }
                     }
@@ -415,7 +452,9 @@ impl ClaudeSdkAdapter {
             };
 
             match line {
-                BridgeResponse::Response { output } => break Ok(output),
+                BridgeResponse::Response { output, session_id } => {
+                    break Ok((output, session_id));
+                }
                 BridgeResponse::Error { error } => break Err(format!("Claude error: {error}")),
                 BridgeResponse::Stream {
                     event,
@@ -455,47 +494,40 @@ impl ClaudeSdkAdapter {
                             .map(parse_decision)
                             .unwrap_or(PermissionDecision::Allow);
 
+                        // request_permission() emits its own PermissionRequest event
+                        // with an internal `perm-...` id; do NOT duplicate it here. The
+                        // writer task still uses the bridge's request_id (`request_id`)
+                        // when forwarding the decision back to the bridge, because the
+                        // bridge keeps its own pending-permissions map keyed by that id.
                         let events_clone = events.clone();
                         let perm_tx = perm_tx.clone();
-                        let req_id_for_writer = request_id.clone();
-                        let tool_name_clone = tool_name.clone();
-                        let input_clone = input.clone();
+                        let req_id_for_writer = request_id;
                         tokio::spawn(async move {
                             let decision = events_clone
-                                .request_permission(tool_name_clone, input_clone, suggested)
+                                .request_permission(tool_name, input, suggested)
                                 .await;
                             let _ = perm_tx.send((req_id_for_writer, decision));
                         });
-                        events
-                            .send(ProviderTurnEvent::PermissionRequest {
-                                request_id,
-                                tool_name,
-                                input,
-                                suggested_decision: suggested,
-                            })
-                            .await;
                     }
                     "user_question" => {
                         let request_id = request_id.unwrap_or_default();
                         let structured = parse_claude_questions(questions.as_ref());
 
+                        // ask_user() emits its own UserQuestion event with an
+                        // internal `q-...` id; do NOT duplicate it here. The
+                        // writer task still uses the bridge's `request_id` when
+                        // forwarding the answer because the bridge keeps its own
+                        // pendingQuestions map keyed by that id.
                         let events_clone = events.clone();
                         let q_tx = q_tx.clone();
-                        let req_id_for_writer = request_id.clone();
-                        let questions_for_task = structured.clone();
+                        let req_id_for_writer = request_id;
                         tokio::spawn(async move {
-                            if let Some(answers) =
-                                events_clone.ask_user(questions_for_task).await
-                            {
-                                let _ = q_tx.send((req_id_for_writer, answers));
-                            }
+                            let outcome = match events_clone.ask_user(structured).await {
+                                Some(answers) => QuestionOutcome::Answered(answers),
+                                None => QuestionOutcome::Cancelled,
+                            };
+                            let _ = q_tx.send((req_id_for_writer, outcome));
                         });
-                        events
-                            .send(ProviderTurnEvent::UserQuestion {
-                                request_id,
-                                questions: structured,
-                            })
-                            .await;
                     }
                     other_event => {
                         forward_stream(
@@ -601,12 +633,13 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         &self,
         session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        let process = self.ensure_session_process(session).await?;
-        let process = process.lock().await;
-        Ok(Some(ProviderSessionState {
-            native_thread_id: Some(process.bridge_session_id.clone()),
-            metadata: None,
-        }))
+        // Spawn the bridge so the session is ready, but leave provider_state as
+        // None until execute_turn captures the real Claude SDK session id from
+        // the bridge's response. The bridge's own `bridge_session_id` is a
+        // zenui-internal UUID — passing it as `resume:` to the SDK on a later
+        // restart would just fail, so we deliberately don't persist it.
+        let _process = self.ensure_session_process(session).await?;
+        Ok(None)
     }
 
     async fn execute_turn(
@@ -629,15 +662,56 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             .await;
 
         match result {
-            Ok(output) => Ok(ProviderTurnOutput {
-                output,
-                provider_state: session.provider_state.clone(),
-            }),
+            Ok((output, session_id)) => {
+                // Prefer the freshly-captured session id from this turn so a
+                // resume after restart works. Fall back to whatever was already
+                // persisted if the bridge didn't return one (e.g. init failed
+                // to carry a session_id in this SDK version).
+                let provider_state = session_id
+                    .map(|id| ProviderSessionState {
+                        native_thread_id: Some(id),
+                        metadata: None,
+                    })
+                    .or_else(|| session.provider_state.clone());
+                Ok(ProviderTurnOutput {
+                    output,
+                    provider_state,
+                })
+            }
             Err(error) => {
                 self.invalidate_session(&session.summary.session_id).await;
                 Err(error)
             }
         }
+    }
+
+    async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
+        // Look up the live bridge process (if any) and send it an `interrupt`
+        // message. The bridge calls `abortController.abort()` on the in-flight
+        // SDK query, which returns `'[interrupted]'` and flips `inFlight = false`
+        // so the bridge is ready to accept the next send_prompt.
+        //
+        // We intentionally do NOT invalidate the session — the bridge's in-memory
+        // `resumeSessionId` must survive so the next turn resumes the same Claude
+        // conversation.
+        let process = self
+            .sessions
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned();
+        let Some(process) = process else {
+            return Ok(format!(
+                "Claude SDK interrupt requested for session `{}` (no active bridge).",
+                session.summary.session_id
+            ));
+        };
+        let process = process.lock().await;
+        write_request(&process.stdin, &BridgeRequest::Interrupt).await?;
+        Ok(format!(
+            "Claude SDK turn interrupted for session `{}`.",
+            session.summary.session_id
+        ))
     }
 
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {

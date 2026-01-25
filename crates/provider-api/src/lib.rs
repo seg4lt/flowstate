@@ -535,6 +535,16 @@ impl TurnEventSink {
             let _ = sender.send(answers);
         }
     }
+
+    /// Host-side: called by the runtime when the user dismisses a question
+    /// without answering. Dropping the sender causes the awaiting `ask_user`
+    /// to return `None`, which each adapter translates into a provider-specific
+    /// cancellation signal (JSON-RPC error, deny permission result, sentinel
+    /// answer) so the model can proceed instead of hanging forever.
+    pub async fn cancel_question(&self, request_id: &str) {
+        let mut guard = self.question_pending.lock().await;
+        guard.remove(request_id);
+    }
 }
 
 fn next_request_id(prefix: &str) -> String {
@@ -716,6 +726,10 @@ pub enum ClientMessage {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    CancelQuestion {
+        session_id: String,
+        request_id: String,
+    },
     AcceptPlan {
         session_id: String,
         plan_id: String,
@@ -779,6 +793,28 @@ pub trait ProviderAdapter: Send + Sync {
     /// Execute a turn. Push streaming events on `events`; return the canonical final output.
     /// The runtime reconciles: if the returned `output` is non-empty it wins; otherwise the
     /// accumulated text from `AssistantTextDelta` events is used.
+    ///
+    /// # Compaction and conversation history
+    ///
+    /// Adapters receive `session: &SessionDetail` for convenience — it carries the turn
+    /// history, provider state, and session summary. **Adapters must not build or replay
+    /// that turn list to their underlying provider.** Each provider manages its own
+    /// conversation state natively:
+    ///
+    /// - **Codex** uses server-side thread state keyed by `provider_state.native_thread_id`,
+    ///   reached via `thread/start` / `thread/resume`.
+    /// - **Claude Agent SDK** uses the SDK's `resume:` option; zenui persists the SDK
+    ///   session id through `provider_state.native_thread_id` so restarts resume cleanly.
+    /// - **GitHub Copilot SDK** keeps an in-memory `session` object alive for the bridge's
+    ///   lifetime and manages history internally.
+    ///
+    /// In all three cases, zenui sends **only the new `input` string** plus a resume
+    /// reference each turn, and delegates compaction / context-window management to the
+    /// provider. `SessionDetail.turns` is consumed by the frontend for chat-history
+    /// display but is never replayed to any model.
+    ///
+    /// The legacy `format_turn_context` helper below is unused dead code and will be
+    /// removed in a follow-up.
     async fn execute_turn(
         &self,
         session: &SessionDetail,

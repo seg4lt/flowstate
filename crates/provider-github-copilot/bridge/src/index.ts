@@ -398,6 +398,13 @@ async function main(): Promise<void> {
     terminal: false,
   });
 
+  // Track the in-flight send_prompt as a background promise so the readline
+  // loop can keep processing stdin (specifically `interrupt` and `answer_*`
+  // messages) while a turn is running. Without this, awaiting `sendPrompt`
+  // inline blocks the loop and the interrupt message never gets read until
+  // after the turn completes — which defeats the whole point.
+  let promptInFlight: Promise<void> | null = null;
+
   try {
     await bridge.start();
 
@@ -423,6 +430,15 @@ async function main(): Promise<void> {
           }
 
           case 'send_prompt': {
+            if (promptInFlight) {
+              process.stdout.write(
+                JSON.stringify({
+                  type: 'error',
+                  error: 'Another turn is already in flight',
+                }) + '\n',
+              );
+              break;
+            }
             const prompt = msg.prompt as string;
             const permissionMode =
               ((msg.permission_mode as ZenUiPermissionMode) ?? 'accept_edits');
@@ -432,19 +448,23 @@ async function main(): Promise<void> {
               | 'medium'
               | 'high'
               | undefined;
-            try {
-              const output = await bridge.sendPrompt(prompt, permissionMode, effort);
-              process.stdout.write(
-                JSON.stringify({ type: 'response', output }) + '\n',
-              );
-            } catch (err) {
-              process.stdout.write(
-                JSON.stringify({
-                  type: 'error',
-                  error: err instanceof Error ? err.message : String(err),
-                }) + '\n',
-              );
-            }
+            promptInFlight = (async () => {
+              try {
+                const output = await bridge.sendPrompt(prompt, permissionMode, effort);
+                process.stdout.write(
+                  JSON.stringify({ type: 'response', output }) + '\n',
+                );
+              } catch (err) {
+                process.stdout.write(
+                  JSON.stringify({
+                    type: 'error',
+                    error: err instanceof Error ? err.message : String(err),
+                  }) + '\n',
+                );
+              } finally {
+                promptInFlight = null;
+              }
+            })();
             break;
           }
 
@@ -457,6 +477,20 @@ async function main(): Promise<void> {
                 answer: (msg.answer as string) ?? '',
                 wasFreeform: (msg.was_freeform as boolean) ?? false,
               });
+            }
+            break;
+          }
+
+          case 'cancel_user_input': {
+            // SDK's UserInputResponse has no cancel variant, so feed the model a
+            // `[cancelled]` sentinel string and mark it as freeform. This unblocks
+            // the ask_user tool call; the model reads the sentinel and typically
+            // proceeds without the answer.
+            const reqId = msg.request_id as string;
+            const resolver = pendingUserInputs.get(reqId);
+            if (resolver) {
+              pendingUserInputs.delete(reqId);
+              resolver({ answer: '[cancelled]', wasFreeform: true });
             }
             break;
           }
@@ -505,6 +539,13 @@ async function main(): Promise<void> {
 
           case 'shutdown': {
             console.error('[bridge] Shutdown requested');
+            if (promptInFlight) {
+              try {
+                await promptInFlight;
+              } catch {
+                // already surfaced via `type: 'error'` inside the inflight task
+              }
+            }
             await bridge.stop();
             process.exit(0);
           }

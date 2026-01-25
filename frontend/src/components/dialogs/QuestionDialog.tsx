@@ -41,6 +41,15 @@ export function QuestionDialog({ sendClientMessage }: Props) {
     actions.clearQuestion();
   };
 
+  const cancel = () => {
+    sendClientMessage({
+      type: "cancel_question",
+      session_id: pendingQuestion.sessionId,
+      request_id: pendingQuestion.requestId,
+    });
+    actions.clearQuestion();
+  };
+
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
@@ -61,7 +70,7 @@ export function QuestionDialog({ sendClientMessage }: Props) {
           />
         ))}
         <div className="flex justify-end gap-2 pt-1">
-          <Button size="sm" variant="outline" onClick={() => actions.clearQuestion()}>
+          <Button size="sm" variant="outline" onClick={cancel}>
             Dismiss
           </Button>
           <Button size="sm" onClick={submit} disabled={!answered}>
