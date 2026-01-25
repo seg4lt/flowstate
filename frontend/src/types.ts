@@ -60,11 +60,33 @@ export interface PendingPermission {
   suggested: PermissionDecision;
 }
 
+export interface UserInputOption {
+  id: string;
+  label: string;
+  description?: string;
+}
+
+export interface UserInputQuestion {
+  id: string;
+  text: string;
+  header?: string;
+  options: UserInputOption[];
+  multiSelect: boolean;
+  allowFreeform: boolean;
+  isSecret: boolean;
+}
+
+export interface UserInputAnswer {
+  questionId: string;
+  optionIds: string[];
+  answer: string;
+}
+
 export interface PendingQuestion {
   sessionId: string;
   turnId: string;
   requestId: string;
-  question: string;
+  questions: UserInputQuestion[];
 }
 
 export interface ProviderModel {
@@ -187,7 +209,7 @@ export type RuntimeEvent =
       session_id: string;
       turn_id: string;
       request_id: string;
-      question: string;
+      questions: UserInputQuestion[];
     }
   | {
       type: "file_changed";
@@ -290,7 +312,7 @@ export type ClientMessage =
       type: "answer_question";
       session_id: string;
       request_id: string;
-      answer: string;
+      answers: UserInputAnswer[];
     }
   | { type: "accept_plan"; session_id: string; plan_id: string }
   | { type: "reject_plan"; session_id: string; plan_id: string }

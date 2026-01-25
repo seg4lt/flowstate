@@ -27,7 +27,31 @@ interface PendingPermission {
   resolve: (decision: PermissionResult) => void;
 }
 
+/**
+ * Shape of one `AskUserQuestion` question as emitted by the Claude Agent SDK.
+ * Mirrors the public contract at
+ * https://code.claude.com/docs/en/agent-sdk/user-input#handle-clarifying-questions
+ */
+interface AskUserSdkQuestion {
+  question: string;
+  header?: string;
+  options: Array<{ label: string; description?: string }>;
+  multiSelect?: boolean;
+}
+
+interface PendingQuestion {
+  resolve: (result: PermissionResult) => void;
+  questions: AskUserSdkQuestion[];
+}
+
+interface StructuredAnswer {
+  questionId: string;
+  optionIds: string[];
+  answer: string;
+}
+
 const pendingPermissions = new Map<string, PendingPermission>();
+const pendingQuestions = new Map<string, PendingQuestion>();
 
 function writeJson(payload: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify(payload) + '\n');
@@ -66,6 +90,24 @@ class ClaudeBridge {
       toolName: string,
       input: Record<string, unknown>,
     ): Promise<PermissionResult> => {
+      // AskUserQuestion is Claude's built-in clarifying-question tool. Route it
+      // to the question-dialog UI instead of the permission dialog; the return
+      // shape is also different — we must pass back `updatedInput: { questions, answers }`
+      // where `answers` is keyed by the question text. See
+      // https://code.claude.com/docs/en/agent-sdk/user-input#handle-clarifying-questions
+      if (toolName === 'AskUserQuestion') {
+        const rawQuestions = (input?.questions as AskUserSdkQuestion[] | undefined) ?? [];
+        const requestId = randomUUID();
+        writeStream({
+          event: 'user_question',
+          request_id: requestId,
+          questions: rawQuestions,
+        });
+        return new Promise<PermissionResult>((resolve) => {
+          pendingQuestions.set(requestId, { resolve, questions: rawQuestions });
+        });
+      }
+
       const requestId = randomUUID();
       writeStream({
         event: 'permission_request',
@@ -309,9 +351,29 @@ class ClaudeBridge {
     }
   }
 
-  // ZenUI does not yet pose user questions through the SDK, so this is a stub for future use.
-  answerQuestion(_requestId: string, _answer: string): void {
-    // no-op
+  answerQuestion(requestId: string, answers: StructuredAnswer[]): void {
+    const pending = pendingQuestions.get(requestId);
+    if (!pending) return;
+    pendingQuestions.delete(requestId);
+
+    // Claude expects `updatedInput: { questions, answers: { "<question text>": "<value>" } }`.
+    // We synthesized `questionId` as the question's array index on the Rust side, so
+    // look up each answer's original question text here.
+    const answerMap: Record<string, string> = {};
+    for (const a of answers) {
+      const idx = Number(a.questionId);
+      const q = pending.questions[idx];
+      if (!q) continue;
+      answerMap[q.question] = a.answer;
+    }
+
+    pending.resolve({
+      behavior: 'allow',
+      updatedInput: {
+        questions: pending.questions,
+        answers: answerMap,
+      },
+    });
   }
 
   interrupt(): void {
@@ -453,7 +515,7 @@ async function main(): Promise<void> {
       case 'answer_question': {
         bridge.answerQuestion(
           msg.request_id as string,
-          msg.answer as string,
+          (msg.answers as StructuredAnswer[]) ?? [],
         );
         break;
       }

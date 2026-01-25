@@ -67,6 +67,41 @@ pub enum PermissionDecision {
     DenyAlways,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputQuestion {
+    pub id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub options: Vec<UserInputOption>,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default)]
+    pub allow_freeform: bool,
+    #[serde(default)]
+    pub is_secret: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputAnswer {
+    pub question_id: String,
+    #[serde(default)]
+    pub option_ids: Vec<String>,
+    pub answer: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -372,7 +407,7 @@ pub enum ProviderTurnEvent {
     },
     UserQuestion {
         request_id: String,
-        question: String,
+        questions: Vec<UserInputQuestion>,
     },
     FileChange {
         call_id: String,
@@ -410,7 +445,7 @@ pub enum ProviderTurnEvent {
 pub struct TurnEventSink {
     tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
     permission_pending: Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>,
-    question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+    question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
 }
 
 impl TurnEventSink {
@@ -458,9 +493,12 @@ impl TurnEventSink {
         }
     }
 
-    /// Ask the user a free-text question and await their typed answer.
-    /// Returns None if the channel closes before the user answers.
-    pub async fn ask_user(&self, question: String) -> Option<String> {
+    /// Ask the user one or more structured clarifying questions and await their
+    /// answers. Returns None if the channel closes before the user answers.
+    pub async fn ask_user(
+        &self,
+        questions: Vec<UserInputQuestion>,
+    ) -> Option<Vec<UserInputAnswer>> {
         let request_id = next_request_id("q");
         let (sender, receiver) = oneshot::channel();
         {
@@ -469,11 +507,11 @@ impl TurnEventSink {
         }
         self.send(ProviderTurnEvent::UserQuestion {
             request_id: request_id.clone(),
-            question,
+            questions,
         })
         .await;
         match receiver.await {
-            Ok(answer) => Some(answer),
+            Ok(answers) => Some(answers),
             Err(_) => {
                 let mut guard = self.question_pending.lock().await;
                 guard.remove(&request_id);
@@ -491,10 +529,10 @@ impl TurnEventSink {
     }
 
     /// Host-side: called by the runtime when the user answers a question.
-    pub async fn resolve_question(&self, request_id: &str, answer: String) {
+    pub async fn resolve_question(&self, request_id: &str, answers: Vec<UserInputAnswer>) {
         let mut guard = self.question_pending.lock().await;
         if let Some(sender) = guard.remove(request_id) {
-            let _ = sender.send(answer);
+            let _ = sender.send(answers);
         }
     }
 }
@@ -573,7 +611,7 @@ pub enum RuntimeEvent {
         session_id: String,
         turn_id: String,
         request_id: String,
-        question: String,
+        questions: Vec<UserInputQuestion>,
     },
     FileChanged {
         session_id: String,
@@ -676,7 +714,7 @@ pub enum ClientMessage {
     AnswerQuestion {
         session_id: String,
         request_id: String,
-        answer: String,
+        answers: Vec<UserInputAnswer>,
     },
     AcceptPlan {
         session_id: String,

@@ -13,7 +13,8 @@ use tracing::{debug, info, warn};
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputAnswer,
+    UserInputOption, UserInputQuestion,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 600_000;
@@ -50,7 +51,7 @@ enum BridgeRequest {
     #[serde(rename = "answer_question")]
     AnswerQuestion {
         request_id: String,
-        answer: String,
+        answers: Vec<UserInputAnswer>,
     },
     #[serde(rename = "list_models")]
     ListModels,
@@ -103,6 +104,8 @@ enum BridgeResponse {
         suggested: Option<String>,
         #[serde(default)]
         question: Option<String>,
+        #[serde(default)]
+        questions: Option<Value>,
         #[serde(default)]
         path: Option<String>,
         #[serde(default)]
@@ -367,7 +370,7 @@ impl ClaudeSdkAdapter {
 
         let stdin = process.stdin.clone();
         let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, PermissionDecision)>();
-        let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, String)>();
+        let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, Vec<UserInputAnswer>)>();
 
         // Background task: forwards permission/question answers from the sink helpers back
         // into the bridge stdin while the turn is in flight.
@@ -385,8 +388,8 @@ impl ClaudeSdkAdapter {
                             break;
                         }
                     }
-                    Some((request_id, answer)) = q_rx.recv() => {
-                        let req = BridgeRequest::AnswerQuestion { request_id, answer };
+                    Some((request_id, answers)) = q_rx.recv() => {
+                        let req = BridgeRequest::AnswerQuestion { request_id, answers };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
                             warn!("failed to forward question answer: {e}");
                             break;
@@ -427,7 +430,8 @@ impl ClaudeSdkAdapter {
                     tool_name,
                     input,
                     suggested,
-                    question,
+                    question: _question,
+                    questions,
                     path,
                     operation,
                     before,
@@ -473,21 +477,23 @@ impl ClaudeSdkAdapter {
                     }
                     "user_question" => {
                         let request_id = request_id.unwrap_or_default();
-                        let question = question.unwrap_or_default();
+                        let structured = parse_claude_questions(questions.as_ref());
 
                         let events_clone = events.clone();
                         let q_tx = q_tx.clone();
                         let req_id_for_writer = request_id.clone();
-                        let question_clone = question.clone();
+                        let questions_for_task = structured.clone();
                         tokio::spawn(async move {
-                            if let Some(answer) = events_clone.ask_user(question_clone).await {
-                                let _ = q_tx.send((req_id_for_writer, answer));
+                            if let Some(answers) =
+                                events_clone.ask_user(questions_for_task).await
+                            {
+                                let _ = q_tx.send((req_id_for_writer, answers));
                             }
                         });
                         events
                             .send(ProviderTurnEvent::UserQuestion {
                                 request_id,
-                                question,
+                                questions: structured,
                             })
                             .await;
                     }
@@ -741,6 +747,63 @@ fn parse_decision(value: &str) -> PermissionDecision {
         "deny_always" => PermissionDecision::DenyAlways,
         _ => PermissionDecision::Allow,
     }
+}
+
+/// Parse Claude SDK's `AskUserQuestion` tool input into zenui's cross-provider
+/// question list. Claude's shape is
+/// `{ questions: [{ question, header, options: [{label, description}], multiSelect }] }`,
+/// per https://code.claude.com/docs/en/agent-sdk/user-input. We synthesize `id` as
+/// the question's array index so `answerQuestion` in the bridge can map answers
+/// back to the original question text (Claude's answer map is keyed by question text).
+fn parse_claude_questions(raw: Option<&Value>) -> Vec<UserInputQuestion> {
+    let Some(array) = raw.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let options = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|opts| {
+                    opts.iter()
+                        .enumerate()
+                        .map(|(j, o)| UserInputOption {
+                            id: j.to_string(),
+                            label: o
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            description: o
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            UserInputQuestion {
+                id: i.to_string(),
+                text: q
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                header: q.get("header").and_then(Value::as_str).map(str::to_string),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                // Claude docs: no explicit allowFreeform flag; the client may always
+                // accept a free-form answer by passing the user's typed text as the value.
+                allow_freeform: true,
+                is_secret: false,
+            }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -13,7 +13,8 @@ use tracing::{debug, info};
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputOption,
+    UserInputQuestion,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 120_000;
@@ -57,6 +58,7 @@ enum BridgeRequest {
     AnswerUserInput {
         request_id: String,
         answer: String,
+        was_freeform: bool,
     },
     #[serde(rename = "list_models")]
     ListModels,
@@ -111,6 +113,10 @@ enum BridgeResponse {
         suggested: Option<String>,
         #[serde(default)]
         question: Option<String>,
+        #[serde(default)]
+        choices: Option<Vec<String>>,
+        #[serde(default)]
+        allow_freeform: Option<bool>,
         #[serde(default)]
         plan_id: Option<String>,
         #[serde(default)]
@@ -327,7 +333,8 @@ impl GitHubCopilotAdapter {
         let stdin = process.stdin.clone();
         let (perm_tx, mut perm_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, PermissionDecision)>();
-        let (q_tx, mut q_rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+        let (q_tx, mut q_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, String, bool)>();
         let stdin_for_writer = stdin.clone();
         let writer_task = tokio::spawn(async move {
             loop {
@@ -342,8 +349,12 @@ impl GitHubCopilotAdapter {
                             break;
                         }
                     }
-                    Some((request_id, answer)) = q_rx.recv() => {
-                        let req = BridgeRequest::AnswerUserInput { request_id, answer };
+                    Some((request_id, answer, was_freeform)) = q_rx.recv() => {
+                        let req = BridgeRequest::AnswerUserInput {
+                            request_id,
+                            answer,
+                            was_freeform,
+                        };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
                             debug!("failed to forward user input answer: {e}");
                             break;
@@ -385,6 +396,8 @@ impl GitHubCopilotAdapter {
                     input,
                     suggested,
                     question,
+                    choices,
+                    allow_freeform,
                     plan_id,
                     title,
                     steps,
@@ -466,20 +479,47 @@ impl GitHubCopilotAdapter {
                     }
                     "user_question" => {
                         let request_id = request_id.unwrap_or_default();
-                        let question = question.unwrap_or_default();
+                        let question_text = question.unwrap_or_default();
+                        let options: Vec<UserInputOption> = choices
+                            .map(|cs| {
+                                cs.into_iter()
+                                    .enumerate()
+                                    .map(|(i, l)| UserInputOption {
+                                        id: i.to_string(),
+                                        label: l,
+                                        description: None,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let allow_freeform = allow_freeform.unwrap_or(true);
+                        let structured = UserInputQuestion {
+                            id: request_id.clone(),
+                            text: question_text,
+                            header: None,
+                            options,
+                            multi_select: false,
+                            allow_freeform,
+                            is_secret: false,
+                        };
                         let events_clone = events.clone();
                         let q_tx = q_tx.clone();
                         let req_id_for_writer = request_id.clone();
-                        let question_clone = question.clone();
+                        let structured_clone = structured.clone();
                         tokio::spawn(async move {
-                            if let Some(answer) = events_clone.ask_user(question_clone).await {
-                                let _ = q_tx.send((req_id_for_writer, answer));
+                            if let Some(answers) =
+                                events_clone.ask_user(vec![structured_clone]).await
+                            {
+                                if let Some(a) = answers.into_iter().next() {
+                                    let was_freeform = a.option_ids.is_empty();
+                                    let _ = q_tx.send((req_id_for_writer, a.answer, was_freeform));
+                                }
                             }
                         });
                         events
                             .send(ProviderTurnEvent::UserQuestion {
                                 request_id,
-                                question,
+                                questions: vec![structured],
                             })
                             .await;
                     }

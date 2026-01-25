@@ -11,6 +11,7 @@ use zenui_provider_api::{
     PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
     ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail,
     SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
+    UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -223,9 +224,9 @@ impl RuntimeCore {
             ClientMessage::AnswerQuestion {
                 session_id,
                 request_id,
-                answer,
+                answers,
             } => {
-                self.answer_question(&session_id, &request_id, answer).await;
+                self.answer_question(&session_id, &request_id, answers).await;
                 Some(ServerMessage::Ack {
                     message: "Question answer recorded.".to_string(),
                 })
@@ -338,10 +339,15 @@ impl RuntimeCore {
         }
     }
 
-    async fn answer_question(&self, session_id: &str, request_id: &str, answer: String) {
+    async fn answer_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: Vec<UserInputAnswer>,
+    ) {
         let sink = self.active_sinks.lock().await.get(session_id).cloned();
         if let Some(sink) = sink {
-            sink.resolve_question(request_id, answer).await;
+            sink.resolve_question(request_id, answers).await;
         } else {
             tracing::warn!(session_id, request_id, "no active sink for question answer");
         }
@@ -602,13 +608,13 @@ impl RuntimeCore {
                 }
                 ProviderTurnEvent::UserQuestion {
                     request_id,
-                    question,
+                    questions,
                 } => {
                     self.publish(RuntimeEvent::UserQuestionAsked {
                         session_id: sid.clone(),
                         turn_id: tid.clone(),
                         request_id,
-                        question,
+                        questions,
                     });
                 }
                 ProviderTurnEvent::FileChange {

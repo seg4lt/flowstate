@@ -2,7 +2,7 @@
 // "Chat"/"Plan" (collaboration mode) and "Full access" (permission mode) buttons
 // into zenui's single 4-value PermissionMode enum. Revisit if the user wants
 // them split into two controls.
-import { Check, ChevronDown, ListTodo, Shield, Unlock } from "lucide-react";
+import { Check, ChevronDown, Circle, ListTodo, Shield, Unlock } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import {
@@ -72,12 +72,18 @@ export function ModeSelector({ value, onChange }: Props) {
       <DropdownMenuContent align="start" className="w-64">
         {OPTIONS.map((option) => {
           const Icon = option.Icon;
+          const isSelected = option.mode === value;
           return (
             <DropdownMenuItem
               key={option.mode}
               onClick={() => onChange(option.mode)}
               className="gap-2 py-2"
             >
+              {isSelected ? (
+                <Check className="h-3.5 w-3.5 shrink-0 text-foreground" />
+              ) : (
+                <Circle className="h-3.5 w-3.5 shrink-0 opacity-0" />
+              )}
               <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <div className="flex flex-col gap-0.5 min-w-0">
                 <span className="text-sm">{option.label}</span>

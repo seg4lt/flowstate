@@ -31,6 +31,13 @@ export interface ComposerDraft {
   reasoningEffort: ReasoningEffort;
 }
 
+export interface QuestionSelection {
+  /** Ids of the currently-selected options (0..n for multi-select, 0..1 for single). */
+  optionIds: string[];
+  /** Free-text the user has typed; prefer this over option ids when non-empty. */
+  freeformText: string;
+}
+
 export interface AppState {
   bootstrap: BootstrapPayload | null;
   snapshot: AppSnapshot;
@@ -38,11 +45,12 @@ export interface AppState {
   activeProjectId: string | null;
   pendingPermissions: PendingPermission[];
   pendingQuestion: PendingQuestion | null;
+  /** Per-question draft state keyed by question id. Cleared when pendingQuestion clears. */
+  questionSelections: Record<string, QuestionSelection>;
   connectionStatus: ConnectionStatus;
   lastAction: string;
   expandedProjectIds: Record<string, boolean>;
   composer: ComposerDraft;
-  questionDraft: string;
 }
 
 const INITIAL_STATE: AppState = {
@@ -52,6 +60,7 @@ const INITIAL_STATE: AppState = {
   activeProjectId: null,
   pendingPermissions: [],
   pendingQuestion: null,
+  questionSelections: {},
   connectionStatus: "connecting",
   lastAction: "Ready",
   expandedProjectIds: {},
@@ -62,7 +71,6 @@ const INITIAL_STATE: AppState = {
     permissionMode: "accept_edits",
     reasoningEffort: "medium",
   },
-  questionDraft: "",
 };
 
 type Listener = () => void;
@@ -165,11 +173,58 @@ export const actions = {
       composer: { ...prev.composer, reasoningEffort: effort },
     }));
   },
-  setQuestionDraft(value: string) {
-    setState((prev) => ({ ...prev, questionDraft: value }));
+  setQuestionOption(questionId: string, optionId: string, multi: boolean) {
+    setState((prev) => {
+      const current = prev.questionSelections[questionId] ?? {
+        optionIds: [],
+        freeformText: "",
+      };
+      let nextIds: string[];
+      if (multi) {
+        nextIds = current.optionIds.includes(optionId)
+          ? current.optionIds.filter((id) => id !== optionId)
+          : [...current.optionIds, optionId];
+      } else {
+        nextIds = current.optionIds[0] === optionId ? [] : [optionId];
+      }
+      return {
+        ...prev,
+        questionSelections: {
+          ...prev.questionSelections,
+          [questionId]: {
+            optionIds: nextIds,
+            // Picking an option clears any freeform — the two are mutually exclusive.
+            freeformText: nextIds.length > 0 ? "" : current.freeformText,
+          },
+        },
+      };
+    });
+  },
+  setQuestionFreeform(questionId: string, text: string) {
+    setState((prev) => {
+      const current = prev.questionSelections[questionId] ?? {
+        optionIds: [],
+        freeformText: "",
+      };
+      return {
+        ...prev,
+        questionSelections: {
+          ...prev.questionSelections,
+          [questionId]: {
+            // Typing clears any option selection.
+            optionIds: text.length > 0 ? [] : current.optionIds,
+            freeformText: text,
+          },
+        },
+      };
+    });
   },
   clearQuestion() {
-    setState((prev) => ({ ...prev, pendingQuestion: null, questionDraft: "" }));
+    setState((prev) => ({
+      ...prev,
+      pendingQuestion: null,
+      questionSelections: {},
+    }));
   },
   toggleProjectExpanded(projectId: string) {
     setState((prev) => ({
@@ -499,15 +554,19 @@ function applyRuntimeEvent(prev: AppState, event: RuntimeEvent): AppState {
       };
     }
     case "user_question_asked": {
+      const selections: Record<string, QuestionSelection> = {};
+      for (const q of event.questions) {
+        selections[q.id] = { optionIds: [], freeformText: "" };
+      }
       return {
         ...prev,
         pendingQuestion: {
           sessionId: event.session_id,
           turnId: event.turn_id,
           requestId: event.request_id,
-          question: event.question,
+          questions: event.questions,
         },
-        questionDraft: "",
+        questionSelections: selections,
       };
     }
     case "provider_models_updated": {

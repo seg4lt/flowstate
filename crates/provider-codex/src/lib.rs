@@ -12,7 +12,7 @@ use tracing::warn;
 use zenui_provider_api::{
     PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
     ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
-    SessionDetail, TurnEventSink,
+    SessionDetail, TurnEventSink, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -334,6 +334,13 @@ impl ProviderAdapter for CodexAdapter {
             if permission_mode == PermissionMode::Plan {
                 if let Some(obj) = turn_params.as_object_mut() {
                     let model = session.summary.model.clone().unwrap_or_default();
+                    // Do NOT set `developer_instructions` — when it's absent/null,
+                    // codex's `normalize_turn_start_collaboration_mode` fills in the
+                    // Plan preset's system prompt (see codex-rs/models-manager/src/
+                    // collaboration_mode_presets.rs::plan_preset), which is what tells
+                    // the model to use `request_user_input` for clarifying questions.
+                    // Sending `""` counts as `Some("")` in serde and suppresses the
+                    // preset, causing the model to fall back to plaintext selection.
                     obj.insert(
                         "collaborationMode".to_string(),
                         json!({
@@ -341,7 +348,6 @@ impl ProviderAdapter for CodexAdapter {
                             "settings": {
                                 "model": model,
                                 "reasoning_effort": effort_str,
-                                "developer_instructions": "",
                             },
                         }),
                     );
@@ -499,24 +505,17 @@ impl CodexSessionProcess {
                 }
                 ProtocolMessage::ServerRequest { id, method, params } => {
                     if method == "item/tool/requestUserInput" {
-                        // Codex's ask_user tool: extract the question, ask the user
-                        // via the runtime, then send a JSON-RPC response back to codex
-                        // carrying the typed answer. While we're awaiting ask_user(),
-                        // codex is blocked waiting for our response, so no other
-                        // messages will arrive on this stream.
-                        let question = params
-                            .get("question")
-                            .or_else(|| params.get("prompt"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("Codex needs your input.")
-                            .to_string();
-                        match events.ask_user(question).await {
-                            Some(answer) => {
-                                self.write_message(json!({
-                                    "id": id,
-                                    "result": { "answer": answer },
-                                }))
-                                .await?;
+                        // Codex's ask_user tool: parse the questions array (schema at
+                        // codex-rs/app-server-protocol/src/protocol/v2.rs::ToolRequestUserInputParams),
+                        // ask the user, then respond with ToolRequestUserInputResponse shape:
+                        // `{ answers: { [questionId]: { answers: [string] } } }`. While
+                        // ask_user() is awaited, codex is blocked on our response.
+                        let questions = parse_codex_questions(&params);
+                        match events.ask_user(questions).await {
+                            Some(answers) => {
+                                let result = build_codex_response(&answers);
+                                self.write_message(json!({ "id": id, "result": result }))
+                                    .await?;
                             }
                             None => {
                                 self.write_message(json!({
@@ -801,6 +800,76 @@ fn extract_model_entry(entry: &Value) -> Option<ProviderModel> {
         .unwrap_or(&value)
         .to_string();
     Some(ProviderModel { value, label })
+}
+
+/// Parse a `ToolRequestUserInputParams` value (from `item/tool/requestUserInput`)
+/// into zenui's cross-provider question list.
+fn parse_codex_questions(params: &Value) -> Vec<UserInputQuestion> {
+    let Some(array) = params.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .map(|q| {
+            let options = q
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|opts| {
+                    opts.iter()
+                        .enumerate()
+                        .map(|(i, o)| UserInputOption {
+                            id: i.to_string(),
+                            label: o
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            description: o
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            UserInputQuestion {
+                id: q
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                text: q
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                header: q.get("header").and_then(Value::as_str).map(str::to_string),
+                options,
+                multi_select: false,
+                allow_freeform: q
+                    .get("isOther")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                is_secret: q
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }
+        })
+        .collect()
+}
+
+/// Build a `ToolRequestUserInputResponse`-shaped JSON value:
+/// `{ answers: { [questionId]: { answers: [string] } } }`.
+fn build_codex_response(answers: &[UserInputAnswer]) -> Value {
+    let mut map = serde_json::Map::new();
+    for a in answers {
+        map.insert(
+            a.question_id.clone(),
+            json!({ "answers": [a.answer.clone()] }),
+        );
+    }
+    json!({ "answers": Value::Object(map) })
 }
 
 /// Map zenui's PermissionMode → codex's (approvalPolicy, sandbox) tuple at thread/start.

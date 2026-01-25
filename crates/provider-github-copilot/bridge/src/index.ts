@@ -231,6 +231,21 @@ class CopilotBridge {
       `[bridge] Sending prompt (${prompt.length} chars, mode=${permissionMode}, effort=${reasoningEffort ?? 'unset'})`,
     );
 
+    // Copilot tracks session-level collaboration mode via `session.rpc.mode.set`.
+    // Values: "interactive" (normal tool execution) or "plan" (plan-only, model
+    // calls exit_plan_mode when done). ZenUI's Plan mode must set "plan"; all
+    // other ZenUI modes map to "interactive" so the model actually executes tools.
+    // See https://github.com/github/copilot-sdk/blob/main/nodejs/test/e2e/rpc.test.ts
+    try {
+      const targetMode = permissionMode === 'plan' ? 'plan' : 'interactive';
+      await this.session.rpc.mode.set({ mode: targetMode });
+      console.error(`[bridge] Session mode set to ${targetMode}`);
+    } catch (err) {
+      console.error(
+        `[bridge] Failed to set session mode: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
     // Subscribe to streaming events. Each returns an unsubscribe fn.
     const unsubs: Array<() => void> = [];
     let deltasSeen = 0;
@@ -440,7 +455,7 @@ async function main(): Promise<void> {
               pendingUserInputs.delete(reqId);
               resolver({
                 answer: (msg.answer as string) ?? '',
-                wasFreeform: true,
+                wasFreeform: (msg.was_freeform as boolean) ?? false,
               });
             }
             break;
