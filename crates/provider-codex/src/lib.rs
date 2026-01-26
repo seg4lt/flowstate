@@ -22,6 +22,7 @@ const RECOVERABLE_THREAD_RESUME_ERRORS: &[&str] = &[
     "no such thread",
     "unknown thread",
     "does not exist",
+    "no rollout found",
 ];
 
 #[derive(Debug, Clone)]
