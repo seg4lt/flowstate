@@ -5,7 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::Utc;
@@ -24,6 +25,7 @@ use zenui_runtime_core::RuntimeCore;
 struct ApiState {
     runtime: Arc<RuntimeCore>,
     ws_url: String,
+    index_file: PathBuf,
 }
 
 pub struct LocalServer {
@@ -73,13 +75,19 @@ pub fn spawn_local_server(
             index_file.display()
         );
     }
-    let state = ApiState { runtime, ws_url };
+    let state = ApiState {
+        runtime,
+        ws_url,
+        index_file: index_file.clone(),
+    };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let task = runtime_handle.spawn(async move {
         let static_assets =
             ServeDir::new(frontend_dist).not_found_service(ServeFile::new(index_file));
         let router = Router::new()
+            .route("/", get(index_handler))
+            .route("/index.html", get(index_handler))
             .route("/api/health", get(health_handler))
             .route("/api/bootstrap", get(bootstrap_handler))
             .route("/api/snapshot", get(snapshot_handler))
@@ -101,6 +109,20 @@ pub fn spawn_local_server(
         shutdown_tx: Some(shutdown_tx),
         task,
     })
+}
+
+async fn index_handler(State(state): State<ApiState>) -> Response {
+    match tokio::fs::read(&state.index_file).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store, must-revalidate"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn health_handler() -> Json<HealthPayload> {

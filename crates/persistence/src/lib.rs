@@ -525,6 +525,7 @@ fn provider_kind_to_str(kind: ProviderKind) -> &'static str {
         ProviderKind::Codex => "codex",
         ProviderKind::Claude => "claude",
         ProviderKind::GitHubCopilot => "github_copilot",
+        ProviderKind::ClaudeCli => "claude_cli",
     }
 }
 
@@ -532,6 +533,7 @@ fn provider_kind_from_str(value: &str) -> ProviderKind {
     match value {
         "claude" => ProviderKind::Claude,
         "github_copilot" => ProviderKind::GitHubCopilot,
+        "claude_cli" => ProviderKind::ClaudeCli,
         _ => ProviderKind::Codex,
     }
 }

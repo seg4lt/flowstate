@@ -7,6 +7,7 @@ use zenui_http_api::{spawn_local_server, LocalServer};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
+use zenui_provider_claude_cli::ClaudeCliAdapter;
 use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
@@ -36,6 +37,7 @@ pub fn bootstrap(bind_addr: SocketAddr, database_name: &str) -> Result<Bootstrap
         Arc::new(CodexAdapter::new(working_directory.clone())),
         Arc::new(ClaudeSdkAdapter::new(working_directory.clone())),
         Arc::new(GitHubCopilotAdapter::new(working_directory.clone())),
+        Arc::new(ClaudeCliAdapter::new(working_directory.clone())),
     ];
     let orchestration = Arc::new(OrchestrationService::new());
     let persistence = Arc::new(

@@ -5,6 +5,7 @@ members = [
   "crates/provider-api",
   "crates/provider-codex",
   "crates/provider-claude-sdk",
+  "crates/provider-claude-cli",
   "crates/provider-github-copilot",
   "crates/orchestration",
   "crates/persistence",

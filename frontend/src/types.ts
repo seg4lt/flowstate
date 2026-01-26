@@ -1,4 +1,4 @@
-export type ProviderKind = "codex" | "claude" | "github_copilot";
+export type ProviderKind = "codex" | "claude" | "github_copilot" | "claude_cli";
 export type ProviderStatusLevel = "ready" | "warning" | "error";
 export type SessionStatus = "ready" | "running" | "interrupted";
 export type TurnStatus = "running" | "completed" | "interrupted" | "failed";
@@ -341,12 +341,14 @@ export const PROVIDER_COLORS: Record<ProviderKind, string> = {
   codex: "bg-emerald-500",
   claude: "bg-amber-500",
   github_copilot: "bg-blue-500",
+  claude_cli: "bg-violet-500",
 };
 
 export const PROVIDER_LABELS: Record<ProviderKind, string> = {
   codex: "Codex",
   claude: "Claude",
   github_copilot: "GitHub Copilot",
+  claude_cli: "Claude (CLI)",
 };
 
 export const PERMISSION_MODE_LABELS: Record<PermissionMode, string> = {
