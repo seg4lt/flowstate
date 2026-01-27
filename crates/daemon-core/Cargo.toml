@@ -1,19 +1,18 @@
 [package]
-name = "zenui-app-shell"
+name = "zenui-daemon-core"
 version.workspace = true
 edition.workspace = true
 publish = false
-build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
-muda = "0.13"
+chrono.workspace = true
+directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tao.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
-wry.workspace = true
 zenui-http-api = { path = "../http-api" }
 zenui-orchestration = { path = "../orchestration" }
 zenui-persistence = { path = "../persistence" }
@@ -24,3 +23,6 @@ zenui-provider-codex = { path = "../provider-codex" }
 zenui-provider-github-copilot = { path = "../provider-github-copilot" }
 zenui-provider-github-copilot-cli = { path = "../provider-github-copilot-cli" }
 zenui-runtime-core = { path = "../runtime-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

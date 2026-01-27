@@ -110,6 +110,43 @@ impl RuntimeCore {
         }
     }
 
+    /// Walk `active_sinks`, send `interrupt_turn` to each session, and wait
+    /// (up to `grace`) for the sinks to drain. Called by daemon-core during
+    /// graceful shutdown. Loops-and-re-snapshots to catch races where a new
+    /// turn slips in between phases. Returns the count of interrupt calls
+    /// that succeeded (not necessarily the count of turns that finished
+    /// cleanly within the grace window).
+    pub async fn shutdown_all_turns(&self, grace: std::time::Duration) -> usize {
+        let deadline = std::time::Instant::now() + grace;
+        let mut total = 0usize;
+        loop {
+            let session_ids: Vec<String> = {
+                let guard = self.active_sinks.lock().await;
+                guard.keys().cloned().collect()
+            };
+            if session_ids.is_empty() {
+                break;
+            }
+            for session_id in session_ids {
+                match self.interrupt_turn(session_id.clone()).await {
+                    Ok(_) => total += 1,
+                    Err(err) => {
+                        tracing::warn!(session_id, "interrupt_turn during shutdown: {err}");
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    ?grace,
+                    "shutdown_all_turns: grace period elapsed with active sinks remaining"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        total
+    }
+
     pub async fn bootstrap(&self, ws_url: String) -> BootstrapPayload {
         let mut providers: Vec<ProviderStatus> =
             join_all(self.adapters.values().map(|adapter| adapter.health())).await;

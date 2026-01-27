@@ -1,6 +1,7 @@
 [workspace]
 members = [
-  "crates/app-shell",
+  "crates/tao-web-shell",
+  "crates/daemon-core",
   "crates/runtime-core",
   "crates/provider-api",
   "crates/provider-codex",
@@ -23,11 +24,13 @@ anyhow = "1.0.100"
 async-trait = "0.1.89"
 axum = { version = "0.8.6", features = ["ws"] }
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
+directories = "5"
 futures = "0.3.31"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 tao = "0.35.0"
-tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tempfile = "3"
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["serde", "v4"] }

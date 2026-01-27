@@ -1,5 +1,5 @@
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::channel;
 
 use anyhow::{Context, Result};
 use tao::dpi::LogicalSize;
@@ -8,7 +8,7 @@ use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 use wry::{Rect, WebViewBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize as WryLogicalSize};
-use zenui_app_shell::bootstrap;
+use zenui_daemon_core::bootstrap;
 
 #[derive(Debug, Clone)]
 enum WindowCommand {
@@ -138,7 +138,7 @@ fn run() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn init_menu_bar() {
-    use muda::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+    use muda::{Menu, PredefinedMenuItem, Submenu};
 
     // Create the menu bar
     let menu_bar = Menu::new();

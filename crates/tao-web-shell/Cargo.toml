@@ -1,0 +1,20 @@
+[package]
+name = "zenui-tao-web-shell"
+version.workspace = true
+edition.workspace = true
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "zenui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+muda = "0.13"
+serde.workspace = true
+serde_json.workspace = true
+tao.workspace = true
+tracing-subscriber.workspace = true
+wry.workspace = true
+zenui-daemon-core = { path = "../daemon-core" }
