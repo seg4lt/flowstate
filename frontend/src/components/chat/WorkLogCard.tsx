@@ -1,6 +1,6 @@
 import { useState } from "react";
 import {
-  ChevronDown,
+  Bot,
   ChevronRight,
   FilePenLine,
   FilePlus,
@@ -79,16 +79,38 @@ function describeToolCall(call: ToolCall, fileChange?: FileChangeRecord): {
   return { label: call.name, detail: argSummary, Icon: Wrench };
 }
 
+function extractSubagentText(events: unknown[] | undefined): string {
+  if (!events) return "";
+  return events
+    .map((e: unknown) =>
+      typeof e === "object" && e !== null && "text" in e
+        ? (e as { text: string }).text
+        : "",
+    )
+    .join("");
+}
+
 function ToolCallRow({ entry }: { entry: Extract<WorkEntry, { kind: "tool" }> }) {
   const [expanded, setExpanded] = useState(false);
   const { call, fileChange, subagent } = entry;
-  const { label, detail, Icon } = describeToolCall(call, fileChange);
-  const statusColor =
-    call.status === "completed"
+
+  const isSubagent = !!subagent;
+
+  const statusColor = isSubagent
+    ? subagent.status === "completed"
+      ? "bg-green-500"
+      : subagent.status === "failed"
+        ? "bg-red-500"
+        : "bg-yellow-500 animate-pulse"
+    : call.status === "completed"
       ? "bg-green-500"
       : call.status === "failed"
         ? "bg-red-500"
         : "bg-yellow-500 animate-pulse";
+
+  const label = isSubagent ? "Subagent" : describeToolCall(call, fileChange).label;
+  const detail = isSubagent ? subagent.agentType : describeToolCall(call, fileChange).detail;
+  const Icon = isSubagent ? Bot : describeToolCall(call, fileChange).Icon;
 
   return (
     <div className="text-xs">
@@ -104,43 +126,63 @@ function ToolCallRow({ entry }: { entry: Extract<WorkEntry, { kind: "tool" }> })
         >
           <ChevronRight className="h-3 w-3 text-muted-foreground/60" />
         </span>
-        <Icon className="h-3 w-3 shrink-0 text-muted-foreground/80" />
+        <Icon
+          className={`h-3 w-3 shrink-0 ${
+            isSubagent ? "text-primary" : "text-muted-foreground/80"
+          }`}
+        />
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${statusColor}`} />
-        <span className="font-medium">{label}</span>
+        <span className={`font-medium ${isSubagent ? "text-primary" : ""}`}>{label}</span>
         {detail && (
           <span className="text-muted-foreground truncate min-w-0">{detail}</span>
         )}
       </button>
       {expanded && (
         <div className="mt-1 ml-6 space-y-1">
-          {fileChange ? (
-            <FileChangeDetail change={fileChange} />
-          ) : (
-            <pre className="text-[11px] bg-muted/40 rounded p-1.5 font-mono overflow-x-auto max-h-48">
-              {JSON.stringify(call.args, null, 2)}
-            </pre>
-          )}
-          {call.output && !fileChange && (
-            <pre className="text-[11px] bg-muted/30 rounded p-1.5 font-mono overflow-x-auto whitespace-pre-wrap max-h-48">
-              {call.output}
-            </pre>
-          )}
-          {call.error && (
-            <pre className="text-[11px] text-destructive bg-destructive/10 rounded p-1.5 font-mono whitespace-pre-wrap">
-              {call.error}
-            </pre>
-          )}
-          {subagent && (
-            <div className="border-l-2 border-muted ml-1 pl-2 space-y-1">
+          {isSubagent ? (
+            <>
               <div className="text-[10px] text-muted-foreground italic line-clamp-2">
                 {subagent.prompt}
               </div>
+              {(() => {
+                const text = extractSubagentText(subagent.events);
+                return text ? (
+                  <pre className="text-[11px] bg-muted/40 rounded p-1.5 font-mono overflow-x-auto whitespace-pre-wrap max-h-48">
+                    {text}
+                  </pre>
+                ) : null;
+              })()}
               {subagent.output && (
-                <div className="text-[11px] bg-muted/40 rounded p-1.5 whitespace-pre-wrap">
+                <pre className="text-[11px] bg-muted/30 rounded p-1.5 font-mono overflow-x-auto whitespace-pre-wrap max-h-48">
                   {subagent.output}
-                </div>
+                </pre>
               )}
-            </div>
+              {subagent.error && (
+                <pre className="text-[11px] text-destructive bg-destructive/10 rounded p-1.5 font-mono whitespace-pre-wrap">
+                  {subagent.error}
+                </pre>
+              )}
+            </>
+          ) : (
+            <>
+              {fileChange ? (
+                <FileChangeDetail change={fileChange} />
+              ) : (
+                <pre className="text-[11px] bg-muted/40 rounded p-1.5 font-mono overflow-x-auto max-h-48">
+                  {JSON.stringify(call.args, null, 2)}
+                </pre>
+              )}
+              {call.output && !fileChange && (
+                <pre className="text-[11px] bg-muted/30 rounded p-1.5 font-mono overflow-x-auto whitespace-pre-wrap max-h-48">
+                  {call.output}
+                </pre>
+              )}
+              {call.error && (
+                <pre className="text-[11px] text-destructive bg-destructive/10 rounded p-1.5 font-mono whitespace-pre-wrap">
+                  {call.error}
+                </pre>
+              )}
+            </>
           )}
         </div>
       )}
@@ -188,47 +230,23 @@ function FileChangeDetail({ change }: { change: FileChangeRecord }) {
 
 export function WorkLogCard(props: Props) {
   const entries = buildEntries(props);
-  const [collapsed, setCollapsed] = useState(props.turnCompleted);
 
   if (entries.length === 0) return null;
 
-  const onlyTools = entries.every((e) => e.kind === "tool");
-  const label = onlyTools ? "Tool calls" : "Work log";
-
   return (
-    <div className="rounded-xl border border-border/60 bg-muted/20 px-2 py-1.5 mt-2">
-      <button
-        type="button"
-        onClick={() => setCollapsed((v) => !v)}
-        className="w-full flex items-center justify-between gap-2 px-0.5"
-      >
-        <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
-          {collapsed ? (
-            <ChevronRight className="h-3 w-3" />
-          ) : (
-            <ChevronDown className="h-3 w-3" />
-          )}
-          <span>
-            {label} ({entries.length})
-          </span>
-        </div>
-      </button>
-      {!collapsed && (
-        <div className="mt-1.5 space-y-0.5">
-          {entries.map((entry, index) => {
-            if (entry.kind === "tool") {
-              return (
-                <ToolCallRow key={`tool:${entry.call.callId || index}`} entry={entry} />
-              );
-            }
-            return (
-              <div key={`file:${entry.fileChange.callId || index}`} className="text-xs px-1">
-                <FileChangeDetail change={entry.fileChange} />
-              </div>
-            );
-          })}
-        </div>
-      )}
+    <div className="mt-2 space-y-0.5">
+      {entries.map((entry, index) => {
+        if (entry.kind === "tool") {
+          return (
+            <ToolCallRow key={`tool:${entry.call.callId || index}`} entry={entry} />
+          );
+        }
+        return (
+          <div key={`file:${entry.fileChange.callId || index}`} className="text-xs px-1">
+            <FileChangeDetail change={entry.fileChange} />
+          </div>
+        );
+      })}
     </div>
   );
 }

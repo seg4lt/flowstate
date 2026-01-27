@@ -1,5 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useVirtualizer, type VirtualItem } from "@tanstack/react-virtual";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { Bot } from "lucide-react";
 import { buildTimelineRows, type TimelineRow } from "./timelineRows";
 import { WorkingIndicator } from "./WorkingIndicator";
@@ -19,7 +18,6 @@ interface Props {
 export function MessagesTimeline({ session, sendClientMessage }: Props) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const wasNearBottomRef = useRef(true);
-  const [, setScrollTick] = useState(0);
 
   const rows = useMemo(() => buildTimelineRows(session), [session]);
   const accumulatedOutputLength = session.turns.reduce(
@@ -27,32 +25,23 @@ export function MessagesTimeline({ session, sendClientMessage }: Props) {
     0,
   );
 
-  const virtualizer = useVirtualizer({
-    count: rows.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: (index) => estimateRowHeight(rows[index]),
-    overscan: 8,
-  });
-
   // Track whether user is near the bottom BEFORE the next update so we can
   // auto-scroll when new content arrives.
   const handleScroll = () => {
     wasNearBottomRef.current = isScrollContainerNearBottom(scrollRef.current);
-    setScrollTick((v) => v + 1);
   };
 
   useLayoutEffect(() => {
     if (!wasNearBottomRef.current) return;
     if (rows.length === 0) return;
-    virtualizer.scrollToIndex(rows.length - 1, { align: "end" });
-  }, [rows.length, accumulatedOutputLength, virtualizer]);
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [rows.length, accumulatedOutputLength]);
 
   useEffect(() => {
     // Refresh the near-bottom flag after the initial mount.
     wasNearBottomRef.current = true;
   }, [session.summary.sessionId]);
 
-  const virtualRows = virtualizer.getVirtualItems();
   const providerColor = PROVIDER_COLORS[session.summary.provider];
   const providerLabel = PROVIDER_LABELS[session.summary.provider];
 
@@ -72,32 +61,16 @@ export function MessagesTimeline({ session, sendClientMessage }: Props) {
           </div>
         ) : (
           <div className="max-w-3xl mx-auto px-6 pt-4 pb-32">
-            <div
-              className="relative w-full"
-              style={{ height: `${virtualizer.getTotalSize()}px` }}
-            >
-              {virtualRows.map((virtualRow: VirtualItem) => {
-                const row = rows[virtualRow.index];
-                if (!row) return null;
-                return (
-                  <div
-                    key={row.id}
-                    data-index={virtualRow.index}
-                    ref={virtualizer.measureElement}
-                    className="absolute left-0 top-0 w-full"
-                    style={{ transform: `translateY(${virtualRow.start}px)` }}
-                  >
-                    <TimelineRowContent
-                      row={row}
-                      providerColor={providerColor}
-                      providerLabel={providerLabel}
-                      sessionId={session.summary.sessionId}
-                      sendClientMessage={sendClientMessage}
-                    />
-                  </div>
-                );
-              })}
-            </div>
+            {rows.map((row) => (
+              <TimelineRowContent
+                key={row.id}
+                row={row}
+                providerColor={providerColor}
+                providerLabel={providerLabel}
+                sessionId={session.summary.sessionId}
+                sendClientMessage={sendClientMessage}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -105,34 +78,13 @@ export function MessagesTimeline({ session, sendClientMessage }: Props) {
         scrollRef={scrollRef}
         rowCount={rows.length}
         onClick={() =>
-          virtualizer.scrollToIndex(rows.length - 1, { align: "end" })
+          scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })
         }
       />
     </div>
   );
 }
 
-function estimateRowHeight(row: TimelineRow | undefined): number {
-  if (!row) return 80;
-  switch (row.kind) {
-    case "user":
-      return 60 + Math.min(row.turn.input.length / 2, 200);
-    case "assistant":
-      return 80 + Math.min(row.turn.output.length / 2, 400);
-    case "reasoning":
-      return 60 + Math.min((row.turn.reasoning?.length ?? 0) / 2, 200);
-    case "worklog": {
-      const count =
-        (row.turn.toolCalls?.length ?? 0) +
-        (row.turn.fileChanges?.length ?? 0);
-      return 40 + count * 24;
-    }
-    case "plan":
-      return 120 + (row.turn.plan?.steps.length ?? 0) * 24;
-    case "working":
-      return 32;
-  }
-}
 
 function TimelineRowContent({
   row,
