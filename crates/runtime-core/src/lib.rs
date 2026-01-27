@@ -9,12 +9,20 @@ use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, FileChangeRecord, PermissionDecision,
     PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
-    ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail,
+    ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail, SessionStatus,
     SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
     UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
+
+/// Observer for turn lifecycle events. Exists so daemon-core can plug in a
+/// `DaemonLifecycle` counter for idle shutdown without runtime-core depending
+/// on any daemon crate. Default path (no observer) is a no-op.
+pub trait TurnLifecycleObserver: Send + Sync {
+    fn on_turn_start(&self, session_id: &str);
+    fn on_turn_end(&self, session_id: &str);
+}
 
 pub struct RuntimeCore {
     adapters: HashMap<ProviderKind, Arc<dyn ProviderAdapter>>,
@@ -26,6 +34,10 @@ pub struct RuntimeCore {
     /// path (HTTP + WebSocket) from spawning two parallel fetches per provider
     /// on a fresh connection.
     in_flight_model_fetches: Arc<Mutex<HashSet<ProviderKind>>>,
+    /// Scaffolded in Phase 0; wired in Phase 2 when send_turn gains the RAII
+    /// counter guard that drives daemon idle-shutdown.
+    #[allow(dead_code)]
+    turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
 impl RuntimeCore {
@@ -33,6 +45,7 @@ impl RuntimeCore {
         adapters: Vec<Arc<dyn ProviderAdapter>>,
         orchestration: Arc<OrchestrationService>,
         persistence: Arc<PersistenceService>,
+        turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
     ) -> Self {
         let adapters = adapters
             .into_iter()
@@ -50,6 +63,7 @@ impl RuntimeCore {
             persistence,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
+            turn_observer,
         }
     }
 
@@ -66,6 +80,33 @@ impl RuntimeCore {
             generated_at: Utc::now().to_rfc3339(),
             sessions: self.persistence.list_sessions().await,
             projects: self.persistence.list_projects().await,
+        }
+    }
+
+    /// Walk all persisted sessions and mark any stuck-in-flight sessions
+    /// (status == Running) as Interrupted. Fixes the latent bug where a
+    /// daemon crash mid-turn leaves sessions stuck in `Running` forever with
+    /// no client-facing recovery path. Call once at startup before serving
+    /// clients.
+    pub async fn reconcile_startup(&self) {
+        let sessions = self.persistence.list_sessions().await;
+        let mut reconciled = 0usize;
+        for mut session in sessions {
+            if session.summary.status != SessionStatus::Running {
+                continue;
+            }
+            self.orchestration.interrupt_session(
+                &mut session,
+                "Daemon was restarted while this turn was in flight.",
+            );
+            self.persistence.upsert_session(session).await;
+            reconciled += 1;
+        }
+        if reconciled > 0 {
+            tracing::info!(
+                reconciled,
+                "startup reconciliation marked stuck sessions as interrupted"
+            );
         }
     }
 
@@ -910,6 +951,7 @@ mod tests {
     use zenui_provider_api::{
         ClientMessage, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
         ProviderStatusLevel, ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
+        TurnStatus,
     };
 
     use super::RuntimeCore;
@@ -956,6 +998,7 @@ mod tests {
             vec![Arc::new(FakeAdapter)],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
         );
 
         let response = runtime
@@ -992,5 +1035,152 @@ mod tests {
         let session = snapshot.sessions.first().expect("session should exist");
         assert_eq!(session.turns.len(), 1);
         assert_eq!(session.turns[0].output, "fake response for hello");
+    }
+
+    struct SlowFakeAdapter;
+
+    #[async_trait]
+    impl ProviderAdapter for SlowFakeAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+            }
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            input: &str,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            _events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok(ProviderTurnOutput {
+                output: format!("slow response for {input}"),
+                provider_state: None,
+            })
+        }
+    }
+
+    /// Proves the turn drain loop does not depend on a live broadcast subscriber.
+    /// If it did, `send_turn` would hang forever here and the timeout would fire.
+    #[tokio::test]
+    async fn turn_completes_without_subscribers() {
+        let runtime = RuntimeCore::new(
+            vec![Arc::new(SlowFakeAdapter)],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+        );
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("No-subscriber Test".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime.handle_client_message(ClientMessage::SendTurn {
+                session_id: session_id.clone(),
+                input: "hello".to_string(),
+                permission_mode: None,
+                reasoning_effort: None,
+            }),
+        )
+        .await
+        .expect("send_turn must complete even with zero subscribers");
+
+        assert!(matches!(
+            response,
+            Some(zenui_provider_api::ServerMessage::Ack { .. })
+        ));
+
+        let snapshot = runtime.snapshot().await;
+        let session = snapshot.sessions.first().expect("session should exist");
+        assert_eq!(session.turns.len(), 1);
+        assert_eq!(session.turns[0].status, TurnStatus::Completed);
+        assert_eq!(session.turns[0].output, "slow response for hello");
+    }
+
+    /// reconcile_startup should flip any session whose persisted status is
+    /// Running (because a prior daemon crashed mid-turn) to Interrupted.
+    #[tokio::test]
+    async fn reconcile_startup_fixes_stuck_running_sessions() {
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
+        let runtime = RuntimeCore::new(
+            vec![Arc::new(FakeAdapter)],
+            Arc::new(OrchestrationService::new()),
+            persistence.clone(),
+            None,
+        );
+
+        // Create a session and hand-stamp it as Running to simulate a prior
+        // daemon crash that never got a chance to flip it back.
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("Stuck".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let snapshot = runtime.snapshot().await;
+        let mut session = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .clone();
+        session.summary.status = zenui_provider_api::SessionStatus::Running;
+        session.turns.push(zenui_provider_api::TurnRecord {
+            turn_id: "turn-1".to_string(),
+            input: "hi".to_string(),
+            output: String::new(),
+            status: TurnStatus::Running,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            file_changes: Vec::new(),
+            subagents: Vec::new(),
+            plan: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        });
+        persistence.upsert_session(session).await;
+
+        runtime.reconcile_startup().await;
+
+        let snapshot = runtime.snapshot().await;
+        let session = snapshot.sessions.first().expect("session should exist");
+        assert_eq!(session.summary.status, zenui_provider_api::SessionStatus::Interrupted);
+        let last_turn = session.turns.last().expect("turn should exist");
+        assert_eq!(last_turn.status, TurnStatus::Interrupted);
     }
 }

@@ -150,6 +150,11 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
     // events through the broadcast channel) would block subscription draining,
     // and the UI would only see events after each turn finishes.
     let (mut sender, mut receiver) = socket.split();
+    // INVARIANT: subscribe() must precede bootstrap(). Any event published
+    // between bootstrap's database read and subscribe() would otherwise be
+    // lost on reconnect, creating a silent gap in the client's view. Do not
+    // reorder these two lines for "efficiency" — the subscription's ring
+    // buffer is what closes the gap.
     let mut subscription = state.runtime.subscribe();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
 
@@ -170,6 +175,7 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
     });
 
     let sub_tx = out_tx.clone();
+    let sub_runtime = state.runtime.clone();
     let subscriber = tokio::spawn(async move {
         loop {
             match subscription.recv().await {
@@ -179,7 +185,16 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("websocket subscriber lagged behind by {skipped} messages");
+                    warn!("websocket subscriber lagged behind by {skipped} messages; sending fresh snapshot");
+                    // On Lagged we've dropped events; push a fresh snapshot so
+                    // the client re-reconciles from authoritative state.
+                    let snapshot = sub_runtime.snapshot().await;
+                    if sub_tx
+                        .send(ServerMessage::Snapshot { snapshot })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }

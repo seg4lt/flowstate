@@ -46,7 +46,12 @@ pub fn bootstrap(bind_addr: SocketAddr, database_name: &str) -> Result<Bootstrap
         PersistenceService::new(database_path)
             .context("failed to initialize sqlite persistence")?,
     );
-    let runtime_core = Arc::new(RuntimeCore::new(adapters, orchestration, persistence));
+    let runtime_core = Arc::new(RuntimeCore::new(adapters, orchestration, persistence, None));
+
+    // Reclaim any sessions stuck at `Running` from a prior crash before we start
+    // accepting connections. Runs on the tokio runtime we just built.
+    tokio_runtime.block_on(runtime_core.reconcile_startup());
+
     let server = spawn_local_server(
         &tokio_runtime,
         runtime_core.clone(),
