@@ -25,8 +25,12 @@ export function buildTimelineRows(session: SessionDetail): TimelineRow[] {
     const hasOutput = turn.output.length > 0;
     const isRunning = turn.status === "running";
 
+    const planProposed = turn.plan?.status === "proposed";
+
     if (isRunning && !hasOutput && !hasWorkEntries) {
-      rows.push({ kind: "working", id: `${turn.turnId}:working`, turn });
+      if (!planProposed) {
+        rows.push({ kind: "working", id: `${turn.turnId}:working`, turn });
+      }
     } else {
       if (hasWorkEntries) {
         rows.push({ kind: "worklog", id: `${turn.turnId}:worklog`, turn });
@@ -34,7 +38,7 @@ export function buildTimelineRows(session: SessionDetail): TimelineRow[] {
       if (hasOutput || turn.status === "completed" || turn.status === "interrupted" || turn.status === "failed") {
         rows.push({ kind: "assistant", id: `${turn.turnId}:assistant`, turn });
       }
-      if (isRunning && (hasOutput || hasWorkEntries)) {
+      if (isRunning && (hasOutput || hasWorkEntries) && !planProposed) {
         rows.push({ kind: "working", id: `${turn.turnId}:working`, turn });
       }
     }
