@@ -1,0 +1,1153 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+use zenui_provider_api::{
+    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputOption,
+    UserInputQuestion,
+};
+
+const TURN_TIMEOUT_SECS: u64 = 600;
+const HEALTH_TIMEOUT_SECS: u64 = 10;
+
+// ── JSON-RPC 2.0 framing ─────────────────────────────────────────────────────
+//
+// The copilot binary uses the vscode-jsonrpc Content-Length framing:
+//   Content-Length: N\r\n
+//   \r\n
+//   <json body, N bytes>
+
+async fn write_rpc_frame(stdin: &Mutex<ChildStdin>, msg: &Value) -> Result<(), String> {
+    let json = serde_json::to_string(msg).map_err(|e| format!("rpc serialize: {e}"))?;
+    let frame = format!("Content-Length: {}\r\n\r\n{}", json.len(), json);
+    let mut guard = stdin.lock().await;
+    guard
+        .write_all(frame.as_bytes())
+        .await
+        .map_err(|e| format!("rpc write: {e}"))?;
+    guard
+        .flush()
+        .await
+        .map_err(|e| format!("rpc flush: {e}"))
+}
+
+/// Read one Content-Length-framed JSON-RPC message from the reader.
+/// Returns None when the stream ends.
+async fn read_rpc_frame(reader: &mut BufReader<ChildStdout>) -> Option<Value> {
+    // Read headers until an empty line.
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => return None, // EOF or error
+            Ok(_) => {}
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break; // end of headers
+        }
+        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+            if let Ok(n) = val.trim().parse::<usize>() {
+                content_length = Some(n);
+            }
+        }
+    }
+
+    let n = content_length?;
+    if n == 0 {
+        return None;
+    }
+
+    let mut body = vec![0u8; n];
+    match reader.read_exact(&mut body).await {
+        Ok(_) => {}
+        Err(_) => return None,
+    }
+
+    serde_json::from_slice(&body).ok()
+}
+
+// ── RPC helpers ───────────────────────────────────────────────────────────────
+
+fn make_request(id: u64, method: &str, params: Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+}
+
+fn make_response(id: &Value, result: Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    })
+}
+
+fn make_error_response(id: &Value, code: i64, message: &str) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
+    })
+}
+
+// ── Pending requests and server callbacks ─────────────────────────────────────
+
+type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type EventSender = Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>;
+type CallbackSender = Arc<Mutex<Option<mpsc::UnboundedSender<ServerCallback>>>>;
+
+/// A server-initiated request that requires a response from our side.
+struct ServerCallback {
+    /// The original JSON-RPC request id (needed to build the response).
+    rpc_id: Value,
+    method: String,
+    params: Value,
+    /// Send the response JSON-RPC result through here; the dispatcher task
+    /// picks it up and writes it back to the copilot process stdin.
+    response_tx: oneshot::Sender<Value>,
+}
+
+// ── Process handle ────────────────────────────────────────────────────────────
+
+struct CopilotCliProcess {
+    child: Child,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: PendingMap,
+    next_id: Arc<Mutex<u64>>,
+    /// Channel forwarding `session.event` notifications to the active turn loop.
+    event_tx: EventSender,
+    /// Channel forwarding server callbacks (`permission.request`,
+    /// `userInput.request`) to the active turn loop.
+    callback_tx: CallbackSender,
+}
+
+impl CopilotCliProcess {
+    /// Send a JSON-RPC request and await its response.
+    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        let id = {
+            let mut guard = self.next_id.lock().await;
+            let id = *guard;
+            *guard += 1;
+            id
+        };
+        let (tx, rx) = oneshot::channel();
+        {
+            self.pending.lock().await.insert(id, tx);
+        }
+        let msg = make_request(id, method, params);
+        write_rpc_frame(&self.stdin, &msg).await?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(TURN_TIMEOUT_SECS),
+            rx,
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(format!("RPC channel closed waiting for '{method}' response")),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(format!("RPC timeout waiting for '{method}' response"))
+            }
+        }
+    }
+}
+
+// ── Background dispatcher ─────────────────────────────────────────────────────
+//
+// Spawned once per CopilotCliProcess. Reads all incoming framed messages and
+// routes them:
+//   • JSON-RPC response (has "id", no "method") → wake pending request
+//   • "session.event" notification → forward to event_tx
+//   • "permission.request" / "userInput.request" requests → forward to callback_tx
+//     and spawn a sub-task that awaits the response then writes it back to stdin.
+
+async fn run_dispatcher(
+    mut reader: BufReader<ChildStdout>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    pending: PendingMap,
+    event_tx: EventSender,
+    callback_tx: CallbackSender,
+) {
+    loop {
+        let Some(msg) = read_rpc_frame(&mut reader).await else {
+            debug!("copilot CLI: stdout closed, stopping dispatcher");
+            break;
+        };
+
+        // Classify the message.
+        let has_id = msg.get("id").is_some();
+        let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+
+        if let Some(method_str) = method {
+            if has_id {
+                // ── server-initiated request (requires a response) ────────────
+                let rpc_id = msg["id"].clone();
+                let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                let (response_tx, response_rx) = oneshot::channel::<Value>();
+                let cb = ServerCallback {
+                    rpc_id: rpc_id.clone(),
+                    method: method_str.clone(),
+                    params,
+                    response_tx,
+                };
+                {
+                    let guard = callback_tx.lock().await;
+                    if let Some(tx) = guard.as_ref() {
+                        if tx.send(cb).is_err() {
+                            debug!("copilot CLI: callback channel closed, auto-denying '{method_str}'");
+                            // No turn loop listening — write an error response so the
+                            // copilot binary doesn't block indefinitely.
+                            let err_resp = make_error_response(&rpc_id, -32603, "no handler");
+                            let stdin2 = stdin.clone();
+                            tokio::spawn(async move {
+                                let _ = write_rpc_frame(&stdin2, &err_resp).await;
+                            });
+                            continue;
+                        }
+                    } else {
+                        // No active turn; auto-deny.
+                        let err_resp = make_error_response(&rpc_id, -32603, "no active session");
+                        let stdin2 = stdin.clone();
+                        tokio::spawn(async move {
+                            let _ = write_rpc_frame(&stdin2, &err_resp).await;
+                        });
+                        continue;
+                    }
+                }
+                // Spawn a task that waits for the turn loop to supply the
+                // response, then writes it back to the copilot binary.
+                let stdin2 = stdin.clone();
+                tokio::spawn(async move {
+                    if let Ok(result) = response_rx.await {
+                        let _ = write_rpc_frame(&stdin2, &result).await;
+                    }
+                });
+            } else {
+                // ── notification (no response needed) ────────────────────────
+                if method_str == "session.event" {
+                    let guard = event_tx.lock().await;
+                    if let Some(tx) = guard.as_ref() {
+                        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+                        let _ = tx.send(params);
+                    }
+                }
+                // session.lifecycle and others are intentionally ignored.
+            }
+        } else if has_id {
+            // ── JSON-RPC response ─────────────────────────────────────────────
+            let id = msg["id"].as_u64();
+            if let Some(id) = id {
+                let mut guard = pending.lock().await;
+                if let Some(tx) = guard.remove(&id) {
+                    let result = if msg.get("error").is_some() {
+                        let err = msg["error"]["message"]
+                            .as_str()
+                            .unwrap_or("unknown error")
+                            .to_string();
+                        Err(err)
+                    } else {
+                        Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+                    };
+                    let _ = tx.send(result);
+                }
+            }
+        }
+    }
+}
+
+// ── Adapter ───────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+pub struct GitHubCopilotCliAdapter {
+    working_directory: PathBuf,
+    /// One process per ZenUI session.
+    active_processes: Arc<Mutex<HashMap<String, Arc<Mutex<CopilotCliProcess>>>>>,
+}
+
+impl GitHubCopilotCliAdapter {
+    pub fn new(working_directory: PathBuf) -> Self {
+        Self {
+            working_directory,
+            active_processes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn find_copilot_binary() -> String {
+        let candidates = [
+            "/opt/homebrew/bin/copilot",
+            "/usr/local/bin/copilot",
+            "/home/linuxbrew/.linuxbrew/bin/copilot",
+            "/usr/bin/copilot",
+        ];
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return path.to_string();
+            }
+        }
+        "copilot".to_string()
+    }
+
+    /// Spawn the copilot binary in headless stdio (JSON-RPC) mode.
+    async fn spawn_process(binary: &str, cwd: &PathBuf) -> Result<CopilotCliProcess, String> {
+        info!("Spawning copilot CLI: {}", binary);
+        let mut child = Command::new(binary)
+            .args([
+                "--headless",
+                "--no-auto-update",
+                "--log-level",
+                "warning",
+                "--stdio",
+            ])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("Failed to spawn copilot CLI ('{binary}'): {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "copilot CLI stdin unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "copilot CLI stdout unavailable".to_string())?;
+
+        // Drain stderr to logs.
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let t = line.trim();
+                    if !t.is_empty() {
+                        debug!(target: "copilot-cli", "{}", t);
+                    }
+                }
+            });
+        }
+
+        let stdin = Arc::new(Mutex::new(stdin));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let event_tx: EventSender = Arc::new(Mutex::new(None));
+        let callback_tx: CallbackSender = Arc::new(Mutex::new(None));
+
+        // Start the dispatcher.
+        let reader = BufReader::new(stdout);
+        tokio::spawn(run_dispatcher(
+            reader,
+            stdin.clone(),
+            pending.clone(),
+            event_tx.clone(),
+            callback_tx.clone(),
+        ));
+
+        Ok(CopilotCliProcess {
+            child,
+            stdin,
+            pending,
+            next_id: Arc::new(Mutex::new(1)),
+            event_tx,
+            callback_tx,
+        })
+    }
+
+    /// Run one turn: send the prompt and consume events until session.idle / error.
+    async fn run_turn(
+        process: Arc<Mutex<CopilotCliProcess>>,
+        session_id: String,
+        input: String,
+        permission_mode: PermissionMode,
+        events: TurnEventSink,
+    ) -> Result<ProviderTurnOutput, String> {
+        // Set up channels for this turn.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Value>();
+        let (callback_tx, mut callback_rx) = mpsc::unbounded_channel::<ServerCallback>();
+
+        {
+            let proc = process.lock().await;
+            *proc.event_tx.lock().await = Some(event_tx);
+            *proc.callback_tx.lock().await = Some(callback_tx);
+        }
+
+        // If plan mode, set the session mode first.
+        if permission_mode == PermissionMode::Plan {
+            let proc = process.lock().await;
+            if let Err(e) = proc
+                .call(
+                    "session.mode.set",
+                    serde_json::json!({ "sessionId": session_id, "mode": "plan" }),
+                )
+                .await
+            {
+                warn!("copilot CLI: failed to set plan mode: {e}");
+            }
+        }
+
+        // Send the user prompt.
+        {
+            let proc = process.lock().await;
+            proc.call(
+                "session.send",
+                serde_json::json!({ "sessionId": session_id, "prompt": input }),
+            )
+            .await?;
+        }
+
+        let mut accumulated_output = String::new();
+        let mut has_deltas = false;
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(TURN_TIMEOUT_SECS);
+
+        let turn_result: Result<(), String> = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break Err("Copilot CLI turn timed out".to_string());
+            }
+
+            tokio::select! {
+                biased;
+
+                // ── server callback (permission / user-input) ─────────────────
+                cb = callback_rx.recv() => {
+                    match cb {
+                        None => break Err("Callback channel closed unexpectedly".to_string()),
+                        Some(cb) => {
+                            handle_callback(cb, permission_mode, &events, &process).await;
+                        }
+                    }
+                }
+
+                // ── session event ─────────────────────────────────────────────
+                event = event_rx.recv() => {
+                    match event {
+                        None => break Err("Event channel closed before session.idle".to_string()),
+                        Some(params) => {
+                            match handle_session_event(
+                                params,
+                                &events,
+                                &mut accumulated_output,
+                                &mut has_deltas,
+                            )
+                            .await {
+                                EventOutcome::Continue => {}
+                                EventOutcome::Idle => break Ok(()),
+                                EventOutcome::Error(e) => break Err(e),
+                            }
+                        }
+                    }
+                }
+
+                // ── timeout ───────────────────────────────────────────────────
+                _ = tokio::time::sleep_until(deadline) => {
+                    break Err("Copilot CLI turn timed out".to_string());
+                }
+            }
+        };
+
+        // Tear down the channels.
+        {
+            let proc = process.lock().await;
+            *proc.event_tx.lock().await = None;
+            *proc.callback_tx.lock().await = None;
+        }
+
+        turn_result.map(|_| ProviderTurnOutput {
+            output: accumulated_output,
+            provider_state: Some(ProviderSessionState {
+                native_thread_id: Some(session_id),
+                metadata: None,
+            }),
+        })
+    }
+}
+
+// ── Turn event handler ────────────────────────────────────────────────────────
+
+enum EventOutcome {
+    Continue,
+    Idle,
+    Error(String),
+}
+
+async fn handle_session_event(
+    params: Value,
+    events: &TurnEventSink,
+    accumulated: &mut String,
+    has_deltas: &mut bool,
+) -> EventOutcome {
+    let event = match params.get("event") {
+        Some(e) => e,
+        None => return EventOutcome::Continue,
+    };
+
+    let event_type = match event.get("type").and_then(Value::as_str) {
+        Some(t) => t,
+        None => return EventOutcome::Continue,
+    };
+
+    let data = event.get("data").unwrap_or(&Value::Null);
+
+    match event_type {
+        "assistant.message_delta" => {
+            if let Some(delta) = data.get("deltaContent").and_then(Value::as_str) {
+                if !delta.is_empty() {
+                    *has_deltas = true;
+                    accumulated.push_str(delta);
+                    events
+                        .send(ProviderTurnEvent::AssistantTextDelta {
+                            delta: delta.to_string(),
+                        })
+                        .await;
+                }
+            }
+        }
+
+        "assistant.reasoning_delta" => {
+            if let Some(delta) = data.get("deltaContent").and_then(Value::as_str) {
+                if !delta.is_empty() {
+                    events
+                        .send(ProviderTurnEvent::ReasoningDelta {
+                            delta: delta.to_string(),
+                        })
+                        .await;
+                }
+            }
+        }
+
+        // Fallback: emit the full message content if no streaming deltas arrived.
+        "assistant.message" => {
+            if !*has_deltas {
+                if let Some(content) = data.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        accumulated.push_str(content);
+                        events
+                            .send(ProviderTurnEvent::AssistantTextDelta {
+                                delta: content.to_string(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            // Reset delta tracking for the next assistant turn in the same loop.
+            *has_deltas = false;
+        }
+
+        "tool.execution_start" => {
+            let call_id = data
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let name = data
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let args = data
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            events
+                .send(ProviderTurnEvent::ToolCallStarted {
+                    call_id,
+                    name,
+                    args,
+                })
+                .await;
+        }
+
+        "tool.execution_complete" => {
+            let call_id = data
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let success = data.get("success").and_then(Value::as_bool).unwrap_or(true);
+            let output = data
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let error = if success {
+                None
+            } else {
+                Some(output.clone())
+            };
+            events
+                .send(ProviderTurnEvent::ToolCallCompleted {
+                    call_id,
+                    output,
+                    error,
+                })
+                .await;
+        }
+
+        "exit_plan_mode.requested" => {
+            let plan_id = data
+                .get("requestId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let raw: String = data
+                .get("planContent")
+                .or_else(|| data.get("summary"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let steps = parse_plan_steps(&raw);
+            events
+                .send(ProviderTurnEvent::PlanProposed {
+                    plan_id,
+                    title: "Copilot plan".to_string(),
+                    steps,
+                    raw,
+                })
+                .await;
+        }
+
+        "session.idle" => {
+            return EventOutcome::Idle;
+        }
+
+        "session.error" => {
+            let msg = data
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string();
+            return EventOutcome::Error(msg);
+        }
+
+        _ => {}
+    }
+
+    EventOutcome::Continue
+}
+
+// ── Server callback handler ───────────────────────────────────────────────────
+
+async fn handle_callback(
+    cb: ServerCallback,
+    permission_mode: PermissionMode,
+    events: &TurnEventSink,
+    _process: &Arc<Mutex<CopilotCliProcess>>,
+) {
+    match cb.method.as_str() {
+        "permission.request" => {
+            let perm_req = cb.params.get("permissionRequest").cloned().unwrap_or(cb.params.clone());
+            let kind = perm_req
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let request_id = perm_req
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            // Decide permission based on mode.
+            let decision = match permission_mode {
+                PermissionMode::Bypass => PermissionDecision::Allow,
+                PermissionMode::AcceptEdits | PermissionMode::Plan => {
+                    if matches!(kind, "read" | "write") {
+                        PermissionDecision::Allow
+                    } else {
+                        events
+                            .request_permission(
+                                kind.to_string(),
+                                perm_req.clone(),
+                                PermissionDecision::Allow,
+                            )
+                            .await
+                    }
+                }
+                PermissionMode::Default => {
+                    events
+                        .request_permission(
+                            kind.to_string(),
+                            perm_req.clone(),
+                            PermissionDecision::Allow,
+                        )
+                        .await
+                }
+            };
+
+            let result = match decision {
+                PermissionDecision::Allow | PermissionDecision::AllowAlways => {
+                    serde_json::json!({ "kind": "approved" })
+                }
+                PermissionDecision::Deny | PermissionDecision::DenyAlways => {
+                    serde_json::json!({ "kind": "denied-interactively-by-user" })
+                }
+            };
+
+            let response = make_response(&cb.rpc_id, result);
+            let _ = cb.response_tx.send(response);
+            let _ = request_id; // used for debug only
+        }
+
+        "userInput.request" => {
+            let question = cb
+                .params
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("What would you like to do?")
+                .to_string();
+            let choices: Vec<String> = cb
+                .params
+                .get("choices")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let allow_freeform = cb
+                .params
+                .get("allowFreeform")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+
+            let q = UserInputQuestion {
+                id: Uuid::new_v4().to_string(),
+                text: question,
+                header: None,
+                options: choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| UserInputOption {
+                        id: i.to_string(),
+                        label: c.clone(),
+                        description: None,
+                    })
+                    .collect(),
+                multi_select: false,
+                allow_freeform,
+                is_secret: false,
+            };
+
+            let result = match events.ask_user(vec![q]).await {
+                Some(answers) => {
+                    let answer = answers
+                        .first()
+                        .map(|a| a.answer.clone())
+                        .unwrap_or_default();
+                    let was_freeform = answers
+                        .first()
+                        .map(|a| a.option_ids.is_empty())
+                        .unwrap_or(true);
+                    serde_json::json!({ "answer": answer, "wasFreeform": was_freeform })
+                }
+                None => serde_json::json!({ "answer": "", "wasFreeform": true }),
+            };
+
+            let response = make_response(&cb.rpc_id, result);
+            let _ = cb.response_tx.send(response);
+        }
+
+        other => {
+            // Unknown callback — send an error response so the server doesn't hang.
+            warn!("copilot CLI: unhandled server request '{other}', sending error response");
+            let response = make_error_response(&cb.rpc_id, -32601, "method not found");
+            let _ = cb.response_tx.send(response);
+        }
+    }
+}
+
+// ── ProviderAdapter impl ──────────────────────────────────────────────────────
+
+#[async_trait]
+impl ProviderAdapter for GitHubCopilotCliAdapter {
+    fn kind(&self) -> ProviderKind {
+        ProviderKind::GitHubCopilotCli
+    }
+
+    async fn health(&self) -> ProviderStatus {
+        let kind = ProviderKind::GitHubCopilotCli;
+        let label = kind.label();
+        let binary = Self::find_copilot_binary();
+
+        // Check the binary exists.
+        if !std::path::Path::new(&binary).exists() && binary != "copilot" {
+            return ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: false,
+                authenticated: false,
+                version: None,
+                status: ProviderStatusLevel::Error,
+                message: Some(
+                    "Copilot CLI not found. Run: gh extension install github/gh-copilot"
+                        .to_string(),
+                ),
+                models: copilot_cli_models(),
+            };
+        }
+
+        // Try to spawn and ping the binary.
+        let spawn_result = tokio::time::timeout(
+            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
+            Self::spawn_process(&binary, &self.working_directory),
+        )
+        .await;
+
+        let mut process = match spawn_result {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => {
+                return ProviderStatus {
+                    kind,
+                    label: label.to_string(),
+                    installed: false,
+                    authenticated: false,
+                    version: None,
+                    status: ProviderStatusLevel::Error,
+                    message: Some(format!("Failed to start copilot CLI: {e}")),
+                    models: copilot_cli_models(),
+                };
+            }
+            Err(_) => {
+                return ProviderStatus {
+                    kind,
+                    label: label.to_string(),
+                    installed: false,
+                    authenticated: false,
+                    version: None,
+                    status: ProviderStatusLevel::Error,
+                    message: Some("Timed out starting copilot CLI".to_string()),
+                    models: copilot_cli_models(),
+                };
+            }
+        };
+
+        // Ping.
+        let ping_ok = tokio::time::timeout(
+            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
+            process.call("ping", serde_json::json!({})),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_some();
+
+        // Version.
+        let version = tokio::time::timeout(
+            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
+            process.call("status.get", serde_json::json!({})),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string));
+
+        // Auth status.
+        let auth_result = tokio::time::timeout(
+            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
+            process.call("auth.getStatus", serde_json::json!({})),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+
+        let authenticated = auth_result
+            .as_ref()
+            .and_then(|v| {
+                v.get("status")
+                    .and_then(Value::as_str)
+                    .map(|s| s == "ok" || s == "authenticated")
+            })
+            .unwrap_or(ping_ok); // fall back to ping success
+
+        // Kill the health-check process.
+        let _ = process.child.start_kill();
+
+        if !ping_ok {
+            return ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: true,
+                authenticated: false,
+                version,
+                status: ProviderStatusLevel::Error,
+                message: Some(
+                    "Copilot CLI found but did not respond to ping. Is it properly installed?"
+                        .to_string(),
+                ),
+                models: copilot_cli_models(),
+            };
+        }
+
+        let (status, message) = if authenticated {
+            (
+                ProviderStatusLevel::Ready,
+                Some(format!("{label} is installed and authenticated.")),
+            )
+        } else {
+            (
+                ProviderStatusLevel::Warning,
+                Some(format!(
+                    "{label} is installed but not authenticated. Run: gh auth login"
+                )),
+            )
+        };
+
+        ProviderStatus {
+            kind,
+            label: label.to_string(),
+            installed: true,
+            authenticated,
+            version,
+            status,
+            message,
+            models: copilot_cli_models(),
+        }
+    }
+
+    async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
+        let binary = Self::find_copilot_binary();
+        let process = Self::spawn_process(&binary, &self.working_directory).await?;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
+            process.call("models.list", serde_json::json!({})),
+        )
+        .await
+        .map_err(|_| "Timed out fetching models".to_string())?
+        .map_err(|e| format!("models.list error: {e}"))?;
+
+        let mut proc = process;
+        let _ = proc.child.start_kill();
+
+        let models_arr = match result.get("models").and_then(Value::as_array) {
+            Some(arr) => arr.clone(),
+            None => return Ok(copilot_cli_models()),
+        };
+
+        let models: Vec<ProviderModel> = models_arr
+            .iter()
+            .filter_map(|m| {
+                let value = m.get("id").and_then(Value::as_str)?.to_string();
+                let label = m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&value)
+                    .to_string();
+                Some(ProviderModel { value, label })
+            })
+            .collect();
+
+        if models.is_empty() {
+            Ok(copilot_cli_models())
+        } else {
+            Ok(models)
+        }
+    }
+
+    async fn start_session(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<Option<ProviderSessionState>, String> {
+        let binary = Self::find_copilot_binary();
+        let process = Self::spawn_process(&binary, &self.working_directory).await?;
+
+        // Use the existing native session ID when resuming, otherwise generate one.
+        let native_session_id = session
+            .provider_state
+            .as_ref()
+            .and_then(|s| s.native_thread_id.as_deref())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let cwd = self.working_directory.to_string_lossy().to_string();
+        let model = session.summary.model.as_deref().unwrap_or("gpt-4o");
+
+        let (method, params) = if session
+            .provider_state
+            .as_ref()
+            .and_then(|s| s.native_thread_id.as_ref())
+            .is_some()
+        {
+            // Resume existing session.
+            (
+                "session.resume",
+                serde_json::json!({
+                    "sessionId": native_session_id,
+                    "requestPermission": true,
+                    "requestUserInput": true,
+                    "streaming": true,
+                }),
+            )
+        } else {
+            // Create new session.
+            (
+                "session.create",
+                serde_json::json!({
+                    "sessionId": native_session_id,
+                    "model": model,
+                    "workingDirectory": cwd,
+                    "requestPermission": true,
+                    "requestUserInput": true,
+                    "streaming": true,
+                }),
+            )
+        };
+
+        process.call(method, params).await.map_err(|e| {
+            format!("Failed to {}: {e}", if method == "session.resume" { "resume" } else { "create" })
+        })?;
+
+        info!("copilot CLI: session ready ({})", native_session_id);
+
+        let process = Arc::new(Mutex::new(process));
+        self.active_processes
+            .lock()
+            .await
+            .insert(session.summary.session_id.clone(), process);
+
+        Ok(Some(ProviderSessionState {
+            native_thread_id: Some(native_session_id),
+            metadata: None,
+        }))
+    }
+
+    async fn execute_turn(
+        &self,
+        session: &SessionDetail,
+        input: &str,
+        permission_mode: PermissionMode,
+        _reasoning_effort: Option<ReasoningEffort>,
+        events: TurnEventSink,
+    ) -> Result<ProviderTurnOutput, String> {
+        let process = self
+            .active_processes
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned()
+            .ok_or_else(|| "No active copilot CLI process for this session".to_string())?;
+
+        let native_session_id = session
+            .provider_state
+            .as_ref()
+            .and_then(|s| s.native_thread_id.as_deref())
+            .unwrap_or(&session.summary.session_id)
+            .to_string();
+
+        Self::run_turn(process, native_session_id, input.to_string(), permission_mode, events)
+            .await
+    }
+
+    async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
+        let process = self
+            .active_processes
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned();
+
+        if let Some(process) = process {
+            let native_id = session
+                .provider_state
+                .as_ref()
+                .and_then(|s| s.native_thread_id.as_deref())
+                .unwrap_or(&session.summary.session_id)
+                .to_string();
+
+            let proc = process.lock().await;
+            if let Err(e) = proc
+                .call("session.abort", serde_json::json!({ "sessionId": native_id }))
+                .await
+            {
+                warn!("copilot CLI: interrupt failed: {e}");
+            }
+        }
+
+        Ok("Interrupt sent to Copilot CLI.".to_string())
+    }
+
+    async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
+        let process = self
+            .active_processes
+            .lock()
+            .await
+            .remove(&session.summary.session_id);
+
+        if let Some(process) = process {
+            let native_id = session
+                .provider_state
+                .as_ref()
+                .and_then(|s| s.native_thread_id.as_deref())
+                .unwrap_or(&session.summary.session_id)
+                .to_string();
+
+            let proc = process.lock().await;
+            // Best-effort destroy then kill.
+            let _ = proc
+                .call("session.destroy", serde_json::json!({ "sessionId": native_id }))
+                .await;
+            drop(proc);
+
+            let mut proc = process.lock().await;
+            let _ = proc.child.start_kill();
+        }
+
+        Ok(())
+    }
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+fn copilot_cli_models() -> Vec<ProviderModel> {
+    vec![
+        ProviderModel { value: "gpt-4o".to_string(),          label: "GPT-4o".to_string() },
+        ProviderModel { value: "gpt-4.1".to_string(),         label: "GPT-4.1".to_string() },
+        ProviderModel { value: "gpt-5".to_string(),           label: "GPT-5".to_string() },
+        ProviderModel { value: "claude-sonnet-4-5".to_string(), label: "Claude Sonnet 4.5".to_string() },
+        ProviderModel { value: "claude-sonnet-4-6".to_string(), label: "Claude Sonnet 4.6".to_string() },
+        ProviderModel { value: "o3".to_string(),              label: "o3".to_string() },
+        ProviderModel { value: "o4-mini".to_string(),         label: "o4-mini".to_string() },
+        ProviderModel { value: "gemini-2.5-pro".to_string(),  label: "Gemini 2.5 Pro".to_string() },
+    ]
+}
+
+/// Parse markdown bullet/numbered list into PlanStep items.
+fn parse_plan_steps(raw: &str) -> Vec<zenui_provider_api::PlanStep> {
+    raw.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let content = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+                .or_else(|| {
+                    // numbered: "1. ", "12. ", etc.
+                    let mut chars = trimmed.chars();
+                    let digits: String = chars.by_ref().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() && chars.next() == Some('.') {
+                        Some(trimmed[digits.len() + 1..].trim())
+                    } else {
+                        None
+                    }
+                });
+            content.map(|c| zenui_provider_api::PlanStep {
+                title: c.to_string(),
+                detail: None,
+            })
+        })
+        .collect()
+}

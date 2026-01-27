@@ -22,4 +22,5 @@ zenui-provider-claude-cli = { path = "../provider-claude-cli" }
 zenui-provider-claude-sdk = { path = "../provider-claude-sdk" }
 zenui-provider-codex = { path = "../provider-codex" }
 zenui-provider-github-copilot = { path = "../provider-github-copilot" }
+zenui-provider-github-copilot-cli = { path = "../provider-github-copilot-cli" }
 zenui-runtime-core = { path = "../runtime-core" }

@@ -3935,6 +3935,7 @@ dependencies = [
  "zenui-provider-claude-sdk",
  "zenui-provider-codex",
  "zenui-provider-github-copilot",
+ "zenui-provider-github-copilot-cli",
  "zenui-runtime-core",
 ]
 
@@ -4032,6 +4033,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zenui-provider-api",
+]
+
+[[package]]
+name = "zenui-provider-github-copilot-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
  "zenui-provider-api",
 ]
 

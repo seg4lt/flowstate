@@ -15,6 +15,8 @@ pub enum ProviderKind {
     GitHubCopilot,
     #[serde(rename = "claude_cli")]
     ClaudeCli,
+    #[serde(rename = "github_copilot_cli")]
+    GitHubCopilotCli,
 }
 
 impl ProviderKind {
@@ -24,6 +26,7 @@ impl ProviderKind {
             Self::Claude => "Claude",
             Self::GitHubCopilot => "GitHub Copilot",
             Self::ClaudeCli => "Claude (CLI)",
+            Self::GitHubCopilotCli => "GitHub Copilot (CLI)",
         }
     }
 }
