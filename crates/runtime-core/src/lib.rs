@@ -34,10 +34,36 @@ pub struct RuntimeCore {
     /// path (HTTP + WebSocket) from spawning two parallel fetches per provider
     /// on a fresh connection.
     in_flight_model_fetches: Arc<Mutex<HashSet<ProviderKind>>>,
-    /// Scaffolded in Phase 0; wired in Phase 2 when send_turn gains the RAII
-    /// counter guard that drives daemon idle-shutdown.
-    #[allow(dead_code)]
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
+}
+
+/// RAII guard that ticks the `TurnLifecycleObserver` counter around the
+/// lifetime of `send_turn`. Drop runs on every exit path (normal return,
+/// early `?` return, panic), so the daemon-side counter cannot leak even if
+/// an adapter panics or a `.await?` unwinds the task.
+struct TurnCounterGuard {
+    observer: Option<Arc<dyn TurnLifecycleObserver>>,
+    session_id: String,
+}
+
+impl TurnCounterGuard {
+    fn new(observer: Option<Arc<dyn TurnLifecycleObserver>>, session_id: String) -> Self {
+        if let Some(obs) = &observer {
+            obs.on_turn_start(&session_id);
+        }
+        Self {
+            observer,
+            session_id,
+        }
+    }
+}
+
+impl Drop for TurnCounterGuard {
+    fn drop(&mut self) {
+        if let Some(obs) = &self.observer {
+            obs.on_turn_end(&self.session_id);
+        }
+    }
 }
 
 impl RuntimeCore {
@@ -581,6 +607,14 @@ impl RuntimeCore {
             session_id: session.summary.session_id.clone(),
             turn: turn.clone(),
         });
+
+        // RAII lifecycle counter: increments daemon's in_flight_turns here,
+        // decrements unconditionally on any exit (return, ?, panic). Keeps the
+        // daemon from auto-shutting-down while a turn is actually running.
+        let _turn_guard = TurnCounterGuard::new(
+            self.turn_observer.clone(),
+            session.summary.session_id.clone(),
+        );
 
         // Set up streaming channel: adapter pushes events, we forward them.
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ProviderTurnEvent>(64);

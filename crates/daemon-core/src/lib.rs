@@ -16,11 +16,12 @@ mod ready_file;
 mod shutdown;
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
-use zenui_http_api::{LocalServer, spawn_local_server};
+use zenui_http_api::{ConnectionObserver, LocalServer, spawn_local_server};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
@@ -29,7 +30,7 @@ use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
 use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
-use zenui_runtime_core::RuntimeCore;
+use zenui_runtime_core::{RuntimeCore, TurnLifecycleObserver};
 
 pub use config::DaemonConfig;
 pub use lifecycle::{DaemonLifecycle, IdleShutdownReason, idle_watchdog};
@@ -46,16 +47,26 @@ pub struct BootstrappedApp {
 /// persistence, orchestration, and `RuntimeCore`, reconciles any stuck
 /// sessions, and starts the local HTTP/WS server.
 ///
-/// This is still the entry point used by the tao-web-shell binary in
-/// Phase 1 (no behavior change). In Phase 3, the shell switches to
-/// `daemon-client` and this is called only by `zenui-server`.
-pub fn bootstrap(bind_addr: SocketAddr, database_name: &str) -> Result<BootstrappedApp> {
+/// `lifecycle` is `None` for callers that just want a local process (the
+/// tao-web-shell in Phase 2) and `Some(Arc<DaemonLifecycle>)` for the
+/// daemon binary. When `Some`, counters fire on every client connect and
+/// every turn start/end, driving `idle_watchdog`.
+pub fn bootstrap(
+    bind_addr: SocketAddr,
+    database_name: &str,
+    project_root: Option<&Path>,
+    frontend_dist: Option<PathBuf>,
+    lifecycle: Option<Arc<DaemonLifecycle>>,
+) -> Result<BootstrappedApp> {
     init_tracing();
 
-    let working_directory =
-        std::env::current_dir().context("failed to resolve working directory")?;
+    let working_directory = match project_root {
+        Some(root) => root.to_path_buf(),
+        None => std::env::current_dir().context("failed to resolve working directory")?,
+    };
     let database_path = working_directory.join(".zenui").join(database_name);
-    let frontend_dist = working_directory.join("frontend").join("dist");
+    let frontend_dist =
+        frontend_dist.unwrap_or_else(|| working_directory.join("frontend").join("dist"));
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -75,7 +86,20 @@ pub fn bootstrap(bind_addr: SocketAddr, database_name: &str) -> Result<Bootstrap
         PersistenceService::new(database_path)
             .context("failed to initialize sqlite persistence")?,
     );
-    let runtime_core = Arc::new(RuntimeCore::new(adapters, orchestration, persistence, None));
+
+    let turn_observer: Option<Arc<dyn TurnLifecycleObserver>> = lifecycle
+        .as_ref()
+        .map(|l| -> Arc<dyn TurnLifecycleObserver> { l.clone() });
+    let connection_observer: Option<Arc<dyn ConnectionObserver>> = lifecycle
+        .as_ref()
+        .map(|l| -> Arc<dyn ConnectionObserver> { l.clone() });
+
+    let runtime_core = Arc::new(RuntimeCore::new(
+        adapters,
+        orchestration,
+        persistence,
+        turn_observer,
+    ));
 
     // Reclaim any sessions stuck at `Running` from a prior crash before we
     // begin serving clients.
@@ -86,6 +110,7 @@ pub fn bootstrap(bind_addr: SocketAddr, database_name: &str) -> Result<Bootstrap
         runtime_core.clone(),
         frontend_dist,
         bind_addr,
+        connection_observer,
     )
     .context("failed to launch local server")?;
 
@@ -108,21 +133,25 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// Block the current thread running the daemon. Bootstraps the runtime,
-/// writes the ready file, installs a SIGINT / ctrl-c handler, waits for
-/// an explicit shutdown request, runs the graceful-shutdown sequence,
-/// and deletes the ready file.
-///
-/// Phase 1: signal handler + explicit shutdown wired. The idle watchdog
-/// is defined in `lifecycle` but not yet spawned from here — Phase 2
-/// wires `DaemonLifecycle` through `http-api` and `runtime-core` so the
-/// counters are meaningful, then starts the watchdog.
+/// Block the current thread running the daemon. Bootstraps the runtime
+/// *with* a real `DaemonLifecycle` attached, writes the ready file, starts
+/// the idle watchdog, installs the SIGINT/ctrl-c handler, then waits for
+/// either the watchdog to fire or an explicit shutdown request. On wake
+/// it runs graceful shutdown, deletes the ready file, and returns.
 pub fn run_blocking(config: DaemonConfig) -> Result<()> {
+    let lifecycle = DaemonLifecycle::new(config.idle_timeout);
+
     let BootstrappedApp {
         tokio_runtime,
         runtime_core,
         server,
-    } = bootstrap(config.bind_addr, &config.database_name)?;
+    } = bootstrap(
+        config.bind_addr,
+        &config.database_name,
+        Some(&config.project_root),
+        config.frontend_dist.clone(),
+        Some(lifecycle.clone()),
+    )?;
 
     let ready = ReadyFile::for_project(&config.project_root)
         .context("resolve daemon ready file")?;
@@ -135,19 +164,32 @@ pub fn run_blocking(config: DaemonConfig) -> Result<()> {
     );
     ready.write_atomic(&content).context("write ready file")?;
 
-    let lifecycle = DaemonLifecycle::new(config.idle_timeout);
     let shutdown_grace = config.shutdown_grace;
 
     let shutdown_result: Result<()> = {
         let lifecycle = lifecycle.clone();
         let runtime_core = runtime_core.clone();
         tokio_runtime.block_on(async move {
+            let (watchdog_tx, watchdog_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(idle_watchdog(lifecycle.clone(), watchdog_tx));
+
             tokio::select! {
-                _ = lifecycle.wait_for_shutdown() => {
-                    tracing::info!("explicit shutdown signal received");
+                reason = watchdog_rx => {
+                    match reason {
+                        Ok(IdleShutdownReason::Idle) => {
+                            tracing::info!("daemon idle timeout reached, shutting down");
+                        }
+                        Ok(IdleShutdownReason::Explicit) => {
+                            tracing::info!("explicit shutdown request received, shutting down");
+                        }
+                        Err(_) => {
+                            tracing::warn!("idle watchdog channel closed unexpectedly");
+                        }
+                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("SIGINT received, initiating graceful shutdown");
+                    lifecycle.request_shutdown();
                 }
             }
             graceful_shutdown(runtime_core, lifecycle, shutdown_grace).await?;

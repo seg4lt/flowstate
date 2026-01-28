@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, oneshot};
+use zenui_http_api::ConnectionObserver;
+use zenui_runtime_core::TurnLifecycleObserver;
 
 /// Runtime state driving the daemon's idle-shutdown behavior.
 ///
@@ -75,6 +77,30 @@ impl DaemonLifecycle {
 
     pub fn is_idle(&self) -> bool {
         self.connected_clients() == 0 && self.in_flight_turns() == 0
+    }
+}
+
+impl TurnLifecycleObserver for DaemonLifecycle {
+    fn on_turn_start(&self, _session_id: &str) {
+        self.turn_started();
+    }
+
+    fn on_turn_end(&self, _session_id: &str) {
+        self.turn_ended();
+    }
+}
+
+impl ConnectionObserver for DaemonLifecycle {
+    fn on_client_connected(&self) {
+        self.client_connected();
+    }
+
+    fn on_client_disconnected(&self) {
+        self.client_disconnected();
+    }
+
+    fn on_shutdown_requested(&self) {
+        self.request_shutdown();
     }
 }
 

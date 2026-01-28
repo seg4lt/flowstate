@@ -29,6 +29,9 @@ fn run() -> Result<()> {
     let app = bootstrap(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         "zenui.db",
+        None,
+        None,
+        None,
     )?;
 
     let event_loop = EventLoop::new();

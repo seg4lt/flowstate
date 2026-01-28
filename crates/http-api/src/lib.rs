@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
@@ -21,11 +21,22 @@ use zenui_provider_api::{
 };
 use zenui_runtime_core::RuntimeCore;
 
+/// Hooks the HTTP layer exposes to daemon-core. The trait is the only reason
+/// http-api knows about "connected client count" and "/api/shutdown" — the
+/// daemon crate implements this to drive its idle-shutdown watchdog, while
+/// non-daemon callers (e.g. tests) pass `None` and the hooks become no-ops.
+pub trait ConnectionObserver: Send + Sync {
+    fn on_client_connected(&self);
+    fn on_client_disconnected(&self);
+    fn on_shutdown_requested(&self);
+}
+
 #[derive(Clone)]
 struct ApiState {
     runtime: Arc<RuntimeCore>,
     ws_url: String,
     index_file: PathBuf,
+    lifecycle: Option<Arc<dyn ConnectionObserver>>,
 }
 
 pub struct LocalServer {
@@ -54,6 +65,7 @@ pub fn spawn_local_server(
     runtime: Arc<RuntimeCore>,
     frontend_dist: PathBuf,
     bind_addr: SocketAddr,
+    lifecycle: Option<Arc<dyn ConnectionObserver>>,
 ) -> Result<LocalServer> {
     let std_listener =
         StdTcpListener::bind(bind_addr).context("failed to bind local HTTP server")?;
@@ -79,6 +91,7 @@ pub fn spawn_local_server(
         runtime,
         ws_url,
         index_file: index_file.clone(),
+        lifecycle,
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -91,11 +104,16 @@ pub fn spawn_local_server(
             .route("/api/health", get(health_handler))
             .route("/api/bootstrap", get(bootstrap_handler))
             .route("/api/snapshot", get(snapshot_handler))
+            .route("/api/shutdown", post(shutdown_handler))
             .route("/ws", get(ws_handler))
             .fallback_service(static_assets)
             .with_state(state);
 
-        let server = axum::serve(listener, router).with_graceful_shutdown(async {
+        let server = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
             let _ = shutdown_rx.await;
         });
 
@@ -144,7 +162,49 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// POST /api/shutdown — loopback-only endpoint that asks the daemon to
+/// begin graceful shutdown. Returns:
+///   204 if the lifecycle observer accepted the request
+///   501 if no lifecycle is wired (e.g. when http-api is running inside the
+///       in-process tao-web-shell with no daemon around it)
+///   403 if the requester is not on loopback (defence in depth — we only
+///       bind 127.0.0.1 anyway)
+async fn shutdown_handler(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<ApiState>,
+) -> StatusCode {
+    if !peer.ip().is_loopback() {
+        warn!(%peer, "rejecting /api/shutdown from non-loopback peer");
+        return StatusCode::FORBIDDEN;
+    }
+    match state.lifecycle.as_ref() {
+        Some(observer) => {
+            tracing::info!(%peer, "loopback shutdown request received");
+            observer.on_shutdown_requested();
+            StatusCode::NO_CONTENT
+        }
+        None => StatusCode::NOT_IMPLEMENTED,
+    }
+}
+
 async fn handle_socket(socket: WebSocket, state: ApiState) {
+    if let Some(observer) = state.lifecycle.as_ref() {
+        observer.on_client_connected();
+    }
+    let lifecycle_for_drop = state.lifecycle.clone();
+    // RAII guard: fires the disconnect hook unconditionally on function exit,
+    // including panic paths. Counter underflow is prevented because we only
+    // decrement from this guard and we set _incremented by construction.
+    struct DisconnectGuard(Option<Arc<dyn ConnectionObserver>>);
+    impl Drop for DisconnectGuard {
+        fn drop(&mut self) {
+            if let Some(observer) = self.0.as_ref() {
+                observer.on_client_disconnected();
+            }
+        }
+    }
+    let _disconnect_guard = DisconnectGuard(lifecycle_for_drop);
+
     // Three concurrent halves share a single outbound mpsc that feeds the writer
     // task. Otherwise, awaiting `handle_client_message` (which streams runtime
     // events through the broadcast channel) would block subscription draining,
