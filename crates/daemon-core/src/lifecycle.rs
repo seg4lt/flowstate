@@ -1,9 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, oneshot};
-use zenui_http_api::ConnectionObserver;
+use zenui_http_api::{ConnectionObserver, DaemonStatus};
 use zenui_runtime_core::TurnLifecycleObserver;
 
 /// Runtime state driving the daemon's idle-shutdown behavior.
@@ -22,6 +22,9 @@ pub struct DaemonLifecycle {
     activity_notify: Notify,
     shutdown_signal: Notify,
     idle_timeout: Duration,
+    started_at: Instant,
+    started_at_rfc3339: String,
+    daemon_version: String,
 }
 
 impl DaemonLifecycle {
@@ -32,6 +35,9 @@ impl DaemonLifecycle {
             activity_notify: Notify::new(),
             shutdown_signal: Notify::new(),
             idle_timeout,
+            started_at: Instant::now(),
+            started_at_rfc3339: chrono::Utc::now().to_rfc3339(),
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         })
     }
 
@@ -101,6 +107,16 @@ impl ConnectionObserver for DaemonLifecycle {
 
     fn on_shutdown_requested(&self) {
         self.request_shutdown();
+    }
+
+    fn status(&self) -> Option<DaemonStatus> {
+        Some(DaemonStatus {
+            connected_clients: self.connected_clients(),
+            in_flight_turns: self.in_flight_turns(),
+            uptime_seconds: self.started_at.elapsed().as_secs(),
+            daemon_version: self.daemon_version.clone(),
+            started_at: self.started_at_rfc3339.clone(),
+        })
     }
 }
 

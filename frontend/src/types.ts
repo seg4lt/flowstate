@@ -166,6 +166,7 @@ export interface BootstrapPayload {
 // RuntimeEvent fields use snake_case to match Rust serde serialization.
 export type RuntimeEvent =
   | { type: "runtime_ready"; message: string }
+  | { type: "daemon_shutting_down"; reason: string }
   | { type: "session_started"; session: SessionSummary }
   | { type: "turn_started"; session_id: string; turn: TurnRecord }
   | {

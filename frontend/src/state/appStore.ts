@@ -21,7 +21,11 @@ import {
   type PlanRecord,
 } from "../types";
 
-export type ConnectionStatus = "connected" | "connecting" | "disconnected";
+export type ConnectionStatus =
+  | "connected"
+  | "connecting"
+  | "reconnecting"
+  | "disconnected";
 
 export interface ComposerDraft {
   prompt: string;
@@ -643,6 +647,12 @@ function applyRuntimeEvent(prev: AppState, event: RuntimeEvent): AppState {
     }
     case "error": {
       return { ...prev, lastAction: `Error: ${event.message}` };
+    }
+    case "daemon_shutting_down": {
+      return {
+        ...prev,
+        lastAction: `Daemon shutting down: ${event.reason}`,
+      };
     }
     default:
       return prev;

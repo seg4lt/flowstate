@@ -571,6 +571,12 @@ pub enum RuntimeEvent {
     RuntimeReady {
         message: String,
     },
+    /// The daemon has entered graceful shutdown. Clients should show a
+    /// banner, finish any in-progress UI interactions, and stop issuing
+    /// new turn-starting commands.
+    DaemonShuttingDown {
+        reason: String,
+    },
     SessionStarted {
         session: SessionSummary,
     },

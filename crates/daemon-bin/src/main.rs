@@ -233,26 +233,49 @@ fn run_stop(args: StopArgs) -> Result<()> {
 fn run_status(args: StatusArgs) -> Result<()> {
     let project_root = resolve_project_root(args.project_root)?;
     let ready = ReadyFile::for_project(&project_root)?;
-    match ready.read()? {
-        Some(content) => {
-            println!(
-                "zenui-server running\n  pid:           {}\n  http_base:     {}\n  ws_url:        {}\n  protocol:      {}\n  started_at:    {}\n  version:       {}\n  project_root:  {}\n  ready_file:    {}",
-                content.pid,
-                content.http_base,
-                content.ws_url,
-                content.protocol_version,
-                content.started_at,
-                content.daemon_version,
-                content.project_root,
-                ready.path().display(),
-            );
-        }
+    let content = match ready.read()? {
+        Some(c) => c,
         None => {
             println!(
                 "zenui-server: no ready file for {}",
                 project_root.display()
             );
+            return Ok(());
         }
+    };
+
+    println!("zenui-server running");
+    println!("  pid:           {}", content.pid);
+    println!("  http_base:     {}", content.http_base);
+    println!("  ws_url:        {}", content.ws_url);
+    println!("  protocol:      {}", content.protocol_version);
+    println!("  started_at:    {}", content.started_at);
+    println!("  version:       {}", content.daemon_version);
+    println!("  project_root:  {}", content.project_root);
+    println!("  ready_file:    {}", ready.path().display());
+
+    // Try to fetch live status — may 501 or unreachable if the daemon
+    // just exited or isn't wired with a lifecycle observer.
+    let status_url = format!("{}/api/status", content.http_base);
+    match ureq::get(&status_url)
+        .timeout(Duration::from_millis(500))
+        .call()
+    {
+        Ok(resp) => match resp.into_string() {
+            Ok(body) => match serde_json::from_str::<serde_json::Value>(&body) {
+                Ok(v) => {
+                    println!("  live status:");
+                    if let Some(obj) = v.as_object() {
+                        for (k, val) in obj.iter() {
+                            println!("    {k}: {val}");
+                        }
+                    }
+                }
+                Err(err) => println!("  live status: parse error ({err})"),
+            },
+            Err(err) => println!("  live status: body read error ({err})"),
+        },
+        Err(err) => println!("  live status: unreachable ({err})"),
     }
     Ok(())
 }

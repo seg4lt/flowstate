@@ -17,6 +17,7 @@ zenui-http-api = { path = "../http-api" }
 zenui-orchestration = { path = "../orchestration" }
 zenui-persistence = { path = "../persistence" }
 zenui-provider-api = { path = "../provider-api" }
+# shutdown.rs imports RuntimeEvent::DaemonShuttingDown directly
 zenui-provider-claude-cli = { path = "../provider-claude-cli" }
 zenui-provider-claude-sdk = { path = "../provider-claude-sdk" }
 zenui-provider-codex = { path = "../provider-codex" }

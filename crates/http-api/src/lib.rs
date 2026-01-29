@@ -21,6 +21,17 @@ use zenui_provider_api::{
 };
 use zenui_runtime_core::RuntimeCore;
 
+/// Status snapshot returned by GET /api/status. Populated by the daemon's
+/// `DaemonLifecycle` when http-api is running under `zenui-server`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaemonStatus {
+    pub connected_clients: usize,
+    pub in_flight_turns: usize,
+    pub uptime_seconds: u64,
+    pub daemon_version: String,
+    pub started_at: String,
+}
+
 /// Hooks the HTTP layer exposes to daemon-core. The trait is the only reason
 /// http-api knows about "connected client count" and "/api/shutdown" — the
 /// daemon crate implements this to drive its idle-shutdown watchdog, while
@@ -29,6 +40,11 @@ pub trait ConnectionObserver: Send + Sync {
     fn on_client_connected(&self);
     fn on_client_disconnected(&self);
     fn on_shutdown_requested(&self);
+    /// Optional status snapshot, returned by GET /api/status. Daemons
+    /// override this; the default `None` makes the endpoint 501.
+    fn status(&self) -> Option<DaemonStatus> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -104,6 +120,7 @@ pub fn spawn_local_server(
             .route("/api/health", get(health_handler))
             .route("/api/bootstrap", get(bootstrap_handler))
             .route("/api/snapshot", get(snapshot_handler))
+            .route("/api/status", get(status_handler))
             .route("/api/shutdown", post(shutdown_handler))
             .route("/ws", get(ws_handler))
             .fallback_service(static_assets)
@@ -160,6 +177,15 @@ async fn snapshot_handler(State(state): State<ApiState>) -> Json<AppSnapshot> {
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<ApiState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+/// GET /api/status — returns a `DaemonStatus` snapshot. Returns 501 when
+/// http-api is running without a daemon observer attached.
+async fn status_handler(State(state): State<ApiState>) -> Response {
+    match state.lifecycle.as_ref().and_then(|o| o.status()) {
+        Some(status) => Json(status).into_response(),
+        None => StatusCode::NOT_IMPLEMENTED.into_response(),
+    }
 }
 
 /// POST /api/shutdown — loopback-only endpoint that asks the daemon to

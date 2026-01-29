@@ -2,6 +2,14 @@ import { useCallback, useEffect, useRef } from "react";
 import { actions } from "./appStore";
 import type { BootstrapPayload, ClientMessage, ServerMessage } from "../types";
 
+// Reconnect policy: capped exponential backoff. The daemon can now
+// legitimately outlive the shell window (session-survival feature), so a
+// WS disconnect is no longer terminal. On reconnect the daemon sends a
+// fresh welcome+bootstrap which replaces client state wholesale.
+const RECONNECT_BASE_DELAY_MS = 500;
+const RECONNECT_MAX_DELAY_MS = 15_000;
+const RECONNECT_MAX_ATTEMPTS = 20;
+
 export function useWebSocket() {
   const socketRef = useRef<WebSocket | null>(null);
 
@@ -16,8 +24,33 @@ export function useWebSocket() {
 
   useEffect(() => {
     let disposed = false;
+    let reconnectAttempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    function scheduleReconnect() {
+      if (disposed) return;
+      if (reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) {
+        console.error("websocket: giving up after max reconnect attempts");
+        actions.setConnectionStatus("disconnected");
+        return;
+      }
+      const delay = Math.min(
+        RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt,
+        RECONNECT_MAX_DELAY_MS,
+      );
+      reconnectAttempt += 1;
+      console.info(
+        `websocket: reconnect attempt ${reconnectAttempt} in ${delay}ms`,
+      );
+      actions.setConnectionStatus("reconnecting");
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        void boot();
+      }, delay);
+    }
 
     async function boot() {
+      if (disposed) return;
       try {
         const response = await fetch("/api/bootstrap");
         if (!response.ok) throw new Error(`Bootstrap failed: ${response.status}`);
@@ -31,16 +64,20 @@ export function useWebSocket() {
 
         socket.addEventListener("open", () => {
           if (disposed) return;
+          reconnectAttempt = 0;
           actions.setConnectionStatus("connected");
         });
 
         socket.addEventListener("close", () => {
           if (disposed) return;
           actions.setConnectionStatus("disconnected");
+          socketRef.current = null;
+          scheduleReconnect();
         });
 
-        socket.addEventListener("error", () => {
+        socket.addEventListener("error", (err) => {
           if (disposed) return;
+          console.error("websocket error", err);
           actions.setConnectionStatus("disconnected");
         });
 
@@ -80,14 +117,20 @@ export function useWebSocket() {
         });
       } catch (err) {
         console.error("bootstrap failed:", err);
+        if (disposed) return;
         actions.setConnectionStatus("disconnected");
+        scheduleReconnect();
       }
     }
 
-    boot();
+    void boot();
 
     return () => {
       disposed = true;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
       socketRef.current?.close();
       socketRef.current = null;
     };
