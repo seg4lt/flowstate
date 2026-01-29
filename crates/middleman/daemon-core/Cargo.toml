@@ -1,0 +1,29 @@
+[package]
+name = "zenui-daemon-core"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zenui-http-api = { path = "../http-api" }
+zenui-orchestration = { path = "../../core/orchestration" }
+zenui-persistence = { path = "../../core/persistence" }
+zenui-provider-api = { path = "../../core/provider-api" }
+# shutdown.rs imports RuntimeEvent::DaemonShuttingDown directly
+zenui-provider-claude-cli = { path = "../../core/provider-claude-cli" }
+zenui-provider-claude-sdk = { path = "../../core/provider-claude-sdk" }
+zenui-provider-codex = { path = "../../core/provider-codex" }
+zenui-provider-github-copilot = { path = "../../core/provider-github-copilot" }
+zenui-provider-github-copilot-cli = { path = "../../core/provider-github-copilot-cli" }
+zenui-runtime-core = { path = "../../core/runtime-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

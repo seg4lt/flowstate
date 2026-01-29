@@ -17,7 +17,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq = { version = "2", default-features = false }
-zenui-daemon-core = { path = "../daemon-core" }
+zenui-daemon-core = { path = "../../../../crates/middleman/daemon-core" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

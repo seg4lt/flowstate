@@ -5,7 +5,9 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir missing"));
-    let frontend_dir = manifest_dir.join("../../frontend");
+    // From apps/zenui/crate/server → workspace root requires four levels up,
+    // then into frontend/.
+    let frontend_dir = manifest_dir.join("../../../../frontend");
 
     watch_path(&frontend_dir.join("package.json"));
     watch_path(&frontend_dir.join("bun.lock"));

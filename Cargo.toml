@@ -1,19 +1,19 @@
 [workspace]
 members = [
-  "crates/tao-web-shell",
-  "crates/daemon-core",
-  "crates/daemon-bin",
-  "crates/daemon-client",
-  "crates/runtime-core",
-  "crates/provider-api",
-  "crates/provider-codex",
-  "crates/provider-claude-sdk",
-  "crates/provider-claude-cli",
-  "crates/provider-github-copilot",
-  "crates/provider-github-copilot-cli",
-  "crates/orchestration",
-  "crates/persistence",
-  "crates/http-api",
+  "apps/zenui/main-application",
+  "apps/zenui/crate/server",
+  "crates/core/runtime-core",
+  "crates/core/provider-api",
+  "crates/core/orchestration",
+  "crates/core/persistence",
+  "crates/core/provider-claude-sdk",
+  "crates/core/provider-claude-cli",
+  "crates/core/provider-codex",
+  "crates/core/provider-github-copilot",
+  "crates/core/provider-github-copilot-cli",
+  "crates/middleman/http-api",
+  "crates/middleman/daemon-core",
+  "crates/middleman/daemon-client",
 ]
 resolver = "2"
 

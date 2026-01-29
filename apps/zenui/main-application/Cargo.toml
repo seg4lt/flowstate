@@ -15,4 +15,4 @@ serde.workspace = true
 serde_json.workspace = true
 tao.workspace = true
 wry.workspace = true
-zenui-daemon-client = { path = "../daemon-client" }
+zenui-daemon-client = { path = "../../../crates/middleman/daemon-client" }
