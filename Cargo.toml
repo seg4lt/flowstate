@@ -3,6 +3,7 @@ members = [
   "crates/tao-web-shell",
   "crates/daemon-core",
   "crates/daemon-bin",
+  "crates/daemon-client",
   "crates/runtime-core",
   "crates/provider-api",
   "crates/provider-codex",

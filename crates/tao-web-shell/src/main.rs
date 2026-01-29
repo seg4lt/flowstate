@@ -1,4 +1,3 @@
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::mpsc::channel;
 
 use anyhow::{Context, Result};
@@ -8,7 +7,7 @@ use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::WindowBuilder;
 use wry::{Rect, WebViewBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize as WryLogicalSize};
-use zenui_daemon_core::bootstrap;
+use zenui_daemon_client::{ClientConfig, DaemonHandle, connect_or_spawn};
 
 #[derive(Debug, Clone)]
 enum WindowCommand {
@@ -26,13 +25,14 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let app = bootstrap(
-        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-        "zenui.db",
-        None,
-        None,
-        None,
-    )?;
+    let client_config =
+        ClientConfig::for_current_project().context("resolve daemon client config")?;
+    let handle: DaemonHandle = connect_or_spawn(&client_config)
+        .context("failed to attach to or spawn zenui-server daemon")?;
+    eprintln!(
+        "zenui: attached to daemon at {} (pid={})",
+        handle.http_base, handle.pid
+    );
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -57,7 +57,7 @@ fn run() -> Result<()> {
     let (tx, rx) = channel::<WindowCommand>();
 
     let webview = WebViewBuilder::new()
-        .with_url(&app.server.frontend_url())
+        .with_url(&handle.http_base)
         .with_devtools(cfg!(debug_assertions))
         .with_transparent(true)
         .with_accept_first_mouse(true)
@@ -85,8 +85,13 @@ fn run() -> Result<()> {
         .build(&window)
         .context("failed to create webview")?;
 
+    // The daemon runs in its own process, so closing the window just
+    // detaches from it. We do not need to keep `handle` alive for the
+    // duration of the event loop — its fields are already consumed.
+    drop(handle);
+
     event_loop.run(move |event, _, control_flow| {
-        let _ = (&app.tokio_runtime, &app.server, &app.runtime_core, &webview);
+        let _ = &webview;
         *control_flow = ControlFlow::Wait;
 
         // Handle window commands from IPC
