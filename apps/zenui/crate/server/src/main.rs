@@ -101,13 +101,24 @@ fn run_start(args: StartArgs) -> Result<()> {
         return spawn_detached(&project_root, &args, bind_addr);
     }
 
+    // Frontend resolution order:
+    //   1. Explicit --frontend-dist flag
+    //   2. Compile-time ZENUI_FRONTEND_DIST injected by build.rs
+    //      (the canonical apps/zenui/frontend/dist path on this machine)
+    //   3. daemon-core's final fallback: working_directory/frontend/dist
+    const COMPILED_FRONTEND_DIST: &str = env!("ZENUI_FRONTEND_DIST");
+    let frontend_dist = args
+        .frontend_dist
+        .clone()
+        .or_else(|| Some(PathBuf::from(COMPILED_FRONTEND_DIST)));
+
     let config = DaemonConfig {
         bind_addr,
         database_name: "zenui.db".to_string(),
         project_root: project_root.clone(),
         idle_timeout: Duration::from_secs(args.idle_timeout_secs),
         shutdown_grace: Duration::from_secs(5),
-        frontend_dist: args.frontend_dist.clone(),
+        frontend_dist,
         log_file: None,
         detach: false,
     };

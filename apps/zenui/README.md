@@ -1,6 +1,7 @@
 # apps/zenui — the ZenUI desktop app
 
-A native desktop AI coding agent shell. Runs as two cooperating binaries:
+A native desktop AI coding agent shell. Runs as two cooperating binaries
+plus a shared frontend:
 
 - **[`main-application/`](./main-application/README.md)** — the `zenui`
   binary the user launches. A tao + wry native window that auto-attaches
@@ -10,7 +11,11 @@ A native desktop AI coding agent shell. Runs as two cooperating binaries:
   binary. The daemon itself: owns `RuntimeCore`, every provider adapter,
   the SQLite database, and the HTTP + WS transport. Runs on its own
   tokio runtime so provider turns continue executing when the shell
-  window is closed.
+  window is closed. Also owns the `build.rs` that builds `frontend/`.
+- **`frontend/`** — the React 19 + Vite + Tailwind 4 + shadcn UI. Lives
+  inside this app because it's consumed only by the two binaries above;
+  the daemon compiles it via `bun run build`, serves `dist/` as static
+  files, and the main-application webview loads that bundled URL.
 
 ## Why two binaries
 

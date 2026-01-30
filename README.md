@@ -84,9 +84,13 @@ zenui/
 │   └── zenui/
 │       ├── crate/
 │       │   └── server/              zenui-server binary (daemon)
+│       │                            owns build.rs that compiles frontend/
 │       │
-│       └── main-application/        zenui binary (desktop shell)
-│                                    owns build.rs for the React frontend
+│       ├── main-application/        zenui binary (desktop shell)
+│       │
+│       └── frontend/                React 19 + Vite + Tailwind 4 + shadcn
+│                                    (the UI the daemon serves and the
+│                                    main-application webview loads)
 │
 ├── crates/
 │   ├── core/                        Shared domain — the product capability
@@ -106,7 +110,6 @@ zenui/
 │       │                             ready file, graceful shutdown
 │       └── daemon-client             Discovery + auto-spawn + health check
 │
-├── frontend/                        React 19 + Vite + Tailwind 4 + shadcn
 ├── scripts/
 │   └── smoke-daemon.sh              End-to-end daemon lifecycle test
 └── README.md                        (this file)
@@ -141,8 +144,11 @@ core. Core never depends on middleman or apps. There are no cycles.
 ### Prerequisites
 
 - **Rust** — edition 2024 requires rustc 1.85+.
-- **Bun** — used by the frontend build at `frontend/` (the `apps/zenui/crate/server/build.rs`
-  script invokes `bun install` and `bun run build`).
+- **Bun** — used by the frontend build at `apps/zenui/frontend/`. The
+  `apps/zenui/crate/server/build.rs` script invokes `bun install` and
+  `bun run build` from there, and embeds the compiled `dist/` path into
+  the `zenui-server` binary via a `cargo:rustc-env` directive so the
+  daemon can find its own static assets without depending on cwd.
 - **Node.js** is NOT required — some providers download their own Node at
   build time for isolated TypeScript bridges.
 
@@ -157,7 +163,7 @@ This produces:
 
 - `target/debug/zenui` — the desktop shell
 - `target/debug/zenui-server` — the daemon
-- `frontend/dist/` — the built React app (served by the daemon)
+- `apps/zenui/frontend/dist/` — the built React app (served by the daemon)
 
 To skip the frontend rebuild on subsequent compile iterations, set
 `ZENUI_SKIP_FRONTEND_BUILD=1`:

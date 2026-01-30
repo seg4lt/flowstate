@@ -40,9 +40,15 @@ follow-up.
 ## Frontend build
 
 `build.rs` in this crate runs `bun install` + `bun run build` against
-`frontend/` (four levels up the workspace tree) to produce
-`frontend/dist/`. The daemon serves that directory as static files
-at `http://127.0.0.1:<port>/`.
+[`../../frontend/`](../../frontend/) (two levels up — the frontend
+lives inside the same app). After the build completes, build.rs sets
+`cargo:rustc-env=ZENUI_FRONTEND_DIST=<absolute dist path>`, which the
+binary picks up at compile time via `env!("ZENUI_FRONTEND_DIST")` and
+uses as the default `frontend_dist` in `DaemonConfig`. The `--frontend-dist`
+flag at runtime still overrides this.
+
+The daemon then serves `dist/` as static files at
+`http://127.0.0.1:<port>/`.
 
 ## Dependencies
 
