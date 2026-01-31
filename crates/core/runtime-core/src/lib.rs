@@ -24,6 +24,52 @@ pub trait TurnLifecycleObserver: Send + Sync {
     fn on_turn_end(&self, session_id: &str);
 }
 
+/// Status snapshot returned by `ConnectionObserver::status` and serialized
+/// by admin endpoints such as `GET /api/status` in the HTTP transport.
+/// Plain serde POD — lives in `runtime-core` so transports and the daemon
+/// lifecycle share a single definition without depending on each other.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaemonStatus {
+    pub connected_clients: usize,
+    pub in_flight_turns: usize,
+    pub uptime_seconds: u64,
+    pub daemon_version: String,
+    pub started_at: String,
+}
+
+/// Hooks a transport calls whenever a client connects or disconnects, plus
+/// the shutdown-request hook used by daemon-owned admin routes. `daemon-core`
+/// implements this on `DaemonLifecycle` to drive its idle watchdog;
+/// non-daemon callers (tests, apps with no idle shutdown) pass an
+/// `Arc<NoopObserver>`.
+///
+/// This trait is the symmetric counterpart to [`TurnLifecycleObserver`] —
+/// one counts connected clients, the other counts in-flight turns.
+/// Keeping both in `runtime-core` means transport crates can depend only
+/// on `runtime-core` + `provider-api` without ever pulling in `daemon-core`
+/// or any specific transport.
+pub trait ConnectionObserver: Send + Sync {
+    fn on_client_connected(&self);
+    fn on_client_disconnected(&self);
+    fn on_shutdown_requested(&self);
+    /// Optional status snapshot for admin endpoints. Daemons override this;
+    /// the default `None` is what non-daemon callers use.
+    fn status(&self) -> Option<DaemonStatus> {
+        None
+    }
+}
+
+/// No-op `ConnectionObserver`. Hand this to a transport when you don't care
+/// about connection counting (in-process tests, embedded shells without
+/// idle-shutdown behavior).
+pub struct NoopObserver;
+
+impl ConnectionObserver for NoopObserver {
+    fn on_client_connected(&self) {}
+    fn on_client_disconnected(&self) {}
+    fn on_shutdown_requested(&self) {}
+}
+
 pub struct RuntimeCore {
     adapters: HashMap<ProviderKind, Arc<dyn ProviderAdapter>>,
     event_tx: broadcast::Sender<RuntimeEvent>,

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
-use zenui_http_api::{ConnectionObserver, LocalServer, spawn_local_server};
+use zenui_http_api::{LocalServer, spawn_local_server};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
@@ -30,7 +30,7 @@ use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
 use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
-use zenui_runtime_core::{RuntimeCore, TurnLifecycleObserver};
+use zenui_runtime_core::{ConnectionObserver, RuntimeCore, TurnLifecycleObserver};
 
 pub use config::DaemonConfig;
 pub use lifecycle::{DaemonLifecycle, IdleShutdownReason, idle_watchdog};

@@ -3,8 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, oneshot};
-use zenui_http_api::{ConnectionObserver, DaemonStatus};
-use zenui_runtime_core::TurnLifecycleObserver;
+use zenui_runtime_core::{ConnectionObserver, DaemonStatus, TurnLifecycleObserver};
 
 /// Runtime state driving the daemon's idle-shutdown behavior.
 ///

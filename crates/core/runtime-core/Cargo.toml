@@ -7,6 +7,7 @@ publish = false
 [dependencies]
 chrono.workspace = true
 futures.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

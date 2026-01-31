@@ -19,33 +19,7 @@ use tracing::{error, warn};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, HealthPayload, ServerMessage,
 };
-use zenui_runtime_core::RuntimeCore;
-
-/// Status snapshot returned by GET /api/status. Populated by the daemon's
-/// `DaemonLifecycle` when http-api is running under `zenui-server`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DaemonStatus {
-    pub connected_clients: usize,
-    pub in_flight_turns: usize,
-    pub uptime_seconds: u64,
-    pub daemon_version: String,
-    pub started_at: String,
-}
-
-/// Hooks the HTTP layer exposes to daemon-core. The trait is the only reason
-/// http-api knows about "connected client count" and "/api/shutdown" — the
-/// daemon crate implements this to drive its idle-shutdown watchdog, while
-/// non-daemon callers (e.g. tests) pass `None` and the hooks become no-ops.
-pub trait ConnectionObserver: Send + Sync {
-    fn on_client_connected(&self);
-    fn on_client_disconnected(&self);
-    fn on_shutdown_requested(&self);
-    /// Optional status snapshot, returned by GET /api/status. Daemons
-    /// override this; the default `None` makes the endpoint 501.
-    fn status(&self) -> Option<DaemonStatus> {
-        None
-    }
-}
+use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 
 #[derive(Clone)]
 struct ApiState {
