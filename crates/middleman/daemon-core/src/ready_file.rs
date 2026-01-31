@@ -5,39 +5,51 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL_VERSION: u32 = 1;
+use crate::transport::TransportAddressInfo;
 
-/// Contents of the daemon's ready file. Written atomically after the local
-/// server binds and begins accepting connections; deleted on graceful
-/// shutdown. Clients discover a running daemon via this file.
+/// Ready file format version. Bumped from 1 → 2 when we added the
+/// `transports` array for multi-transport daemons. `daemon-client`
+/// still accepts v1 files (migrating them to v2 internally) for one
+/// release cycle.
+const PROTOCOL_VERSION: u32 = 2;
+
+/// Contents of the daemon's ready file (v2 format).
+///
+/// Written atomically **after** every transport is accepting connections;
+/// deleted on graceful shutdown. Clients discover a running daemon via
+/// this file and pick whichever transport they speak from the
+/// `transports` array.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyFileContent {
     pub pid: u32,
-    pub http_base: String,
-    pub ws_url: String,
     pub protocol_version: u32,
     pub started_at: String,
     pub daemon_version: String,
     pub project_root: String,
+    /// Every wire the daemon is currently accepting clients on. At
+    /// least one entry for a non-zero-transport daemon; empty for a
+    /// zero-transport daemon (which is a valid but unusual state).
+    pub transports: Vec<TransportAddressInfo>,
 }
 
 impl ReadyFileContent {
-    pub fn new(http_base: String, ws_url: String, project_root: String) -> Self {
+    /// Construct a v2 ready file payload. Called by `run_blocking` after
+    /// every transport has successfully entered its accept loop.
+    pub fn new_v2(project_root: String, transports: Vec<TransportAddressInfo>) -> Self {
         Self {
             pid: std::process::id(),
-            http_base,
-            ws_url,
             protocol_version: PROTOCOL_VERSION,
             started_at: chrono::Utc::now().to_rfc3339(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             project_root,
+            transports,
         }
     }
 }
 
-/// The daemon ready file is per-boot, per-user, per-project runtime state.
-/// Lives in the OS runtime/temp dir so a stale file from a prior boot
-/// never survives to confuse a fresh session.
+/// Per-boot, per-user, per-project runtime state file. Lives in the OS
+/// runtime/temp dir so a stale file from a prior boot never survives to
+/// confuse a fresh session.
 #[derive(Debug, Clone)]
 pub struct ReadyFile {
     path: PathBuf,
@@ -48,9 +60,8 @@ impl ReadyFile {
     /// stable across invocations targeting the same project but distinct
     /// across different projects.
     pub fn for_project(project_root: &Path) -> Result<Self> {
-        let canonical = fs::canonicalize(project_root).with_context(|| {
-            format!("failed to canonicalize {}", project_root.display())
-        })?;
+        let canonical = fs::canonicalize(project_root)
+            .with_context(|| format!("failed to canonicalize {}", project_root.display()))?;
         let digest = short_hash(canonical.to_string_lossy().as_bytes());
         let dir = runtime_dir()?.join("zenui");
         fs::create_dir_all(&dir)
@@ -74,9 +85,8 @@ impl ReadyFile {
             f.write_all(&json).context("write ready file bytes")?;
             f.sync_all().context("fsync ready file")?;
         }
-        fs::rename(&tmp, &self.path).with_context(|| {
-            format!("rename {} -> {}", tmp.display(), self.path.display())
-        })?;
+        fs::rename(&tmp, &self.path)
+            .with_context(|| format!("rename {} -> {}", tmp.display(), self.path.display()))?;
         Ok(())
     }
 
@@ -101,8 +111,9 @@ impl ReadyFile {
     }
 }
 
-/// Per-boot runtime directory. macOS uses $TMPDIR (user-scoped), Linux uses
-/// $XDG_RUNTIME_DIR with /tmp fallback, Windows uses %LOCALAPPDATA%\zenui.
+/// Per-boot runtime directory. macOS uses $TMPDIR (user-scoped), Linux
+/// uses $XDG_RUNTIME_DIR with a tmp fallback, Windows uses
+/// %LOCALAPPDATA%\zenui.
 fn runtime_dir() -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -116,8 +127,8 @@ fn runtime_dir() -> Result<PathBuf> {
             return Ok(dirs.data_local_dir().to_path_buf());
         }
     }
-    // macOS and everything else: std::env::temp_dir() resolves $TMPDIR on
-    // macOS (user-scoped) and /tmp on most other platforms.
+    // macOS and everything else: std::env::temp_dir() resolves $TMPDIR
+    // on macOS (user-scoped) and /tmp on most other platforms.
     Ok(std::env::temp_dir())
 }
 
@@ -134,20 +145,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ready_file_roundtrip() {
+    fn ready_file_roundtrip_v2() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let content = ReadyFileContent::new(
-            "http://127.0.0.1:12345".to_string(),
-            "ws://127.0.0.1:12345/ws".to_string(),
-            tmp.path().to_string_lossy().into_owned(),
-        );
+        let transports = vec![TransportAddressInfo::Http {
+            http_base: "http://127.0.0.1:12345".to_string(),
+            ws_url: "ws://127.0.0.1:12345/ws".to_string(),
+        }];
+        let content =
+            ReadyFileContent::new_v2(tmp.path().to_string_lossy().into_owned(), transports);
         let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
         rf.write_atomic(&content).expect("write");
         let read = rf.read().expect("read").expect("present");
-        assert_eq!(read.http_base, content.http_base);
-        assert_eq!(read.ws_url, content.ws_url);
         assert_eq!(read.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(read.transports.len(), 1);
+        match &read.transports[0] {
+            TransportAddressInfo::Http { http_base, ws_url } => {
+                assert_eq!(http_base, "http://127.0.0.1:12345");
+                assert_eq!(ws_url, "ws://127.0.0.1:12345/ws");
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
         rf.delete().expect("delete");
         assert!(rf.read().expect("read-after-delete").is_none());
+    }
+
+    #[test]
+    fn ready_file_roundtrip_multi_transport() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transports = vec![
+            TransportAddressInfo::Http {
+                http_base: "http://127.0.0.1:99".to_string(),
+                ws_url: "ws://127.0.0.1:99/ws".to_string(),
+            },
+            TransportAddressInfo::UnixSocket {
+                path: "/tmp/zenui-test.sock".to_string(),
+            },
+        ];
+        let content =
+            ReadyFileContent::new_v2(tmp.path().to_string_lossy().into_owned(), transports);
+        let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
+        rf.write_atomic(&content).expect("write");
+        let read = rf.read().expect("read").expect("present");
+        assert_eq!(read.transports.len(), 2);
+        assert!(matches!(
+            read.transports[0],
+            TransportAddressInfo::Http { .. }
+        ));
+        assert!(matches!(
+            read.transports[1],
+            TransportAddressInfo::UnixSocket { .. }
+        ));
+        rf.delete().expect("delete");
     }
 }

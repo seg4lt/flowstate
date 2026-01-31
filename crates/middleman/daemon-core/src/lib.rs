@@ -1,14 +1,24 @@
 //! ZenUI daemon core.
 //!
-//! Owns the runtime bootstrap, the lifecycle state (counters + idle
-//! watchdog), the ready file coordination, and the graceful shutdown
-//! sequence. It deliberately has no transport code of its own — the
-//! HTTP + WebSocket surface lives in `zenui-http-api` and daemon-core
-//! just spins it up as one of its sidecar tasks.
+//! Owns the runtime bootstrap, lifecycle state (counters + idle
+//! watchdog), ready file coordination, and the graceful shutdown
+//! sequence. **Transport-agnostic**: does not depend on any transport
+//! crate. The app binary composes a `Vec<Box<dyn Transport>>` (HTTP,
+//! Unix socket, wry IPC, anything that implements the trait) and hands
+//! it to `run_blocking`, which drives the shared lifecycle across all
+//! of them.
 //!
-//! Phase 1: extraction from `app-shell`. `bootstrap()` is moved verbatim.
-//! `run_blocking()` is scaffolded against the new module set but is not
-//! yet wired for idle auto-shutdown — that's Phase 2.
+//! # Entry points
+//!
+//! - [`bootstrap_core`] — builds the tokio runtime, providers, SQLite,
+//!   `RuntimeCore`, and `DaemonLifecycle`. Reconciles stuck sessions.
+//!   Does NOT start any transport. Use this when you want the runtime
+//!   in-process and will wire your own transport.
+//! - [`run_blocking`] — the daemon-binary entry point. Calls
+//!   `bootstrap_core`, invokes `bind()` then `serve()` on each provided
+//!   transport, writes the ready file after every transport is live,
+//!   spawns the idle watchdog, waits for shutdown, runs graceful
+//!   shutdown, deletes the ready file.
 
 mod config;
 mod lifecycle;
@@ -16,13 +26,10 @@ mod ready_file;
 mod shutdown;
 pub mod transport;
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
-use zenui_transport_http::{LocalServer, spawn_local_server};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
@@ -39,42 +46,35 @@ pub use ready_file::{ReadyFile, ReadyFileContent};
 pub use shutdown::graceful_shutdown;
 pub use transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 
-pub struct BootstrappedApp {
+/// Headless runtime handle returned by [`bootstrap_core`]. Owns the tokio
+/// runtime, the `RuntimeCore`, and the `DaemonLifecycle`. Callers use
+/// `run_blocking` to drive the full daemon lifecycle with transports, or
+/// work with these fields directly for in-process embedding.
+pub struct BootstrappedCore {
     pub tokio_runtime: tokio::runtime::Runtime,
     pub runtime_core: Arc<RuntimeCore>,
-    pub server: LocalServer,
+    pub lifecycle: Arc<DaemonLifecycle>,
 }
 
-/// Single-process bootstrap. Creates the tokio runtime, wires providers,
-/// persistence, orchestration, and `RuntimeCore`, reconciles any stuck
-/// sessions, and starts the local HTTP/WS server.
-///
-/// `lifecycle` is `None` for callers that just want a local process (the
-/// tao-web-shell in Phase 2) and `Some(Arc<DaemonLifecycle>)` for the
-/// daemon binary. When `Some`, counters fire on every client connect and
-/// every turn start/end, driving `idle_watchdog`.
-pub fn bootstrap(
-    bind_addr: SocketAddr,
-    database_name: &str,
-    project_root: Option<&Path>,
-    frontend_dist: Option<PathBuf>,
-    lifecycle: Option<Arc<DaemonLifecycle>>,
-) -> Result<BootstrappedApp> {
+/// Transport-free bootstrap. Builds the tokio runtime, wires every
+/// provider adapter, opens SQLite, constructs `RuntimeCore` with a
+/// `DaemonLifecycle` as the `TurnLifecycleObserver`, and reconciles any
+/// sessions stuck at `Running` from a prior crash. Does **not** start
+/// any transport — the caller (usually `run_blocking`) is responsible
+/// for that.
+pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
     init_tracing();
 
-    let working_directory = match project_root {
-        Some(root) => root.to_path_buf(),
-        None => std::env::current_dir().context("failed to resolve working directory")?,
-    };
-    let database_path = working_directory.join(".zenui").join(database_name);
-    let frontend_dist =
-        frontend_dist.unwrap_or_else(|| working_directory.join("frontend").join("dist"));
+    let working_directory = config.project_root.clone();
+    let database_path = working_directory.join(".zenui").join(&config.database_name);
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("zenui-runtime")
         .build()
         .context("failed to build tokio runtime")?;
+
+    let lifecycle = DaemonLifecycle::new(config.idle_timeout);
 
     let adapters: Vec<Arc<dyn ProviderAdapter>> = vec![
         Arc::new(CodexAdapter::new(working_directory.clone())),
@@ -89,41 +89,22 @@ pub fn bootstrap(
             .context("failed to initialize sqlite persistence")?,
     );
 
-    let turn_observer: Option<Arc<dyn TurnLifecycleObserver>> = lifecycle
-        .as_ref()
-        .map(|l| -> Arc<dyn TurnLifecycleObserver> { l.clone() });
-    let connection_observer: Option<Arc<dyn ConnectionObserver>> = lifecycle
-        .as_ref()
-        .map(|l| -> Arc<dyn ConnectionObserver> { l.clone() });
-
+    let turn_observer: Arc<dyn TurnLifecycleObserver> = lifecycle.clone();
     let runtime_core = Arc::new(RuntimeCore::new(
         adapters,
         orchestration,
         persistence,
-        turn_observer,
+        Some(turn_observer),
     ));
 
-    // Reclaim any sessions stuck at `Running` from a prior crash before we
-    // begin serving clients.
+    // Reclaim any sessions stuck at `Running` from a prior crash before
+    // we serve any clients.
     tokio_runtime.block_on(runtime_core.reconcile_startup());
 
-    let server = spawn_local_server(
-        &tokio_runtime,
-        runtime_core.clone(),
-        frontend_dist,
-        bind_addr,
-        connection_observer,
-    )
-    .context("failed to launch local server")?;
-
-    runtime_core.publish(RuntimeEvent::RuntimeReady {
-        message: format!("Local server listening on {}", server.frontend_url()),
-    });
-
-    Ok(BootstrappedApp {
+    Ok(BootstrappedCore {
         tokio_runtime,
         runtime_core,
-        server,
+        lifecycle,
     })
 }
 
@@ -135,45 +116,101 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// Block the current thread running the daemon. Bootstraps the runtime
-/// *with* a real `DaemonLifecycle` attached, writes the ready file, starts
-/// the idle watchdog, installs the SIGINT/ctrl-c handler, then waits for
-/// either the watchdog to fire or an explicit shutdown request. On wake
-/// it runs graceful shutdown, deletes the ready file, and returns.
-pub fn run_blocking(config: DaemonConfig) -> Result<()> {
-    let lifecycle = DaemonLifecycle::new(config.idle_timeout);
-
-    let BootstrappedApp {
+/// Full daemon lifecycle with a caller-supplied set of transports.
+///
+/// Sequence:
+///   1. `bootstrap_core` — runtime + providers + lifecycle + reconcile.
+///   2. For each transport, call `bind()` on the host thread. Any error
+///      aborts startup.
+///   3. Enter `tokio_runtime.block_on` and call `serve()` on each Bound,
+///      collecting `Box<dyn TransportHandle>`s. On error, already-started
+///      handles are drained via their `shutdown()` before bubbling up.
+///   4. Write the ready file v2 listing every transport's address. The
+///      write happens **after** every transport is serving, so clients
+///      polling the file never see a "ready file exists but port isn't
+///      accepting yet" race.
+///   5. Spawn `idle_watchdog`; install SIGINT handler; wait for shutdown.
+///   6. On shutdown: publish `DaemonShuttingDown`, sweep in-flight turns,
+///      drain every transport via `shutdown().await`, delete ready file,
+///      drop runtime.
+///
+/// Zero-transport daemons are allowed. In that case the idle watchdog
+/// fires immediately unless `config.idle_timeout == Duration::MAX`
+/// (which `DaemonConfig::zero_transport` sets automatically).
+pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -> Result<()> {
+    let BootstrappedCore {
         tokio_runtime,
         runtime_core,
-        server,
-    } = bootstrap(
-        config.bind_addr,
-        &config.database_name,
-        Some(&config.project_root),
-        config.frontend_dist.clone(),
-        Some(lifecycle.clone()),
-    )?;
+        lifecycle,
+    } = bootstrap_core(&config)?;
+
+    // Phase 1: sync bind on host thread. Errors abort startup.
+    let mut bound_transports: Vec<Box<dyn Bound>> = Vec::with_capacity(transports.len());
+    for t in transports {
+        let kind = t.kind();
+        let b = t
+            .bind()
+            .with_context(|| format!("transport '{kind}' failed to bind"))?;
+        bound_transports.push(b);
+    }
 
     let ready = ReadyFile::for_project(&config.project_root)
         .context("resolve daemon ready file")?;
-    let http_base = server.frontend_url();
-    let ws_url = format!("{}/ws", http_base.replacen("http://", "ws://", 1));
-    let content = ReadyFileContent::new(
-        http_base,
-        ws_url,
-        config.project_root.to_string_lossy().into_owned(),
-    );
-    ready.write_atomic(&content).context("write ready file")?;
-
     let shutdown_grace = config.shutdown_grace;
 
-    let shutdown_result: Result<()> = {
-        let lifecycle = lifecycle.clone();
-        let runtime_core = runtime_core.clone();
+    let result: Result<()> = {
+        let lifecycle_inner = lifecycle.clone();
+        let runtime_inner = runtime_core.clone();
+        let ready_inner = ready.clone();
+        let project_root_str = config.project_root.to_string_lossy().into_owned();
+
         tokio_runtime.block_on(async move {
+            let observer: Arc<dyn ConnectionObserver> = lifecycle_inner.clone();
+
+            // Phase 2: serve each bound transport. On error, drain the
+            // already-started transports in reverse order.
+            let mut handles: Vec<Box<dyn TransportHandle>> =
+                Vec::with_capacity(bound_transports.len());
+            for b in bound_transports {
+                let kind = b.kind();
+                match b.serve(runtime_inner.clone(), observer.clone()) {
+                    Ok(h) => handles.push(h),
+                    Err(e) => {
+                        for h in handles.into_iter().rev() {
+                            h.shutdown().await;
+                        }
+                        return Err(e).with_context(|| {
+                            format!("transport '{kind}' failed to start serving")
+                        });
+                    }
+                }
+            }
+
+            // Phase 3: write the ready file AFTER every transport is
+            // serving. Invariant: ready file exists ⟹ every listed
+            // transport is accepting connections.
+            let address_infos: Vec<TransportAddressInfo> =
+                handles.iter().map(|h| h.address_info()).collect();
+            let ready_content =
+                ReadyFileContent::new_v2(project_root_str, address_infos.clone());
+            if let Err(e) = ready_inner.write_atomic(&ready_content) {
+                for h in handles.into_iter().rev() {
+                    h.shutdown().await;
+                }
+                return Err(e).context("write ready file");
+            }
+
+            runtime_inner.publish(RuntimeEvent::RuntimeReady {
+                message: format!(
+                    "daemon ready with {} transport(s): {:?}",
+                    handles.len(),
+                    address_infos.iter().map(|a| a.kind()).collect::<Vec<_>>()
+                ),
+            });
+
+            // Phase 4: watchdog + signal + shutdown.
             let (watchdog_tx, watchdog_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(idle_watchdog(lifecycle.clone(), watchdog_tx));
+            tokio::spawn(idle_watchdog(lifecycle_inner.clone(), watchdog_tx));
 
             tokio::select! {
                 reason = watchdog_rx => {
@@ -191,21 +228,27 @@ pub fn run_blocking(config: DaemonConfig) -> Result<()> {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("SIGINT received, initiating graceful shutdown");
-                    lifecycle.request_shutdown();
+                    lifecycle_inner.request_shutdown();
                 }
             }
-            graceful_shutdown(runtime_core, lifecycle, shutdown_grace).await?;
-            drop(server);
-            Ok(())
+
+            graceful_shutdown(runtime_inner, lifecycle_inner, shutdown_grace).await?;
+
+            // Drain transports in reverse order of start.
+            for h in handles.into_iter().rev() {
+                h.shutdown().await;
+            }
+
+            Ok::<_, anyhow::Error>(())
         })
     };
 
-    // Explicit drop order: tokio_runtime after runtime_core so that any
-    // still-pending task cleanup runs on a live runtime. `tokio_runtime`
-    // goes out of scope at end-of-function, which reaps subprocesses.
+    // Explicit drop order: runtime_core before tokio_runtime so any
+    // still-pending cleanup runs on a live runtime. tokio_runtime goes
+    // out of scope at end-of-function, reaping subprocesses.
     drop(runtime_core);
     drop(tokio_runtime);
 
     let _ = ready.delete();
-    shutdown_result
+    result
 }

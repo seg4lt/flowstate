@@ -18,6 +18,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ureq = { version = "2", default-features = false }
 zenui-daemon-core = { path = "../../../../crates/middleman/daemon-core" }
+zenui-transport-http = { path = "../../../../crates/middleman/transport-http" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

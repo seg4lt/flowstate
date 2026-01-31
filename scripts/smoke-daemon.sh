@@ -48,7 +48,15 @@ if ! echo "$STATUS_OUTPUT" | grep -q "zenui-server running"; then
     fail "status did not report running daemon"
 fi
 
-HTTP_BASE="$(echo "$STATUS_OUTPUT" | awk '/http_base:/ {print $2; exit}')"
+# Ready file v2: the HTTP transport line looks like
+#   [0] kind=http  http_base=http://127.0.0.1:51916  ws_url=ws://.../ws
+# Pull out the http_base= field.
+HTTP_BASE="$(
+    echo "$STATUS_OUTPUT" \
+        | grep -E 'kind=http[[:space:]]' \
+        | head -n1 \
+        | sed -E 's/.*http_base=([^[:space:]]+).*/\1/'
+)"
 if [[ -z "$HTTP_BASE" ]]; then
     fail "could not parse http_base from status output"
 fi

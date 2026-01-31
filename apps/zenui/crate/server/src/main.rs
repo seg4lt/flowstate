@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use zenui_daemon_core::{DaemonConfig, ReadyFile, run_blocking};
+use zenui_daemon_core::{
+    DaemonConfig, ReadyFile, Transport, TransportAddressInfo, run_blocking,
+};
+use zenui_transport_http::HttpTransport;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -101,29 +104,31 @@ fn run_start(args: StartArgs) -> Result<()> {
         return spawn_detached(&project_root, &args, bind_addr);
     }
 
-    // Frontend resolution order:
-    //   1. Explicit --frontend-dist flag
-    //   2. Compile-time ZENUI_FRONTEND_DIST injected by build.rs
-    //      (the canonical apps/zenui/frontend/dist path on this machine)
-    //   3. daemon-core's final fallback: working_directory/frontend/dist
+    // Frontend resolution: explicit --frontend-dist flag first, then the
+    // compile-time ZENUI_FRONTEND_DIST injected by build.rs (the canonical
+    // apps/zenui/frontend/dist path on this machine).
     const COMPILED_FRONTEND_DIST: &str = env!("ZENUI_FRONTEND_DIST");
     let frontend_dist = args
         .frontend_dist
         .clone()
-        .or_else(|| Some(PathBuf::from(COMPILED_FRONTEND_DIST)));
+        .unwrap_or_else(|| PathBuf::from(COMPILED_FRONTEND_DIST));
 
     let config = DaemonConfig {
-        bind_addr,
         database_name: "zenui.db".to_string(),
         project_root: project_root.clone(),
         idle_timeout: Duration::from_secs(args.idle_timeout_secs),
         shutdown_grace: Duration::from_secs(5),
-        frontend_dist,
         log_file: None,
         detach: false,
     };
 
-    run_blocking(config).context("daemon exited with error")
+    // Compose the transport list explicitly. Today zenui-server only
+    // speaks HTTP+WS — but adding a second transport is now a one-line
+    // change here, not a daemon-core patch.
+    let transports: Vec<Box<dyn Transport>> =
+        vec![Box::new(HttpTransport::new(bind_addr, frontend_dist))];
+
+    run_blocking(config, transports).context("daemon exited with error")
 }
 
 /// Fork-exec ourselves with `--foreground` set, detaching so the shell can
@@ -190,9 +195,25 @@ fn spawn_detached(project_root: &PathBuf, args: &StartArgs, _bind: SocketAddr) -
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(content) = ready.read()? {
+            // Print the first HTTP transport address if available; the
+            // parent shell uses this for a "running at" log line.
+            let address_hint = content
+                .transports
+                .iter()
+                .find_map(|t| match t {
+                    TransportAddressInfo::Http { http_base, .. } => Some(http_base.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    content
+                        .transports
+                        .first()
+                        .map(|t| format!("transport={}", t.kind()))
+                        .unwrap_or_else(|| "no-transports".to_string())
+                });
             println!(
                 "zenui-server ready at {} (pid={})",
-                content.http_base, content.pid
+                address_hint, content.pid
             );
             return Ok(());
         }
@@ -217,7 +238,24 @@ fn run_stop(args: StopArgs) -> Result<()> {
         }
     };
 
-    let shutdown_url = format!("{}/api/shutdown", content.http_base);
+    // Find the HTTP entry. Non-HTTP-only daemons can't be stopped via
+    // this command yet — future work.
+    let http_base = content
+        .transports
+        .iter()
+        .find_map(|t| match t {
+            TransportAddressInfo::Http { http_base, .. } => Some(http_base.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "daemon has no HTTP transport to post /api/shutdown to; \
+                 transports: {:?}",
+                content.transports.iter().map(|t| t.kind()).collect::<Vec<_>>()
+            )
+        })?;
+
+    let shutdown_url = format!("{}/api/shutdown", http_base);
     let response = ureq::post(&shutdown_url)
         .timeout(Duration::from_secs(5))
         .call();
@@ -257,17 +295,40 @@ fn run_status(args: StatusArgs) -> Result<()> {
 
     println!("zenui-server running");
     println!("  pid:           {}", content.pid);
-    println!("  http_base:     {}", content.http_base);
-    println!("  ws_url:        {}", content.ws_url);
     println!("  protocol:      {}", content.protocol_version);
     println!("  started_at:    {}", content.started_at);
     println!("  version:       {}", content.daemon_version);
     println!("  project_root:  {}", content.project_root);
     println!("  ready_file:    {}", ready.path().display());
+    println!("  transports:    {}", content.transports.len());
+    let mut http_base_for_probe: Option<String> = None;
+    for (i, entry) in content.transports.iter().enumerate() {
+        match entry {
+            TransportAddressInfo::Http { http_base, ws_url } => {
+                println!("    [{i}] kind=http  http_base={http_base}  ws_url={ws_url}");
+                if http_base_for_probe.is_none() {
+                    http_base_for_probe = Some(http_base.clone());
+                }
+            }
+            TransportAddressInfo::UnixSocket { path } => {
+                println!("    [{i}] kind=unix-socket  path={path}");
+            }
+            TransportAddressInfo::NamedPipe { path } => {
+                println!("    [{i}] kind=named-pipe  path={path}");
+            }
+            TransportAddressInfo::InProcess => {
+                println!("    [{i}] kind=in-process");
+            }
+        }
+    }
 
     // Try to fetch live status — may 501 or unreachable if the daemon
-    // just exited or isn't wired with a lifecycle observer.
-    let status_url = format!("{}/api/status", content.http_base);
+    // just exited. Only HTTP transports support /api/status today.
+    let Some(http_base) = http_base_for_probe else {
+        println!("  live status: (no HTTP transport to probe)");
+        return Ok(());
+    };
+    let status_url = format!("{}/api/status", http_base);
     match ureq::get(&status_url)
         .timeout(Duration::from_millis(500))
         .call()
