@@ -14,6 +14,7 @@ mod config;
 mod lifecycle;
 mod ready_file;
 mod shutdown;
+pub mod transport;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,7 @@ pub use config::DaemonConfig;
 pub use lifecycle::{DaemonLifecycle, IdleShutdownReason, idle_watchdog};
 pub use ready_file::{ReadyFile, ReadyFileContent};
 pub use shutdown::graceful_shutdown;
+pub use transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 
 pub struct BootstrappedApp {
     pub tokio_runtime: tokio::runtime::Runtime,
