@@ -4218,6 +4218,7 @@ name = "zenui-daemon-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "directories",
  "serde",
@@ -4226,7 +4227,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zenui-http-api",
  "zenui-orchestration",
  "zenui-persistence",
  "zenui-provider-api",
@@ -4236,23 +4236,7 @@ dependencies = [
  "zenui-provider-github-copilot",
  "zenui-provider-github-copilot-cli",
  "zenui-runtime-core",
-]
-
-[[package]]
-name = "zenui-http-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tower-http",
- "tracing",
- "zenui-provider-api",
- "zenui-runtime-core",
+ "zenui-transport-http",
 ]
 
 [[package]]
@@ -4355,6 +4339,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "serde",
  "tokio",
  "tracing",
  "uuid",
@@ -4374,6 +4359,23 @@ dependencies = [
  "tao",
  "wry",
  "zenui-daemon-client",
+]
+
+[[package]]
+name = "zenui-transport-http"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "zenui-provider-api",
+ "zenui-runtime-core",
 ]
 
 [[package]]

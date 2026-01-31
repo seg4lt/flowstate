@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
-use zenui_http_api::{LocalServer, spawn_local_server};
+use zenui_transport_http::{LocalServer, spawn_local_server};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{ProviderAdapter, RuntimeEvent};

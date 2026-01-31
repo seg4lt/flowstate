@@ -1,5 +1,5 @@
 [package]
-name = "zenui-http-api"
+name = "zenui-transport-http"
 version.workspace = true
 edition.workspace = true
 publish = false
