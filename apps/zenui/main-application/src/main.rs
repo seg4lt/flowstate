@@ -25,14 +25,26 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // The tao+wry shell only speaks HTTP/WS (the webview doesn't know how
+    // to load a Unix socket). Ask daemon-client for an HTTP transport
+    // specifically; fail loudly if the running daemon doesn't offer one.
     let client_config =
         ClientConfig::for_current_project().context("resolve daemon client config")?;
     let handle: DaemonHandle = connect_or_spawn(&client_config)
         .context("failed to attach to or spawn zenui-server daemon")?;
+    let http = handle.as_http().ok_or_else(|| {
+        anyhow::anyhow!(
+            "tao-web-shell requires an HTTP transport; daemon offered: {:?}",
+            handle.address
+        )
+    })?;
     eprintln!(
         "zenui: attached to daemon at {} (pid={})",
-        handle.http_base, handle.pid
+        http.http_base, handle.pid
     );
+    // Clone URL strings out of the borrow before dropping the handle so
+    // we can pass them to wry and into the event-loop closure.
+    let webview_url = http.http_base.to_string();
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
@@ -57,7 +69,7 @@ fn run() -> Result<()> {
     let (tx, rx) = channel::<WindowCommand>();
 
     let webview = WebViewBuilder::new()
-        .with_url(&handle.http_base)
+        .with_url(&webview_url)
         .with_devtools(cfg!(debug_assertions))
         .with_transparent(true)
         .with_accept_first_mouse(true)
