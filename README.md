@@ -105,9 +105,11 @@ zenui/
 │   │   └── provider-github-copilot-cli   GitHub Copilot CLI
 │   │
 │   └── middleman/                   Shared wire / lifecycle / discovery
-│       ├── http-api                  axum HTTP+WS transport
-│       ├── daemon-core               Lifecycle state, idle watchdog,
-│       │                             ready file, graceful shutdown
+│       ├── daemon-core               Transport trait + lifecycle state,
+│       │                             idle watchdog, ready file v2,
+│       │                             graceful shutdown
+│       ├── transport-http            axum HTTP+WS transport
+│       │                             (impl Transport for HttpTransport)
 │       └── daemon-client             Discovery + auto-spawn + health check
 │
 ├── scripts/

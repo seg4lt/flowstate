@@ -1,48 +1,60 @@
-# http-api
+# transport-http
 
-The HTTP + WebSocket transport that fronts `RuntimeCore`. Built on
-`axum` + `tower-http`. Binds loopback-only and serves both the React
-frontend (static files) and the runtime API surface.
+HTTP + WebSocket transport for the ZenUI daemon. Implements the
+`Transport` trait from `zenui-daemon-core` via a two-stage
+`HttpTransport` → `HttpBound` → `HttpHandle` lifecycle. Built on
+`axum` + `tower-http`.
+
+## Where it plugs in
+
+```
+apps/zenui/crate/server/src/main.rs
+ └─ vec![Box::new(HttpTransport::new(bind_addr, frontend_dist))]
+     │
+     ▼
+zenui_daemon_core::run_blocking(config, transports)
+     │
+     ├─► HttpTransport::bind()    (host thread, claims TCP socket)
+     ├─► HttpBound::serve()        (tokio ctx, spawns accept loop)
+     └─► HttpHandle::shutdown()    (async, drains connections)
+```
+
+`daemon-core` does NOT depend on this crate. The dependency direction
+is `transport-http → daemon-core` (for the trait) and
+`transport-http → runtime-core` (for `RuntimeCore` +
+`ConnectionObserver`). Apps that don't need HTTP/WS simply don't link
+`zenui-transport-http`.
 
 ## Routes
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET`  | `/` and fallback | Static React app from `frontend/dist`. |
+| `GET`  | `/` and fallback | Static React app from `frontend_dist`. |
 | `GET`  | `/api/health` | Liveness probe. |
 | `GET`  | `/api/bootstrap` | Full `BootstrapPayload` — snapshot + providers + models + `ws_url`. |
 | `GET`  | `/api/snapshot` | Just the session + project snapshot. |
-| `GET`  | `/api/status` | `DaemonStatus` (counters + uptime + version). Returns 501 if no lifecycle observer is attached. |
-| `POST` | `/api/shutdown` | Request graceful shutdown. 204 on success, 403 for non-loopback peers, 501 without a lifecycle. |
+| `GET`  | `/api/status` | `DaemonStatus` from the observer. 501 when `NoopObserver` is wired. |
+| `POST` | `/api/shutdown` | Request graceful shutdown. 204 on success, 403 for non-loopback peers. |
 | `GET`  | `/ws` | WebSocket upgrade. Sends `Welcome { bootstrap }` then streams `RuntimeEvent`s. Accepts `ClientMessage` frames from the client. |
 
-## Key types
-
-- **`LocalServer`** — Returned by `spawn_local_server`. Drop it to
-  shut the server down gracefully via its embedded oneshot.
-- **`ConnectionObserver`** (trait) — The hook daemon-core implements.
-  Methods: `on_client_connected`, `on_client_disconnected`,
-  `on_shutdown_requested`, and an optional `status()` returning
-  `DaemonStatus`. Non-daemon callers pass `None` and all hooks become
-  no-ops.
-- **`DaemonStatus`** — `{ connected_clients, in_flight_turns,
-  uptime_seconds, daemon_version, started_at }`. Serialized by
-  `/api/status`.
-
-## `spawn_local_server`
+## `HttpTransport::new`
 
 ```rust
-pub fn spawn_local_server(
-    runtime_handle: &tokio::runtime::Runtime,
-    runtime: Arc<RuntimeCore>,
-    frontend_dist: PathBuf,
-    bind_addr: SocketAddr,
-    lifecycle: Option<Arc<dyn ConnectionObserver>>,
-) -> Result<LocalServer>
+pub fn new(bind_addr: SocketAddr, frontend_dist: PathBuf) -> Self
 ```
 
-Binds synchronously via `std::net::TcpListener::bind`, hands the
-listener to tokio, mounts the router, and returns.
+Holds only configuration. `bind()` synchronously claims the TCP socket
+on the host thread, verifies `frontend_dist/index.html` exists, and
+returns `Box<dyn Bound>`. `serve()` — called inside the tokio runtime —
+wraps the `StdTcpListener` in `TcpListener::from_std`, spawns the axum
+accept loop, and returns a `Box<dyn TransportHandle>`.
+
+## `ConnectionObserver` is non-optional
+
+`HttpBound::serve` takes `observer: Arc<dyn ConnectionObserver>` by
+value. Callers who don't want observation pass `Arc::new(NoopObserver)`
+from `zenui-runtime-core`. All the `Option::map` chains in the old
+handlers are gone.
 
 ## WebSocket loop
 
@@ -50,18 +62,18 @@ listener to tokio, mounts the router, and returns.
 mpsc:
 
 1. **Writer** — drains the mpsc and writes each `ServerMessage` to the
-   socket.
+   WebSocket.
 2. **Subscriber** — consumes the broadcast `RuntimeEvent` stream and
    forwards each event as `ServerMessage::Event`. On
    `RecvError::Lagged`, sends a fresh `ServerMessage::Snapshot` so the
    client re-reconciles from authoritative state.
 3. **Receiver** — reads inbound frames, parses them as `ClientMessage`,
-   and spawns a per-message task that dispatches into `RuntimeCore`
-   and writes the result back through the shared mpsc.
+   and spawns a per-message task that dispatches into `RuntimeCore` and
+   writes the result back through the shared mpsc.
 
-The client-count `DisconnectGuard` RAII struct ensures
-`on_client_disconnected` fires on every exit path, including panic
-unwinds from any of the three halves.
+A `DisconnectGuard` RAII struct ensures `observer.on_client_disconnected()`
+fires on every exit path, including panic unwinds from any of the
+three halves.
 
 ## Invariant
 
@@ -69,10 +81,12 @@ unwinds from any of the three halves.
 Any `RuntimeEvent` published between the bootstrap's database read and
 the subscription call would otherwise land in a gap the client never
 sees on reconnect. The invariant is protected by an explicit comment
-at the call site in `handle_socket`.
+at the call site.
 
 ## Dependencies
 
-- `axum` (with `ws` feature), `tower-http`, `tokio`, `futures`.
-- `runtime-core` — for `RuntimeCore` and subscription semantics.
-- `provider-api` — for the message types carried on the wire.
+- `zenui-daemon-core` — for the `Transport` / `Bound` / `TransportHandle`
+  trait definitions and `TransportAddressInfo`.
+- `zenui-runtime-core` — for `RuntimeCore`, `ConnectionObserver`.
+- `zenui-provider-api` — for the wire types.
+- `axum` (with `ws`), `tower-http`, `tokio`, `futures`, `async-trait`.

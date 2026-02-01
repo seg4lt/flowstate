@@ -1,102 +1,175 @@
 # daemon-core
 
-Daemon lifecycle wiring. Everything needed to turn `runtime-core` +
-`http-api` into a long-lived background process with idle
-auto-shutdown, SIGINT handling, ready-file coordination, and graceful
-shutdown.
+Daemon lifecycle wiring. Everything needed to turn `runtime-core` + a
+caller-supplied set of transports into a long-lived background process
+with idle auto-shutdown, SIGINT handling, ready-file coordination, and
+graceful shutdown.
+
+**Transport-agnostic.** `daemon-core` depends on `runtime-core`,
+`provider-api`, `orchestration`, `persistence`, and every `provider-*`
+crate — but NOT on any transport crate. Apps compose transports
+explicitly and pass them to `run_blocking`. A GPUI or native CLI app
+can use `bootstrap_core` or `run_blocking` with an empty transport
+list, linking `daemon-core` without dragging in axum, hyper, or any
+network stack.
 
 ## Entry points
 
-### `bootstrap(bind_addr, database_name, project_root, frontend_dist, lifecycle)`
+### `bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore>`
 
-Constructs the full runtime: builds a tokio runtime, constructs every
-provider adapter, opens SQLite, runs `reconcile_startup`, and spawns
-an `http-api` server. Returns a `BootstrappedApp { tokio_runtime,
-runtime_core, server }`. Used both by `run_blocking` below and by
-in-process callers (e.g. dev tools) that want a real runtime without
-the full daemon lifecycle.
+Pure headless bootstrap. Builds the tokio runtime, wires every provider
+adapter, opens SQLite, constructs `RuntimeCore` with the
+`DaemonLifecycle` as its `TurnLifecycleObserver`, and reconciles any
+stuck sessions. Does not start any transport. Returns a
+`BootstrappedCore { tokio_runtime, runtime_core, lifecycle }` for
+embedded callers that want to drive the runtime in-process without
+the full daemon loop.
 
-The `lifecycle: Option<Arc<DaemonLifecycle>>` parameter toggles daemon
-mode. `None` = fully in-process, no counters, no idle shutdown. `Some`
-= wired to counters and ready for `run_blocking` below.
+### `run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -> Result<()>`
 
-### `run_blocking(config: DaemonConfig)`
+The zenui-server binary entry point. Sequence:
 
-The daemon-binary entry point. Calls `bootstrap`, writes the ready
-file, spawns `idle_watchdog` on the tokio runtime, installs a
-SIGINT / ctrl-c handler, and blocks until either shutdown signal
-fires. On wake, runs `graceful_shutdown`, drops the server and
-runtime in the right order, and deletes the ready file.
+1. `bootstrap_core(&config)`.
+2. For each transport, call `bind()` on the host thread. Errors abort
+   startup.
+3. Enter `tokio_runtime.block_on`. For each `Bound`, call `serve()`.
+   On error, drain already-started handles via `shutdown()` before
+   bubbling up.
+4. **Write the ready file v2** (with the `transports: [...]` array)
+   *after* every transport is serving. Invariant: ready file exists ⟹
+   every listed transport is accepting connections.
+5. Spawn `idle_watchdog`. Install SIGINT handler. Wait for shutdown.
+6. On shutdown: publish `RuntimeEvent::DaemonShuttingDown`, call
+   `graceful_shutdown` (which runs `shutdown_all_turns`), then drain
+   every transport handle via `shutdown().await` in reverse order of
+   start, delete the ready file, drop the runtime.
+
+## The `Transport` trait
+
+Defined in `src/transport.rs`. Three traits + one enum:
+
+```rust
+pub trait Transport: Send {
+    fn kind(&self) -> &'static str;
+    fn bind(self: Box<Self>) -> Result<Box<dyn Bound>>;
+}
+
+pub trait Bound: Send {
+    fn kind(&self) -> &'static str;
+    fn address_info(&self) -> TransportAddressInfo;
+    fn serve(
+        self: Box<Self>,
+        runtime: Arc<RuntimeCore>,
+        observer: Arc<dyn ConnectionObserver>,
+    ) -> Result<Box<dyn TransportHandle>>;
+}
+
+#[async_trait]
+pub trait TransportHandle: Send + Sync {
+    fn kind(&self) -> &'static str;
+    fn address_info(&self) -> TransportAddressInfo;
+    async fn shutdown(self: Box<Self>);
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum TransportAddressInfo {
+    Http { http_base: String, ws_url: String },
+    UnixSocket { path: String },
+    NamedPipe { path: String },
+    InProcess,
+}
+```
+
+### Two-stage lifecycle rationale
+
+**`bind()` is synchronous on the host thread.** This is the only place
+a transport can claim OS resources (`StdTcpListener::bind`,
+`UnixListener::bind`, `CreateNamedPipe`, ...). `bind()` must NOT call
+any tokio API — tokio isn't running yet. Preserving this property is
+what lets `zenui-server start` fail fast with a clear error when the
+port is in use.
+
+**`serve()` is synchronous but called inside tokio.** `tokio::spawn` is
+a sync API, so marking `serve()` async would be misleading. The
+returned `Box<dyn TransportHandle>` owns the spawned accept task plus
+a shutdown oneshot.
+
+**Only `shutdown()` is async** — it's the only method that needs to
+await (drain outbound queues, wait for WebSocket close handshake, etc.).
 
 ## `DaemonLifecycle`
 
 Atomic-counter state struct implementing both
-`http_api::ConnectionObserver` (for client counts + shutdown requests +
-`/api/status`) and `runtime_core::TurnLifecycleObserver` (for in-flight
-turn count). The same `Arc<DaemonLifecycle>` gets upcast into both
-trait objects and handed to `http-api` and `runtime-core` respectively
-during `bootstrap`.
+`runtime_core::TurnLifecycleObserver` (for in-flight turn counting) and
+`runtime_core::ConnectionObserver` (for client counting + shutdown
+requests + `/api/status` snapshots). Same `Arc<DaemonLifecycle>` gets
+upcast into both trait objects and handed to `RuntimeCore` and each
+`Transport` respectively.
 
-Also records `started_at` (`Instant` for uptime, RFC3339 string for
-the status response) and `daemon_version` (from `CARGO_PKG_VERSION`)
-so `/api/status` can serialize a complete snapshot.
+Also records `started_at` (an `Instant` for uptime + an RFC3339 string
+for serialization) and `daemon_version` (`env!("CARGO_PKG_VERSION")`)
+so `DaemonStatus` is a complete snapshot.
 
-## `idle_watchdog` task
+## `idle_watchdog`
 
-Tokio task spawned from `run_blocking`. Waits for both counters
-(`connected_clients` and `in_flight_turns`) to hit zero, then races
-an `idle_timeout` (default 60s) against any new activity notification
-or an explicit shutdown request. On timeout, fires the shutdown
-oneshot. On activity, re-enters the wait loop.
+Tokio task spawned from `run_blocking`. Waits for both
+`connected_clients` and `in_flight_turns` to reach zero, then races
+`idle_timeout` (default 60s) against new activity or explicit shutdown.
+On timeout: fires the shutdown oneshot. On activity: re-enters the
+wait loop.
 
-## `ReadyFile`
+`DaemonConfig::zero_transport(project_root)` sets `idle_timeout:
+Duration::MAX` for embedded daemons — they'll never fire the idle
+timer by themselves and rely on explicit `DaemonLifecycle::request_shutdown`.
 
-Per-boot, per-project coordination file. Resolved via:
+## `ReadyFile` (v2 format)
 
-- macOS: `$TMPDIR/zenui/daemon-<hash>.json`
-- Linux: `$XDG_RUNTIME_DIR/zenui/daemon-<hash>.json` (with `/tmp`
-  fallback)
-- Windows: `%LOCALAPPDATA%\zenui\daemon-<hash>.json`
-
-Where `<hash>` is a `DefaultHasher` digest of the canonical project
-root. Written atomically (`tmp` + `fsync` + `rename`) immediately
-after the http-api server binds; deleted on graceful shutdown. Read
-by [`../daemon-client/`](../daemon-client/README.md) to discover a
-running daemon.
-
-Contents:
+Per-boot, per-project coordination file at
+`$TMPDIR/zenui/daemon-<hash>.json` (or platform equivalent). Written
+atomically (`tmp` + `fsync` + `rename`) by `run_blocking` **after**
+every transport is serving; deleted on graceful shutdown.
 
 ```json
 {
   "pid": 12345,
-  "http_base": "http://127.0.0.1:53271",
-  "ws_url": "ws://127.0.0.1:53271/ws",
-  "protocol_version": 1,
-  "started_at": "2026-04-11T22:26:26.459943+00:00",
+  "protocol_version": 2,
+  "started_at": "2026-04-11T17:32:01Z",
   "daemon_version": "0.1.0",
-  "project_root": "/path/to/project"
+  "project_root": "/path/to/project",
+  "transports": [
+    {
+      "kind": "http",
+      "http_base": "http://127.0.0.1:51705",
+      "ws_url": "ws://127.0.0.1:51705/ws"
+    }
+  ]
 }
 ```
 
+Multi-transport daemons list every wire in the `transports[]` array.
+`daemon-client` picks whichever transport its caller prefers.
+
 ## Graceful shutdown sequence
 
-1. Publish `RuntimeEvent::DaemonShuttingDown` so any attached client
-   can surface a banner immediately.
-2. Call `RuntimeCore::shutdown_all_turns(grace)` — loop-and-re-snapshot
-   sweep of `active_sinks` via `interrupt_turn`, up to `grace` seconds
-   (default 5). A new turn that slips in between phases is caught on
-   the next iteration.
-3. Return. The caller (`run_blocking`) drops the `LocalServer`,
-   `RuntimeCore`, and tokio runtime in that order so subprocesses
-   are reaped on a live runtime.
+1. Publish `RuntimeEvent::DaemonShuttingDown` so attached clients can
+   surface a banner immediately.
+2. `RuntimeCore::shutdown_all_turns(grace)` — loop-and-re-snapshot
+   sweep of `active_sinks` via `interrupt_turn`, up to `grace` seconds.
+3. For each transport handle in reverse order, `shutdown().await` to
+   drain connections.
+4. Delete the ready file. Drop `RuntimeCore`, drop the tokio runtime.
+   Subprocess providers are reaped as the runtime drops.
 
 ## Dependencies
 
-- `runtime-core` — for `RuntimeCore`, `TurnLifecycleObserver`.
-- `http-api` — for `spawn_local_server`, `ConnectionObserver`,
-  `DaemonStatus`.
-- `provider-api` — for `RuntimeEvent::DaemonShuttingDown`.
+- `runtime-core` — for `RuntimeCore`, `ConnectionObserver`,
+  `DaemonStatus`, `TurnLifecycleObserver`.
+- `provider-api` — for shared types and `RuntimeEvent`.
 - `orchestration`, `persistence`, all five `provider-*` crates — for
-  `bootstrap` to construct the full runtime.
-- `directories`, `tokio`, `anyhow`, `chrono`, `serde`, `serde_json`,
-  `tracing`, `tracing-subscriber`.
+  `bootstrap_core` to construct the full runtime.
+- `directories`, `tokio`, `async-trait`, `anyhow`, `chrono`, `serde`,
+  `serde_json`, `tracing`, `tracing-subscriber`.
+
+**Not** a dep: any transport crate. `daemon-core` defines the trait;
+transport crates depend *on* `daemon-core`, not the other way around.
