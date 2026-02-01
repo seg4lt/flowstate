@@ -192,7 +192,7 @@ pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -
             let address_infos: Vec<TransportAddressInfo> =
                 handles.iter().map(|h| h.address_info()).collect();
             let ready_content =
-                ReadyFileContent::new_v2(project_root_str, address_infos.clone());
+                ReadyFileContent::new(project_root_str, address_infos.clone());
             if let Err(e) = ready_inner.write_atomic(&ready_content) {
                 for h in handles.into_iter().rev() {
                     h.shutdown().await;

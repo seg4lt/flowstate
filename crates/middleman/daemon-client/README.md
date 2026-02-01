@@ -11,7 +11,7 @@ doesn't drag in SQLite, axum, or the full runtime stack.
 
 Race-safe discovery sequence:
 
-1. Read the per-project ready file (accepts v1 or v2; see below).
+1. Read the per-project ready file.
 2. Find a transport matching `config.preferred_transport`. If present,
    probe its liveness (`/api/health` for HTTP; stub `true` for others).
    On success → return the handle.
@@ -89,17 +89,15 @@ pub enum TransportAddressInfo {
 }
 ```
 
-## Ready file v1 ↔ v2 compatibility
+## Ready file format
 
-`daemon-client` reads both formats. Ready files with `protocol_version:
-2` parse directly into `ReadyFileContentV2`. Files with
-`protocol_version: 1` (or no version field) are parsed as a legacy v1
-struct and migrated internally by synthesizing a single `{ kind:
-"http", ... }` entry in the `transports` array. Unknown protocol
-versions error with an upgrade hint.
-
-The v1 shim is a one-release-cycle compatibility bridge and is
-scheduled for removal in the next release.
+There's one on-disk format (`protocol_version: 1`) with a
+`transports: Vec<TransportAddressInfo>` array. ZenUI is pre-release,
+so there's no legacy format to migrate from — the reader just
+`serde_json::from_slice` into `ReadyFileContent` directly. If the
+schema ever breaks, bump `PROTOCOL_VERSION` in daemon-core's writer,
+add a version check here in the reader, and handle the old shape
+then.
 
 ## Binary resolution
 

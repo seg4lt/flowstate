@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::transport::TransportAddressInfo;
 
-/// Ready file format version. Bumped from 1 → 2 when we added the
-/// `transports` array for multi-transport daemons. `daemon-client`
-/// still accepts v1 files (migrating them to v2 internally) for one
-/// release cycle.
-const PROTOCOL_VERSION: u32 = 2;
+/// Ready file format version. ZenUI is pre-release; this is the only
+/// format we've ever written on disk. The field is kept for future
+/// evolution — bump it when the schema breaks and add a version check
+/// to the reader.
+const PROTOCOL_VERSION: u32 = 1;
 
-/// Contents of the daemon's ready file (v2 format).
+/// Contents of the daemon's ready file.
 ///
 /// Written atomically **after** every transport is accepting connections;
 /// deleted on graceful shutdown. Clients discover a running daemon via
@@ -33,9 +33,9 @@ pub struct ReadyFileContent {
 }
 
 impl ReadyFileContent {
-    /// Construct a v2 ready file payload. Called by `run_blocking` after
+    /// Construct a ready file payload. Called by `run_blocking` after
     /// every transport has successfully entered its accept loop.
-    pub fn new_v2(project_root: String, transports: Vec<TransportAddressInfo>) -> Self {
+    pub fn new(project_root: String, transports: Vec<TransportAddressInfo>) -> Self {
         Self {
             pid: std::process::id(),
             protocol_version: PROTOCOL_VERSION,
@@ -145,14 +145,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ready_file_roundtrip_v2() {
+    fn ready_file_roundtrip() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let transports = vec![TransportAddressInfo::Http {
             http_base: "http://127.0.0.1:12345".to_string(),
             ws_url: "ws://127.0.0.1:12345/ws".to_string(),
         }];
         let content =
-            ReadyFileContent::new_v2(tmp.path().to_string_lossy().into_owned(), transports);
+            ReadyFileContent::new(tmp.path().to_string_lossy().into_owned(), transports);
         let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
         rf.write_atomic(&content).expect("write");
         let read = rf.read().expect("read").expect("present");
@@ -182,7 +182,7 @@ mod tests {
             },
         ];
         let content =
-            ReadyFileContent::new_v2(tmp.path().to_string_lossy().into_owned(), transports);
+            ReadyFileContent::new(tmp.path().to_string_lossy().into_owned(), transports);
         let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
         rf.write_atomic(&content).expect("write");
         let read = rf.read().expect("read").expect("present");

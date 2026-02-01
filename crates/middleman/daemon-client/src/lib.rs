@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-pub use ready_file::{ReadyFile, ReadyFileContentV2, TransportAddressInfo};
+pub use ready_file::{ReadyFile, ReadyFileContent, TransportAddressInfo};
 
 /// Which transport the caller wants. `Any` picks the first entry the
 /// daemon offers in ready-file order.
@@ -182,7 +182,7 @@ pub fn connect_or_spawn(config: &ClientConfig) -> Result<DaemonHandle> {
 /// fails its health check (in which case the caller should treat the
 /// ready file as stale).
 fn try_attach(
-    content: &ReadyFileContentV2,
+    content: &ReadyFileContent,
     config: &ClientConfig,
 ) -> Result<Option<DaemonHandle>> {
     // Find first transport that matches the caller's preference.

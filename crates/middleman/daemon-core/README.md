@@ -35,7 +35,7 @@ The zenui-server binary entry point. Sequence:
 3. Enter `tokio_runtime.block_on`. For each `Bound`, call `serve()`.
    On error, drain already-started handles via `shutdown()` before
    bubbling up.
-4. **Write the ready file v2** (with the `transports: [...]` array)
+4. **Write the ready file** (with the `transports: [...]` array)
    *after* every transport is serving. Invariant: ready file exists ⟹
    every listed transport is accepting connections.
 5. Spawn `idle_watchdog`. Install SIGINT handler. Wait for shutdown.
@@ -123,7 +123,7 @@ wait loop.
 Duration::MAX` for embedded daemons — they'll never fire the idle
 timer by themselves and rely on explicit `DaemonLifecycle::request_shutdown`.
 
-## `ReadyFile` (v2 format)
+## `ReadyFile`
 
 Per-boot, per-project coordination file at
 `$TMPDIR/zenui/daemon-<hash>.json` (or platform equivalent). Written
@@ -133,7 +133,7 @@ every transport is serving; deleted on graceful shutdown.
 ```json
 {
   "pid": 12345,
-  "protocol_version": 2,
+  "protocol_version": 1,
   "started_at": "2026-04-11T17:32:01Z",
   "daemon_version": "0.1.0",
   "project_root": "/path/to/project",
