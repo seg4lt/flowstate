@@ -17,7 +17,18 @@ export function ThreadMenuItem({ session, sendClientMessage }: Props) {
     <SidebarMenuItem>
       <SidebarMenuButton
         isActive={isActive}
-        onClick={() => actions.selectSession(session.summary.sessionId)}
+        onClick={() => {
+          actions.selectSession(session.summary.sessionId);
+          // Bootstrap ships sessions without their turns (to keep the sidebar
+          // fast on startup). Hydrate on first open; subsequent opens already
+          // have the turn history in memory.
+          if (session.turns.length === 0 && session.summary.turnCount > 0) {
+            sendClientMessage({
+              type: "load_session",
+              session_id: session.summary.sessionId,
+            });
+          }
+        }}
         className="gap-2"
       >
         <div

@@ -148,9 +148,23 @@ impl RuntimeCore {
     }
 
     pub async fn snapshot(&self) -> AppSnapshot {
+        // Summary-only load: the sidebar only reads `session.summary.*`, and
+        // shipping every turn of every session in the bootstrap payload was
+        // previously the dominant startup cost. Full turn lists are fetched
+        // on demand via `ClientMessage::LoadSession` when the user opens a
+        // session.
+        let summaries = self.persistence.list_session_summaries().await;
+        let sessions = summaries
+            .into_iter()
+            .map(|summary| SessionDetail {
+                summary,
+                turns: Vec::new(),
+                provider_state: None,
+            })
+            .collect();
         AppSnapshot {
             generated_at: Utc::now().to_rfc3339(),
-            sessions: self.persistence.list_sessions().await,
+            sessions,
             projects: self.persistence.list_projects().await,
         }
     }
@@ -323,6 +337,14 @@ impl RuntimeCore {
             ClientMessage::LoadSnapshot => Some(ServerMessage::Snapshot {
                 snapshot: self.snapshot().await,
             }),
+            ClientMessage::LoadSession { session_id } => {
+                match self.persistence.get_session(&session_id).await {
+                    Some(session) => Some(ServerMessage::SessionLoaded { session }),
+                    None => Some(ServerMessage::Error {
+                        message: format!("Session `{session_id}` not found."),
+                    }),
+                }
+            }
             ClientMessage::StartSession {
                 provider,
                 title,
@@ -1149,9 +1171,20 @@ mod tests {
         ));
 
         let snapshot = runtime.snapshot().await;
-        let session = snapshot.sessions.first().expect("session should exist");
-        assert_eq!(session.turns.len(), 1);
-        assert_eq!(session.turns[0].output, "fake response for hello");
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+        let detail = runtime
+            .persistence
+            .get_session(&session_id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(detail.turns[0].output, "fake response for hello");
     }
 
     struct SlowFakeAdapter;
@@ -1237,11 +1270,14 @@ mod tests {
             Some(zenui_provider_api::ServerMessage::Ack { .. })
         ));
 
-        let snapshot = runtime.snapshot().await;
-        let session = snapshot.sessions.first().expect("session should exist");
-        assert_eq!(session.turns.len(), 1);
-        assert_eq!(session.turns[0].status, TurnStatus::Completed);
-        assert_eq!(session.turns[0].output, "slow response for hello");
+        let detail = runtime
+            .persistence
+            .get_session(&session_id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(detail.turns[0].status, TurnStatus::Completed);
+        assert_eq!(detail.turns[0].output, "slow response for hello");
     }
 
     /// reconcile_startup should flip any session whose persisted status is
@@ -1295,9 +1331,22 @@ mod tests {
         runtime.reconcile_startup().await;
 
         let snapshot = runtime.snapshot().await;
-        let session = snapshot.sessions.first().expect("session should exist");
-        assert_eq!(session.summary.status, zenui_provider_api::SessionStatus::Interrupted);
-        let last_turn = session.turns.last().expect("turn should exist");
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+        let detail = persistence
+            .get_session(&session_id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(
+            detail.summary.status,
+            zenui_provider_api::SessionStatus::Interrupted
+        );
+        let last_turn = detail.turns.last().expect("turn should exist");
         assert_eq!(last_turn.status, TurnStatus::Interrupted);
     }
 }

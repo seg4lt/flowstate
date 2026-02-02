@@ -147,6 +147,23 @@ export const actions = {
   setSnapshot(snapshot: AppSnapshot) {
     setState((prev) => ({ ...prev, snapshot }));
   },
+  /**
+   * Replace an existing session's entry with a fully-hydrated detail
+   * returned from `ClientMessage::LoadSession`. Bootstrap ships sessions
+   * with empty turns, so this is how a session gets its turn history the
+   * first time the user opens it.
+   */
+  mergeSessionDetail(detail: SessionDetail) {
+    setState((prev) => ({
+      ...prev,
+      snapshot: {
+        ...prev.snapshot,
+        sessions: prev.snapshot.sessions.map((session) =>
+          session.summary.sessionId !== detail.summary.sessionId ? session : detail,
+        ),
+      },
+    }));
+  },
   setConnectionStatus(status: ConnectionStatus) {
     setState((prev) => ({ ...prev, connectionStatus: status }));
   },

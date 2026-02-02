@@ -706,6 +706,9 @@ pub enum RuntimeEvent {
 pub enum ClientMessage {
     Ping,
     LoadSnapshot,
+    LoadSession {
+        session_id: String,
+    },
     StartSession {
         provider: ProviderKind,
         title: Option<String>,
@@ -775,6 +778,7 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Welcome { bootstrap: BootstrapPayload },
     Snapshot { snapshot: AppSnapshot },
+    SessionLoaded { session: SessionDetail },
     SessionCreated { session: SessionSummary },
     Pong,
     Ack { message: String },

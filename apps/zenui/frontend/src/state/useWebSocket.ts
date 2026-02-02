@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { actions } from "./appStore";
+import { actions, appStore } from "./appStore";
 import type { BootstrapPayload, ClientMessage, ServerMessage } from "../types";
 
 // Reconnect policy: capped exponential backoff. The daemon can now
@@ -66,6 +66,17 @@ export function useWebSocket() {
           if (disposed) return;
           reconnectAttempt = 0;
           actions.setConnectionStatus("connected");
+          // Re-hydrate the active session on (re)connect. Bootstrap ships
+          // sessions without turns, so an open chat view needs its turn
+          // history loaded via LoadSession. On first connect this is a
+          // no-op (nothing selected yet); on reconnect it restores the
+          // chat view the user was looking at before the socket dropped.
+          const active = appStore.getState().activeSessionId;
+          if (active) {
+            socket.send(
+              JSON.stringify({ type: "load_session", session_id: active } satisfies ClientMessage),
+            );
+          }
         });
 
         socket.addEventListener("close", () => {
@@ -96,6 +107,9 @@ export function useWebSocket() {
               break;
             case "snapshot":
               actions.setSnapshot(payload.snapshot);
+              break;
+            case "session_loaded":
+              actions.mergeSessionDetail(payload.session);
               break;
             case "session_created":
               actions.setLastAction(`Session created: ${payload.session.title}`);

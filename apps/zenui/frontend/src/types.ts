@@ -278,6 +278,7 @@ export type RuntimeEvent =
 export type ServerMessage =
   | { type: "welcome"; bootstrap: BootstrapPayload }
   | { type: "snapshot"; snapshot: AppSnapshot }
+  | { type: "session_loaded"; session: SessionDetail }
   | { type: "session_created"; session: SessionSummary }
   | { type: "pong" }
   | { type: "ack"; message: string }
@@ -287,6 +288,7 @@ export type ServerMessage =
 export type ClientMessage =
   | { type: "ping" }
   | { type: "load_snapshot" }
+  | { type: "load_session"; session_id: string }
   | {
       type: "start_session";
       provider: ProviderKind;

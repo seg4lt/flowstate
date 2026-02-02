@@ -170,6 +170,43 @@ impl PersistenceService {
             .collect()
     }
 
+    /// Like `list_sessions` but skips the per-session turns query and JSON
+    /// deserialization. Used by the bootstrap path so the sidebar can render
+    /// instantly regardless of how much history the user has — the full
+    /// turn list for a session is loaded lazily via `get_session` when the
+    /// user actually opens it.
+    pub async fn list_session_summaries(&self) -> Vec<SessionSummary> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = match connection.prepare(
+            "SELECT session_id, provider, title, status, created_at, updated_at,
+                    last_turn_preview, turn_count, model, project_id
+             FROM sessions ORDER BY updated_at DESC",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match statement.query_map([], |row| {
+            Ok(SessionSummary {
+                session_id: row.get(0)?,
+                provider: provider_kind_from_str(&row.get::<_, String>(1)?),
+                title: row.get(2)?,
+                status: session_status_from_str(&row.get::<_, String>(3)?),
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                last_turn_preview: row.get(6)?,
+                turn_count: row.get::<_, i64>(7)? as usize,
+                model: row.get(8)?,
+                project_id: row.get(9)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.filter_map(Result::ok).collect()
+    }
+
     pub fn delete_session(&self, session_id: &str) -> bool {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
