@@ -29,3 +29,7 @@ Thumbs.db
 
 # ZenUI specific
 .zenui/
+
+# Bridge build artifacts (bun/tsc output + npm deps)
+crates/core/*/bridge/dist/
+crates/core/*/bridge/node_modules/
