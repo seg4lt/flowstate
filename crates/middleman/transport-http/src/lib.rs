@@ -8,29 +8,27 @@
 //! loop. `shutdown()` is async — it sends the oneshot, awaits the accept
 //! task, and drops the listener.
 //!
-//! All the route handlers below are unchanged from the pre-transport-trait
-//! code: `/`, `/index.html`, `/api/health`, `/api/bootstrap`,
-//! `/api/snapshot`, `/api/status`, `/api/shutdown`, `/ws`, and the static
-//! asset fallback from `frontend_dist`.
+//! The frontend is embedded into the binary at compile time via
+//! `rust-embed` (see `build.rs` + `FrontendAssets`), so the daemon has no
+//! runtime dependency on `apps/zenui/frontend/dist` existing on disk.
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+use rust_embed::Embed;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
-use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, warn};
 use zenui_daemon_core::{Bound, Transport, TransportAddressInfo, TransportHandle};
 use zenui_provider_api::{
@@ -38,20 +36,24 @@ use zenui_provider_api::{
 };
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 
+/// Frontend bundle embedded into the binary at build time. The path is
+/// relative to this crate's `Cargo.toml`; `build.rs` runs
+/// `bun install && bun run build` before the embed happens, so the
+/// `dist/` directory is guaranteed to exist whenever this compiles.
+#[derive(Embed)]
+#[folder = "../../../apps/zenui/frontend/dist/"]
+struct FrontendAssets;
+
 /// HTTP + WebSocket transport. Construct this in your app's `main()`,
 /// add it to `run_blocking`'s transport list, and daemon-core handles
 /// the rest of the lifecycle.
 pub struct HttpTransport {
     bind_addr: SocketAddr,
-    frontend_dist: PathBuf,
 }
 
 impl HttpTransport {
-    pub fn new(bind_addr: SocketAddr, frontend_dist: PathBuf) -> Self {
-        Self {
-            bind_addr,
-            frontend_dist,
-        }
+    pub fn new(bind_addr: SocketAddr) -> Self {
+        Self { bind_addr }
     }
 }
 
@@ -70,17 +72,19 @@ impl Transport for HttpTransport {
             .local_addr()
             .context("failed to read local listener address")?;
 
-        // Verify the frontend bundle exists up front so we fail fast
-        // during startup instead of at first request.
-        let index_file = self.frontend_dist.join("index.html");
-        if !index_file.exists() {
-            anyhow::bail!("frontend build output is missing at {}", index_file.display());
+        // Verify the embedded frontend is present. This is a compile-time
+        // guarantee once rust-embed runs, but we check defensively so a
+        // mis-wired build.rs surfaces at daemon startup instead of at
+        // first request.
+        if FrontendAssets::get("index.html").is_none() {
+            anyhow::bail!(
+                "embedded frontend bundle is missing index.html; check transport-http build.rs"
+            );
         }
 
         Ok(Box::new(HttpBound {
             std_listener: Some(std_listener),
             address,
-            frontend_dist: self.frontend_dist,
         }))
     }
 }
@@ -90,7 +94,6 @@ impl Transport for HttpTransport {
 pub struct HttpBound {
     std_listener: Option<StdTcpListener>,
     address: SocketAddr,
-    frontend_dist: PathBuf,
 }
 
 impl Bound for HttpBound {
@@ -119,20 +122,15 @@ impl Bound for HttpBound {
 
         let address = self.address;
         let ws_url = format!("ws://{address}/ws");
-        let index_file = self.frontend_dist.join("index.html");
-        let frontend_dist = self.frontend_dist;
 
         let state = ApiState {
             runtime,
             ws_url,
-            index_file: index_file.clone(),
             observer,
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let task = tokio::spawn(async move {
-            let static_assets =
-                ServeDir::new(frontend_dist).not_found_service(ServeFile::new(index_file));
             let router = Router::new()
                 .route("/", get(index_handler))
                 .route("/index.html", get(index_handler))
@@ -142,7 +140,7 @@ impl Bound for HttpBound {
                 .route("/api/status", get(status_handler))
                 .route("/api/shutdown", post(shutdown_handler))
                 .route("/ws", get(ws_handler))
-                .fallback_service(static_assets)
+                .route("/{*path}", get(static_handler))
                 .with_state(state);
 
             let server = axum::serve(
@@ -229,21 +227,50 @@ impl Drop for HttpHandle {
 struct ApiState {
     runtime: Arc<RuntimeCore>,
     ws_url: String,
-    index_file: PathBuf,
     observer: Arc<dyn ConnectionObserver>,
 }
 
-async fn index_handler(State(state): State<ApiState>) -> Response {
-    match tokio::fs::read(&state.index_file).await {
-        Ok(bytes) => (
-            [
-                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                (header::CACHE_CONTROL, "no-store, must-revalidate"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+async fn index_handler() -> Response {
+    serve_embedded("index.html")
+}
+
+/// Fallback route handler for everything that isn't an API/WS route.
+/// Serves the requested file from the embedded bundle; for paths that
+/// don't resolve to an embedded file, falls back to `index.html` so the
+/// React SPA router can take over.
+async fn static_handler(Path(path): Path<String>) -> Response {
+    // API and websocket routes have their own handlers and never reach
+    // here. The SPA fallback below covers client-side routes like
+    // `/projects/123` that don't correspond to embedded files.
+    if FrontendAssets::get(&path).is_some() {
+        serve_embedded(&path)
+    } else {
+        serve_embedded("index.html")
+    }
+}
+
+fn serve_embedded(path: &str) -> Response {
+    match FrontendAssets::get(path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .as_ref()
+                .to_string();
+            let cache_control = if path == "index.html" {
+                "no-store, must-revalidate"
+            } else {
+                "public, max-age=3600"
+            };
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, cache_control.to_string()),
+                ],
+                file.data.into_owned(),
+            )
+                .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 

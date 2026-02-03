@@ -5,13 +5,14 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir missing"));
-    // From apps/zenui/crate/server → apps/zenui/frontend is two levels up
-    // then into frontend/. The frontend lives inside the same app.
-    //   ..           = apps/zenui/crate
-    //   ../..        = apps/zenui
-    //   ../../frontend
+    // From crates/middleman/transport-http → apps/zenui/frontend is three
+    // levels up and then into apps/zenui/frontend.
+    //   ..           = crates/middleman
+    //   ../..        = crates
+    //   ../../..     = repo root
+    //   ../../../apps/zenui/frontend
     let frontend_dir = manifest_dir
-        .join("../../frontend")
+        .join("../../../apps/zenui/frontend")
         .canonicalize()
         .unwrap_or_else(|err| {
             panic!(
@@ -19,16 +20,6 @@ fn main() {
                 manifest_dir.display()
             )
         });
-    let frontend_dist = frontend_dir.join("dist");
-
-    // Embed the absolute frontend_dist path into the compiled binary so
-    // `zenui-server` can find its own static assets without depending on
-    // the invocation cwd. Any `--frontend-dist` flag at runtime still
-    // overrides this.
-    println!(
-        "cargo:rustc-env=ZENUI_FRONTEND_DIST={}",
-        frontend_dist.display()
-    );
 
     watch_path(&frontend_dir.join("package.json"));
     watch_path(&frontend_dir.join("bun.lock"));

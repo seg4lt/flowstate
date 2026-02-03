@@ -1,3 +1,9 @@
+//! Daemon entry point embedded in the single zenui binary.
+//!
+//! When the zenui binary is invoked as `zenui server <subcommand>`, `main()`
+//! strips the `server` arg and hands the rest to [`run`], which implements
+//! the same CLI that the old standalone `zenui-server` binary provided.
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -12,7 +18,7 @@ use zenui_transport_http::HttpTransport;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "zenui-server",
+    name = "zenui server",
     about = "The ZenUI daemon: owns the runtime and serves clients over HTTP/WS.",
     version
 )]
@@ -23,34 +29,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Launch the daemon. With --foreground the daemon runs in this process
-    /// and logs to stderr; without it the daemon detaches and re-execs with
-    /// --foreground, redirecting logs to `$logdir/zenui-server.log`.
     Start(StartArgs),
-    /// Ask the running daemon to shut down cleanly. Reads the ready file,
-    /// POSTs /api/shutdown, and waits up to 10 seconds for the ready file
-    /// to disappear.
     Stop(StopArgs),
-    /// Print the contents of the daemon's ready file for this project, or
-    /// a message if no daemon is running.
     Status(StatusArgs),
 }
 
 #[derive(Debug, Args)]
 struct StartArgs {
-    /// Run the daemon in the foreground instead of detaching.
     #[arg(long)]
     foreground: bool,
-    /// Bind address (defaults to 127.0.0.1 with an OS-assigned port).
     #[arg(long, default_value = "127.0.0.1:0")]
     bind: String,
-    /// Project root (defaults to the current working directory).
     #[arg(long)]
     project_root: Option<PathBuf>,
-    /// Frontend dist directory (optional override).
-    #[arg(long)]
-    frontend_dist: Option<PathBuf>,
-    /// Idle timeout in seconds before auto-shutdown.
     #[arg(long, default_value_t = 60)]
     idle_timeout_secs: u64,
 }
@@ -67,20 +58,37 @@ struct StatusArgs {
     project_root: Option<PathBuf>,
 }
 
-fn main() {
-    if let Err(err) = real_main() {
-        eprintln!("zenui-server error: {err:?}");
-        std::process::exit(1);
-    }
-}
+/// Entry point for `zenui server ...`. `argv` is the full process argv
+/// (including `argv[0]` and the `server` dispatch arg); we strip them both
+/// so clap sees only the subcommand and its flags.
+pub fn run(argv: Vec<String>) -> i32 {
+    // Synthesise argv with "zenui server" as the program name so clap's
+    // error messages read naturally.
+    let mut parser_argv: Vec<String> = vec!["zenui server".to_string()];
+    // Skip argv[0] (the exe path) and argv[1] ("server"); keep the rest.
+    parser_argv.extend(argv.into_iter().skip(2));
 
-fn real_main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    let cli = match Cli::try_parse_from(parser_argv) {
+        Ok(cli) => cli,
+        Err(err) => {
+            // clap's print() uses the right stream (stdout for --help, stderr for errors)
+            // and returns the correct exit code (0 for --help/--version, 2 for errors).
+            let _ = err.print();
+            return err.exit_code();
+        }
+    };
+
+    let result = match cli.command {
         Commands::Start(args) => run_start(args),
         Commands::Stop(args) => run_stop(args),
         Commands::Status(args) => run_status(args),
+    };
+
+    if let Err(err) = result {
+        eprintln!("zenui server error: {err:?}");
+        return 1;
     }
+    0
 }
 
 fn resolve_project_root(arg: Option<PathBuf>) -> Result<PathBuf> {
@@ -104,15 +112,6 @@ fn run_start(args: StartArgs) -> Result<()> {
         return spawn_detached(&project_root, &args, bind_addr);
     }
 
-    // Frontend resolution: explicit --frontend-dist flag first, then the
-    // compile-time ZENUI_FRONTEND_DIST injected by build.rs (the canonical
-    // apps/zenui/frontend/dist path on this machine).
-    const COMPILED_FRONTEND_DIST: &str = env!("ZENUI_FRONTEND_DIST");
-    let frontend_dist = args
-        .frontend_dist
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(COMPILED_FRONTEND_DIST));
-
     let config = DaemonConfig {
         database_name: "zenui.db".to_string(),
         project_root: project_root.clone(),
@@ -122,22 +121,20 @@ fn run_start(args: StartArgs) -> Result<()> {
         detach: false,
     };
 
-    // Compose the transport list explicitly. Today zenui-server only
-    // speaks HTTP+WS — but adding a second transport is now a one-line
-    // change here, not a daemon-core patch.
     let transports: Vec<Box<dyn Transport>> =
-        vec![Box::new(HttpTransport::new(bind_addr, frontend_dist))];
+        vec![Box::new(HttpTransport::new(bind_addr))];
 
     run_blocking(config, transports).context("daemon exited with error")
 }
 
-/// Fork-exec ourselves with `--foreground` set, detaching so the shell can
-/// return immediately and the daemon outlives its parent.
+/// Fork-exec ourselves with `server start --foreground`, detaching so the
+/// parent shell can return immediately and the daemon outlives its caller.
 fn spawn_detached(project_root: &PathBuf, args: &StartArgs, _bind: SocketAddr) -> Result<()> {
     let current_exe = std::env::current_exe().context("locate current executable")?;
 
     let mut cmd = Command::new(&current_exe);
-    cmd.arg("start")
+    cmd.arg("server")
+        .arg("start")
         .arg("--foreground")
         .arg("--bind")
         .arg(&args.bind)
@@ -145,11 +142,7 @@ fn spawn_detached(project_root: &PathBuf, args: &StartArgs, _bind: SocketAddr) -
         .arg(project_root)
         .arg("--idle-timeout-secs")
         .arg(args.idle_timeout_secs.to_string());
-    if let Some(dist) = args.frontend_dist.as_ref() {
-        cmd.arg("--frontend-dist").arg(dist);
-    }
 
-    // Redirect stdio so the detached child doesn't share our terminal.
     let log_path = log_file_path()?;
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -169,8 +162,6 @@ fn spawn_detached(project_root: &PathBuf, args: &StartArgs, _bind: SocketAddr) -
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // setsid() so the child becomes its own session leader and survives
-        // the parent shell closing its tty.
         unsafe {
             cmd.pre_exec(|| {
                 if libc::setsid() == -1 {
@@ -183,20 +174,17 @@ fn spawn_detached(project_root: &PathBuf, args: &StartArgs, _bind: SocketAddr) -
 
     let child = cmd
         .spawn()
-        .context("failed to spawn detached zenui-server")?;
+        .context("failed to spawn detached zenui server")?;
     eprintln!(
-        "zenui-server spawned (pid={}), waiting for ready file; logs: {}",
+        "zenui server spawned (pid={}), waiting for ready file; logs: {}",
         child.id(),
         log_path.display()
     );
 
-    // Poll for the ready file to appear so the parent can confirm boot.
     let ready = ReadyFile::for_project(project_root)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(content) = ready.read()? {
-            // Print the first HTTP transport address if available; the
-            // parent shell uses this for a "running at" log line.
             let address_hint = content
                 .transports
                 .iter()
@@ -212,14 +200,14 @@ fn spawn_detached(project_root: &PathBuf, args: &StartArgs, _bind: SocketAddr) -
                         .unwrap_or_else(|| "no-transports".to_string())
                 });
             println!(
-                "zenui-server ready at {} (pid={})",
+                "zenui server ready at {} (pid={})",
                 address_hint, content.pid
             );
             return Ok(());
         }
         if Instant::now() >= deadline {
             bail!(
-                "timeout waiting for zenui-server ready file; see {}",
+                "timeout waiting for zenui server ready file; see {}",
                 log_path.display()
             );
         }
@@ -233,13 +221,11 @@ fn run_stop(args: StopArgs) -> Result<()> {
     let content = match ready.read()? {
         Some(c) => c,
         None => {
-            println!("zenui-server: no ready file for {}", project_root.display());
+            println!("zenui server: no ready file for {}", project_root.display());
             return Ok(());
         }
     };
 
-    // Find the HTTP entry. Non-HTTP-only daemons can't be stopped via
-    // this command yet — future work.
     let http_base = content
         .transports
         .iter()
@@ -260,23 +246,22 @@ fn run_stop(args: StopArgs) -> Result<()> {
         .timeout(Duration::from_secs(5))
         .call();
     match response {
-        Ok(_) => println!("zenui-server: shutdown request accepted"),
+        Ok(_) => println!("zenui server: shutdown request accepted"),
         Err(ureq::Error::Status(code, _)) if code == 204 || code == 200 => {
-            println!("zenui-server: shutdown request accepted");
+            println!("zenui server: shutdown request accepted");
         }
         Err(err) => return Err(anyhow!("/api/shutdown failed: {err}")),
     }
 
-    // Wait for the ready file to be deleted, then we know the daemon is gone.
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if ready.read()?.is_none() {
-            println!("zenui-server: exited cleanly");
+            println!("zenui server: exited cleanly");
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    bail!("zenui-server did not delete its ready file within 10s")
+    bail!("zenui server did not delete its ready file within 10s")
 }
 
 fn run_status(args: StatusArgs) -> Result<()> {
@@ -286,14 +271,14 @@ fn run_status(args: StatusArgs) -> Result<()> {
         Some(c) => c,
         None => {
             println!(
-                "zenui-server: no ready file for {}",
+                "zenui server: no ready file for {}",
                 project_root.display()
             );
             return Ok(());
         }
     };
 
-    println!("zenui-server running");
+    println!("zenui server running");
     println!("  pid:           {}", content.pid);
     println!("  protocol:      {}", content.protocol_version);
     println!("  started_at:    {}", content.started_at);
@@ -322,8 +307,6 @@ fn run_status(args: StatusArgs) -> Result<()> {
         }
     }
 
-    // Try to fetch live status — may 501 or unreachable if the daemon
-    // just exited. Only HTTP transports support /api/status today.
     let Some(http_base) = http_base_for_probe else {
         println!("  live status: (no HTTP transport to probe)");
         return Ok(());

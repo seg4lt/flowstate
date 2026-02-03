@@ -1,3 +1,5 @@
+mod bridge_runtime;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -156,81 +158,27 @@ impl GitHubCopilotAdapter {
     async fn spawn_bridge(&self) -> Result<CopilotBridgeProcess, String> {
         info!("Spawning GitHub Copilot bridge process...");
 
-        let exe_path = std::env::current_exe().ok();
-        let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
-        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
+        let node = zenui_embedded_node::ensure_extracted()
+            .map_err(|e| format!("embedded Node.js setup failed: {e:?}"))?;
+        let bridge = bridge_runtime::ensure_extracted()
+            .map_err(|e| format!("Copilot bridge extraction failed: {e:?}"))?;
 
-        let mut bridge_paths = vec![];
+        info!("Using bridge at: {}", bridge.script.display());
+        info!("Using embedded node at: {}", node.node_bin.display());
 
-        if let Some(ref dir) = out_dir {
-            bridge_paths.push(dir.join("copilot-bridge.js"));
-        }
+        // Put the embedded node on PATH so the Copilot SDK's internal
+        // `node` subprocess calls resolve to the same runtime.
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = if existing_path.is_empty() {
+            node.bin_dir.to_string_lossy().into_owned()
+        } else {
+            format!("{}:{}", node.bin_dir.display(), existing_path)
+        };
 
-        bridge_paths.push(PathBuf::from("bridge/dist/index.js"));
-        bridge_paths.push(PathBuf::from("crates/provider-github-copilot/bridge/dist/index.js"));
-        bridge_paths.push(PathBuf::from("../crates/provider-github-copilot/bridge/dist/index.js"));
-        bridge_paths.push(PathBuf::from(
-            "../../crates/provider-github-copilot/bridge/dist/index.js",
-        ));
-
-        if let Some(dir) = exe_dir {
-            bridge_paths.push(dir.join("copilot-bridge.js"));
-            bridge_paths.push(dir.join("bridge/dist/index.js"));
-            bridge_paths.push(dir.join("crates/provider-github-copilot/bridge/dist/index.js"));
-            bridge_paths.push(dir.join("../crates/provider-github-copilot/bridge/dist/index.js"));
-        }
-
-        bridge_paths.push(PathBuf::from("/usr/share/zenui/copilot-bridge/dist/index.js"));
-
-        let bridge_path = bridge_paths
-            .iter()
-            .find(|p| p.exists())
-            .cloned()
-            .ok_or_else(|| {
-                "Copilot bridge not found. Searched in: ".to_string()
-                    + &bridge_paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-            })?;
-
-        info!("Using bridge at: {}", bridge_path.display());
-
-        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-        let mut node_paths: Vec<PathBuf> = vec![];
-
-        if let Some(ref dir) = out_dir {
-            node_paths.push(dir.join("node/bin/node"));
-        }
-        if let Some(ref dir) = exe_dir {
-            node_paths.push(dir.join("node/bin/node"));
-        }
-
-        node_paths.push(PathBuf::from("/opt/homebrew/bin/node"));
-        node_paths.push(PathBuf::from("/usr/local/bin/node"));
-        node_paths.push(PathBuf::from("/usr/bin/node"));
-        node_paths.push(PathBuf::from("node"));
-
-        let node_path = node_paths
-            .iter()
-            .find(|p| p.to_string_lossy() == "node" || p.exists())
-            .cloned()
-            .ok_or_else(|| "Node.js not found. Install from https://nodejs.org".to_string())?;
-
-        let bridge_dir = bridge_path.parent().unwrap_or(&self.working_directory);
-        let bridge_file = bridge_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| "Invalid bridge path".to_string())?;
-
-        let mut child = Command::new(node_path)
-            .arg(bridge_file)
-            .current_dir(bridge_dir)
+        let mut child = Command::new(&node.node_bin)
+            .arg(&bridge.script)
+            .current_dir(&bridge.dir)
+            .env("PATH", new_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -662,43 +610,29 @@ impl ProviderAdapter for GitHubCopilotAdapter {
 
         info!("Checking GitHub Copilot health...");
 
-        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-        let mut node_paths: Vec<PathBuf> = vec![];
-
-        if let Some(ref dir) = out_dir {
-            node_paths.push(dir.join("node/bin/node"));
+        if let Err(err) = zenui_embedded_node::ensure_extracted() {
+            return ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: false,
+                authenticated: false,
+                version: None,
+                status: ProviderStatusLevel::Error,
+                message: Some(format!("embedded Node.js extraction failed: {err:?}")),
+                models: copilot_models(),
+            };
         }
-        if let Some(ref dir) = exe_dir {
-            node_paths.push(dir.join("node/bin/node"));
-        }
-
-        node_paths.push(PathBuf::from("/opt/homebrew/bin/node"));
-        node_paths.push(PathBuf::from("/usr/local/bin/node"));
-        node_paths.push(PathBuf::from("/usr/bin/node"));
-
-        let node_found = node_paths.iter().find(|p| p.exists());
-
-        if node_found.is_none() {
-            if let Ok(output) = Command::new("which").arg("node").output().await {
-                if !output.status.success() {
-                    return ProviderStatus {
-                        kind,
-                        label: label.to_string(),
-                        installed: false,
-                        authenticated: false,
-                        version: None,
-                        status: ProviderStatusLevel::Error,
-                        message: Some(
-                            "Node.js not found. Install from https://nodejs.org".to_string(),
-                        ),
-                        models: copilot_models(),
-                    };
-                }
-            }
+        if let Err(err) = bridge_runtime::ensure_extracted() {
+            return ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: false,
+                authenticated: false,
+                version: None,
+                status: ProviderStatusLevel::Error,
+                message: Some(format!("Copilot bridge extraction failed: {err:?}")),
+                models: copilot_models(),
+            };
         }
 
         let copilot_paths = [

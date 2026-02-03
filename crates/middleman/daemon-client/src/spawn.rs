@@ -56,13 +56,14 @@ pub fn acquire_spawn_lock(project_root: &Path) -> Result<SpawnLock> {
     }
 }
 
-/// Invoke `zenui-server start --project-root=<root>` synchronously. The
-/// server's own `start` subcommand handles the fork-exec and polls its
-/// own ready file before returning — so by the time this call returns,
-/// the daemon is up (or the spawn has reported an error).
+/// Invoke `zenui server start --project-root=<root>` synchronously. The
+/// server subcommand handles the fork-exec and polls its own ready file
+/// before returning — so by the time this call returns, the daemon is up
+/// (or the spawn has reported an error).
 pub fn spawn_daemon(config: &ClientConfig) -> Result<()> {
     let server_bin = resolve_server_binary(config)?;
     let status = Command::new(&server_bin)
+        .arg("server")
         .arg("start")
         .arg("--project-root")
         .arg(&config.project_root)
@@ -72,17 +73,15 @@ pub fn spawn_daemon(config: &ClientConfig) -> Result<()> {
         .status()
         .with_context(|| format!("invoke {}", server_bin.display()))?;
     if !status.success() {
-        bail!("zenui-server start exited with {status}");
+        bail!("zenui server start exited with {status}");
     }
     Ok(())
 }
 
-/// Resolve the `zenui-server` binary in priority order:
-/// 1. `config.server_binary` (explicit override — tests and dev)
-/// 2. `$ZENUI_SERVER_BIN` environment variable
-/// 3. A sibling of `current_exe()` in the same directory (the normal
-///    case when tao-web-shell and daemon-bin are built into the same
-///    `target/debug/` or installed into the same prefix).
+/// Resolve the binary to invoke for `zenui server ...`. The shell, daemon,
+/// and frontend all live inside a single fat binary, so the default is
+/// `current_exe()` (re-exec ourselves). Tests and dev can still override
+/// via `ClientConfig::server_binary` or `$ZENUI_SERVER_BIN`.
 fn resolve_server_binary(config: &ClientConfig) -> Result<PathBuf> {
     if let Some(path) = config.server_binary.as_ref() {
         if path.exists() {
@@ -95,27 +94,7 @@ fn resolve_server_binary(config: &ClientConfig) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(parent) = current.parent() {
-            let candidate = parent.join(server_binary_name());
-            if candidate.exists() {
-                return Ok(candidate);
-            }
-        }
-    }
-    bail!(
-        "could not locate zenui-server binary; set ZENUI_SERVER_BIN or place it next to the shell binary"
-    )
-}
-
-#[cfg(target_os = "windows")]
-fn server_binary_name() -> &'static str {
-    "zenui-server.exe"
-}
-
-#[cfg(not(target_os = "windows"))]
-fn server_binary_name() -> &'static str {
-    "zenui-server"
+    std::env::current_exe().context("locate current executable for daemon self-re-exec")
 }
 
 fn spawn_lock_path(project_root: &Path) -> Result<PathBuf> {

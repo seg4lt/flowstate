@@ -1,0 +1,13 @@
+[package]
+name = "zenui-embedded-node"
+version.workspace = true
+edition.workspace = true
+publish = false
+build = "build.rs"
+
+[dependencies]
+anyhow.workspace = true
+dirs = "5"
+flate2 = "1"
+tar = "0.4"
+tracing.workspace = true

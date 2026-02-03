@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "apps/zenui/main-application",
-  "apps/zenui/crate/server",
   "crates/core/runtime-core",
   "crates/core/provider-api",
   "crates/core/orchestration",
@@ -14,6 +13,7 @@ members = [
   "crates/middleman/transport-http",
   "crates/middleman/daemon-core",
   "crates/middleman/daemon-client",
+  "crates/middleman/embedded-node",
 ]
 resolver = "2"
 

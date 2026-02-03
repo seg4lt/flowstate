@@ -10,9 +10,19 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+clap = { version = "4.5", features = ["derive"] }
 muda = "0.13"
 serde.workspace = true
 serde_json.workspace = true
 tao.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ureq = { version = "2", default-features = false }
 wry.workspace = true
 zenui-daemon-client = { path = "../../../crates/middleman/daemon-client" }
+zenui-daemon-core = { path = "../../../crates/middleman/daemon-core" }
+zenui-transport-http = { path = "../../../crates/middleman/transport-http" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

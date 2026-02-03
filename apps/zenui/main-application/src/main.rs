@@ -1,3 +1,5 @@
+mod server_entry;
+
 use std::sync::mpsc::channel;
 
 use anyhow::{Context, Result};
@@ -18,6 +20,15 @@ enum WindowCommand {
 }
 
 fn main() {
+    // Fat-binary dispatch: `zenui server ...` runs the daemon CLI; anything
+    // else launches the tao/wry shell window. The shell's daemon-client
+    // re-execs this same binary with `server start ...` to bring up the
+    // daemon as an isolated child process.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("server") {
+        std::process::exit(server_entry::run(argv));
+    }
+
     if let Err(error) = run() {
         eprintln!("zenui failed: {error:?}");
         std::process::exit(1);

@@ -1,3 +1,5 @@
+mod bridge_runtime;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -173,86 +175,27 @@ impl ClaudeSdkAdapter {
     async fn spawn_bridge(&self) -> Result<ClaudeBridgeProcess, String> {
         info!("Spawning Claude SDK bridge process...");
 
-        let exe_path = std::env::current_exe().ok();
-        let exe_dir = exe_path.as_ref().and_then(|p| p.parent());
-        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
+        let node = zenui_embedded_node::ensure_extracted()
+            .map_err(|e| format!("embedded Node.js setup failed: {e:?}"))?;
+        let bridge = bridge_runtime::ensure_extracted()
+            .map_err(|e| format!("Claude SDK bridge extraction failed: {e:?}"))?;
 
-        let mut bridge_paths = vec![];
+        info!("Using bridge at: {}", bridge.script.display());
+        info!("Using embedded node at: {}", node.node_bin.display());
 
-        if let Some(ref dir) = out_dir {
-            bridge_paths.push(dir.join("claude-sdk-bridge.js"));
-        }
-
-        bridge_paths.push(PathBuf::from("bridge/dist/index.js"));
-        bridge_paths.push(PathBuf::from("crates/provider-claude-sdk/bridge/dist/index.js"));
-        bridge_paths.push(PathBuf::from("../crates/provider-claude-sdk/bridge/dist/index.js"));
-        bridge_paths.push(PathBuf::from(
-            "../../crates/provider-claude-sdk/bridge/dist/index.js",
-        ));
-
-        if let Some(dir) = exe_dir {
-            bridge_paths.push(dir.join("claude-sdk-bridge.js"));
-            bridge_paths.push(dir.join("bridge/dist/index.js"));
-            bridge_paths.push(dir.join("crates/provider-claude-sdk/bridge/dist/index.js"));
-        }
-
-        bridge_paths.push(PathBuf::from("/usr/share/zenui/claude-sdk-bridge/dist/index.js"));
-
-        let bridge_path = bridge_paths
-            .iter()
-            .find(|p| p.exists())
-            .cloned()
-            .ok_or_else(|| {
-                "Claude SDK bridge not found. Searched in: ".to_string()
-                    + &bridge_paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-            })?;
-
-        info!("Using bridge at: {}", bridge_path.display());
-
-        let mut node_paths: Vec<PathBuf> = vec![];
-        if let Some(ref dir) = out_dir {
-            node_paths.push(dir.join("node/bin/node"));
-        }
-        if let Some(dir) = exe_dir {
-            node_paths.push(dir.join("node/bin/node"));
-        }
-        node_paths.push(PathBuf::from("/opt/homebrew/bin/node"));
-        node_paths.push(PathBuf::from("/usr/local/bin/node"));
-        node_paths.push(PathBuf::from("/usr/bin/node"));
-        node_paths.push(PathBuf::from("node"));
-
-        let node_path = node_paths
-            .iter()
-            .find(|p| p.to_string_lossy() == "node" || p.exists())
-            .cloned()
-            .ok_or_else(|| "Node.js not found. Install from https://nodejs.org".to_string())?;
-
-        let bridge_dir = bridge_path.parent().unwrap_or(&self.working_directory);
-        let bridge_file = bridge_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| "Invalid bridge path".to_string())?;
-
-        // The Claude Agent SDK spawns a child `node` process internally, so the
-        // embedded node's directory must be on PATH or the SDK fails with ENOENT.
-        let node_bin_dir = node_path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."));
+        // The Claude Agent SDK spawns a child `node` process internally,
+        // so the embedded node's directory must be on PATH or the SDK
+        // fails with ENOENT when it tries to re-exec itself.
         let existing_path = std::env::var("PATH").unwrap_or_default();
         let new_path = if existing_path.is_empty() {
-            node_bin_dir.to_string_lossy().into_owned()
+            node.bin_dir.to_string_lossy().into_owned()
         } else {
-            format!("{}:{}", node_bin_dir.display(), existing_path)
+            format!("{}:{}", node.bin_dir.display(), existing_path)
         };
 
-        let mut child = Command::new(&node_path)
-            .arg(bridge_file)
-            .current_dir(bridge_dir)
+        let mut child = Command::new(&node.node_bin)
+            .arg(&bridge.script)
+            .current_dir(&bridge.dir)
             .env("PATH", new_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -582,39 +525,33 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         let kind = ProviderKind::Claude;
         let label = kind.label();
 
-        let mut node_paths: Vec<PathBuf> = vec![];
-        let out_dir = option_env!("OUT_DIR").map(PathBuf::from);
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-        if let Some(dir) = out_dir.as_ref() {
-            node_paths.push(dir.join("node/bin/node"));
+        // The embedded Node.js runtime and SDK bridge both live in the
+        // binary itself; the health check just confirms we can extract
+        // them to the per-user cache dir. Any filesystem or permission
+        // error surfaces here instead of at first turn.
+        if let Err(err) = zenui_embedded_node::ensure_extracted() {
+            return ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: false,
+                authenticated: false,
+                version: None,
+                status: ProviderStatusLevel::Error,
+                message: Some(format!("embedded Node.js extraction failed: {err:?}")),
+                models: claude_models(),
+            };
         }
-        if let Some(dir) = exe_dir.as_ref() {
-            node_paths.push(dir.join("node/bin/node"));
-        }
-        node_paths.push(PathBuf::from("/opt/homebrew/bin/node"));
-        node_paths.push(PathBuf::from("/usr/local/bin/node"));
-        node_paths.push(PathBuf::from("/usr/bin/node"));
-
-        let node_found = node_paths.iter().any(|p| p.exists());
-        if !node_found {
-            if let Ok(output) = Command::new("which").arg("node").output().await {
-                if !output.status.success() {
-                    return ProviderStatus {
-                        kind,
-                        label: label.to_string(),
-                        installed: false,
-                        authenticated: false,
-                        version: None,
-                        status: ProviderStatusLevel::Error,
-                        message: Some(
-                            "Node.js not found. Install from https://nodejs.org".to_string(),
-                        ),
-                        models: claude_models(),
-                    };
-                }
-            }
+        if let Err(err) = bridge_runtime::ensure_extracted() {
+            return ProviderStatus {
+                kind,
+                label: label.to_string(),
+                installed: false,
+                authenticated: false,
+                version: None,
+                status: ProviderStatusLevel::Error,
+                message: Some(format!("Claude SDK bridge extraction failed: {err:?}")),
+                models: claude_models(),
+            };
         }
 
         ProviderStatus {
