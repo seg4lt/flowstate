@@ -2,43 +2,43 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
-  Link,
   Outlet,
 } from "@tanstack/react-router";
-import App from "./App";
+import { AppSidebar } from "@/components/app-sidebar";
+import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
+import { TooltipProvider } from "@/components/ui/tooltip";
 
 const rootRoute = createRootRoute({
   component: () => (
-    <>
-      <nav className="row" style={{ gap: "1rem", padding: "0.5rem" }}>
-        <Link to="/">Home</Link>
-        <Link to="/about">About</Link>
-      </nav>
-      <Outlet />
-    </>
+    <TooltipProvider>
+      <SidebarProvider>
+        <AppSidebar />
+        <SidebarInset>
+          <Outlet />
+        </SidebarInset>
+      </SidebarProvider>
+    </TooltipProvider>
   ),
 });
 
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
-  component: App,
-});
-
-const aboutRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/about",
-  component: function AboutPage() {
+  component: function IndexPage() {
     return (
-      <main className="container">
-        <h1>About flowzen</h1>
-        <p>A Tauri + React + Vite app.</p>
-      </main>
+      <div className="flex h-full min-h-svh flex-col">
+        <header className="flex h-10 items-center border-b border-border px-4 text-sm text-muted-foreground">
+          No active thread
+        </header>
+        <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
+          Select a thread or create a new one to get started.
+        </div>
+      </div>
     );
   },
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, aboutRoute]);
+const routeTree = rootRoute.addChildren([indexRoute]);
 
 export const router = createRouter({ routeTree });
 
