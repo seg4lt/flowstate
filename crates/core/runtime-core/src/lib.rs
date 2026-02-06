@@ -503,6 +503,55 @@ impl RuntimeCore {
                     })
                 }
             }
+            ClientMessage::UpdateSessionModel { session_id, model } => {
+                if let Some(mut session) = self.persistence.get_session(&session_id).await {
+                    session.summary.model = Some(model.clone());
+                    self.persistence.upsert_session(session).await;
+                    self.publish(RuntimeEvent::SessionModelUpdated {
+                        session_id,
+                        model,
+                    });
+                    Some(ServerMessage::Ack {
+                        message: "Session model updated.".to_string(),
+                    })
+                } else {
+                    Some(ServerMessage::Error {
+                        message: "Session not found.".to_string(),
+                    })
+                }
+            }
+            ClientMessage::ArchiveSession { session_id } => {
+                if self.persistence.archive_session(&session_id).await {
+                    self.publish(RuntimeEvent::SessionArchived {
+                        session_id: session_id.clone(),
+                    });
+                    Some(ServerMessage::Ack {
+                        message: "Session archived.".to_string(),
+                    })
+                } else {
+                    Some(ServerMessage::Error {
+                        message: "Archive failed — session not found.".to_string(),
+                    })
+                }
+            }
+            ClientMessage::UnarchiveSession { session_id } => {
+                if let Some(session) = self.persistence.unarchive_session(&session_id).await {
+                    self.publish(RuntimeEvent::SessionUnarchived {
+                        session: session.summary,
+                    });
+                    Some(ServerMessage::Ack {
+                        message: "Session unarchived.".to_string(),
+                    })
+                } else {
+                    Some(ServerMessage::Error {
+                        message: "Unarchive failed — session not found.".to_string(),
+                    })
+                }
+            }
+            ClientMessage::ListArchivedSessions => {
+                let sessions = self.persistence.list_archived_session_summaries().await;
+                Some(ServerMessage::ArchivedSessionsList { sessions })
+            }
         }
     }
 

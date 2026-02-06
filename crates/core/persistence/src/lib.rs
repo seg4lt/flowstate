@@ -443,7 +443,164 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN permission_mode TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_effort TEXT", []);
 
+        // Archived session/turn tables — same schema, plus archived_at timestamp.
+        let _ = connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS archived_sessions (
+                session_id TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_turn_preview TEXT,
+                turn_count INTEGER NOT NULL,
+                provider_state_json TEXT,
+                model TEXT,
+                project_id TEXT,
+                archived_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS archived_turns (
+                turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                input TEXT NOT NULL,
+                output TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reasoning_json TEXT,
+                tool_calls_json TEXT,
+                file_changes_json TEXT,
+                subagents_json TEXT,
+                plan_json TEXT,
+                permission_mode TEXT,
+                reasoning_effort TEXT,
+                FOREIGN KEY(session_id) REFERENCES archived_sessions(session_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_archived_turns_session_id ON archived_turns(session_id);
+            ",
+        );
+
         Ok(())
+    }
+
+    pub async fn archive_session(&self, session_id: &str) -> bool {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        let tx = match connection.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(_) => return false,
+        };
+
+        let moved = tx
+            .execute(
+                "INSERT INTO archived_sessions
+                    (session_id, provider, title, status, created_at, updated_at,
+                     last_turn_preview, turn_count, provider_state_json, model, project_id, archived_at)
+                 SELECT session_id, provider, title, status, created_at, updated_at,
+                        last_turn_preview, turn_count, provider_state_json, model, project_id, ?1
+                 FROM sessions WHERE session_id = ?2",
+                params![now, session_id],
+            )
+            .unwrap_or(0);
+
+        if moved == 0 {
+            return false;
+        }
+
+        let _ = tx.execute(
+            "INSERT INTO archived_turns
+                (turn_id, session_id, input, output, status, created_at, updated_at,
+                 reasoning_json, tool_calls_json, file_changes_json, subagents_json,
+                 plan_json, permission_mode, reasoning_effort)
+             SELECT turn_id, session_id, input, output, status, created_at, updated_at,
+                    reasoning_json, tool_calls_json, file_changes_json, subagents_json,
+                    plan_json, permission_mode, reasoning_effort
+             FROM turns WHERE session_id = ?1",
+            params![session_id],
+        );
+        let _ = tx.execute("DELETE FROM turns WHERE session_id = ?1", params![session_id]);
+        let _ = tx.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id]);
+        let _ = tx.commit();
+        true
+    }
+
+    pub async fn unarchive_session(&self, session_id: &str) -> Option<SessionDetail> {
+        let success = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let tx = match connection.unchecked_transaction() {
+                Ok(tx) => tx,
+                Err(_) => return None,
+            };
+
+            let moved = tx
+                .execute(
+                    "INSERT INTO sessions
+                        (session_id, provider, title, status, created_at, updated_at,
+                         last_turn_preview, turn_count, provider_state_json, model, project_id)
+                     SELECT session_id, provider, title, status, created_at, updated_at,
+                            last_turn_preview, turn_count, provider_state_json, model, project_id
+                     FROM archived_sessions WHERE session_id = ?1",
+                    params![session_id],
+                )
+                .unwrap_or(0);
+
+            if moved == 0 {
+                return None;
+            }
+
+            let _ = tx.execute(
+                "INSERT INTO turns
+                    (turn_id, session_id, input, output, status, created_at, updated_at,
+                     reasoning_json, tool_calls_json, file_changes_json, subagents_json,
+                     plan_json, permission_mode, reasoning_effort)
+                 SELECT turn_id, session_id, input, output, status, created_at, updated_at,
+                        reasoning_json, tool_calls_json, file_changes_json, subagents_json,
+                        plan_json, permission_mode, reasoning_effort
+                 FROM archived_turns WHERE session_id = ?1",
+                params![session_id],
+            );
+            let _ = tx.execute("DELETE FROM archived_turns WHERE session_id = ?1", params![session_id]);
+            let _ = tx.execute("DELETE FROM archived_sessions WHERE session_id = ?1", params![session_id]);
+            tx.commit().is_ok()
+        }; // connection + tx dropped here
+
+        if success {
+            self.get_session(session_id).await
+        } else {
+            None
+        }
+    }
+
+    pub async fn list_archived_session_summaries(&self) -> Vec<SessionSummary> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut stmt = match connection.prepare(
+            "SELECT session_id, provider, title, status, created_at, updated_at,
+                    last_turn_preview, turn_count, model, project_id
+             FROM archived_sessions ORDER BY updated_at DESC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+
+        stmt.query_map([], |row| {
+            Ok(SessionSummary {
+                session_id: row.get(0)?,
+                provider: provider_kind_from_str(&row.get::<_, String>(1)?),
+                title: row.get(2)?,
+                status: session_status_from_str(&row.get::<_, String>(3)?),
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                last_turn_preview: row.get(6)?,
+                turn_count: row.get::<_, i64>(7)? as usize,
+                model: row.get(8)?,
+                project_id: row.get(9)?,
+            })
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 }
 

@@ -699,6 +699,16 @@ pub enum RuntimeEvent {
         session_id: String,
         project_id: Option<String>,
     },
+    SessionModelUpdated {
+        session_id: String,
+        model: String,
+    },
+    SessionArchived {
+        session_id: String,
+    },
+    SessionUnarchived {
+        session: SessionSummary,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -771,6 +781,17 @@ pub enum ClientMessage {
         #[serde(default)]
         project_id: Option<String>,
     },
+    UpdateSessionModel {
+        session_id: String,
+        model: String,
+    },
+    ArchiveSession {
+        session_id: String,
+    },
+    UnarchiveSession {
+        session_id: String,
+    },
+    ListArchivedSessions,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -784,6 +805,7 @@ pub enum ServerMessage {
     Ack { message: String },
     Event { event: RuntimeEvent },
     Error { message: String },
+    ArchivedSessionsList { sessions: Vec<SessionSummary> },
 }
 
 #[async_trait]
