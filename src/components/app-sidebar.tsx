@@ -25,6 +25,7 @@ import {
   SidebarMenuSub,
   SidebarMenuSubButton,
   SidebarMenuSubItem,
+  SidebarRail,
 } from "@/components/ui/sidebar";
 
 type Thread = {
@@ -66,11 +67,11 @@ const projects: Project[] = [
 
 export function AppSidebar() {
   return (
-    <Sidebar>
-      <SidebarHeader className="border-b border-sidebar-border px-4 py-3">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-semibold tracking-tight">flowzen</span>
-        </div>
+    <Sidebar collapsible="icon">
+      <SidebarHeader className="h-12 flex-row items-center justify-start border-b border-sidebar-border px-4 py-0">
+        <span className="text-sm font-semibold tracking-tight [[data-collapsible=icon]_&]:hidden">
+          flowzen
+        </span>
       </SidebarHeader>
 
       <SidebarContent>
@@ -94,7 +95,7 @@ export function AppSidebar() {
                 >
                   <SidebarMenuItem>
                     <CollapsibleTrigger asChild>
-                      <SidebarMenuButton>
+                      <SidebarMenuButton tooltip={project.name}>
                         <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
                         <FolderIcon />
                         <span>{project.name}</span>
@@ -127,13 +128,14 @@ export function AppSidebar() {
       <SidebarFooter className="border-t border-sidebar-border">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton>
+            <SidebarMenuButton tooltip="Settings">
               <Settings />
               <span>Settings</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>
+      <SidebarRail />
     </Sidebar>
   );
 }
