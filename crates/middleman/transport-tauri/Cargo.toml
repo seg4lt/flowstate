@@ -1,0 +1,15 @@
+[package]
+name = "zenui-transport-tauri"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tauri = "2"
+zenui-daemon-core = { path = "../daemon-core" }
+zenui-provider-api = { path = "../../core/provider-api" }
+zenui-runtime-core = { path = "../../core/runtime-core" }
