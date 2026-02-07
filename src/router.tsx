@@ -13,9 +13,9 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
 import { ChatView } from "@/components/chat/chat-view";
-import { NewThreadPage } from "@/components/new-thread-page";
 
 const SIDEBAR_WIDTH_KEY = "flowzen:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -136,7 +136,17 @@ const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   component: function IndexPage() {
-    return <NewThreadPage />;
+    return (
+      <div className="flex h-full min-h-svh flex-col">
+        <header className="flex h-12 items-center gap-2 border-b border-border px-2 text-sm text-muted-foreground">
+          <SidebarTrigger />
+          <span>No active thread</span>
+        </header>
+        <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
+          Select a thread or create a new one to get started.
+        </div>
+      </div>
+    );
   },
 });
 

@@ -174,6 +174,32 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "session_model_updated": {
+      const sessions = new Map(state.sessions);
+      const s = sessions.get(event.session_id);
+      if (s) sessions.set(event.session_id, { ...s, model: event.model });
+      return { ...state, sessions };
+    }
+
+    case "session_archived": {
+      const sessions = new Map(state.sessions);
+      sessions.delete(event.session_id);
+      return {
+        ...state,
+        sessions,
+        activeSessionId:
+          state.activeSessionId === event.session_id
+            ? null
+            : state.activeSessionId,
+      };
+    }
+
+    case "session_unarchived": {
+      const sessions = new Map(state.sessions);
+      sessions.set(event.session.sessionId, event.session);
+      return { ...state, sessions };
+    }
+
     default:
       return state;
   }

@@ -1,10 +1,10 @@
 import { useNavigate } from "@tanstack/react-router";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronRight,
   FolderIcon,
   Plus,
   Settings,
-  ArrowUpDown,
   MessageSquare,
 } from "lucide-react";
 import {
@@ -30,6 +30,7 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
+import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import type { SessionSummary } from "@/lib/types";
 
 function formatTimeAgo(iso: string): string {
@@ -47,6 +48,7 @@ export function AppSidebar() {
   const { state, send } = useApp();
   const navigate = useNavigate();
 
+  // Group sessions by project
   const sessionsByProject = new Map<string | null, SessionSummary[]>();
   for (const session of state.sessions.values()) {
     const key = session.projectId ?? null;
@@ -54,8 +56,6 @@ export function AppSidebar() {
     list.push(session);
     sessionsByProject.set(key, list);
   }
-
-  // Sort sessions within each group by updatedAt descending
   for (const list of sessionsByProject.values()) {
     list.sort(
       (a, b) =>
@@ -63,23 +63,20 @@ export function AppSidebar() {
     );
   }
 
-  async function handleNewThread() {
-    const provider =
-      state.providers.find((p) => p.kind === "claude" && p.installed)?.kind ??
-      state.providers.find((p) => p.installed)?.kind ??
-      "claude";
-    const res = await send({ type: "start_session", provider });
-    if (res && res.type === "session_created") {
-      navigate({
-        to: "/chat/$sessionId",
-        params: { sessionId: res.session.sessionId },
-      });
-    }
+  async function handleAddFolder() {
+    const selected = await open({ directory: true, multiple: false });
+    if (!selected) return;
+    const path = typeof selected === "string" ? selected : selected[0];
+    if (!path) return;
+    const name = path.split("/").pop() ?? path;
+    await send({ type: "create_project", name });
   }
 
   function handleThreadClick(sessionId: string) {
     navigate({ to: "/chat/$sessionId", params: { sessionId } });
   }
+
+  const unassigned = sessionsByProject.get(null) ?? [];
 
   return (
     <Sidebar collapsible="icon">
@@ -92,36 +89,34 @@ export function AppSidebar() {
       <SidebarContent>
         <SidebarGroup>
           <SidebarGroupLabel>Projects</SidebarGroupLabel>
-          <SidebarGroupAction title="Sort projects">
-            <ArrowUpDown />
-            <span className="sr-only">Sort projects</span>
-          </SidebarGroupAction>
-          <SidebarGroupAction
-            title="New thread"
-            className="right-7"
-            onClick={handleNewThread}
-          >
+          <SidebarGroupAction title="Add folder" onClick={handleAddFolder}>
             <Plus />
-            <span className="sr-only">New thread</span>
+            <span className="sr-only">Add folder</span>
           </SidebarGroupAction>
           <SidebarGroupContent>
             <SidebarMenu>
               {state.projects.map((project) => {
-                const threads = sessionsByProject.get(project.projectId) ?? [];
+                const threads =
+                  sessionsByProject.get(project.projectId) ?? [];
                 return (
                   <Collapsible
                     key={project.projectId}
                     defaultOpen
                     className="group/collapsible"
                   >
-                    <SidebarMenuItem>
+                    <SidebarMenuItem className="group/project">
                       <CollapsibleTrigger asChild>
                         <SidebarMenuButton tooltip={project.name}>
                           <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
                           <FolderIcon />
-                          <span>{project.name}</span>
+                          <span className="flex-1 truncate">
+                            {project.name}
+                          </span>
                         </SidebarMenuButton>
                       </CollapsibleTrigger>
+                      <div className="absolute right-1 top-1">
+                        <ProviderDropdown projectId={project.projectId} />
+                      </div>
                       <CollapsibleContent>
                         <SidebarMenuSub>
                           {threads.map((session) => (
@@ -144,6 +139,13 @@ export function AppSidebar() {
                               </SidebarMenuSubButton>
                             </SidebarMenuSubItem>
                           ))}
+                          {threads.length === 0 && (
+                            <SidebarMenuSubItem>
+                              <span className="px-2 py-1 text-xs text-muted-foreground">
+                                No threads yet
+                              </span>
+                            </SidebarMenuSubItem>
+                          )}
                         </SidebarMenuSub>
                       </CollapsibleContent>
                     </SidebarMenuItem>
@@ -151,48 +153,52 @@ export function AppSidebar() {
                 );
               })}
 
-              {/* Unassigned sessions */}
-              {(() => {
-                const unassigned = sessionsByProject.get(null) ?? [];
-                if (unassigned.length === 0) return null;
-                return (
-                  <Collapsible defaultOpen className="group/collapsible">
-                    <SidebarMenuItem>
-                      <CollapsibleTrigger asChild>
-                        <SidebarMenuButton tooltip="Threads">
-                          <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
-                          <MessageSquare />
-                          <span>Threads</span>
-                        </SidebarMenuButton>
-                      </CollapsibleTrigger>
-                      <CollapsibleContent>
-                        <SidebarMenuSub>
-                          {unassigned.map((session) => (
-                            <SidebarMenuSubItem key={session.sessionId}>
-                              <SidebarMenuSubButton
-                                className="h-auto flex-col items-start gap-0.5 py-1.5"
-                                isActive={
-                                  state.activeSessionId === session.sessionId
-                                }
-                                onClick={() =>
-                                  handleThreadClick(session.sessionId)
-                                }
-                              >
-                                <span className="truncate text-sm">
-                                  {session.title || "New thread"}
-                                </span>
-                                <span className="text-xs text-muted-foreground">
-                                  {formatTimeAgo(session.updatedAt)}
-                                </span>
-                              </SidebarMenuSubButton>
-                            </SidebarMenuSubItem>
-                          ))}
-                        </SidebarMenuSub>
-                      </CollapsibleContent>
-                    </SidebarMenuItem>
-                  </Collapsible>
-                );
-              })()}
+              {/* Folder-less threads */}
+              <Collapsible defaultOpen className="group/collapsible">
+                <SidebarMenuItem className="group/project">
+                  <CollapsibleTrigger asChild>
+                    <SidebarMenuButton tooltip="Threads">
+                      <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                      <MessageSquare />
+                      <span className="flex-1 truncate">Threads</span>
+                    </SidebarMenuButton>
+                  </CollapsibleTrigger>
+                  <div className="absolute right-1 top-1">
+                    <ProviderDropdown />
+                  </div>
+                  <CollapsibleContent>
+                    <SidebarMenuSub>
+                      {unassigned.map((session) => (
+                        <SidebarMenuSubItem key={session.sessionId}>
+                          <SidebarMenuSubButton
+                            className="h-auto flex-col items-start gap-0.5 py-1.5"
+                            isActive={
+                              state.activeSessionId === session.sessionId
+                            }
+                            onClick={() =>
+                              handleThreadClick(session.sessionId)
+                            }
+                          >
+                            <span className="truncate text-sm">
+                              {session.title || "New thread"}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              {formatTimeAgo(session.updatedAt)}
+                            </span>
+                          </SidebarMenuSubButton>
+                        </SidebarMenuSubItem>
+                      ))}
+                      {unassigned.length === 0 && (
+                        <SidebarMenuSubItem>
+                          <span className="px-2 py-1 text-xs text-muted-foreground">
+                            No threads yet
+                          </span>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </SidebarMenuItem>
+              </Collapsible>
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

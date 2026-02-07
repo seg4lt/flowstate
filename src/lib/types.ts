@@ -188,7 +188,11 @@ export type ClientMessage =
   | { type: "create_project"; name: string }
   | { type: "rename_project"; project_id: string; name: string }
   | { type: "delete_project"; project_id: string }
-  | { type: "assign_session_to_project"; session_id: string; project_id?: string };
+  | { type: "assign_session_to_project"; session_id: string; project_id?: string }
+  | { type: "update_session_model"; session_id: string; model: string }
+  | { type: "archive_session"; session_id: string }
+  | { type: "unarchive_session"; session_id: string }
+  | { type: "list_archived_sessions" };
 
 export type ServerMessage =
   | { type: "welcome"; bootstrap: BootstrapPayload }
@@ -198,7 +202,8 @@ export type ServerMessage =
   | { type: "pong" }
   | { type: "ack"; message: string }
   | { type: "event"; event: RuntimeEvent }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "archived_sessions_list"; sessions: SessionSummary[] };
 
 export type RuntimeEvent =
   | { type: "runtime_ready"; message: string }
@@ -222,6 +227,9 @@ export type RuntimeEvent =
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }
+  | { type: "session_model_updated"; session_id: string; model: string }
+  | { type: "session_archived"; session_id: string }
+  | { type: "session_unarchived"; session: SessionSummary }
   | { type: "project_created"; project: ProjectRecord }
   | { type: "project_renamed"; project_id: string; name: string; updated_at: string }
   | { type: "project_deleted"; project_id: string; reassigned_session_ids: string[] }

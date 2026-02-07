@@ -6,6 +6,7 @@ import { connectStream, sendMessage } from "@/lib/api";
 import { MessageList } from "./message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionDialog } from "./permission-dialog";
+import { ModelSelector } from "./model-selector";
 
 interface PermissionRequest {
   requestId: string;
@@ -124,11 +125,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
         <SidebarTrigger />
         <span className="truncate font-medium">{title}</span>
-        {isRunning && (
-          <span className="ml-auto text-xs text-muted-foreground">
-            Running...
-          </span>
-        )}
+        <div className="ml-auto flex items-center gap-2">
+          {isRunning && (
+            <span className="text-xs text-muted-foreground">Running...</span>
+          )}
+          {session && (
+            <ModelSelector
+              sessionId={sessionId}
+              provider={session.provider}
+              currentModel={session.model}
+            />
+          )}
+        </div>
       </header>
 
       <MessageList
