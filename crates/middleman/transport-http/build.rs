@@ -37,15 +37,21 @@ fn main() {
         return;
     }
 
-    println!("cargo:warning=Building ZenUI frontend with Bun");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR missing"));
+    let bun_install_stamp = out_dir.join(".bun-install-stamp");
+    let pkg_json = frontend_dir.join("package.json");
+    let bun_lock = frontend_dir.join("bun.lock");
 
-    let install_args: &[&str] = if frontend_dir.join("bun.lock").exists() {
-        &["install", "--frozen-lockfile"]
-    } else {
-        &["install"]
-    };
+    if !is_stamp_fresh(&bun_install_stamp, &[&pkg_json, &bun_lock]) {
+        let install_args: &[&str] = if bun_lock.exists() {
+            &["install", "--frozen-lockfile"]
+        } else {
+            &["install"]
+        };
+        run_bun(&frontend_dir, install_args);
+        touch_stamp(&bun_install_stamp);
+    }
 
-    run_bun(&frontend_dir, install_args);
     run_bun(&frontend_dir, &["run", "build"]);
 }
 
@@ -102,4 +108,24 @@ fn run_bun(frontend_dir: &Path, args: &[&str]) {
             status
         );
     }
+}
+
+/// Returns `true` if `stamp` exists and is newer than every path in `sources`.
+fn is_stamp_fresh(stamp: &Path, sources: &[&Path]) -> bool {
+    let stamp_mtime = match fs::metadata(stamp).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    for src in sources {
+        match fs::metadata(src).and_then(|m| m.modified()) {
+            Ok(src_mtime) if src_mtime > stamp_mtime => return false,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn touch_stamp(stamp: &Path) {
+    fs::write(stamp, b"ok").expect("failed to write stamp file");
 }

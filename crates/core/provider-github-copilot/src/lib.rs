@@ -38,7 +38,6 @@ struct CopilotBridgeProcess {
     // main read loop. Mirrors the pattern in provider-claude-sdk/src/lib.rs.
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Lines<BufReader<ChildStdout>>,
-    next_request_id: u64,
     bridge_session_id: String,
 }
 
@@ -210,7 +209,6 @@ impl GitHubCopilotAdapter {
             child,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
-            next_request_id: 1,
             bridge_session_id: String::new(),
         };
 

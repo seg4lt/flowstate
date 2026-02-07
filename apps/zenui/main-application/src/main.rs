@@ -16,7 +16,7 @@ enum WindowCommand {
     Minimize,
     Maximize,
     Close,
-    Drag { x: f64, y: f64 },
+    Drag,
 }
 
 fn main() {
@@ -92,11 +92,7 @@ fn run() -> Result<()> {
                         "minimize" => Some(WindowCommand::Minimize),
                         "maximize" => Some(WindowCommand::Maximize),
                         "close" => Some(WindowCommand::Close),
-                        "drag" => {
-                            let x = data.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            let y = data.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                            Some(WindowCommand::Drag { x, y })
-                        }
+                        "drag" => Some(WindowCommand::Drag),
                         _ => None,
                     };
                     if let Some(command) = command {
@@ -131,7 +127,7 @@ fn run() -> Result<()> {
                 WindowCommand::Close => {
                     *control_flow = ControlFlow::Exit;
                 }
-                WindowCommand::Drag { .. } => {
+                WindowCommand::Drag => {
                     // Window dragging is handled by the drag_window API
                     // This command is a placeholder for future drag implementation
                     #[cfg(target_os = "macos")]
