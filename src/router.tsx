@@ -4,15 +4,18 @@ import {
   createRoute,
   createRouter,
   Outlet,
+  useParams,
 } from "@tanstack/react-router";
 import { AppSidebar } from "@/components/app-sidebar";
 import {
   SidebarInset,
   SidebarProvider,
-  SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { AppProvider } from "@/stores/app-store";
+import { ChatView } from "@/components/chat/chat-view";
+import { NewThreadPage } from "@/components/new-thread-page";
 
 const SIDEBAR_WIDTH_KEY = "flowzen:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -107,19 +110,21 @@ function AppLayout() {
   }, [width]);
 
   return (
-    <TooltipProvider>
-      <SidebarProvider
-        style={
-          { "--sidebar-width": `${width}px` } as React.CSSProperties
-        }
-      >
-        <AppSidebar />
-        <DragHandle width={width} onResize={setWidth} />
-        <SidebarInset>
-          <Outlet />
-        </SidebarInset>
-      </SidebarProvider>
-    </TooltipProvider>
+    <AppProvider>
+      <TooltipProvider>
+        <SidebarProvider
+          style={
+            { "--sidebar-width": `${width}px` } as React.CSSProperties
+          }
+        >
+          <AppSidebar />
+          <DragHandle width={width} onResize={setWidth} />
+          <SidebarInset>
+            <Outlet />
+          </SidebarInset>
+        </SidebarProvider>
+      </TooltipProvider>
+    </AppProvider>
   );
 }
 
@@ -131,21 +136,20 @@ const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   component: function IndexPage() {
-    return (
-      <div className="flex h-full min-h-svh flex-col">
-        <header className="flex h-12 items-center gap-2 border-b border-border px-2 text-sm text-muted-foreground">
-          <SidebarTrigger />
-          <span>No active thread</span>
-        </header>
-        <div className="flex flex-1 items-center justify-center p-8 text-sm text-muted-foreground">
-          Select a thread or create a new one to get started.
-        </div>
-      </div>
-    );
+    return <NewThreadPage />;
   },
 });
 
-const routeTree = rootRoute.addChildren([indexRoute]);
+const chatRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/chat/$sessionId",
+  component: function ChatPage() {
+    const { sessionId } = useParams({ from: "/chat/$sessionId" });
+    return <ChatView sessionId={sessionId} />;
+  },
+});
+
+const routeTree = rootRoute.addChildren([indexRoute, chatRoute]);
 
 export const router = createRouter({ routeTree });
 
