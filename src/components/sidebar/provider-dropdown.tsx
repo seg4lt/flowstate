@@ -1,16 +1,18 @@
 import { useNavigate } from "@tanstack/react-router";
-import { SquarePen } from "lucide-react";
+import { Loader2, SquarePen } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useApp } from "@/stores/app-store";
-import type { ProviderKind } from "@/lib/types";
+import type { ProviderKind, ProviderStatus } from "@/lib/types";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
   claude: "bg-amber-500",
@@ -20,6 +22,38 @@ const PROVIDER_COLORS: Record<ProviderKind, string> = {
   github_copilot_cli: "bg-cyan-500",
 };
 
+// Shown before health checks complete
+const ALL_PROVIDERS: { kind: ProviderKind; label: string }[] = [
+  { kind: "claude", label: "Claude" },
+  { kind: "claude_cli", label: "Claude (CLI)" },
+  { kind: "codex", label: "Codex" },
+  { kind: "github_copilot", label: "GitHub Copilot" },
+  { kind: "github_copilot_cli", label: "GitHub Copilot (CLI)" },
+];
+
+function statusBadge(provider: ProviderStatus | undefined) {
+  if (!provider) {
+    return (
+      <span className="ml-auto flex items-center gap-1 text-[10px] text-muted-foreground">
+        <Loader2 className="h-3 w-3 animate-spin" />
+      </span>
+    );
+  }
+  if (provider.status === "ready") return null;
+  if (provider.status === "warning") {
+    return (
+      <span className="ml-auto text-[10px] text-yellow-500">
+        {provider.message ?? "warning"}
+      </span>
+    );
+  }
+  return (
+    <span className="ml-auto text-[10px] text-muted-foreground">
+      {provider.message ?? "unavailable"}
+    </span>
+  );
+}
+
 interface ProviderDropdownProps {
   projectId?: string;
 }
@@ -28,7 +62,8 @@ export function ProviderDropdown({ projectId }: ProviderDropdownProps) {
   const { state, send } = useApp();
   const navigate = useNavigate();
 
-  const availableProviders = state.providers.filter((p) => p.installed);
+  const providerMap = new Map(state.providers.map((p) => [p.kind, p]));
+  const stillLoading = !state.ready;
 
   async function createThread(provider: ProviderKind, model?: string) {
     const res = await send({
@@ -56,47 +91,62 @@ export function ProviderDropdown({ projectId }: ProviderDropdownProps) {
           <SquarePen className="h-3.5 w-3.5" />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-56">
-        {availableProviders.map((provider) =>
-          provider.models.length > 0 ? (
-            <DropdownMenuSub key={provider.kind}>
-              <DropdownMenuSubTrigger>
-                <span
-                  className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[provider.kind]}`}
-                />
-                New {provider.label} thread
-              </DropdownMenuSubTrigger>
-              <DropdownMenuSubContent>
-                <DropdownMenuItem
-                  onClick={() => createThread(provider.kind)}
-                >
-                  Default model
-                </DropdownMenuItem>
-                {provider.models.map((model) => (
-                  <DropdownMenuItem
-                    key={model.value}
-                    onClick={() => createThread(provider.kind, model.value)}
-                  >
-                    {model.label}
+      <DropdownMenuContent align="end" className="w-64">
+        {stillLoading && (
+          <>
+            <DropdownMenuLabel className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Checking providers...
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+          </>
+        )}
+
+        {ALL_PROVIDERS.map(({ kind, label }) => {
+          const info = providerMap.get(kind);
+          const isReady = info?.status === "ready";
+          const hasModels = info && info.models.length > 0;
+
+          if (hasModels && isReady) {
+            return (
+              <DropdownMenuSub key={kind}>
+                <DropdownMenuSubTrigger>
+                  <span
+                    className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[kind]}`}
+                  />
+                  New {label} thread
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <DropdownMenuItem onClick={() => createThread(kind)}>
+                    Default model
                   </DropdownMenuItem>
-                ))}
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          ) : (
+                  {info.models.map((model) => (
+                    <DropdownMenuItem
+                      key={model.value}
+                      onClick={() => createThread(kind, model.value)}
+                    >
+                      {model.label}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            );
+          }
+
+          return (
             <DropdownMenuItem
-              key={provider.kind}
-              onClick={() => createThread(provider.kind)}
+              key={kind}
+              disabled={!isReady}
+              onClick={() => isReady && createThread(kind)}
             >
               <span
-                className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[provider.kind]}`}
+                className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${isReady ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"}`}
               />
-              New {provider.label} thread
+              New {label} thread
+              {statusBadge(info)}
             </DropdownMenuItem>
-          ),
-        )}
-        {availableProviders.length === 0 && (
-          <DropdownMenuItem disabled>No providers available</DropdownMenuItem>
-        )}
+          );
+        })}
       </DropdownMenuContent>
     </DropdownMenu>
   );
