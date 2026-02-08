@@ -227,6 +227,7 @@ export type RuntimeEvent =
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }
+  | { type: "provider_health_updated"; status: ProviderStatus }
   | { type: "session_model_updated"; session_id: string; model: string }
   | { type: "session_archived"; session_id: string }
   | { type: "session_unarchived"; session: SessionSummary }

@@ -174,6 +174,18 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "provider_health_updated": {
+      const exists = state.providers.some((p) => p.kind === event.status.kind);
+      return {
+        ...state,
+        providers: exists
+          ? state.providers.map((p) =>
+              p.kind === event.status.kind ? event.status : p,
+            )
+          : [...state.providers, event.status],
+      };
+    }
+
     case "session_model_updated": {
       const sessions = new Map(state.sessions);
       const s = sessions.get(event.session_id);

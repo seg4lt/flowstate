@@ -1,0 +1,80 @@
+---
+description: React component composition, state management, and code style guidelines for the flowzen frontend
+globs: "*.tsx, *.ts"
+alwaysApply: false
+---
+
+## Component Composition
+
+- Keep components small and single-purpose. If a component exceeds ~80 lines of JSX, split it.
+- Separate **container** components (data fetching, state, side effects) from **presentational** components (props in, JSX out).
+- Compose via props and children, not deeply nested internal logic. Prefer passing data down over reaching up.
+- No index.tsx barrel files. Import components directly by their file path.
+
+## File & Naming Conventions
+
+- **Files**: kebab-case (`message-bubble.tsx`, `chat-input.tsx`)
+- **Components**: PascalCase exports (`export function MessageBubble()`)
+- **Hooks**: `use-` prefix, kebab-case file (`use-mobile.ts`)
+- **Props**: Define a `Props` interface (or inline type) at the top of the file. Keep prop surface area minimal.
+
+## Directory Structure
+
+```
+src/
+  components/
+    chat/          # Feature-specific components
+    sidebar/       # Feature-specific components
+    ui/            # Shared shadcn/ui primitives only
+  stores/          # State management (context + reducer)
+  hooks/           # Custom hooks
+  lib/             # Types, utilities, API client
+```
+
+- Group components by feature, not by type.
+- `ui/` is reserved for reusable design-system primitives (shadcn/ui). Do not put feature logic here.
+
+## State Management
+
+- Global state lives in `stores/app-store.tsx` via React Context + `useReducer`.
+- Access state with `useApp()`. Mutations only via `dispatch`.
+- Keep local UI state (input values, toggles, expanded/collapsed) in `useState` at the component level.
+- Streaming/real-time state (`streamingTurns`) is kept separate from persistent session data.
+- State updates must be immutable. Always create new objects/Maps; never mutate in place.
+
+## Styling
+
+- Tailwind CSS utility classes only. No CSS modules, no styled-components, no inline `style` objects.
+- Use the `cn()` utility from `lib/utils` for conditional/merged classes.
+- Theme via CSS custom properties defined in `index.css`. Reference with Tailwind's `var()` syntax.
+- shadcn/ui components for all standard UI primitives (Button, Tooltip, DropdownMenu, etc.).
+
+## TypeScript
+
+- All components must be typed. No `any` unless absolutely unavoidable.
+- Shared domain types live in `lib/types.ts`. Keep this file as the single source of truth for backend-mirrored types.
+- Discriminated unions for messages and events (use `type` field). Match with exhaustive `switch/case`.
+- Props interfaces colocated with the component, not exported unless reused.
+
+## Hooks & Effects
+
+- `useEffect` cleanup is mandatory for subscriptions, listeners, and async operations. Use a `cancelled` flag for async effects.
+- Prefer `useRef` for values that don't trigger re-renders (scroll positions, mutable tracking flags).
+- Custom hooks go in `hooks/`. Extract a hook when the same stateful logic appears in 2+ components.
+- Do not create hooks for one-off logic that only exists in a single component.
+
+## Patterns to Follow
+
+- Functional components only. No class components.
+- Callbacks passed as props use clear verb names (`onSend`, `onInterrupt`, `onSelect`).
+- Comments only where intent isn't obvious from the code. No JSDoc on simple props or obvious functions.
+- Radix UI primitives for accessibility. Use semantic HTML and aria attributes.
+- Controlled inputs: component owns its value via `useState`, calls parent callback on submit.
+
+## Anti-patterns to Avoid
+
+- Monolithic components that handle data fetching, state, and rendering in one file.
+- Prop drilling more than 2 levels deep. Extract a context or restructure the component tree.
+- `useEffect` for derived state. Use `useMemo` or compute inline.
+- Premature abstraction. Three similar lines is fine; don't create a helper until the pattern repeats meaningfully.
+- Direct DOM manipulation outside of refs for measurement/focus.
