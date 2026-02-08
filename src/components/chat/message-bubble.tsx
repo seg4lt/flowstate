@@ -25,7 +25,7 @@ export function MessageBubble({ turn }: MessageBubbleProps) {
       )}
 
       {/* Tool calls */}
-      {turn.toolCalls.length > 0 && (
+      {turn.toolCalls && turn.toolCalls.length > 0 && (
         <div className="space-y-2 pl-2">
           {turn.toolCalls.map((tc) => (
             <ToolCallCard key={tc.callId} toolCall={tc} />

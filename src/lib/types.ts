@@ -93,9 +93,9 @@ export interface TurnRecord {
   createdAt: string;
   updatedAt: string;
   reasoning?: string;
-  toolCalls: ToolCall[];
-  fileChanges: FileChangeRecord[];
-  subagents: SubagentRecord[];
+  toolCalls?: ToolCall[];
+  fileChanges?: FileChangeRecord[];
+  subagents?: SubagentRecord[];
   plan?: PlanRecord;
   permissionMode?: PermissionMode;
   reasoningEffort?: ReasoningEffort;
