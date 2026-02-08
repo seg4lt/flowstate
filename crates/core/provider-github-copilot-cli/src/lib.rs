@@ -836,34 +836,22 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             }
         };
 
-        // Ping.
-        let ping_ok = tokio::time::timeout(
-            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
-            process.call("ping", serde_json::json!({})),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .is_some();
+        // Run all three RPC calls concurrently — they have no data dependencies.
+        let timeout = std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS);
+        let (ping_raw, status_raw, auth_raw) = tokio::join!(
+            tokio::time::timeout(timeout, process.call("ping", serde_json::json!({}))),
+            tokio::time::timeout(timeout, process.call("status.get", serde_json::json!({}))),
+            tokio::time::timeout(timeout, process.call("auth.getStatus", serde_json::json!({}))),
+        );
 
-        // Version.
-        let version = tokio::time::timeout(
-            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
-            process.call("status.get", serde_json::json!({})),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string));
+        let ping_ok = ping_raw.ok().and_then(|r| r.ok()).is_some();
 
-        // Auth status.
-        let auth_result = tokio::time::timeout(
-            std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
-            process.call("auth.getStatus", serde_json::json!({})),
-        )
-        .await
-        .ok()
-        .and_then(|r| r.ok());
+        let version = status_raw
+            .ok()
+            .and_then(|r| r.ok())
+            .and_then(|v| v.get("version").and_then(Value::as_str).map(str::to_string));
+
+        let auth_result = auth_raw.ok().and_then(|r| r.ok());
 
         let authenticated = auth_result
             .as_ref()

@@ -603,6 +603,22 @@ function applyRuntimeEvent(prev: AppState, event: RuntimeEvent): AppState {
         lastAction: `Refreshed ${event.provider} models (${event.models.length})`,
       };
     }
+    case "provider_health_updated": {
+      if (!prev.bootstrap) return prev;
+      const exists = prev.bootstrap.providers.some(
+        (p) => p.kind === event.status.kind,
+      );
+      const providers = exists
+        ? prev.bootstrap.providers.map((p) =>
+            p.kind === event.status.kind ? event.status : p,
+          )
+        : [...prev.bootstrap.providers, event.status];
+      return {
+        ...prev,
+        bootstrap: { ...prev.bootstrap, providers },
+        lastAction: `Health check completed for ${event.status.kind}`,
+      };
+    }
     case "project_created": {
       return {
         ...prev,

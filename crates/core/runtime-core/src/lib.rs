@@ -2,13 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
-use futures::future::join_all;
 use tokio::sync::{Mutex, broadcast};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, FileChangeRecord, PermissionDecision,
-    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
+    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
     ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail, SessionStatus,
     SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
     UserInputAnswer,
@@ -80,6 +79,9 @@ pub struct RuntimeCore {
     /// path (HTTP + WebSocket) from spawning two parallel fetches per provider
     /// on a fresh connection.
     in_flight_model_fetches: Arc<Mutex<HashSet<ProviderKind>>>,
+    /// Providers with an in-flight health check. Prevents duplicate health
+    /// checks when multiple transports bootstrap near-simultaneously.
+    in_flight_health_checks: Arc<Mutex<HashSet<ProviderKind>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
@@ -135,6 +137,7 @@ impl RuntimeCore {
             persistence,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
+            in_flight_health_checks: Arc::new(Mutex::new(HashSet::new())),
             turn_observer,
         }
     }
@@ -234,15 +237,49 @@ impl RuntimeCore {
     }
 
     pub async fn bootstrap(&self, ws_url: String) -> BootstrapPayload {
-        let mut providers: Vec<ProviderStatus> =
-            join_all(self.adapters.values().map(|adapter| adapter.health())).await;
+        // Spawn each provider health check independently — results arrive as
+        // ProviderHealthUpdated events. The dedup guard prevents duplicate
+        // checks when multiple transports bootstrap near-simultaneously.
+        for &kind in self.adapters.keys() {
+            self.spawn_health_check(kind);
+        }
 
-        // Merge cached models into ProviderStatus.models. If a provider has no
-        // cache or the cache is stale, kick off a background refresh that will
-        // broadcast a ProviderModelsUpdated event when it completes.
-        for status in providers.iter_mut() {
-            let kind = status.kind;
-            match self.persistence.get_cached_models(kind).await {
+        BootstrapPayload {
+            app_name: "zenui".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            ws_url,
+            providers: vec![],
+            snapshot: self.snapshot().await,
+        }
+    }
+
+    /// Background health-check for one provider. Merges cached models into the
+    /// result, kicks off a model refresh if stale, and broadcasts a
+    /// `ProviderHealthUpdated` event when done. Deduped per provider.
+    fn spawn_health_check(&self, kind: ProviderKind) {
+        let Some(adapter) = self.adapters.get(&kind).cloned() else {
+            return;
+        };
+        let persistence = self.persistence.clone();
+        let event_tx = self.event_tx.clone();
+        let in_flight = self.in_flight_health_checks.clone();
+        let in_flight_models = self.in_flight_model_fetches.clone();
+
+        tokio::spawn(async move {
+            // Dedupe: skip if another health check for this provider is running.
+            {
+                let mut guard = in_flight.lock().await;
+                if guard.contains(&kind) {
+                    tracing::debug!(?kind, "skipping duplicate health check");
+                    return;
+                }
+                guard.insert(kind);
+            }
+
+            let mut status = adapter.health().await;
+
+            // Merge cached models into the result.
+            let needs_refresh = match persistence.get_cached_models(kind).await {
                 Some((fetched_at, cached)) => {
                     tracing::info!(
                         ?kind,
@@ -251,10 +288,7 @@ impl RuntimeCore {
                         "loaded cached provider models"
                     );
                     status.models = cached;
-                    if is_cache_stale(&fetched_at) {
-                        tracing::info!(?kind, "model cache stale, refreshing in background");
-                        self.spawn_model_refresh(kind);
-                    }
+                    is_cache_stale(&fetched_at)
                 }
                 None => {
                     tracing::info!(
@@ -262,72 +296,47 @@ impl RuntimeCore {
                         fallback_count = status.models.len(),
                         "no cached models, using hardcoded fallback and refreshing"
                     );
-                    self.spawn_model_refresh(kind);
+                    true
                 }
-            }
-        }
+            };
 
-        BootstrapPayload {
-            app_name: "zenui".to_string(),
-            generated_at: Utc::now().to_rfc3339(),
-            ws_url,
-            providers,
-            snapshot: self.snapshot().await,
-        }
+            if needs_refresh {
+                spawn_model_refresh_detached(
+                    kind,
+                    adapter.clone(),
+                    persistence,
+                    event_tx.clone(),
+                    in_flight_models,
+                );
+            }
+
+            let _ = event_tx.send(RuntimeEvent::ProviderHealthUpdated {
+                status,
+            });
+
+            // Release the in-flight slot.
+            {
+                let mut guard = in_flight.lock().await;
+                guard.remove(&kind);
+            }
+        });
     }
 
     /// Background-fetch the model list for one provider, persist it, and
     /// broadcast a ProviderModelsUpdated event so connected clients can update.
     /// Deduped per provider — repeated calls while a fetch is in flight are
     /// ignored. Errors are logged and swallowed (cached/hardcoded list stays).
-    fn spawn_model_refresh(self: &Self, kind: ProviderKind) {
+    fn spawn_model_refresh(&self, kind: ProviderKind) {
         let Some(adapter) = self.adapters.get(&kind).cloned() else {
             return;
         };
-        let persistence = self.persistence.clone();
-        let event_tx = self.event_tx.clone();
-        let in_flight = self.in_flight_model_fetches.clone();
-
-        tokio::spawn(async move {
-            // Dedupe: skip if another refresh for this provider is already running.
-            {
-                let mut guard = in_flight.lock().await;
-                if guard.contains(&kind) {
-                    tracing::debug!(?kind, "skipping duplicate model refresh");
-                    return;
-                }
-                guard.insert(kind);
-            }
-
-            let result = adapter.fetch_models().await;
-
-            // Always release the in-flight slot, regardless of outcome.
-            {
-                let mut guard = in_flight.lock().await;
-                guard.remove(&kind);
-            }
-
-            match result {
-                Ok(models) if !models.is_empty() => {
-                    tracing::info!(
-                        ?kind,
-                        count = models.len(),
-                        "fetched provider models, persisting and broadcasting"
-                    );
-                    persistence.set_cached_models(kind, &models).await;
-                    let _ = event_tx.send(RuntimeEvent::ProviderModelsUpdated {
-                        provider: kind,
-                        models,
-                    });
-                }
-                Ok(_) => {
-                    tracing::debug!(?kind, "fetch_models returned empty list");
-                }
-                Err(e) => {
-                    tracing::warn!(?kind, "fetch_models failed: {e}");
-                }
-            }
-        });
+        spawn_model_refresh_detached(
+            kind,
+            adapter,
+            self.persistence.clone(),
+            self.event_tx.clone(),
+            self.in_flight_model_fetches.clone(),
+        );
     }
 
     pub async fn handle_client_message(&self, message: ClientMessage) -> Option<ServerMessage> {
@@ -1115,6 +1124,57 @@ impl RuntimeCore {
 
         Ok(format!("Session {session_id} deleted."))
     }
+}
+
+/// Standalone model-refresh spawner, usable from both `RuntimeCore::spawn_model_refresh`
+/// and from within already-spawned tasks (like `spawn_health_check`) that don't have `&self`.
+fn spawn_model_refresh_detached(
+    kind: ProviderKind,
+    adapter: Arc<dyn ProviderAdapter>,
+    persistence: Arc<PersistenceService>,
+    event_tx: broadcast::Sender<RuntimeEvent>,
+    in_flight: Arc<Mutex<HashSet<ProviderKind>>>,
+) {
+    tokio::spawn(async move {
+        // Dedupe: skip if another refresh for this provider is already running.
+        {
+            let mut guard = in_flight.lock().await;
+            if guard.contains(&kind) {
+                tracing::debug!(?kind, "skipping duplicate model refresh");
+                return;
+            }
+            guard.insert(kind);
+        }
+
+        let result = adapter.fetch_models().await;
+
+        // Always release the in-flight slot, regardless of outcome.
+        {
+            let mut guard = in_flight.lock().await;
+            guard.remove(&kind);
+        }
+
+        match result {
+            Ok(models) if !models.is_empty() => {
+                tracing::info!(
+                    ?kind,
+                    count = models.len(),
+                    "fetched provider models, persisting and broadcasting"
+                );
+                persistence.set_cached_models(kind, &models).await;
+                let _ = event_tx.send(RuntimeEvent::ProviderModelsUpdated {
+                    provider: kind,
+                    models,
+                });
+            }
+            Ok(_) => {
+                tracing::debug!(?kind, "fetch_models returned empty list");
+            }
+            Err(e) => {
+                tracing::warn!(?kind, "fetch_models failed: {e}");
+            }
+        }
+    });
 }
 
 /// Returns true if the ISO-8601 `fetched_at` timestamp is older than the model

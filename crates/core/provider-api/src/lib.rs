@@ -683,6 +683,9 @@ pub enum RuntimeEvent {
         provider: ProviderKind,
         models: Vec<ProviderModel>,
     },
+    ProviderHealthUpdated {
+        status: ProviderStatus,
+    },
     ProjectCreated {
         project: ProjectRecord,
     },

@@ -262,6 +262,7 @@ export type RuntimeEvent =
       provider: ProviderKind;
       models: ProviderModel[];
     }
+  | { type: "provider_health_updated"; status: ProviderStatus }
   | { type: "project_created"; project: ProjectRecord }
   | { type: "project_renamed"; project_id: string; name: string; updated_at: string }
   | {
