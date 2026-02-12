@@ -143,7 +143,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   ) : null;
 
   return (
-    <div className="flex h-full min-h-svh flex-col">
+    <div className="flex h-svh flex-col">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
         <SidebarTrigger />
         <span className="truncate font-medium">{title}</span>

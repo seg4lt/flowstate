@@ -56,7 +56,7 @@ export function MessageList({ turns, streaming, loading }: MessageListProps) {
   }
 
   return (
-    <div ref={containerRef} className="flex-1 overflow-y-auto">
+    <div ref={containerRef} className="min-h-0 flex-1 overflow-y-auto">
       <div className="mx-auto max-w-3xl space-y-4 p-4">
         {turns.map((turn) => (
           <MessageBubble key={turn.turnId} turn={turn} />

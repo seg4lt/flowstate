@@ -137,7 +137,7 @@ const indexRoute = createRoute({
   path: "/",
   component: function IndexPage() {
     return (
-      <div className="flex h-full min-h-svh flex-col">
+      <div className="flex h-svh flex-col">
         <header className="flex h-12 items-center gap-2 border-b border-border px-2 text-sm text-muted-foreground">
           <SidebarTrigger />
           <span>No active thread</span>
