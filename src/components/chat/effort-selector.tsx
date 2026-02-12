@@ -1,11 +1,9 @@
-import { ChevronDown } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { Check, ChevronDown } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { ReasoningEffort } from "@/lib/types";
@@ -29,23 +27,29 @@ export function EffortSelector({ value, onChange }: EffortSelectorProps) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="xs">
-          {currentLabel}
-          <ChevronDown className="ml-0.5 h-3 w-3 text-muted-foreground" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent side="top" align="start" className="min-w-36">
-        <DropdownMenuLabel>Effort</DropdownMenuLabel>
-        <DropdownMenuRadioGroup
-          value={value}
-          onValueChange={(v) => onChange(v as ReasoningEffort)}
+        <button
+          type="button"
+          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-accent"
         >
-          {EFFORT_OPTIONS.map((option) => (
-            <DropdownMenuRadioItem key={option.value} value={option.value}>
-              {option.label}
-            </DropdownMenuRadioItem>
-          ))}
-        </DropdownMenuRadioGroup>
+          {currentLabel}
+          <ChevronDown className="h-3 w-3 text-muted-foreground" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-36">
+        <DropdownMenuLabel>Effort</DropdownMenuLabel>
+        {EFFORT_OPTIONS.map((option) => (
+          <DropdownMenuItem
+            key={option.value}
+            onClick={() => onChange(option.value)}
+          >
+            {value === option.value ? (
+              <Check className="mr-2 h-3 w-3" />
+            ) : (
+              <span className="mr-2 w-3" />
+            )}
+            {option.label}
+          </DropdownMenuItem>
+        ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );

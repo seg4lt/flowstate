@@ -6,6 +6,7 @@ import { StreamingText } from "./streaming-text";
 interface StreamingTurn {
   turnId: string;
   accumulatedOutput: string;
+  accumulatedReasoning: string;
 }
 
 interface MessageListProps {
@@ -37,7 +38,7 @@ export function MessageList({ turns, streaming, loading }: MessageListProps) {
     if (shouldAutoScrollRef.current) {
       endRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [turns, streaming?.accumulatedOutput]);
+  }, [turns, streaming?.accumulatedOutput, streaming?.accumulatedReasoning]);
 
   if (loading) {
     return (
@@ -63,7 +64,10 @@ export function MessageList({ turns, streaming, loading }: MessageListProps) {
         ))}
 
         {streaming && (
-          <StreamingText content={streaming.accumulatedOutput} />
+          <StreamingText
+            content={streaming.accumulatedOutput}
+            reasoning={streaming.accumulatedReasoning}
+          />
         )}
 
         <div ref={endRef} />

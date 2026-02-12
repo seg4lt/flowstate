@@ -12,6 +12,7 @@ import type {
 interface StreamingTurn {
   turnId: string;
   accumulatedOutput: string;
+  accumulatedReasoning: string;
 }
 
 interface AppState {
@@ -109,15 +110,30 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       streaming.set(event.session_id, {
         turnId: event.turn.turnId,
         accumulatedOutput: "",
+        accumulatedReasoning: "",
+      });
+      return { ...state, streamingTurns: streaming };
+    }
+
+    case "reasoning_delta": {
+      const streaming = new Map(state.streamingTurns);
+      const existing = streaming.get(event.session_id);
+      streaming.set(event.session_id, {
+        turnId: event.turn_id,
+        accumulatedOutput: existing?.accumulatedOutput ?? "",
+        accumulatedReasoning:
+          (existing?.accumulatedReasoning ?? "") + event.delta,
       });
       return { ...state, streamingTurns: streaming };
     }
 
     case "content_delta": {
       const streaming = new Map(state.streamingTurns);
+      const existing = streaming.get(event.session_id);
       streaming.set(event.session_id, {
         turnId: event.turn_id,
         accumulatedOutput: event.accumulated_output,
+        accumulatedReasoning: existing?.accumulatedReasoning ?? "",
       });
       return { ...state, streamingTurns: streaming };
     }
