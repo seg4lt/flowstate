@@ -6,6 +6,7 @@ interface ChatInputProps {
   onInterrupt: () => void;
   isRunning: boolean;
   disabled: boolean;
+  toolbar?: React.ReactNode;
 }
 
 export function ChatInput({
@@ -13,6 +14,7 @@ export function ChatInput({
   onInterrupt,
   isRunning,
   disabled,
+  toolbar,
 }: ChatInputProps) {
   const [value, setValue] = React.useState("");
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
@@ -42,40 +44,43 @@ export function ChatInput({
   }
 
   return (
-    <div className="shrink-0 border-t border-border p-3">
-      <div className="mx-auto flex max-w-3xl items-end gap-2">
-        <textarea
-          ref={textareaRef}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          onInput={handleInput}
-          placeholder="Send a message..."
-          disabled={disabled}
-          rows={1}
-          className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-        />
+    <div className="shrink-0 border-t border-border px-3 pb-2 pt-3">
+      <div className="mx-auto max-w-3xl">
+        <div className="flex items-end gap-2">
+          <textarea
+            ref={textareaRef}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onInput={handleInput}
+            placeholder="Send a message..."
+            disabled={disabled}
+            rows={1}
+            className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+          />
 
-        {isRunning ? (
-          <button
-            type="button"
-            onClick={onInterrupt}
-            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            title="Interrupt"
-          >
-            <Square className="h-4 w-4" />
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={handleSubmit}
-            disabled={!value.trim() || disabled}
-            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
-            title="Send"
-          >
-            <Send className="h-4 w-4" />
-          </button>
-        )}
+          {isRunning ? (
+            <button
+              type="button"
+              onClick={onInterrupt}
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              title="Interrupt"
+            >
+              <Square className="h-4 w-4" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={!value.trim() || disabled}
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
+              title="Send"
+            >
+              <Send className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+        {toolbar && <div className="mt-1.5">{toolbar}</div>}
       </div>
     </div>
   );

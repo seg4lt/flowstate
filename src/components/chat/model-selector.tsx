@@ -1,4 +1,5 @@
 import { ChevronDown, Check } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -39,15 +40,12 @@ export function ModelSelector({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2 py-1 text-xs hover:bg-accent"
-        >
+        <Button variant="ghost" size="xs">
           {currentLabel}
-          <ChevronDown className="h-3 w-3 text-muted-foreground" />
-        </button>
+          <ChevronDown className="ml-0.5 h-3 w-3 text-muted-foreground" />
+        </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
+      <DropdownMenuContent side="top" align="start" className="min-w-36">
         {models.map((model) => (
           <DropdownMenuItem
             key={model.value}

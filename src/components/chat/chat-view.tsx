@@ -1,12 +1,18 @@
 import * as React from "react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
-import type { PermissionDecision, TurnRecord } from "@/lib/types";
+import type {
+  PermissionDecision,
+  PermissionMode,
+  ReasoningEffort,
+  TurnRecord,
+} from "@/lib/types";
 import { connectStream, sendMessage } from "@/lib/api";
 import { MessageList } from "./message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionDialog } from "./permission-dialog";
-import { ModelSelector } from "./model-selector";
+import { ChatToolbar } from "./chat-toolbar";
+import { HeaderActions } from "./header-actions";
 
 interface PermissionRequest {
   requestId: string;
@@ -21,6 +27,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [loading, setLoading] = React.useState(true);
   const [pendingPermission, setPendingPermission] =
     React.useState<PermissionRequest | null>(null);
+  const [effort, setEffort] = React.useState<ReasoningEffort>("high");
+  const [permissionMode, setPermissionMode] =
+    React.useState<PermissionMode>("accept_edits");
 
   const session = state.sessions.get(sessionId);
   const streaming = state.streamingTurns.get(sessionId);
@@ -98,7 +107,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       type: "send_turn",
       session_id: sessionId,
       input,
-      permission_mode: "accept_edits",
+      permission_mode: permissionMode,
+      reasoning_effort: effort,
     });
   }
 
@@ -120,6 +130,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const isRunning = session?.status === "running";
   const title = session?.title || "New thread";
 
+  const toolbar = session ? (
+    <ChatToolbar
+      sessionId={sessionId}
+      provider={session.provider}
+      currentModel={session.model}
+      effort={effort}
+      onEffortChange={setEffort}
+      permissionMode={permissionMode}
+      onPermissionModeChange={setPermissionMode}
+    />
+  ) : null;
+
   return (
     <div className="flex h-full min-h-svh flex-col">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
@@ -129,13 +151,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           {isRunning && (
             <span className="text-xs text-muted-foreground">Running...</span>
           )}
-          {session && (
-            <ModelSelector
-              sessionId={sessionId}
-              provider={session.provider}
-              currentModel={session.model}
-            />
-          )}
+          <HeaderActions />
         </div>
       </header>
 
@@ -150,6 +166,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         onInterrupt={handleInterrupt}
         isRunning={isRunning}
         disabled={loading}
+        toolbar={toolbar}
       />
 
       {pendingPermission && (
