@@ -1,7 +1,7 @@
 mod bridge_runtime;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -20,6 +20,14 @@ use zenui_provider_api::{
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 600_000;
+
+fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
+    session
+        .cwd
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
 
 /// Result of asking the user a question: either they answered or dismissed.
 /// Carried over the writer-task channel so the bridge can be told which
@@ -280,7 +288,9 @@ impl ClaudeSdkAdapter {
             .as_ref()
             .and_then(|state| state.native_thread_id.clone());
         let request = BridgeRequest::CreateSession {
-            cwd: self.working_directory.display().to_string(),
+            cwd: session_cwd(session, &self.working_directory)
+                .display()
+                .to_string(),
             model: session.summary.model.clone(),
             resume_session_id,
         };

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,6 +17,14 @@ use zenui_provider_api::{
 };
 
 const TURN_TIMEOUT_SECS: u64 = 600;
+
+fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
+    session
+        .cwd
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
 
 // ── subprocess handle ────────────────────────────────────────────────────────
 
@@ -191,9 +199,10 @@ impl ClaudeCliAdapter {
 
         info!("Spawning claude CLI: {} {:?}", binary, args);
 
+        let cwd = session_cwd(session, &self.working_directory);
         let mut child = Command::new(&binary)
             .args(&args)
-            .current_dir(&self.working_directory)
+            .current_dir(&cwd)
             .env("CLAUDE_CODE_ENTRYPOINT", "zenui")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")

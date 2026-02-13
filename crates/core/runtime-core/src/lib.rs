@@ -75,6 +75,8 @@ pub struct RuntimeCore {
     orchestration: Arc<OrchestrationService>,
     persistence: Arc<PersistenceService>,
     active_sinks: Arc<Mutex<HashMap<String, TurnEventSink>>>,
+    /// Default working directory for sessions without a project path.
+    default_threads_dir: String,
     /// Providers with an in-flight model fetch. Prevents the dual bootstrap
     /// path (HTTP + WebSocket) from spawning two parallel fetches per provider
     /// on a fresh connection.
@@ -120,6 +122,7 @@ impl RuntimeCore {
         orchestration: Arc<OrchestrationService>,
         persistence: Arc<PersistenceService>,
         turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
+        default_threads_dir: String,
     ) -> Self {
         let adapters = adapters
             .into_iter()
@@ -136,6 +139,7 @@ impl RuntimeCore {
             orchestration,
             persistence,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
+            default_threads_dir,
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
             in_flight_health_checks: Arc::new(Mutex::new(HashSet::new())),
             turn_observer,
@@ -163,6 +167,7 @@ impl RuntimeCore {
                 summary,
                 turns: Vec::new(),
                 provider_state: None,
+                cwd: None,
             })
             .collect();
         AppSnapshot {
@@ -441,8 +446,8 @@ impl RuntimeCore {
                     message: format!("Refreshing models for {}.", provider.label()),
                 })
             }
-            ClientMessage::CreateProject { name } => {
-                match self.persistence.create_project(name).await {
+            ClientMessage::CreateProject { name, path } => {
+                match self.persistence.create_project(name, path).await {
                     Some(project) => {
                         self.publish(RuntimeEvent::ProjectCreated {
                             project: project.clone(),
@@ -651,6 +656,18 @@ impl RuntimeCore {
         Err(format!("Unknown plan `{plan_id}`."))
     }
 
+    async fn resolve_session_cwd(&self, session: &mut SessionDetail) {
+        if let Some(ref project_id) = session.summary.project_id {
+            if let Some(project) = self.persistence.get_project(project_id).await {
+                if let Some(path) = project.path {
+                    session.cwd = Some(path);
+                    return;
+                }
+            }
+        }
+        session.cwd = Some(self.default_threads_dir.clone());
+    }
+
     async fn start_session(
         &self,
         provider: ProviderKind,
@@ -675,6 +692,7 @@ impl RuntimeCore {
             .orchestration
             .create_session(provider, title, model, project_id);
         tracing::info!("Session created in orchestration, calling adapter.start_session");
+        self.resolve_session_cwd(&mut session).await;
 
         match adapter.start_session(&session).await {
             Ok(provider_state) => {
@@ -711,6 +729,7 @@ impl RuntimeCore {
             .get_session(&session_id)
             .await
             .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        self.resolve_session_cwd(&mut session).await;
         let adapter = self
             .adapters
             .get(&session.summary.provider)
@@ -1247,6 +1266,7 @@ mod tests {
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
+            "/tmp/zenui-test/threads".to_string(),
         );
 
         let response = runtime
@@ -1342,6 +1362,7 @@ mod tests {
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
+            "/tmp/zenui-test/threads".to_string(),
         );
 
         runtime
@@ -1400,6 +1421,7 @@ mod tests {
             Arc::new(OrchestrationService::new()),
             persistence.clone(),
             None,
+            "/tmp/zenui-test/threads".to_string(),
         );
 
         // Create a session and hand-stamp it as Running to simulate a prior

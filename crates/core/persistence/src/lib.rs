@@ -263,7 +263,7 @@ impl PersistenceService {
     pub async fn list_projects(&self) -> Vec<ProjectRecord> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = match connection.prepare(
-            "SELECT project_id, name, created_at, updated_at, sort_order
+            "SELECT project_id, name, path, created_at, updated_at, sort_order
              FROM projects
              ORDER BY sort_order ASC, created_at ASC",
         ) {
@@ -274,9 +274,10 @@ impl PersistenceService {
             Ok(ProjectRecord {
                 project_id: row.get(0)?,
                 name: row.get(1)?,
-                created_at: row.get(2)?,
-                updated_at: row.get(3)?,
-                sort_order: row.get(4)?,
+                path: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                sort_order: row.get(5)?,
             })
         });
         match rows {
@@ -285,7 +286,30 @@ impl PersistenceService {
         }
     }
 
-    pub async fn create_project(&self, name: String) -> Option<ProjectRecord> {
+    pub async fn get_project(&self, project_id: &str) -> Option<ProjectRecord> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT project_id, name, path, created_at, updated_at, sort_order
+                 FROM projects WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(ProjectRecord {
+                        project_id: row.get(0)?,
+                        name: row.get(1)?,
+                        path: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        sort_order: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub async fn create_project(&self, name: String, path: Option<String>) -> Option<ProjectRecord> {
         let trimmed = name.trim().to_string();
         if trimmed.is_empty() {
             return None;
@@ -302,9 +326,9 @@ impl PersistenceService {
             )
             .unwrap_or(0);
         let result = connection.execute(
-            "INSERT INTO projects (project_id, name, created_at, updated_at, sort_order)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![project_id, trimmed, now, now, next_order],
+            "INSERT INTO projects (project_id, name, path, created_at, updated_at, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![project_id, trimmed, path, now, now, next_order],
         );
         if result.is_err() {
             return None;
@@ -312,6 +336,7 @@ impl PersistenceService {
         Some(ProjectRecord {
             project_id,
             name: trimmed,
+            path,
             created_at: now.clone(),
             updated_at: now,
             sort_order: next_order,
@@ -442,6 +467,7 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN plan_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN permission_mode TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_effort TEXT", []);
+        let _ = connection.execute("ALTER TABLE projects ADD COLUMN path TEXT", []);
 
         // Archived session/turn tables — same schema, plus archived_at timestamp.
         let _ = connection.execute_batch(
@@ -711,6 +737,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
         summary,
         turns,
         provider_state,
+        cwd: None,
     }))
 }
 

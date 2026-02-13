@@ -292,6 +292,8 @@ pub struct TurnRecord {
 pub struct ProjectRecord {
     pub project_id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub sort_order: i32,
@@ -329,6 +331,10 @@ pub struct SessionDetail {
     pub turns: Vec<TurnRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_state: Option<ProviderSessionState>,
+    /// Transient working directory resolved by RuntimeCore before adapter calls.
+    /// Not persisted in the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl SessionDetail {
@@ -780,6 +786,8 @@ pub enum ClientMessage {
     },
     CreateProject {
         name: String,
+        #[serde(default)]
+        path: Option<String>,
     },
     RenameProject {
         project_id: String,

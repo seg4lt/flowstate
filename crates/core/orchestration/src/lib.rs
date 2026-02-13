@@ -42,6 +42,7 @@ impl OrchestrationService {
             },
             turns: Vec::new(),
             provider_state: None,
+            cwd: None,
         }
     }
 

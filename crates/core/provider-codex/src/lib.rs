@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,6 +16,14 @@ use zenui_provider_api::{
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
+
+fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
+    session
+        .cwd
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
 const RECOVERABLE_THREAD_RESUME_ERRORS: &[&str] = &[
     "not found",
     "missing thread",
@@ -108,9 +116,10 @@ impl CodexAdapter {
         session: &SessionDetail,
         permission_mode: PermissionMode,
     ) -> Result<CodexSessionProcess, String> {
+        let cwd = session_cwd(session, &self.working_directory);
         let mut child = Command::new(&self.binary_path)
             .arg("app-server")
-            .current_dir(&self.working_directory)
+            .current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -155,7 +164,7 @@ impl CodexAdapter {
         let (approval_policy, sandbox) = map_permission_mode(permission_mode);
         let mut base_params = json!({
             "approvalPolicy": approval_policy,
-            "cwd": self.working_directory.display().to_string(),
+            "cwd": cwd.display().to_string(),
             "personality": "pragmatic",
             "sandbox": sandbox,
         });

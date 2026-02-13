@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -18,6 +18,14 @@ use zenui_provider_api::{
 
 const TURN_TIMEOUT_SECS: u64 = 600;
 const HEALTH_TIMEOUT_SECS: u64 = 10;
+
+fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
+    session
+        .cwd
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
 
 // ── JSON-RPC 2.0 framing ─────────────────────────────────────────────────────
 //
@@ -952,7 +960,8 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
         let binary = Self::find_copilot_binary();
-        let process = Self::spawn_process(&binary, &self.working_directory).await?;
+        let resolved_cwd = session_cwd(session, &self.working_directory);
+        let process = Self::spawn_process(&binary, &resolved_cwd).await?;
 
         // Use the existing native session ID when resuming, otherwise generate one.
         let native_session_id = session
@@ -962,7 +971,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let cwd = self.working_directory.to_string_lossy().to_string();
+        let cwd = resolved_cwd.to_string_lossy().to_string();
         let model = session.summary.model.as_deref().unwrap_or("gpt-4o");
 
         let (method, params) = if session

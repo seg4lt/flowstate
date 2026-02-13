@@ -97,12 +97,17 @@ pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
             .context("failed to initialize sqlite persistence")?,
     );
 
+    let threads_dir = working_directory
+        .join("threads")
+        .to_string_lossy()
+        .into_owned();
     let turn_observer: Arc<dyn TurnLifecycleObserver> = lifecycle.clone();
     let runtime_core = Arc::new(RuntimeCore::new(
         adapters,
         orchestration,
         persistence,
         Some(turn_observer),
+        threads_dir,
     ));
 
     // Reclaim any sessions stuck at `Running` from a prior crash before
