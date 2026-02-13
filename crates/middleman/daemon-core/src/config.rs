@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use zenui_provider_api::ProviderKind;
+
 /// Transport-agnostic runtime configuration for the daemon. Any
 /// transport-specific settings (bind address, socket path, frontend
 /// dist, TLS certs, ...) live on the individual `Transport` structs
@@ -13,6 +15,10 @@ pub struct DaemonConfig {
     pub shutdown_grace: Duration,
     pub log_file: Option<PathBuf>,
     pub detach: bool,
+    /// Which providers to instantiate and health-check. Defaults to all
+    /// known providers (`ProviderKind::ALL`). Pass a subset to skip
+    /// providers the app doesn't need.
+    pub enabled_providers: Vec<ProviderKind>,
 }
 
 impl DaemonConfig {
@@ -27,6 +33,7 @@ impl DaemonConfig {
             shutdown_grace: Duration::from_secs(5),
             log_file: None,
             detach: false,
+            enabled_providers: ProviderKind::ALL.to_vec(),
         }
     }
 
@@ -45,6 +52,7 @@ impl DaemonConfig {
             shutdown_grace: Duration::from_secs(5),
             log_file: None,
             detach: false,
+            enabled_providers: ProviderKind::ALL.to_vec(),
         }
     }
 }

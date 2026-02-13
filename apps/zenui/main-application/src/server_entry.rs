@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use zenui_daemon_core::{
     DaemonConfig, ReadyFile, Transport, TransportAddressInfo, run_blocking,
 };
+use zenui_provider_api::ProviderKind;
 use zenui_transport_http::HttpTransport;
 
 #[derive(Debug, Parser)]
@@ -119,6 +120,7 @@ fn run_start(args: StartArgs) -> Result<()> {
         shutdown_grace: Duration::from_secs(5),
         log_file: None,
         detach: false,
+        enabled_providers: ProviderKind::ALL.to_vec(),
     };
 
     let transports: Vec<Box<dyn Transport>> =

@@ -6112,6 +6112,7 @@ dependencies = [
  "wry 0.55.0",
  "zenui-daemon-client",
  "zenui-daemon-core",
+ "zenui-provider-api",
  "zenui-transport-http",
 ]
 

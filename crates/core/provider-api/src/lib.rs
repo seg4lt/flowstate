@@ -20,6 +20,15 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
+    /// Every known provider variant. Keep in sync with the enum definition.
+    pub const ALL: &[ProviderKind] = &[
+        ProviderKind::Codex,
+        ProviderKind::Claude,
+        ProviderKind::GitHubCopilot,
+        ProviderKind::ClaudeCli,
+        ProviderKind::GitHubCopilotCli,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",

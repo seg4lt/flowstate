@@ -22,6 +22,7 @@ ureq = { version = "2", default-features = false }
 wry.workspace = true
 zenui-daemon-client = { path = "../../../crates/middleman/daemon-client" }
 zenui-daemon-core = { path = "../../../crates/middleman/daemon-core" }
+zenui-provider-api = { path = "../../../crates/core/provider-api" }
 zenui-transport-http = { path = "../../../crates/middleman/transport-http" }
 
 [target.'cfg(unix)'.dependencies]
