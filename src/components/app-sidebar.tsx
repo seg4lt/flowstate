@@ -58,7 +58,7 @@ export function AppSidebar() {
     const path = typeof selected === "string" ? selected : selected[0];
     if (!path) return;
     const name = path.split("/").pop() ?? path;
-    await send({ type: "create_project", name });
+    await send({ type: "create_project", name, path });
   }
 
   function handleThreadClick(sessionId: string) {

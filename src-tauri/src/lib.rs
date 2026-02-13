@@ -19,14 +19,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
-            let cwd = std::env::current_dir().unwrap_or_default();
+            let flowzen_root = dirs::home_dir()
+                .expect("no home directory")
+                .join(".flowzen");
+            std::fs::create_dir_all(&flowzen_root)
+                .expect("failed to create ~/.flowzen");
+            std::fs::create_dir_all(flowzen_root.join("threads")).ok();
 
             let transport = Box::new(TauriTransport::new(app_handle));
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
             std::thread::spawn(move || {
-                let mut config = DaemonConfig::with_project_root(cwd);
+                let mut config = DaemonConfig::with_project_root(flowzen_root);
                 config.idle_timeout = Duration::MAX;
 
                 let core = bootstrap_core(&config).expect("daemon bootstrap failed");

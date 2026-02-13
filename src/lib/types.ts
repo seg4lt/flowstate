@@ -104,6 +104,7 @@ export interface TurnRecord {
 export interface ProjectRecord {
   projectId: string;
   name: string;
+  path?: string;
   createdAt: string;
   updatedAt: string;
   sortOrder: number;
@@ -185,7 +186,7 @@ export type ClientMessage =
   | { type: "accept_plan"; session_id: string; plan_id: string }
   | { type: "reject_plan"; session_id: string; plan_id: string }
   | { type: "refresh_models"; provider: ProviderKind }
-  | { type: "create_project"; name: string }
+  | { type: "create_project"; name: string; path?: string }
   | { type: "rename_project"; project_id: string; name: string }
   | { type: "delete_project"; project_id: string }
   | { type: "assign_session_to_project"; session_id: string; project_id?: string }
