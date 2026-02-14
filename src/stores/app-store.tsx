@@ -256,9 +256,15 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   dispatchRef.current = dispatch;
 
   React.useEffect(() => {
+    let active = true;
     connectStream((message) => {
-      dispatchRef.current({ type: "server_message", message });
+      if (active) {
+        dispatchRef.current({ type: "server_message", message });
+      }
     });
+    return () => {
+      active = false;
+    };
   }, []);
 
   const send = React.useCallback(
