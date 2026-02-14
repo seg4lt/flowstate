@@ -343,6 +343,22 @@ impl PersistenceService {
         })
     }
 
+    pub async fn rename_session(&self, session_id: &str, title: String) -> Option<String> {
+        let trimmed = title.trim().to_string();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        let affected = connection
+            .execute(
+                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE session_id = ?3",
+                params![trimmed, now, session_id],
+            )
+            .unwrap_or(0);
+        if affected == 0 { None } else { Some(now) }
+    }
+
     pub async fn rename_project(&self, project_id: &str, name: String) -> Option<String> {
         let trimmed = name.trim().to_string();
         if trimmed.is_empty() {

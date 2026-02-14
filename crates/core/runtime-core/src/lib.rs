@@ -517,6 +517,23 @@ impl RuntimeCore {
                     })
                 }
             }
+            ClientMessage::RenameSession { session_id, title } => {
+                match self.persistence.rename_session(&session_id, title.clone()).await {
+                    Some(_updated_at) => {
+                        let trimmed = title.trim().to_string();
+                        self.publish(RuntimeEvent::SessionRenamed {
+                            session_id,
+                            title: trimmed,
+                        });
+                        Some(ServerMessage::Ack {
+                            message: "Session renamed.".to_string(),
+                        })
+                    }
+                    None => Some(ServerMessage::Error {
+                        message: "Rename failed — session not found or title empty.".to_string(),
+                    }),
+                }
+            }
             ClientMessage::UpdateSessionModel { session_id, model } => {
                 if let Some(mut session) = self.persistence.get_session(&session_id).await {
                     session.summary.model = Some(model.clone());
@@ -741,6 +758,7 @@ impl RuntimeCore {
             })?
             .clone();
 
+        let title_before = session.summary.title.clone();
         let turn = self.orchestration.start_turn(
             &mut session,
             trimmed.clone(),
@@ -748,6 +766,13 @@ impl RuntimeCore {
             reasoning_effort,
         );
         self.persistence.upsert_session(session.clone()).await;
+        // Publish title change immediately so the sidebar updates before the turn finishes.
+        if session.summary.title != title_before {
+            self.publish(RuntimeEvent::SessionRenamed {
+                session_id: session.summary.session_id.clone(),
+                title: session.summary.title.clone(),
+            });
+        }
         self.publish(RuntimeEvent::TurnStarted {
             session_id: session.summary.session_id.clone(),
             turn: turn.clone(),

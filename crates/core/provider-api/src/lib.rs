@@ -717,6 +717,10 @@ pub enum RuntimeEvent {
         session_id: String,
         project_id: Option<String>,
     },
+    SessionRenamed {
+        session_id: String,
+        title: String,
+    },
     SessionModelUpdated {
         session_id: String,
         model: String,
@@ -800,6 +804,10 @@ pub enum ClientMessage {
         session_id: String,
         #[serde(default)]
         project_id: Option<String>,
+    },
+    RenameSession {
+        session_id: String,
+        title: String,
     },
     UpdateSessionModel {
         session_id: String,
