@@ -1,3 +1,4 @@
+import * as React from "react";
 import { Archive, Ellipsis, Trash2 } from "lucide-react";
 import {
   DropdownMenu,
@@ -39,59 +40,108 @@ export function ThreadItem({
   onClick,
 }: ThreadItemProps) {
   const { send } = useApp();
+  const [editing, setEditing] = React.useState(false);
+  const [draft, setDraft] = React.useState(title);
+  const inputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    setDraft(title);
+  }, [title]);
+
+  React.useEffect(() => {
+    if (editing) {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing]);
+
+  function commitRename() {
+    const trimmed = draft.trim();
+    setEditing(false);
+    if (trimmed && trimmed !== title) {
+      send({ type: "rename_session", session_id: sessionId, title: trimmed });
+    }
+  }
 
   return (
     <SidebarMenuSubItem className="group/thread -mr-6">
-      <SidebarMenuSubButton
-        className="h-7 w-full min-w-0 rounded-r-none pr-8"
-        isActive={isActive}
-        onClick={onClick}
-      >
-        <span className="flex-1 truncate text-xs">{title || "New thread"}</span>
-      </SidebarMenuSubButton>
+      {editing ? (
+        <input
+          ref={inputRef}
+          className="h-7 w-full min-w-0 rounded-md border border-input bg-background px-2 text-xs outline-none"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") {
+              setDraft(title);
+              setEditing(false);
+            }
+          }}
+        />
+      ) : (
+        <SidebarMenuSubButton
+          className="h-7 w-full min-w-0 rounded-r-none pr-8"
+          isActive={isActive}
+          onClick={onClick}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            setEditing(true);
+          }}
+        >
+          <span className="flex-1 truncate text-xs">
+            {title || "New thread"}
+          </span>
+        </SidebarMenuSubButton>
+      )}
 
       {/* Timestamp — fades out on hover */}
-      <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground transition-opacity group-hover/thread:opacity-0">
-        {formatTimeAgo(updatedAt)}
-      </span>
+      {!editing && (
+        <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground transition-opacity group-hover/thread:opacity-0">
+          {formatTimeAgo(updatedAt)}
+        </span>
+      )}
 
       {/* Actions — fades in on hover, stays visible when dropdown is open */}
-      <div
-        className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
-        onClick={(e) => e.stopPropagation()}
-        onKeyDown={(e) => e.stopPropagation()}
-      >
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-sidebar-accent text-sidebar-foreground outline-none hover:bg-sidebar-border"
-            >
-              <Ellipsis className="h-3 w-3" />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="min-w-32">
-            <DropdownMenuItem
-              onClick={() =>
-                send({ type: "archive_session", session_id: sessionId })
-              }
-            >
-              <Archive className="mr-2 h-3.5 w-3.5" />
-              Archive
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              variant="destructive"
-              onClick={() =>
-                send({ type: "delete_session", session_id: sessionId })
-              }
-            >
-              <Trash2 className="mr-2 h-3.5 w-3.5" />
-              Delete
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </div>
+      {!editing && (
+        <div
+          className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
+          onClick={(e) => e.stopPropagation()}
+          onKeyDown={(e) => e.stopPropagation()}
+        >
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-sidebar-accent text-sidebar-foreground outline-none hover:bg-sidebar-border"
+              >
+                <Ellipsis className="h-3 w-3" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="min-w-32">
+              <DropdownMenuItem
+                onClick={() =>
+                  send({ type: "archive_session", session_id: sessionId })
+                }
+              >
+                <Archive className="mr-2 h-3.5 w-3.5" />
+                Archive
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                variant="destructive"
+                onClick={() =>
+                  send({ type: "delete_session", session_id: sessionId })
+                }
+              >
+                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                Delete
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
     </SidebarMenuSubItem>
   );
 }

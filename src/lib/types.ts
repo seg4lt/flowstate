@@ -190,6 +190,7 @@ export type ClientMessage =
   | { type: "rename_project"; project_id: string; name: string }
   | { type: "delete_project"; project_id: string }
   | { type: "assign_session_to_project"; session_id: string; project_id?: string }
+  | { type: "rename_session"; session_id: string; title: string }
   | { type: "update_session_model"; session_id: string; model: string }
   | { type: "archive_session"; session_id: string }
   | { type: "unarchive_session"; session_id: string }
@@ -229,6 +230,7 @@ export type RuntimeEvent =
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }
   | { type: "provider_health_updated"; status: ProviderStatus }
+  | { type: "session_renamed"; session_id: string; title: string }
   | { type: "session_model_updated"; session_id: string; model: string }
   | { type: "session_archived"; session_id: string }
   | { type: "session_unarchived"; session: SessionSummary }

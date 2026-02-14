@@ -130,6 +130,33 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const isRunning = session?.status === "running";
   const title = session?.title || "New thread";
 
+  const [editingTitle, setEditingTitle] = React.useState(false);
+  const [titleDraft, setTitleDraft] = React.useState(title);
+  const titleInputRef = React.useRef<HTMLInputElement>(null);
+
+  React.useEffect(() => {
+    setTitleDraft(title);
+  }, [title]);
+
+  React.useEffect(() => {
+    if (editingTitle) {
+      titleInputRef.current?.focus();
+      titleInputRef.current?.select();
+    }
+  }, [editingTitle]);
+
+  function commitTitleRename() {
+    const trimmed = titleDraft.trim();
+    setEditingTitle(false);
+    if (trimmed && trimmed !== title) {
+      sendMessage({
+        type: "rename_session",
+        session_id: sessionId,
+        title: trimmed,
+      });
+    }
+  }
+
   const toolbar = session ? (
     <ChatToolbar
       sessionId={sessionId}
@@ -146,7 +173,29 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     <div className="flex h-svh flex-col">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
         <SidebarTrigger />
-        <span className="truncate font-medium">{title}</span>
+        {editingTitle ? (
+          <input
+            ref={titleInputRef}
+            className="min-w-0 flex-1 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={commitTitleRename}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitTitleRename();
+              if (e.key === "Escape") {
+                setTitleDraft(title);
+                setEditingTitle(false);
+              }
+            }}
+          />
+        ) : (
+          <span
+            className="cursor-pointer truncate font-medium hover:text-muted-foreground"
+            onClick={() => setEditingTitle(true)}
+          >
+            {title}
+          </span>
+        )}
         <div className="ml-auto flex items-center gap-2">
           {isRunning && (
             <span className="text-xs text-muted-foreground">Running...</span>

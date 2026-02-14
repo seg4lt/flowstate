@@ -202,6 +202,13 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "session_renamed": {
+      const sessions = new Map(state.sessions);
+      const s = sessions.get(event.session_id);
+      if (s) sessions.set(event.session_id, { ...s, title: event.title });
+      return { ...state, sessions };
+    }
+
     case "session_model_updated": {
       const sessions = new Map(state.sessions);
       const s = sessions.get(event.session_id);
