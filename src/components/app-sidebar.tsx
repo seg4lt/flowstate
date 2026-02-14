@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   ChevronRight,
   FolderIcon,
+  FolderMinus,
   Plus,
   Settings,
   MessageSquare,
@@ -61,6 +62,14 @@ export function AppSidebar() {
     await send({ type: "create_project", name, path });
   }
 
+  async function handleRemoveProject(projectId: string) {
+    const threads = sessionsByProject.get(projectId) ?? [];
+    for (const session of threads) {
+      await send({ type: "archive_session", session_id: session.sessionId });
+    }
+    await send({ type: "delete_project", project_id: projectId });
+  }
+
   function handleThreadClick(sessionId: string) {
     navigate({ to: "/chat/$sessionId", params: { sessionId } });
   }
@@ -103,7 +112,18 @@ export function AppSidebar() {
                           </span>
                         </SidebarMenuButton>
                       </CollapsibleTrigger>
-                      <div className="absolute right-1 top-1">
+                      <div className="absolute right-1 top-1 flex items-center gap-0.5">
+                        <button
+                          type="button"
+                          title="Remove project"
+                          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/project:opacity-100"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveProject(project.projectId);
+                          }}
+                        >
+                          <FolderMinus className="h-3.5 w-3.5" />
+                        </button>
                         <ProviderDropdown projectId={project.projectId} />
                       </div>
                       <CollapsibleContent>
