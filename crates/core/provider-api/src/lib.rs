@@ -733,7 +733,7 @@ pub enum RuntimeEvent {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Ping,
@@ -822,7 +822,7 @@ pub enum ClientMessage {
     ListArchivedSessions,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Welcome { bootstrap: BootstrapPayload },
