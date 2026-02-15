@@ -77,7 +77,7 @@ export function AppSidebar() {
   const unassigned = sessionsByProject.get(null) ?? [];
 
   return (
-    <Sidebar collapsible="icon">
+    <Sidebar collapsible="offcanvas">
       <SidebarHeader className="h-12 flex-row items-center justify-start border-b border-sidebar-border px-4 py-0">
         <span className="text-sm font-semibold tracking-tight [[data-collapsible=icon]_&]:hidden">
           flowzen
