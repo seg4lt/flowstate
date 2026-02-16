@@ -1,6 +1,5 @@
 import * as React from "react";
-import { initWebSocket, onServerMessage, sendMessage } from "@/lib/api";
-import { getDaemonUrl } from "@/lib/get-daemon-url";
+import { connectStream, sendMessage } from "@/lib/api";
 import type {
   ClientMessage,
   ProviderStatus,
@@ -265,23 +264,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     let active = true;
-    let unsubscribe: (() => void) | null = null;
-
-    getDaemonUrl().then((wsUrl) => {
-      if (!active) return;
-      return initWebSocket(wsUrl).then(() => {
-        if (!active) return;
-        unsubscribe = onServerMessage((message) => {
-          if (active) {
-            dispatchRef.current({ type: "server_message", message });
-          }
-        });
-      });
+    connectStream((message) => {
+      if (active) {
+        dispatchRef.current({ type: "server_message", message });
+      }
     });
-
     return () => {
       active = false;
-      unsubscribe?.();
     };
   }, []);
 

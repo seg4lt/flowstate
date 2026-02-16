@@ -7,7 +7,7 @@ import type {
   ReasoningEffort,
   TurnRecord,
 } from "@/lib/types";
-import { onServerMessage, sendMessage } from "@/lib/api";
+import { connectStream, sendMessage } from "@/lib/api";
 import { MessageList } from "./message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionDialog } from "./permission-dialog";
@@ -62,9 +62,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [sessionId]);
 
-  // Listen for session-specific events via the shared WebSocket
+  // Listen for session-specific events via a dedicated stream
   React.useEffect(() => {
-    const unsubscribe = onServerMessage((message) => {
+    let active = true;
+
+    connectStream((message) => {
+      if (!active) return;
       if (message.type !== "event") return;
       const event = message.event;
 
@@ -94,7 +97,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       }
     });
 
-    return unsubscribe;
+    return () => {
+      active = false;
+    };
   }, [sessionId]);
 
   async function handleSend(input: string) {

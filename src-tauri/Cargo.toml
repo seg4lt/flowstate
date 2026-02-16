@@ -33,6 +33,11 @@ zenui-transport-http = { path = "../../rs-agent-sdk/crates/middleman/transport-h
 # Types
 zenui-provider-api = { path = "../../rs-agent-sdk/crates/core/provider-api" }
 
+# WebSocket client (Tauri backend → daemon)
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
