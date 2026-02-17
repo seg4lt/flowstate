@@ -1,32 +1,33 @@
-pub mod daemon_proxy;
-pub mod server_entry;
-
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::Manager;
-use tauri::ipc::Channel;
 use tracing_subscriber::EnvFilter;
-use zenui_daemon_client::{ClientConfig, TransportPreference, connect_or_spawn};
-use zenui_provider_api::{ClientMessage, ServerMessage};
+use zenui_daemon_core::{
+    DaemonConfig, DaemonLifecycle, Transport, bootstrap_core, graceful_shutdown,
+};
+use zenui_runtime_core::ConnectionObserver;
+use zenui_transport_tauri::TauriTransport;
 
-use crate::daemon_proxy::DaemonProxy;
+struct AppLifecycle {
+    lifecycle: Arc<DaemonLifecycle>,
+}
 
-/// Initialize tracing to stderr + a log file so the user can see what the
-/// Tauri backend is doing. The log file lives alongside the daemon log.
+/// Initialize tracing to stderr + a log file so the Tauri backend logs
+/// are visible. The log file lives alongside the daemon log.
 fn init_tracing() {
     let log_dir = std::env::temp_dir().join("flowzen").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join("flowzen-ui.log");
+    let log_path = log_dir.join("flowzen.log");
 
-    // File writer (append).
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
         .ok();
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("flowzen=info,zenui=info,warn"));
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("flowzen=info,zenui=info,warn"));
 
     if let Some(file) = file {
         let subscriber = tracing_subscriber::fmt()
@@ -42,51 +43,6 @@ fn init_tracing() {
     }
 }
 
-/// Proxy a client message to the daemon over the shared WebSocket.
-#[tauri::command]
-async fn handle_message(
-    state: tauri::State<'_, DaemonProxy>,
-    message: ClientMessage,
-) -> Result<Option<ServerMessage>, String> {
-    Ok(state.send(message).await)
-}
-
-/// Subscribe to the daemon's event stream. First replays every message
-/// the proxy has buffered since it opened the daemon connection (so the
-/// frontend catches up on startup events like ProviderHealthUpdated),
-/// then forwards live broadcasts until the channel closes.
-#[tauri::command]
-async fn connect(
-    state: tauri::State<'_, DaemonProxy>,
-    on_event: Channel<ServerMessage>,
-) -> Result<(), String> {
-    let (replay, mut rx) = state.subscribe().await;
-
-    tracing::info!(replay_count = replay.len(), "connect: replaying buffered messages");
-    for msg in replay {
-        if on_event.send(msg).is_err() {
-            return Ok(());
-        }
-    }
-
-    loop {
-        match rx.recv().await {
-            Ok(message) => {
-                if on_event.send(message).is_err() {
-                    break;
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("connect subscriber lagged by {n} messages");
-                continue;
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
@@ -95,65 +51,67 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let total_start = Instant::now();
-            tracing::info!("flowzen: starting up");
-
+            let app_handle = app.handle().clone();
             let flowzen_root = dirs::home_dir()
                 .expect("no home directory")
                 .join(".flowzen");
             std::fs::create_dir_all(&flowzen_root)
                 .expect("failed to create ~/.flowzen");
+            std::fs::create_dir_all(flowzen_root.join("threads")).ok();
 
-            let canonical = std::fs::canonicalize(&flowzen_root)
-                .expect("failed to canonicalize ~/.flowzen");
+            let transport = Box::new(TauriTransport::new(app_handle));
 
-            let config = ClientConfig {
-                project_root: canonical.clone(),
-                server_binary: None,
-                spawn_timeout: std::time::Duration::from_secs(15),
-                health_timeout: std::time::Duration::from_secs(2),
-                preferred_transport: TransportPreference::Http,
-            };
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
-            tracing::info!(project_root = %canonical.display(), "calling connect_or_spawn");
-            let spawn_start = Instant::now();
-            let handle = connect_or_spawn(&config)
-                .expect("failed to connect to or spawn flowzen daemon");
-            tracing::info!(
-                elapsed_ms = spawn_start.elapsed().as_millis() as u64,
-                pid = handle.pid,
-                "connect_or_spawn returned"
-            );
+            std::thread::spawn(move || {
+                let mut config = DaemonConfig::with_project_root(flowzen_root);
+                config.idle_timeout = Duration::MAX;
 
-            let http = handle
-                .as_http()
-                .expect("flowzen daemon has no HTTP transport");
-            let ws_url = http.ws_url.to_string();
+                let core = bootstrap_core(&config).expect("daemon bootstrap failed");
 
-            tracing::info!(http_base = %http.http_base, ws_url = %ws_url, "daemon address");
+                core.tokio_runtime.block_on(async {
+                    let bound = transport.bind().expect("transport bind failed");
+                    let observer: Arc<dyn ConnectionObserver> = core.lifecycle.clone();
+                    let handle = bound
+                        .serve(core.runtime_core.clone(), observer)
+                        .expect("transport serve failed");
 
-            // Open the proxy WebSocket. This blocks the setup closure
-            // until the connection is established, which is fine — it
-            // happens once at startup and is fast on loopback.
-            tracing::info!("opening daemon proxy WebSocket");
-            let ws_start = Instant::now();
-            let proxy = tauri::async_runtime::block_on(DaemonProxy::connect(&ws_url))
-                .expect("failed to open daemon proxy WebSocket");
-            tracing::info!(
-                elapsed_ms = ws_start.elapsed().as_millis() as u64,
-                "daemon proxy WebSocket opened"
-            );
+                    // Signal main thread AFTER serve() has managed TauriDaemonState.
+                    // This guarantees the connect command can access it.
+                    ready_tx
+                        .send(core.lifecycle.clone())
+                        .expect("failed to signal ready");
 
-            app.manage(proxy);
+                    core.lifecycle.wait_for_shutdown().await;
 
-            tracing::info!(
-                total_ms = total_start.elapsed().as_millis() as u64,
-                "flowzen: startup complete"
-            );
+                    let _ = graceful_shutdown(
+                        core.runtime_core.clone(),
+                        core.lifecycle.clone(),
+                        config.shutdown_grace,
+                    )
+                    .await;
+
+                    handle.shutdown().await;
+                });
+            });
+
+            // Block until serve() is done and TauriDaemonState is managed.
+            let lifecycle = ready_rx.recv().expect("daemon failed to start");
+            app.manage(AppLifecycle { lifecycle });
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![handle_message, connect])
+        .invoke_handler(tauri::generate_handler![
+            zenui_transport_tauri::commands::connect,
+            zenui_transport_tauri::commands::handle_message,
+        ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<AppLifecycle>() {
+                    state.lifecycle.request_shutdown();
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

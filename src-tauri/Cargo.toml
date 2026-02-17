@@ -17,29 +17,18 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 dirs = "5"
-anyhow = "1"
-clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", default-features = false }
 
-# Daemon client (connect or spawn)
-zenui-daemon-client = { path = "../../rs-agent-sdk/crates/middleman/daemon-client" }
-
-# Daemon core + HTTP transport (for server mode)
+# Daemon core + Tauri transport (embedded daemon)
 zenui-daemon-core = { path = "../../rs-agent-sdk/crates/middleman/daemon-core" }
-zenui-transport-http = { path = "../../rs-agent-sdk/crates/middleman/transport-http" }
+zenui-transport-tauri = { path = "../../rs-agent-sdk/crates/middleman/transport-tauri" }
 
-# Types
+# Types used in Tauri commands
 zenui-provider-api = { path = "../../rs-agent-sdk/crates/core/provider-api" }
+zenui-runtime-core = { path = "../../rs-agent-sdk/crates/core/runtime-core" }
 
-# WebSocket client (Tauri backend → daemon)
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
-
+# Async
+tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
