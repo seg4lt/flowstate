@@ -26,3 +26,6 @@ playwright-report/
 # Generated files
 vite.config.js
 vite.config.d.ts
+
+# ZenUI specific
+.zenui/
