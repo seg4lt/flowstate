@@ -7,8 +7,8 @@ use chrono::Utc;
 use uuid::Uuid;
 use zenui_provider_api::{
     FileChangeRecord, PermissionMode, PlanRecord, ProjectRecord, ProviderKind, ProviderModel,
-    ReasoningEffort, SessionDetail, SessionStatus, SessionSummary, SubagentRecord, ToolCall,
-    TurnRecord, TurnStatus,
+    ProviderStatus, ReasoningEffort, SessionDetail, SessionStatus, SessionSummary, SubagentRecord,
+    ToolCall, TurnRecord, TurnStatus,
 };
 
 #[derive(Debug)]
@@ -260,6 +260,51 @@ impl PersistenceService {
         );
     }
 
+    /// Returns the cached health status for a provider along with the ISO-8601
+    /// timestamp it was checked at, or None if no entry exists.
+    pub async fn get_cached_health(
+        &self,
+        kind: ProviderKind,
+    ) -> Option<(String, ProviderStatus)> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT checked_at, status_json FROM provider_health_cache WHERE provider = ?1",
+                params![provider_kind_to_str(kind)],
+                |row| {
+                    let checked_at: String = row.get(0)?;
+                    let status_json: String = row.get(1)?;
+                    Ok((checked_at, status_json))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|(checked_at, json)| {
+                serde_json::from_str::<ProviderStatus>(&json)
+                    .ok()
+                    .map(|status| (checked_at, status))
+            })
+    }
+
+    /// Persist the health status for a provider with `now` as the checked_at timestamp.
+    pub async fn set_cached_health(&self, kind: ProviderKind, status: &ProviderStatus) {
+        let json = match serde_json::to_string(status) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let _ = connection.execute(
+            "INSERT INTO provider_health_cache (provider, checked_at, status_json)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(provider) DO UPDATE SET
+                checked_at = excluded.checked_at,
+                status_json = excluded.status_json",
+            params![provider_kind_to_str(kind), now, json],
+        );
+    }
+
     pub async fn list_projects(&self) -> Vec<ProjectRecord> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = match connection.prepare(
@@ -467,6 +512,12 @@ impl PersistenceService {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 sort_order INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_health_cache (
+                provider TEXT PRIMARY KEY,
+                checked_at TEXT NOT NULL,
+                status_json TEXT NOT NULL
             );
             ",
             )

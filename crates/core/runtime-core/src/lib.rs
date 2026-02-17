@@ -7,7 +7,7 @@ use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, FileChangeRecord, PermissionDecision,
-    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
+    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
     ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail, SessionStatus,
     SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
     UserInputAnswer,
@@ -242,18 +242,36 @@ impl RuntimeCore {
     }
 
     pub async fn bootstrap(&self, ws_url: String) -> BootstrapPayload {
-        // Spawn each provider health check independently — results arrive as
-        // ProviderHealthUpdated events. The dedup guard prevents duplicate
-        // checks when multiple transports bootstrap near-simultaneously.
+        // Load cached health for every adapter so the frontend gets a
+        // populated providers list immediately. If the cache is stale
+        // (>24h) or missing, spawn a background health check to refresh.
+        // If fresh, skip the expensive health check entirely — next launch
+        // will still see the cached entry.
+        let mut cached_providers: Vec<ProviderStatus> = Vec::new();
         for &kind in self.adapters.keys() {
-            self.spawn_health_check(kind);
+            match self.persistence.get_cached_health(kind).await {
+                Some((checked_at, status)) => {
+                    tracing::info!(
+                        ?kind,
+                        ?checked_at,
+                        "loaded cached provider health"
+                    );
+                    cached_providers.push(status);
+                    if is_cache_stale(&checked_at) {
+                        self.spawn_health_check(kind);
+                    }
+                }
+                None => {
+                    self.spawn_health_check(kind);
+                }
+            }
         }
 
         BootstrapPayload {
             app_name: "zenui".to_string(),
             generated_at: Utc::now().to_rfc3339(),
             ws_url,
-            providers: vec![],
+            providers: cached_providers,
             snapshot: self.snapshot().await,
         }
     }
@@ -304,6 +322,11 @@ impl RuntimeCore {
                     true
                 }
             };
+
+            // Persist the freshly-checked health so the next daemon start
+            // can return it in the bootstrap payload without re-running
+            // the slow health probe.
+            persistence.set_cached_health(kind, &status).await;
 
             if needs_refresh {
                 spawn_model_refresh_detached(
