@@ -7,11 +7,53 @@
     <title>flowzen</title>
     <style>
       html, body { background-color: #252525; margin: 0; }
+      #root { min-height: 100vh; }
+      .splash {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        color: #fbfbfb;
+        font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-size: 2rem;
+        font-weight: 600;
+      }
+      .splash-text {
+        display: inline-block;
+        width: 8ch;
+        text-align: left;
+        white-space: nowrap;
+      }
+      .typewriter {
+        display: inline-block;
+        overflow: hidden;
+        vertical-align: bottom;
+        width: 0;
+        animation: type 0.7s steps(7, end) forwards;
+      }
+      .cursor {
+        display: inline-block;
+        vertical-align: bottom;
+        animation: blink 1s infinite;
+      }
+      @keyframes type {
+        to { width: 7ch; }
+      }
+      @keyframes blink {
+        0%, 49.99% { opacity: 1; }
+        50%, 100% { opacity: 0; }
+      }
     </style>
   </head>
 
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <div class="splash">
+        <div class="splash-text">
+          <span class="typewriter">flowzen</span><span class="cursor">_</span>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
