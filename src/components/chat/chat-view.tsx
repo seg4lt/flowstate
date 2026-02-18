@@ -1,4 +1,5 @@
 import * as React from "react";
+import { GitBranch } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
 import type {
@@ -7,7 +8,7 @@ import type {
   ReasoningEffort,
   TurnRecord,
 } from "@/lib/types";
-import { connectStream, sendMessage } from "@/lib/api";
+import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
 import { MessageList } from "./message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionDialog } from "./permission-dialog";
@@ -33,6 +34,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   const session = state.sessions.get(sessionId);
   const streaming = state.streamingTurns.get(sessionId);
+  const projectPath = React.useMemo(() => {
+    if (!session?.projectId) return null;
+    return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
+  }, [session?.projectId, state.projects]);
+  const [gitBranch, setGitBranch] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!projectPath) {
+      setGitBranch(null);
+      return;
+    }
+    let cancelled = false;
+    getGitBranch(projectPath).then((branch) => {
+      if (!cancelled) setGitBranch(branch);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectPath]);
 
   // Set active session
   React.useEffect(() => {
@@ -173,29 +193,37 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     <div className="flex h-svh flex-col">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
         <SidebarTrigger />
-        {editingTitle ? (
-          <input
-            ref={titleInputRef}
-            className="min-w-0 flex-1 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
-            value={titleDraft}
-            onChange={(e) => setTitleDraft(e.target.value)}
-            onBlur={commitTitleRename}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitTitleRename();
-              if (e.key === "Escape") {
-                setTitleDraft(title);
-                setEditingTitle(false);
-              }
-            }}
-          />
-        ) : (
-          <span
-            className="cursor-pointer truncate font-medium hover:text-muted-foreground"
-            onClick={() => setEditingTitle(true)}
-          >
-            {title}
-          </span>
-        )}
+        <div className="flex min-w-0 flex-col leading-tight">
+          {editingTitle ? (
+            <input
+              ref={titleInputRef}
+              className="min-w-0 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={commitTitleRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitTitleRename();
+                if (e.key === "Escape") {
+                  setTitleDraft(title);
+                  setEditingTitle(false);
+                }
+              }}
+            />
+          ) : (
+            <span
+              className="cursor-pointer truncate font-medium hover:text-muted-foreground"
+              onClick={() => setEditingTitle(true)}
+            >
+              {title}
+            </span>
+          )}
+          {gitBranch && (
+            <span className="inline-flex items-center gap-1 truncate text-[11px] text-muted-foreground">
+              <GitBranch className="h-3 w-3 shrink-0" />
+              {gitBranch}
+            </span>
+          )}
+        </div>
         <div className="ml-auto flex items-center gap-2">
           {isRunning && (
             <span className="text-xs text-muted-foreground">Running...</span>

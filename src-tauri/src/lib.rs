@@ -1,3 +1,4 @@
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,22 @@ use zenui_daemon_core::{
 };
 use zenui_runtime_core::ConnectionObserver;
 use zenui_transport_tauri::TauriTransport;
+
+/// Return the current git branch for `path`, or `None` if `path` is not
+/// inside a git repo (or git itself fails). Used by the chat header to
+/// surface the active branch under the thread title.
+#[tauri::command]
+fn get_git_branch(path: String) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if branch.is_empty() { None } else { Some(branch) }
+}
 
 struct AppLifecycle {
     lifecycle: Arc<DaemonLifecycle>,
@@ -104,6 +121,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             zenui_transport_tauri::commands::connect,
             zenui_transport_tauri::commands::handle_message,
+            get_git_branch,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

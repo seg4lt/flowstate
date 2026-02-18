@@ -14,3 +14,7 @@ export function connectStream(
   channel.onmessage = onMessage;
   return invoke("connect", { onEvent: channel });
 }
+
+export function getGitBranch(path: string): Promise<string | null> {
+  return invoke<string | null>("get_git_branch", { path });
+}
