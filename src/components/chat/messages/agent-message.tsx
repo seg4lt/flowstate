@@ -56,6 +56,16 @@ function AgentMessageInner({
 
   return (
     <div className="text-sm leading-relaxed">
+      {reasoning && (
+        <details className="mb-3 rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs">
+          <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+            Reasoning
+          </summary>
+          <p className="mt-2 whitespace-pre-wrap italic text-muted-foreground">
+            {reasoning}
+          </p>
+        </details>
+      )}
       <MarkdownContent content={deferredOutput} />
       {streaming && <BlinkingCursor tone="foreground" />}
       {status === "failed" && (
