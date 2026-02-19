@@ -70,6 +70,12 @@ function handleServerMessage(
       };
     }
 
+    case "session_created": {
+      const sessions = new Map(state.sessions);
+      sessions.set(message.session.sessionId, message.session);
+      return { ...state, sessions };
+    }
+
     case "event":
       return handleRuntimeEvent(state, message.event);
 
@@ -274,10 +280,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const send = React.useCallback(
-    (message: ClientMessage) => sendMessage(message),
-    [],
-  );
+  // Wrap sendMessage so that any response coming back from a client
+  // request is also funneled through the reducer. This is what makes
+  // e.g. session_created from start_session land in state.sessions
+  // before the navigate fires — without it, only events delivered via
+  // connectStream are visible to the store.
+  const send = React.useCallback(async (message: ClientMessage) => {
+    const res = await sendMessage(message);
+    if (res) {
+      dispatchRef.current({ type: "server_message", message: res });
+    }
+    return res;
+  }, []);
 
   const value = React.useMemo(() => ({ state, dispatch, send }), [state, send]);
 

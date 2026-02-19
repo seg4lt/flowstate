@@ -9,7 +9,7 @@ import type {
   TurnRecord,
 } from "@/lib/types";
 import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
-import { MessageList } from "./message-list";
+import { MessageList } from "./messages/message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionDialog } from "./permission-dialog";
 import { ChatToolbar } from "./chat-toolbar";
@@ -31,6 +31,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [effort, setEffort] = React.useState<ReasoningEffort>("high");
   const [permissionMode, setPermissionMode] =
     React.useState<PermissionMode>("accept_edits");
+  const [pendingInput, setPendingInput] = React.useState<string | null>(null);
 
   const session = state.sessions.get(sessionId);
   const streaming = state.streamingTurns.get(sessionId);
@@ -68,6 +69,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setLoading(true);
     setTurns([]);
     setPendingPermission(null);
+    setPendingInput(null);
 
     sendMessage({ type: "load_session", session_id: sessionId }).then((res) => {
       if (cancelled) return;
@@ -94,7 +96,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       if (!("session_id" in event) || event.session_id !== sessionId) return;
 
       switch (event.type) {
+        case "turn_started":
+          // Push the partial turn (with input set, output empty) so the
+          // user message becomes visible immediately. The optimistic
+          // pending row covers the gap between sendMessage being called
+          // and this event arriving — clear it now.
+          setPendingInput(null);
+          setTurns((prev) => {
+            const exists = prev.some((t) => t.turnId === event.turn.turnId);
+            if (exists) {
+              return prev.map((t) =>
+                t.turnId === event.turn.turnId ? event.turn : t,
+              );
+            }
+            return [...prev, event.turn];
+          });
+          break;
+
         case "turn_completed":
+          setPendingInput(null);
           setTurns((prev) => {
             const exists = prev.some((t) => t.turnId === event.turn.turnId);
             if (exists) {
@@ -123,13 +143,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, [sessionId]);
 
   async function handleSend(input: string) {
-    await sendMessage({
-      type: "send_turn",
-      session_id: sessionId,
-      input,
-      permission_mode: permissionMode,
-      reasoning_effort: effort,
-    });
+    // Optimistic: show the user's message immediately, then await the
+    // round-trip. turn_started will clear this and replace it with the
+    // real turn from the daemon.
+    setPendingInput(input);
+    try {
+      await sendMessage({
+        type: "send_turn",
+        session_id: sessionId,
+        input,
+        permission_mode: permissionMode,
+        reasoning_effort: effort,
+      });
+    } catch (err) {
+      setPendingInput(null);
+      throw err;
+    }
   }
 
   async function handleInterrupt() {
@@ -236,6 +265,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         turns={turns}
         streaming={streaming ?? null}
         loading={loading}
+        pendingInput={pendingInput}
       />
 
       <ChatInput
