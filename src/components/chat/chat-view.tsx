@@ -11,7 +11,7 @@ import type {
 import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
 import { MessageList } from "./messages/message-list";
 import { ChatInput } from "./chat-input";
-import { PermissionDialog } from "./permission-dialog";
+import { PermissionPrompt } from "./permission-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 
@@ -125,6 +125,58 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             return [...prev, event.turn];
           });
           break;
+
+        case "tool_call_started": {
+          // Append the new tool call to the matching turn so it appears
+          // immediately rather than waiting for turn_completed.
+          const callEvent = event;
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.turnId === callEvent.turn_id
+                ? {
+                    ...t,
+                    toolCalls: [
+                      ...(t.toolCalls ?? []),
+                      {
+                        callId: callEvent.call_id,
+                        name: callEvent.name,
+                        args: callEvent.args,
+                        status: "pending" as const,
+                      },
+                    ],
+                  }
+                : t,
+            ),
+          );
+          break;
+        }
+
+        case "tool_call_completed": {
+          // Update the matching tool call with its output/error and
+          // flip status. New arrays so memoization detects the change.
+          const callEvent = event;
+          setTurns((prev) =>
+            prev.map((t) => {
+              if (t.turnId !== callEvent.turn_id || !t.toolCalls) return t;
+              return {
+                ...t,
+                toolCalls: t.toolCalls.map((tc) =>
+                  tc.callId === callEvent.call_id
+                    ? {
+                        ...tc,
+                        output: callEvent.output,
+                        error: callEvent.error,
+                        status: callEvent.error
+                          ? ("failed" as const)
+                          : ("completed" as const),
+                      }
+                    : tc,
+                ),
+              };
+            }),
+          );
+          break;
+        }
 
         case "permission_requested":
           setPendingPermission({
@@ -268,6 +320,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         pendingInput={pendingInput}
       />
 
+      {pendingPermission && (
+        <PermissionPrompt
+          toolName={pendingPermission.toolName}
+          input={pendingPermission.input}
+          onDecision={handlePermissionDecision}
+        />
+      )}
+
       <ChatInput
         onSend={handleSend}
         onInterrupt={handleInterrupt}
@@ -275,15 +335,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         disabled={loading}
         toolbar={toolbar}
       />
-
-      {pendingPermission && (
-        <PermissionDialog
-          toolName={pendingPermission.toolName}
-          input={pendingPermission.input}
-          suggested={pendingPermission.suggested}
-          onDecision={handlePermissionDecision}
-        />
-      )}
     </div>
   );
 }

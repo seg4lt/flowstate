@@ -58,6 +58,9 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
     a.reasoning === b.reasoning &&
     a.status === b.status &&
     a.streaming === b.streaming &&
-    (a.toolCalls?.length ?? 0) === (b.toolCalls?.length ?? 0)
+    // Reference equality — chat-view always builds new arrays when a
+    // tool call is added or completes, so this catches both length
+    // changes and per-call status updates.
+    a.toolCalls === b.toolCalls
   );
 });
