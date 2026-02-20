@@ -2,6 +2,7 @@ import * as React from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { CodeBlock } from "./code-block";
 
 interface MarkdownContentProps {
   content: string;
@@ -102,27 +103,43 @@ const components: Components = {
       </a>
     );
   },
-  pre({ children }) {
-    // Block code container. The nested <code> gets its inline styles
-    // stripped via the arbitrary variants so language-tagged and
-    // untagged fences both look right.
+  pre({ node, children }) {
+    // Block code: read the code text and language from the ORIGINAL
+    // hast AST node (the `node` prop), not from `children`. By the time
+    // pre's `children` is built, the `code` override below has already
+    // replaced the inner element's className with our pill style and
+    // wrapped the text — so reading `children.props.className` would
+    // see "rounded bg-muted ..." instead of "language-rust", and every
+    // code block would fall back to plain text. The hast `node` is the
+    // pre-render AST and still has the original language-* class.
+    const codeNode = node?.children?.[0];
+    if (
+      codeNode &&
+      codeNode.type === "element" &&
+      codeNode.tagName === "code"
+    ) {
+      const classNames =
+        (codeNode.properties?.className as string[] | undefined) ?? [];
+      const langClass = classNames.find((c) => c.startsWith("language-"));
+      const language = langClass?.slice("language-".length);
+      const code = (codeNode.children ?? [])
+        .map((c) => (c.type === "text" ? c.value : ""))
+        .join("")
+        .replace(/\n$/, "");
+      return <CodeBlock code={code} language={language} />;
+    }
+    // Defensive fallback: unexpected pre structure, render plain.
     return (
-      <pre className="mb-3 overflow-x-auto rounded-md border border-border bg-muted p-3 font-mono text-xs last:mb-0 [&>code]:bg-transparent [&>code]:p-0 [&>code]:text-[0.95em]">
+      <pre className="mb-3 overflow-x-auto rounded-md border border-border bg-muted p-3 font-mono text-xs last:mb-0">
         {children}
       </pre>
     );
   },
-  code({ className, children }) {
-    // This fires for both inline and block code. Block code is always
-    // wrapped in <pre> (see override above), which strips our inline
-    // styling. Inline code gets the pill look below.
+  code({ children }) {
+    // Only fires for inline code now — block code is intercepted at
+    // the <pre> level above and rendered via <CodeBlock>.
     return (
-      <code
-        className={
-          className ??
-          "rounded bg-muted px-1 py-0.5 font-mono text-[0.9em]"
-        }
-      >
+      <code className="rounded bg-muted px-1 py-0.5 font-mono text-[0.9em]">
         {children}
       </code>
     );
