@@ -75,6 +75,12 @@ pub struct RuntimeCore {
     orchestration: Arc<OrchestrationService>,
     persistence: Arc<PersistenceService>,
     active_sinks: Arc<Mutex<HashMap<String, TurnEventSink>>>,
+    /// Per-session permission policy memory. Keyed by session_id; the inner
+    /// map remembers tools the user answered AllowAlways/DenyAlways for, so
+    /// later turns in the same session short-circuit the host prompt.
+    /// Lives at runtime-core level (not on TurnEventSink directly) so it
+    /// outlives any single turn.
+    session_policies: Arc<Mutex<HashMap<String, zenui_provider_api::PermissionPolicy>>>,
     /// Default working directory for sessions without a project path.
     default_threads_dir: String,
     /// Providers with an in-flight model fetch. Prevents the dual bootstrap
@@ -139,6 +145,7 @@ impl RuntimeCore {
             orchestration,
             persistence,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
+            session_policies: Arc::new(Mutex::new(HashMap::new())),
             default_threads_dir,
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
             in_flight_health_checks: Arc::new(Mutex::new(HashSet::new())),
@@ -811,7 +818,19 @@ impl RuntimeCore {
 
         // Set up streaming channel: adapter pushes events, we forward them.
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<ProviderTurnEvent>(64);
-        let sink = TurnEventSink::new(event_tx);
+        // Look up (or lazily create) this session's persistent permission
+        // policy so AllowAlways/DenyAlways decisions from prior turns
+        // short-circuit subsequent prompts in the same session.
+        let session_policy = {
+            let mut guard = self.session_policies.lock().await;
+            guard
+                .entry(session.summary.session_id.clone())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(HashMap::new()))
+                })
+                .clone()
+        };
+        let sink = TurnEventSink::with_policy(event_tx, session_policy);
 
         // Register the sink so AnswerPermission/AnswerQuestion can route to it.
         {
@@ -1184,6 +1203,9 @@ impl RuntimeCore {
         if !self.persistence.delete_session(&session_id) {
             return Err(format!("Session `{session_id}` could not be deleted."));
         }
+
+        // Drop the session's permission policy so it doesn't grow forever.
+        self.session_policies.lock().await.remove(&session_id);
 
         self.publish(RuntimeEvent::SessionDeleted {
             session_id: session_id.clone(),

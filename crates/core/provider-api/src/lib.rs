@@ -460,6 +460,16 @@ pub enum ProviderTurnEvent {
     },
 }
 
+/// Per-session "always allow / always deny" memory keyed by tool name.
+/// Lives in `RuntimeCore` and is shared across every `TurnEventSink` for
+/// a given session, so a user's "Always" decision in turn N short-circuits
+/// every subsequent prompt for the same tool in turn N+1, N+2, ...
+///
+/// Stored decisions are normalized to `Allow` or `Deny` (never `AllowAlways`
+/// or `DenyAlways`) — providers don't care about the "always" suffix, only
+/// about the binary outcome.
+pub type PermissionPolicy = Arc<Mutex<HashMap<String, PermissionDecision>>>;
+
 /// A handle for adapters to push streaming events during `execute_turn`.
 /// Dropping the sink closes the channel, signalling to the runtime that the turn is complete.
 #[derive(Clone)]
@@ -467,14 +477,30 @@ pub struct TurnEventSink {
     tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
     permission_pending: Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>,
     question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
+    /// Session-scoped persistent permission decisions. Shared across turns.
+    policy: PermissionPolicy,
 }
 
 impl TurnEventSink {
+    /// Create a sink with a fresh, isolated permission policy. Mostly for
+    /// tests and one-off uses where there's no shared session state.
     pub fn new(tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>) -> Self {
+        Self::with_policy(tx, Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Create a sink wired to an existing per-session permission policy. The
+    /// runtime calls this once per turn, passing in the policy that lives on
+    /// `RuntimeCore` keyed by `session_id`, so always-allow/always-deny
+    /// decisions persist for the rest of the session.
+    pub fn with_policy(
+        tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
+        policy: PermissionPolicy,
+    ) -> Self {
         Self {
             tx,
             permission_pending: Arc::new(Mutex::new(HashMap::new())),
             question_pending: Arc::new(Mutex::new(HashMap::new())),
+            policy,
         }
     }
 
@@ -485,12 +511,24 @@ impl TurnEventSink {
 
     /// Ask the host to decide on a tool invocation. Emits a PermissionRequest event
     /// and awaits the host's answer. Returns Deny if the channel closes.
+    ///
+    /// Short-circuits the host prompt entirely if a previous turn in this
+    /// session already answered `AllowAlways` or `DenyAlways` for the same
+    /// tool name.
     pub async fn request_permission(
         &self,
         tool_name: String,
         input: Value,
         suggested: PermissionDecision,
     ) -> PermissionDecision {
+        // Fast path: prior "always" decision in this session.
+        {
+            let policy = self.policy.lock().await;
+            if let Some(decision) = policy.get(&tool_name).copied() {
+                return decision;
+            }
+        }
+
         let request_id = next_request_id("perm");
         let (sender, receiver) = oneshot::channel();
         {
@@ -499,18 +537,39 @@ impl TurnEventSink {
         }
         self.send(ProviderTurnEvent::PermissionRequest {
             request_id: request_id.clone(),
-            tool_name,
+            tool_name: tool_name.clone(),
             input,
             suggested_decision: suggested,
         })
         .await;
-        match receiver.await {
+        let decision = match receiver.await {
             Ok(decision) => decision,
             Err(_) => {
                 let mut guard = self.permission_pending.lock().await;
                 guard.remove(&request_id);
+                return PermissionDecision::Deny;
+            }
+        };
+
+        // Persist "always" decisions before normalizing the return value.
+        // The provider only sees Allow/Deny — the "always" suffix is purely
+        // a host-side hint that we should remember the answer.
+        match decision {
+            PermissionDecision::AllowAlways => {
+                self.policy
+                    .lock()
+                    .await
+                    .insert(tool_name, PermissionDecision::Allow);
+                PermissionDecision::Allow
+            }
+            PermissionDecision::DenyAlways => {
+                self.policy
+                    .lock()
+                    .await
+                    .insert(tool_name, PermissionDecision::Deny);
                 PermissionDecision::Deny
             }
+            other => other,
         }
     }
 
