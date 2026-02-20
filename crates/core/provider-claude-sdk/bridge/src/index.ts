@@ -25,6 +25,11 @@ type DecisionString = 'allow' | 'allow_always' | 'deny' | 'deny_always';
 
 interface PendingPermission {
   resolve: (decision: PermissionResult) => void;
+  // Echoed back as updatedInput when the user allows. Without this the
+  // SDK would replace the tool's args with {} and the tool would crash
+  // (e.g. Bash with command=undefined → "Cannot read properties of
+  // undefined (reading 'includes')").
+  input: Record<string, unknown>;
 }
 
 /**
@@ -52,6 +57,20 @@ interface StructuredAnswer {
 
 const pendingPermissions = new Map<string, PendingPermission>();
 const pendingQuestions = new Map<string, PendingQuestion>();
+
+/// Resolve every in-flight permission and question with a denial /
+/// dismissal so the SDK's canUseTool callbacks unwind. Called when the
+/// turn aborts — without this, awaiting Promises leak forever.
+function drainPendingOnAbort(): void {
+  for (const [, p] of pendingPermissions) {
+    p.resolve({ behavior: 'deny', message: 'Turn aborted' });
+  }
+  pendingPermissions.clear();
+  for (const [, q] of pendingQuestions) {
+    q.resolve({ behavior: 'deny', message: 'Turn aborted' });
+  }
+  pendingQuestions.clear();
+}
 
 function writeJson(payload: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify(payload) + '\n');
@@ -132,7 +151,7 @@ class ClaudeBridge {
         suggested: 'allow',
       });
       return new Promise<PermissionResult>((resolve) => {
-        pendingPermissions.set(requestId, { resolve });
+        pendingPermissions.set(requestId, { resolve, input });
       });
     };
 
@@ -176,6 +195,10 @@ class ClaudeBridge {
     } catch (err) {
       const e = err as Error;
       if (e.name === 'AbortError') {
+        // Drain any in-flight permission/question prompts so their callers
+        // (the SDK's canUseTool callbacks) don't sit on a Promise that never
+        // resolves. They'll see a deny / dismissal and unwind cleanly.
+        drainPendingOnAbort();
         return '[interrupted]';
       }
       throw err;
@@ -249,8 +272,18 @@ class ClaudeBridge {
         for (const block of m.message.content) {
           const t = block.type as string;
           if (t === 'tool_use') {
-            const callId = (block.id as string) ?? '';
-            const name = (block.name as string) ?? '';
+            const callId = block.id as string | undefined;
+            const name = block.name as string | undefined;
+            // Anthropic guarantees both fields on tool_use blocks, but
+            // skipping defensively keeps a corrupted SDK message from
+            // propagating empty IDs that break tool result correlation
+            // downstream. Log so the malformed block is visible in debug.
+            if (!callId || !name) {
+              console.error(
+                `[bridge] skipping malformed tool_use block (id=${callId} name=${name})`,
+              );
+              continue;
+            }
             const input = (block.input as Record<string, unknown>) ?? {};
             writeStream({
               event: 'tool_started',
@@ -360,7 +393,9 @@ class ClaudeBridge {
     pendingPermissions.delete(requestId);
     const allow = decision === 'allow' || decision === 'allow_always';
     if (allow) {
-      p.resolve({ behavior: 'allow', updatedInput: {} });
+      // Echo the original input — passing {} would replace the tool's
+      // args with an empty object and crash inside the tool handler.
+      p.resolve({ behavior: 'allow', updatedInput: p.input });
     } else {
       p.resolve({ behavior: 'deny', message: 'User denied' });
     }

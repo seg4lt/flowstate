@@ -592,7 +592,7 @@ impl ClaudeCliAdapter {
                                 let decision = events
                                     .request_permission(
                                         tool_name,
-                                        tool_input,
+                                        tool_input.clone(),
                                         PermissionDecision::Allow,
                                     )
                                     .await;
@@ -601,9 +601,18 @@ impl ClaudeCliAdapter {
                                     PermissionDecision::Allow
                                         | PermissionDecision::AllowAlways
                                 ) {
+                                    // Echo the original tool_input back as
+                                    // updatedInput. The Claude CLI replaces
+                                    // the tool's args with whatever we send
+                                    // here, so passing {} would call e.g.
+                                    // Bash with command=undefined and crash
+                                    // inside the tool with a TypeError.
                                     control_success(
                                         &request_id,
-                                        serde_json::json!({ "behavior": "allow", "updatedInput": {} }),
+                                        serde_json::json!({
+                                            "behavior": "allow",
+                                            "updatedInput": tool_input,
+                                        }),
                                     )
                                 } else {
                                     control_error(&request_id, "User denied")
