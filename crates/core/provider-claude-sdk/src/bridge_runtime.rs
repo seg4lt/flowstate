@@ -82,6 +82,19 @@ fn extract_once() -> Result<BridgeRuntime> {
         }
         fs::write(&target, file.data.as_ref())
             .with_context(|| format!("write {}", target.display()))?;
+        // rust-embed strips Unix file mode, so bundled binaries (e.g. the
+        // ripgrep shipped inside claude-agent-sdk) come out non-executable
+        // and spawning them fails with EACCES. Restore +x on vendored bins.
+        #[cfg(unix)]
+        if is_vendored_binary(&path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&target)
+                .with_context(|| format!("stat {}", target.display()))?
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&target, perms)
+                .with_context(|| format!("chmod +x {}", target.display()))?;
+        }
     }
 
     if cache_root.exists() {
@@ -109,6 +122,18 @@ fn extract_once() -> Result<BridgeRuntime> {
         dir: cache_root,
         script,
     })
+}
+
+/// True for files that ship as native executables inside `node_modules`
+/// and therefore need the execute bit restored after extraction. Today
+/// the only case is the ripgrep binary bundled with
+/// `@anthropic-ai/claude-agent-sdk` under `vendor/ripgrep/<target>/rg`.
+fn is_vendored_binary(path: &str) -> bool {
+    path.contains("/vendor/ripgrep/")
+        && matches!(
+            path.rsplit('/').next(),
+            Some("rg") | Some("rg.exe")
+        )
 }
 
 /// Deterministic fingerprint of the embedded bridge assets. Used as a
