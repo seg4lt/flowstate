@@ -578,14 +578,13 @@ impl ProviderAdapter for ClaudeSdkAdapter {
 
     async fn start_session(
         &self,
-        session: &SessionDetail,
+        _session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        // Spawn the bridge so the session is ready, but leave provider_state as
-        // None until execute_turn captures the real Claude SDK session id from
-        // the bridge's response. The bridge's own `bridge_session_id` is a
-        // zenui-internal UUID — passing it as `resume:` to the SDK on a later
-        // restart would just fail, so we deliberately don't persist it.
-        let _process = self.ensure_session_process(session).await?;
+        // Defer the bridge spawn to the first execute_turn (which already
+        // calls ensure_session_process). Spawning eagerly here used to add
+        // 300-800ms to "create new thread" for no UX benefit — the bridge
+        // session id isn't persisted across restarts anyway, since it's a
+        // zenui-internal UUID rather than a real Claude SDK resume id.
         Ok(None)
     }
 

@@ -288,16 +288,16 @@ impl ProviderAdapter for CodexAdapter {
 
     async fn start_session(
         &self,
-        session: &SessionDetail,
+        _session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        // We don't know the permission mode at session-creation time (the user
-        // picks it per turn), so seed with the default. execute_turn will tear
-        // down and recreate the thread if a different mode is requested.
-        let process = self
-            .ensure_session_process(session, PermissionMode::default())
-            .await?;
-        let process = process.lock().await;
-        Ok(Some(provider_state(process.provider_thread_id.clone())))
+        // Defer the codex CLI spawn (and the thread/start RPC handshake) to
+        // the first execute_turn. Spawning eagerly here used to add 1-3s to
+        // "create new thread" because thread/start waits on the codex
+        // binary to fully initialize. execute_turn already calls
+        // ensure_session_process lazily, and the captured provider_thread_id
+        // flows back via ProviderTurnOutput.provider_state on the first
+        // successful turn — the runtime persists it from there.
+        Ok(None)
     }
 
     async fn execute_turn(

@@ -374,6 +374,90 @@ impl GitHubCopilotCliAdapter {
         })
     }
 
+    /// Return the cached copilot CLI process for `session`, lazily
+    /// spawning + handshaking if it's the first call. Reads the
+    /// `needs_create` metadata marker that `start_session` plants on
+    /// new threads to decide between `session.create` (fresh) and
+    /// `session.resume` (restored from persistence). The marker is
+    /// auto-cleared by `run_turn`'s output (which sets `metadata: None`)
+    /// after the first successful turn.
+    async fn ensure_session_process(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<Arc<Mutex<CopilotCliProcess>>, String> {
+        if let Some(existing) = self
+            .active_processes
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned()
+        {
+            return Ok(existing);
+        }
+
+        let binary = Self::find_copilot_binary();
+        let resolved_cwd = session_cwd(session, &self.working_directory);
+        let process = Self::spawn_process(&binary, &resolved_cwd).await?;
+
+        let native_session_id = session
+            .provider_state
+            .as_ref()
+            .and_then(|s| s.native_thread_id.as_deref())
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let cwd = resolved_cwd.to_string_lossy().to_string();
+        let model = session.summary.model.as_deref().unwrap_or("gpt-4o");
+
+        let needs_create = session
+            .provider_state
+            .as_ref()
+            .and_then(|s| s.metadata.as_ref())
+            .and_then(|m| m.get("needs_create"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        let (method, params) = if needs_create {
+            (
+                "session.create",
+                serde_json::json!({
+                    "sessionId": native_session_id,
+                    "model": model,
+                    "workingDirectory": cwd,
+                    "requestPermission": true,
+                    "requestUserInput": true,
+                    "streaming": true,
+                }),
+            )
+        } else {
+            (
+                "session.resume",
+                serde_json::json!({
+                    "sessionId": native_session_id,
+                    "requestPermission": true,
+                    "requestUserInput": true,
+                    "streaming": true,
+                }),
+            )
+        };
+
+        process.call(method, params).await.map_err(|e| {
+            format!(
+                "Failed to {}: {e}",
+                if method == "session.resume" { "resume" } else { "create" }
+            )
+        })?;
+
+        info!("copilot CLI: session ready ({})", native_session_id);
+
+        let process = Arc::new(Mutex::new(process));
+        let mut sessions = self.active_processes.lock().await;
+        Ok(sessions
+            .entry(session.summary.session_id.clone())
+            .or_insert_with(|| process.clone())
+            .clone())
+    }
+
     /// Run one turn: send the prompt and consume events until session.idle / error.
     async fn run_turn(
         process: Arc<Mutex<CopilotCliProcess>>,
@@ -959,67 +1043,25 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         &self,
         session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        let binary = Self::find_copilot_binary();
-        let resolved_cwd = session_cwd(session, &self.working_directory);
-        let process = Self::spawn_process(&binary, &resolved_cwd).await?;
-
-        // Use the existing native session ID when resuming, otherwise generate one.
-        let native_session_id = session
-            .provider_state
-            .as_ref()
-            .and_then(|s| s.native_thread_id.as_deref())
-            .map(str::to_string)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let cwd = resolved_cwd.to_string_lossy().to_string();
-        let model = session.summary.model.as_deref().unwrap_or("gpt-4o");
-
-        let (method, params) = if session
-            .provider_state
-            .as_ref()
-            .and_then(|s| s.native_thread_id.as_ref())
-            .is_some()
-        {
-            // Resume existing session.
-            (
-                "session.resume",
-                serde_json::json!({
-                    "sessionId": native_session_id,
-                    "requestPermission": true,
-                    "requestUserInput": true,
-                    "streaming": true,
-                }),
-            )
-        } else {
-            // Create new session.
-            (
-                "session.create",
-                serde_json::json!({
-                    "sessionId": native_session_id,
-                    "model": model,
-                    "workingDirectory": cwd,
-                    "requestPermission": true,
-                    "requestUserInput": true,
-                    "streaming": true,
-                }),
-            )
-        };
-
-        process.call(method, params).await.map_err(|e| {
-            format!("Failed to {}: {e}", if method == "session.resume" { "resume" } else { "create" })
-        })?;
-
-        info!("copilot CLI: session ready ({})", native_session_id);
-
-        let process = Arc::new(Mutex::new(process));
-        self.active_processes
-            .lock()
-            .await
-            .insert(session.summary.session_id.clone(), process);
-
+        // Defer spawning the copilot CLI binary and the session.create
+        // round-trip to first execute_turn. For brand new threads we
+        // generate the native session id here and tag it with a
+        // metadata marker so ensure_session_process knows to use
+        // session.create instead of session.resume on its first call.
+        // run_turn returns provider_state with metadata: None after the
+        // first successful turn, which clears the marker on disk so
+        // subsequent restarts use session.resume.
+        if let Some(state) = &session.provider_state {
+            if state.native_thread_id.is_some() {
+                // Restored session: keep the existing native_thread_id,
+                // no marker. ensure_session_process will use resume.
+                return Ok(Some(state.clone()));
+            }
+        }
+        let native_session_id = Uuid::new_v4().to_string();
         Ok(Some(ProviderSessionState {
             native_thread_id: Some(native_session_id),
-            metadata: None,
+            metadata: Some(serde_json::json!({ "needs_create": true })),
         }))
     }
 
@@ -1031,13 +1073,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         _reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
-        let process = self
-            .active_processes
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned()
-            .ok_or_else(|| "No active copilot CLI process for this session".to_string())?;
+        let process = self.ensure_session_process(session).await?;
 
         let native_session_id = session
             .provider_state

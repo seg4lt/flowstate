@@ -682,17 +682,14 @@ impl ProviderAdapter for GitHubCopilotAdapter {
 
     async fn start_session(
         &self,
-        session: &SessionDetail,
+        _session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        info!("Starting GitHub Copilot session...");
-
-        let process = self.ensure_session_process(session).await?;
-        let process = process.lock().await;
-
-        Ok(Some(ProviderSessionState {
-            native_thread_id: Some(process.bridge_session_id.clone()),
-            metadata: None,
-        }))
+        // Defer the bridge spawn (and the CreateSession round-trip to the
+        // Copilot CLI it sits on top of) to the first execute_turn. The
+        // bridge_session_id used to be returned here as native_thread_id,
+        // but it's a Copilot-CLI-assigned id we can't pre-generate, so we
+        // capture it inside execute_turn's result instead.
+        Ok(None)
     }
 
     async fn execute_turn(
@@ -711,6 +708,10 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         let process = self.ensure_session_process(session).await?;
         let result = {
             let mut process = process.lock().await;
+            // Capture the bridge session id BEFORE the streaming call so
+            // we can return it as native_thread_id even on first turn.
+            // ensure_session_process populates it during CreateSession.
+            let bridge_session_id = process.bridge_session_id.clone();
             let output = self
                 .bridge_request_streaming(
                     &mut process,
@@ -722,7 +723,10 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 .await?;
             Ok(ProviderTurnOutput {
                 output,
-                provider_state: session.provider_state.clone(),
+                provider_state: Some(ProviderSessionState {
+                    native_thread_id: Some(bridge_session_id),
+                    metadata: None,
+                }),
             })
         };
 
