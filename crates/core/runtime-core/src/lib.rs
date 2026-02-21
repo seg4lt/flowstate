@@ -6,11 +6,11 @@ use tokio::sync::{Mutex, broadcast};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
-    AppSnapshot, BootstrapPayload, ClientMessage, FileChangeRecord, PermissionDecision,
-    PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind, ProviderStatus,
-    ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage, SessionDetail, SessionStatus,
-    SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus, TurnEventSink, TurnStatus,
-    UserInputAnswer,
+    AppSnapshot, BootstrapPayload, ClientMessage, ContentBlock, FileChangeRecord,
+    PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
+    ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
+    SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus,
+    TurnEventSink, TurnStatus, UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -877,6 +877,12 @@ impl RuntimeCore {
         let mut file_changes: Vec<FileChangeRecord> = Vec::new();
         let mut subagents: Vec<SubagentRecord> = Vec::new();
         let mut plan: Option<PlanRecord> = None;
+        // Ordered content stream — text, reasoning, and tool-call positions
+        // captured in the exact order events arrived. Adjacent text or
+        // reasoning deltas coalesce into the trailing block; a tool call
+        // closes any open run and records its position so the UI can
+        // render interleaved "text → tool → text → tool" turns faithfully.
+        let mut blocks: Vec<ContentBlock> = Vec::new();
         let sid = session.summary.session_id.clone();
         let tid = turn.turn_id.clone();
 
@@ -884,6 +890,10 @@ impl RuntimeCore {
             match ev {
                 ProviderTurnEvent::AssistantTextDelta { delta } => {
                     accumulated.push_str(&delta);
+                    match blocks.last_mut() {
+                        Some(ContentBlock::Text { text }) => text.push_str(&delta),
+                        _ => blocks.push(ContentBlock::Text { text: delta.clone() }),
+                    }
                     self.publish(RuntimeEvent::ContentDelta {
                         session_id: sid.clone(),
                         turn_id: tid.clone(),
@@ -893,6 +903,10 @@ impl RuntimeCore {
                 }
                 ProviderTurnEvent::ReasoningDelta { delta } => {
                     reasoning.push_str(&delta);
+                    match blocks.last_mut() {
+                        Some(ContentBlock::Reasoning { text }) => text.push_str(&delta),
+                        _ => blocks.push(ContentBlock::Reasoning { text: delta.clone() }),
+                    }
                     self.publish(RuntimeEvent::ReasoningDelta {
                         session_id: sid.clone(),
                         turn_id: tid.clone(),
@@ -907,6 +921,9 @@ impl RuntimeCore {
                         output: None,
                         error: None,
                         status: ToolCallStatus::Pending,
+                    });
+                    blocks.push(ContentBlock::ToolCall {
+                        call_id: call_id.clone(),
                     });
                     self.publish(RuntimeEvent::ToolCallStarted {
                         session_id: sid.clone(),
@@ -1117,6 +1134,7 @@ impl RuntimeCore {
                     t.file_changes = file_changes;
                     t.subagents = subagents;
                     t.plan = plan;
+                    t.blocks = blocks;
                     t.clone()
                 } else {
                     completed_turn
@@ -1286,9 +1304,9 @@ mod tests {
     use zenui_orchestration::OrchestrationService;
     use zenui_persistence::PersistenceService;
     use zenui_provider_api::{
-        ClientMessage, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
-        ProviderStatusLevel, ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
-        TurnStatus,
+        ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind,
+        ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput,
+        ReasoningEffort, SessionDetail, TurnEventSink, TurnStatus,
     };
 
     use super::RuntimeCore;
@@ -1327,6 +1345,180 @@ mod tests {
                 provider_state: None,
             })
         }
+    }
+
+    /// Adapter that emits a deliberately interleaved event stream:
+    /// `text → tool → text → tool → text`. The runtime accumulator is
+    /// expected to capture these in the same order as a `Vec<ContentBlock>`
+    /// so the UI can render them faithfully — that's the entire bug
+    /// this fix exists for.
+    struct InterleavingAdapter;
+
+    #[async_trait]
+    impl ProviderAdapter for InterleavingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+            }
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            _input: &str,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            // Two adjacent deltas to verify they coalesce.
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "Looking it up. ".to_string(),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "One sec.".to_string(),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallStarted {
+                    call_id: "call-a".to_string(),
+                    name: "search".to_string(),
+                    args: serde_json::json!({"q": "x"}),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallCompleted {
+                    call_id: "call-a".to_string(),
+                    output: "ok".to_string(),
+                    error: None,
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "Found it. Now editing.".to_string(),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallStarted {
+                    call_id: "call-b".to_string(),
+                    name: "edit".to_string(),
+                    args: serde_json::json!({"path": "f"}),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallCompleted {
+                    call_id: "call-b".to_string(),
+                    output: "ok".to_string(),
+                    error: None,
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "Done.".to_string(),
+                })
+                .await;
+            // Empty output → runtime falls back to accumulated text.
+            Ok(ProviderTurnOutput {
+                output: String::new(),
+                provider_state: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn interleaved_events_become_ordered_blocks() {
+        let runtime = RuntimeCore::new(
+            vec![Arc::new(InterleavingAdapter)],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        );
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("Interleave".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        runtime
+            .handle_client_message(ClientMessage::SendTurn {
+                session_id: session_id.clone(),
+                input: "go".to_string(),
+                permission_mode: None,
+                reasoning_effort: None,
+            })
+            .await;
+
+        let detail = runtime
+            .persistence
+            .get_session(&session_id)
+            .await
+            .expect("session detail should exist");
+        assert_eq!(detail.turns.len(), 1);
+        let turn = &detail.turns[0];
+        assert_eq!(turn.status, TurnStatus::Completed);
+
+        // Five blocks: text, tool, text, tool, text — exactly the order
+        // the adapter emitted them. The two leading text deltas must
+        // coalesce into a single Text block.
+        assert_eq!(turn.blocks.len(), 5, "blocks: {:?}", turn.blocks);
+        match &turn.blocks[0] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "Looking it up. One sec.");
+            }
+            other => panic!("expected Text block 0, got {other:?}"),
+        }
+        match &turn.blocks[1] {
+            ContentBlock::ToolCall { call_id } => assert_eq!(call_id, "call-a"),
+            other => panic!("expected ToolCall block 1, got {other:?}"),
+        }
+        match &turn.blocks[2] {
+            ContentBlock::Text { text } => {
+                assert_eq!(text, "Found it. Now editing.");
+            }
+            other => panic!("expected Text block 2, got {other:?}"),
+        }
+        match &turn.blocks[3] {
+            ContentBlock::ToolCall { call_id } => assert_eq!(call_id, "call-b"),
+            other => panic!("expected ToolCall block 3, got {other:?}"),
+        }
+        match &turn.blocks[4] {
+            ContentBlock::Text { text } => assert_eq!(text, "Done."),
+            other => panic!("expected Text block 4, got {other:?}"),
+        }
+
+        // Legacy fields still populated for back-compat.
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(
+            turn.output, "Looking it up. One sec.Found it. Now editing.Done.",
+            "accumulated text falls into the legacy output field"
+        );
     }
 
     #[tokio::test]
@@ -1526,6 +1718,7 @@ mod tests {
             plan: None,
             permission_mode: None,
             reasoning_effort: None,
+            blocks: Vec::new(),
         });
         persistence.upsert_session(session).await;
 

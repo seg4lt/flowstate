@@ -6,9 +6,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use chrono::Utc;
 use uuid::Uuid;
 use zenui_provider_api::{
-    FileChangeRecord, PermissionMode, PlanRecord, ProjectRecord, ProviderKind, ProviderModel,
-    ProviderStatus, ReasoningEffort, SessionDetail, SessionStatus, SessionSummary, SubagentRecord,
-    ToolCall, TurnRecord, TurnStatus,
+    ContentBlock, FileChangeRecord, PermissionMode, PlanRecord, ProjectRecord, ProviderKind,
+    ProviderModel, ProviderStatus, ReasoningEffort, SessionDetail, SessionStatus, SessionSummary,
+    SubagentRecord, ToolCall, TurnRecord, TurnStatus,
 };
 
 #[derive(Debug)]
@@ -119,13 +119,18 @@ impl PersistenceService {
                 turn.permission_mode.map(permission_mode_to_str);
             let reasoning_effort_str: Option<String> =
                 turn.reasoning_effort.map(|e| e.as_str().to_string());
+            let blocks_json: Option<String> = if turn.blocks.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&turn.blocks).ok()
+            };
             if transaction
                 .execute(
                     "INSERT INTO turns (
                         turn_id, session_id, input, output, status, created_at, updated_at,
                         reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                        plan_json, permission_mode, reasoning_effort
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        plan_json, permission_mode, reasoning_effort, blocks_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                     params![
                         turn.turn_id,
                         session.summary.session_id,
@@ -141,6 +146,7 @@ impl PersistenceService {
                         plan_json,
                         permission_mode_str,
                         reasoning_effort_str,
+                        blocks_json,
                     ],
                 )
                 .is_err()
@@ -534,6 +540,8 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN plan_json TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN permission_mode TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_effort TEXT", []);
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN blocks_json TEXT", []);
+        let _ = connection.execute("ALTER TABLE archived_turns ADD COLUMN blocks_json TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN path TEXT", []);
 
         // Archived session/turn tables — same schema, plus archived_at timestamp.
@@ -569,6 +577,7 @@ impl PersistenceService {
                 plan_json TEXT,
                 permission_mode TEXT,
                 reasoning_effort TEXT,
+                blocks_json TEXT,
                 FOREIGN KEY(session_id) REFERENCES archived_sessions(session_id) ON DELETE CASCADE
             );
 
@@ -607,10 +616,10 @@ impl PersistenceService {
             "INSERT INTO archived_turns
                 (turn_id, session_id, input, output, status, created_at, updated_at,
                  reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                 plan_json, permission_mode, reasoning_effort)
+                 plan_json, permission_mode, reasoning_effort, blocks_json)
              SELECT turn_id, session_id, input, output, status, created_at, updated_at,
                     reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                    plan_json, permission_mode, reasoning_effort
+                    plan_json, permission_mode, reasoning_effort, blocks_json
              FROM turns WHERE session_id = ?1",
             params![session_id],
         );
@@ -648,10 +657,10 @@ impl PersistenceService {
                 "INSERT INTO turns
                     (turn_id, session_id, input, output, status, created_at, updated_at,
                      reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                     plan_json, permission_mode, reasoning_effort)
+                     plan_json, permission_mode, reasoning_effort, blocks_json)
                  SELECT turn_id, session_id, input, output, status, created_at, updated_at,
                         reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                        plan_json, permission_mode, reasoning_effort
+                        plan_json, permission_mode, reasoning_effort, blocks_json
                  FROM archived_turns WHERE session_id = ?1",
                 params![session_id],
             );
@@ -741,12 +750,13 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
         .prepare(
             "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
                     tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
-                    reasoning_effort
+                    reasoning_effort, blocks_json
              FROM turns WHERE session_id = ?1 ORDER BY created_at ASC",
         )
         .context("failed to prepare turn query")?;
     let turns = statement
         .query_map(params![session_id], |row| {
+            let output: String = row.get(2)?;
             let reasoning: Option<String> = row.get(6)?;
             let tool_calls_json: Option<String> = row.get(7)?;
             let file_changes_json: Option<String> = row.get(8)?;
@@ -754,6 +764,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
             let plan_json: Option<String> = row.get(10)?;
             let permission_mode_str: Option<String> = row.get(11)?;
             let reasoning_effort_str: Option<String> = row.get(12)?;
+            let blocks_json: Option<String> = row.get(13)?;
             let tool_calls: Vec<ToolCall> = tool_calls_json
                 .and_then(|j| serde_json::from_str(&j).ok())
                 .unwrap_or_default();
@@ -769,10 +780,18 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                 permission_mode_str.as_deref().map(permission_mode_from_str);
             let reasoning_effort: Option<ReasoningEffort> =
                 reasoning_effort_str.as_deref().and_then(reasoning_effort_from_str);
+            // Prefer the persisted ordered blocks. For historical rows
+            // (no blocks_json), synthesize a plausible block list from
+            // the legacy columns: reasoning, then text, then tool calls,
+            // matching the old text-then-tools UI so historic turns keep
+            // rendering through the same code path as new ones.
+            let blocks: Vec<ContentBlock> = blocks_json
+                .and_then(|j| serde_json::from_str(&j).ok())
+                .unwrap_or_else(|| synthesize_blocks(reasoning.as_deref(), &output, &tool_calls));
             Ok(TurnRecord {
                 turn_id: row.get(0)?,
                 input: row.get(1)?,
-                output: row.get(2)?,
+                output,
                 status: turn_status_from_str(&row.get::<_, String>(3)?),
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
@@ -783,6 +802,7 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
                 plan,
                 permission_mode,
                 reasoning_effort,
+                blocks,
             })
         })
         .context("failed to query turns")?
@@ -879,6 +899,36 @@ fn permission_mode_from_str(value: &str) -> PermissionMode {
         "bypass" => PermissionMode::Bypass,
         _ => PermissionMode::AcceptEdits,
     }
+}
+
+/// Reconstruct an ordered block list for a historical turn that was
+/// persisted before `blocks_json` existed. Layout matches the old UI:
+/// reasoning fold-open first, then the text body, then any tool calls.
+/// Not perfect, but stable and consistent across reloads.
+fn synthesize_blocks(
+    reasoning: Option<&str>,
+    output: &str,
+    tool_calls: &[ToolCall],
+) -> Vec<ContentBlock> {
+    let mut blocks: Vec<ContentBlock> = Vec::new();
+    if let Some(text) = reasoning {
+        if !text.is_empty() {
+            blocks.push(ContentBlock::Reasoning {
+                text: text.to_string(),
+            });
+        }
+    }
+    if !output.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: output.to_string(),
+        });
+    }
+    for tc in tool_calls {
+        blocks.push(ContentBlock::ToolCall {
+            call_id: tc.call_id.clone(),
+        });
+    }
+    blocks
 }
 
 fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffort> {

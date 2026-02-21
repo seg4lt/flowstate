@@ -77,6 +77,7 @@ impl OrchestrationService {
             plan: None,
             permission_mode,
             reasoning_effort,
+            blocks: Vec::new(),
         };
 
         session.summary.status = SessionStatus::Running;

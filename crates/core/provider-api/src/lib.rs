@@ -241,6 +241,35 @@ pub struct ToolCall {
     pub status: ToolCallStatus,
 }
 
+/// One element of an assistant turn's ordered content stream.
+///
+/// Models a turn the way Anthropic does — as a sequence of blocks in
+/// the order they arrived from the provider — so that interleaved
+/// "text, tool, text, tool" responses render in stream order rather
+/// than getting flattened into "all text first, then all tools at the
+/// end". The legacy `output`, `reasoning`, and `tool_calls` fields on
+/// `TurnRecord` remain populated for backwards compatibility.
+///
+/// `Text` and `Reasoning` carry their own text segment so a single
+/// turn can hold multiple separate runs interrupted by tool calls.
+/// `ToolCall` references the matching entry in `TurnRecord::tool_calls`
+/// by `call_id` — that's where mutable status/output live; the block
+/// itself only carries position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    Reasoning {
+        text: String,
+    },
+    ToolCall {
+        #[serde(rename = "callId")]
+        call_id: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
@@ -285,6 +314,11 @@ pub struct TurnRecord {
     pub permission_mode: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ordered content stream — text, reasoning, and tool calls in the
+    /// exact order the provider emitted them. Canonical view for UIs
+    /// that want to render interleaved content correctly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<ContentBlock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
