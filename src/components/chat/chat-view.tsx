@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useNavigate } from "@tanstack/react-router";
 import { GitBranch } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
@@ -24,6 +25,7 @@ interface PermissionRequest {
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const { state, dispatch } = useApp();
+  const navigate = useNavigate();
   const [turns, setTurns] = React.useState<TurnRecord[]>([]);
   const [loading, setLoading] = React.useState(true);
   const [pendingPermission, setPendingPermission] =
@@ -186,13 +188,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             suggested: event.suggested,
           });
           break;
+
+        case "session_deleted":
+        case "session_archived":
+          // The active thread was deleted or archived from the sidebar
+          // (or another window). Get out of the chat view so the user
+          // isn't staring at a stale title with no data behind it.
+          navigate({ to: "/" });
+          break;
       }
     });
 
     return () => {
       active = false;
     };
-  }, [sessionId]);
+  }, [sessionId, navigate]);
 
   async function handleSend(input: string) {
     // Optimistic: show the user's message immediately, then await the
