@@ -4,6 +4,7 @@ import { GitBranch } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
 import type {
+  ContentBlock,
   PermissionDecision,
   PermissionMode,
   ReasoningEffort,
@@ -23,6 +24,37 @@ interface PermissionRequest {
   suggested: string;
 }
 
+// Stream-order block accumulators. Adjacent text deltas coalesce into
+// the trailing text block; a non-text block (e.g. a tool call) closes
+// the run so the next text delta opens a new block. Always returns a
+// new array so React.memo / reference equality picks up the change.
+function appendTextDelta(
+  blocks: ContentBlock[] | undefined,
+  delta: string,
+): ContentBlock[] {
+  const list = blocks ?? [];
+  const last = list[list.length - 1];
+  if (last && last.kind === "text") {
+    return [...list.slice(0, -1), { kind: "text", text: last.text + delta }];
+  }
+  return [...list, { kind: "text", text: delta }];
+}
+
+function appendReasoningDelta(
+  blocks: ContentBlock[] | undefined,
+  delta: string,
+): ContentBlock[] {
+  const list = blocks ?? [];
+  const last = list[list.length - 1];
+  if (last && last.kind === "reasoning") {
+    return [
+      ...list.slice(0, -1),
+      { kind: "reasoning", text: last.text + delta },
+    ];
+  }
+  return [...list, { kind: "reasoning", text: delta }];
+}
+
 export function ChatView({ sessionId }: { sessionId: string }) {
   const { state, dispatch } = useApp();
   const navigate = useNavigate();
@@ -36,7 +68,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
 
   const session = state.sessions.get(sessionId);
-  const streaming = state.streamingTurns.get(sessionId);
   const projectPath = React.useMemo(() => {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
@@ -128,9 +159,47 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           });
           break;
 
+        case "content_delta": {
+          // Extend the trailing text block of the matching turn with
+          // the new delta, or push a new text block if the previous
+          // block was something else (e.g. a tool call). This is what
+          // preserves stream order in the rendered view.
+          const deltaEvent = event;
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.turnId === deltaEvent.turn_id
+                ? {
+                    ...t,
+                    output: deltaEvent.accumulated_output,
+                    blocks: appendTextDelta(t.blocks, deltaEvent.delta),
+                  }
+                : t,
+            ),
+          );
+          break;
+        }
+
+        case "reasoning_delta": {
+          const deltaEvent = event;
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.turnId === deltaEvent.turn_id
+                ? {
+                    ...t,
+                    reasoning: (t.reasoning ?? "") + deltaEvent.delta,
+                    blocks: appendReasoningDelta(t.blocks, deltaEvent.delta),
+                  }
+                : t,
+            ),
+          );
+          break;
+        }
+
         case "tool_call_started": {
           // Append the new tool call to the matching turn so it appears
-          // immediately rather than waiting for turn_completed.
+          // immediately rather than waiting for turn_completed. The
+          // block records the stream position; toolCalls[] holds the
+          // mutable status/output that tool_call_completed updates.
           const callEvent = event;
           setTurns((prev) =>
             prev.map((t) =>
@@ -146,6 +215,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                         status: "pending" as const,
                       },
                     ],
+                    blocks: [
+                      ...(t.blocks ?? []),
+                      { kind: "tool_call", callId: callEvent.call_id },
+                    ],
                   }
                 : t,
             ),
@@ -156,6 +229,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         case "tool_call_completed": {
           // Update the matching tool call with its output/error and
           // flip status. New arrays so memoization detects the change.
+          // No blocks change — the block is just a position reference.
           const callEvent = event;
           setTurns((prev) =>
             prev.map((t) => {
@@ -325,7 +399,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
       <MessageList
         turns={turns}
-        streaming={streaming ?? null}
         loading={loading}
         pendingInput={pendingInput}
       />

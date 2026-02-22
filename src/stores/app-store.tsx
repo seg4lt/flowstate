@@ -9,18 +9,11 @@ import type {
   SessionSummary,
 } from "@/lib/types";
 
-interface StreamingTurn {
-  turnId: string;
-  accumulatedOutput: string;
-  accumulatedReasoning: string;
-}
-
 interface AppState {
   providers: ProviderStatus[];
   sessions: Map<string, SessionSummary>;
   projects: ProjectRecord[];
   activeSessionId: string | null;
-  streamingTurns: Map<string, StreamingTurn>;
   ready: boolean;
 }
 
@@ -111,45 +104,10 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       return { ...state, sessions };
     }
 
-    case "turn_started": {
-      const streaming = new Map(state.streamingTurns);
-      streaming.set(event.session_id, {
-        turnId: event.turn.turnId,
-        accumulatedOutput: "",
-        accumulatedReasoning: "",
-      });
-      return { ...state, streamingTurns: streaming };
-    }
-
-    case "reasoning_delta": {
-      const streaming = new Map(state.streamingTurns);
-      const existing = streaming.get(event.session_id);
-      streaming.set(event.session_id, {
-        turnId: event.turn_id,
-        accumulatedOutput: existing?.accumulatedOutput ?? "",
-        accumulatedReasoning:
-          (existing?.accumulatedReasoning ?? "") + event.delta,
-      });
-      return { ...state, streamingTurns: streaming };
-    }
-
-    case "content_delta": {
-      const streaming = new Map(state.streamingTurns);
-      const existing = streaming.get(event.session_id);
-      streaming.set(event.session_id, {
-        turnId: event.turn_id,
-        accumulatedOutput: event.accumulated_output,
-        accumulatedReasoning: existing?.accumulatedReasoning ?? "",
-      });
-      return { ...state, streamingTurns: streaming };
-    }
-
     case "turn_completed": {
       const sessions = new Map(state.sessions);
       sessions.set(event.session.sessionId, event.session);
-      const streaming = new Map(state.streamingTurns);
-      streaming.delete(event.session_id);
-      return { ...state, sessions, streamingTurns: streaming };
+      return { ...state, sessions };
     }
 
     case "project_created": {
@@ -251,7 +209,6 @@ const initialState: AppState = {
   sessions: new Map(),
   projects: [],
   activeSessionId: null,
-  streamingTurns: new Map(),
   ready: false,
 };
 

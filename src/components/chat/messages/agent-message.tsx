@@ -4,70 +4,26 @@ import { MarkdownContent } from "./markdown-content";
 
 interface AgentMessageProps {
   output: string;
-  reasoning?: string;
   streaming: boolean;
   status: TurnStatus;
 }
 
-function BlinkingCursor({ tone }: { tone: "foreground" | "muted" }) {
+function BlinkingCursor() {
   return (
-    <span
-      className={
-        "ml-0.5 inline-block h-4 w-[2px] animate-pulse align-text-bottom " +
-        (tone === "muted" ? "bg-muted-foreground" : "bg-foreground")
-      }
-    />
+    <span className="ml-0.5 inline-block h-4 w-[2px] animate-pulse bg-foreground align-text-bottom" />
   );
 }
 
-function AgentMessageInner({
-  output,
-  reasoning,
-  streaming,
-  status,
-}: AgentMessageProps) {
+function AgentMessageInner({ output, streaming, status }: AgentMessageProps) {
   // Defer the markdown parse during rapid streaming deltas — React
   // concurrent mode will render stale markdown if the main thread is
   // busy, then catch up when it has time. No manual throttling.
   const deferredOutput = React.useDeferredValue(output);
 
-  // Thinking placeholder — streaming, no reasoning, no content yet.
-  if (streaming && !output && !reasoning) {
-    return (
-      <div className="text-sm text-muted-foreground">
-        <span className="animate-pulse">Thinking…</span>
-      </div>
-    );
-  }
-
-  // Reasoning-only streaming — content hasn't started yet, show the
-  // thinking stream in italics with a cursor. Matches previous behavior
-  // where reasoning disappears once output begins streaming.
-  if (streaming && !output && reasoning) {
-    return (
-      <div className="text-sm">
-        <p className="whitespace-pre-wrap text-muted-foreground italic">
-          {reasoning}
-        </p>
-        <BlinkingCursor tone="muted" />
-      </div>
-    );
-  }
-
   return (
     <div className="text-sm leading-relaxed">
-      {reasoning && (
-        <details className="mb-3 rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs">
-          <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
-            Reasoning
-          </summary>
-          <p className="mt-2 whitespace-pre-wrap italic text-muted-foreground">
-            {reasoning}
-          </p>
-        </details>
-      )}
       <MarkdownContent content={deferredOutput} />
-      {streaming && <BlinkingCursor tone="foreground" />}
+      {streaming && <BlinkingCursor />}
       {status === "failed" && (
         <p className="mt-2 text-xs text-destructive">Turn failed</p>
       )}
@@ -82,7 +38,6 @@ export const AgentMessage = React.memo(
   AgentMessageInner,
   (prev, next) =>
     prev.output === next.output &&
-    prev.reasoning === next.reasoning &&
     prev.streaming === next.streaming &&
     prev.status === next.status,
 );

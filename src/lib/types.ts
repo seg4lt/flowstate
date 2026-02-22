@@ -66,6 +66,18 @@ export interface ToolCall {
   status: ToolCallStatus;
 }
 
+// Mirrors `zenui_provider_api::ContentBlock` — the canonical ordered
+// content stream for an assistant turn. Tagged on `kind` (snake_case)
+// because the Rust enum uses #[serde(tag = "kind", rename_all = "snake_case")].
+// Tool-call blocks reference TurnRecord.toolCalls by callId — that's
+// where mutable status/output live; the block itself only carries the
+// stream position so interleaved "text → tool → text → tool" turns
+// render in the order the provider emitted them.
+export type ContentBlock =
+  | { kind: "text"; text: string }
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool_call"; callId: string };
+
 export interface FileChangeRecord {
   callId: string;
   path: string;
@@ -99,6 +111,7 @@ export interface TurnRecord {
   plan?: PlanRecord;
   permissionMode?: PermissionMode;
   reasoningEffort?: ReasoningEffort;
+  blocks?: ContentBlock[];
 }
 
 export interface ProjectRecord {

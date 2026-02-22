@@ -1,5 +1,5 @@
 import * as React from "react";
-import type { ToolCall, TurnStatus } from "@/lib/types";
+import type { ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
 import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
@@ -12,9 +12,11 @@ import { AgentMessage } from "./agent-message";
 export interface MessageItem {
   turnId: string;
   input: string | null;
-  output: string;
-  reasoning: string | null;
   status: TurnStatus;
+  // Canonical ordered content stream — text, reasoning, and tool-call
+  // positions in the order the provider emitted them. Tool-call blocks
+  // reference toolCalls[] by callId.
+  blocks: ContentBlock[];
   toolCalls: ToolCall[] | null;
   streaming: boolean;
 }
@@ -24,26 +26,69 @@ interface TurnViewProps {
 }
 
 function TurnViewInner({ item }: TurnViewProps) {
+  const callsById = React.useMemo(() => {
+    const map = new Map<string, ToolCall>();
+    for (const tc of item.toolCalls ?? []) map.set(tc.callId, tc);
+    return map;
+  }, [item.toolCalls]);
+
+  // Find the trailing text block so the blinking cursor only attaches
+  // to the very last text run while the turn is still streaming.
+  const lastTextIdx = React.useMemo(() => {
+    for (let i = item.blocks.length - 1; i >= 0; i--) {
+      if (item.blocks[i].kind === "text") return i;
+    }
+    return -1;
+  }, [item.blocks]);
+
+  const hasAnyContent = item.blocks.length > 0;
+
   return (
     <div className="space-y-3">
       {item.input !== null && <UserMessage input={item.input} />}
 
-      {(item.output || item.streaming) && (
-        <AgentMessage
-          output={item.output}
-          reasoning={item.reasoning ?? undefined}
-          streaming={item.streaming}
-          status={item.status}
-        />
-      )}
-
-      {item.toolCalls && item.toolCalls.length > 0 && (
-        <div className="space-y-2 pl-2">
-          {item.toolCalls.map((tc) => (
-            <ToolCallCard key={tc.callId} toolCall={tc} />
-          ))}
+      {!hasAnyContent && item.streaming && (
+        <div className="text-sm text-muted-foreground">
+          <span className="animate-pulse">Thinking…</span>
         </div>
       )}
+
+      {item.blocks.map((block, idx) => {
+        switch (block.kind) {
+          case "text":
+            return (
+              <AgentMessage
+                key={`text-${idx}`}
+                output={block.text}
+                streaming={item.streaming && idx === lastTextIdx}
+                status={item.status}
+              />
+            );
+          case "reasoning":
+            return (
+              <details
+                key={`reasoning-${idx}`}
+                className="rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs"
+              >
+                <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+                  Reasoning
+                </summary>
+                <p className="mt-2 whitespace-pre-wrap italic text-muted-foreground">
+                  {block.text}
+                </p>
+              </details>
+            );
+          case "tool_call": {
+            const tc = callsById.get(block.callId);
+            if (!tc) return null;
+            return (
+              <div key={`tool-${block.callId}`} className="pl-2">
+                <ToolCallCard toolCall={tc} />
+              </div>
+            );
+          }
+        }
+      })}
     </div>
   );
 }
@@ -54,13 +99,12 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
   return (
     a.turnId === b.turnId &&
     a.input === b.input &&
-    a.output === b.output &&
-    a.reasoning === b.reasoning &&
     a.status === b.status &&
     a.streaming === b.streaming &&
-    // Reference equality — chat-view always builds new arrays when a
-    // tool call is added or completes, so this catches both length
-    // changes and per-call status updates.
+    // Reference equality on both arrays — chat-view always builds new
+    // arrays when blocks or tool calls change, so this catches every
+    // streaming update.
+    a.blocks === b.blocks &&
     a.toolCalls === b.toolCalls
   );
 });
