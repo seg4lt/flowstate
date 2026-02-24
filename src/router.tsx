@@ -117,6 +117,11 @@ function AppLayout() {
             { "--sidebar-width": `${width}px` } as React.CSSProperties
           }
         >
+          {import.meta.env.DEV && (
+            <div className="pointer-events-none fixed top-1 left-1/2 z-50 -translate-x-1/2 rounded bg-amber-500/90 px-2 py-0.5 text-[10px] font-medium text-black shadow-sm">
+              DEV BUILD
+            </div>
+          )}
           <AppSidebar />
           <DragHandle width={width} onResize={setWidth} />
           <SidebarInset>
