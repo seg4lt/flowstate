@@ -123,6 +123,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
     connectStream((message) => {
       if (!active) return;
+      // SessionLoaded arrives outside the event stream — both as a
+      // direct response to load_session and as a daemon-pushed reseed
+      // when the broadcast subscriber lagged and dropped events. In
+      // both cases, if it's for the active session we treat its
+      // turns[] as authoritative and replace local state. This is the
+      // recovery path for tool calls that would otherwise be stuck on
+      // pending after a dropped tool_call_completed event.
+      if (message.type === "session_loaded") {
+        if (message.session.summary.sessionId === sessionId) {
+          setTurns(message.session.turns);
+          setPendingInput(null);
+        }
+        return;
+      }
       if (message.type !== "event") return;
       const event = message.event;
 
