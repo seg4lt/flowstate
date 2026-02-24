@@ -47,12 +47,32 @@ pub async fn connect(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("streaming channel lagged by {n} events; sending snapshot");
+                tracing::warn!(
+                    "streaming channel lagged by {n} events; sending snapshot + active session reseed"
+                );
                 let snapshot = state.runtime.snapshot().await;
                 if on_event
                     .send(ServerMessage::Snapshot { snapshot })
                     .is_err()
                 {
+                    break;
+                }
+                // Snapshot only carries summaries — chat-view needs the
+                // full live turn list (including any in-flight tool
+                // calls that were dropped from the broadcast queue) to
+                // reconcile, so push a SessionLoaded for every session
+                // that's currently mid-turn.
+                let mut send_failed = false;
+                for session in state.runtime.active_session_details().await {
+                    if on_event
+                        .send(ServerMessage::SessionLoaded { session })
+                        .is_err()
+                    {
+                        send_failed = true;
+                        break;
+                    }
+                }
+                if send_failed {
                     break;
                 }
             }

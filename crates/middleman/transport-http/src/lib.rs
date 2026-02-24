@@ -372,13 +372,25 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(
-                        "websocket subscriber lagged behind by {skipped} messages; sending fresh snapshot"
+                        "websocket subscriber lagged behind by {skipped} messages; sending snapshot + active session reseed"
                     );
                     // On Lagged we've dropped events; push a fresh
-                    // snapshot so the client re-reconciles from
-                    // authoritative state.
+                    // snapshot for the sidebar plus a SessionLoaded for
+                    // every session that's currently mid-turn so chat
+                    // views can reconcile in-flight tool calls that
+                    // were dropped from the broadcast queue.
                     let snapshot = sub_runtime.snapshot().await;
                     if sub_tx.send(ServerMessage::Snapshot { snapshot }).is_err() {
+                        break;
+                    }
+                    let mut send_failed = false;
+                    for session in sub_runtime.active_session_details().await {
+                        if sub_tx.send(ServerMessage::SessionLoaded { session }).is_err() {
+                            send_failed = true;
+                            break;
+                        }
+                    }
+                    if send_failed {
                         break;
                     }
                 }

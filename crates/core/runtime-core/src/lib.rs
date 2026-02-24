@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use tokio::sync::{Mutex, broadcast};
@@ -10,7 +10,7 @@ use zenui_provider_api::{
     PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
     ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
     SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus,
-    TurnEventSink, TurnStatus, UserInputAnswer,
+    TurnEventSink, TurnRecord, TurnStatus, UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -90,6 +90,14 @@ pub struct RuntimeCore {
     /// Providers with an in-flight health check. Prevents duplicate health
     /// checks when multiple transports bootstrap near-simultaneously.
     in_flight_health_checks: Arc<Mutex<HashSet<ProviderKind>>>,
+    /// Live snapshot of every actively-streaming turn, keyed by session id.
+    /// The accumulator inside `handle_send_turn` writes a fresh `TurnRecord`
+    /// here after every mutating event so lag-recovery code paths can hand
+    /// the client an authoritative view of the in-flight turn — persistence
+    /// only catches state at turn completion, so any tool call dropped from
+    /// the broadcast queue would otherwise be invisible until the very end.
+    /// Cleared in both the success and failure exit paths.
+    in_flight_turns: Arc<RwLock<HashMap<String, TurnRecord>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
@@ -134,7 +142,15 @@ impl RuntimeCore {
             .into_iter()
             .map(|adapter| (adapter.kind(), adapter))
             .collect::<HashMap<_, _>>();
-        let (event_tx, _) = broadcast::channel(128);
+        // Sized for chatty providers: a single Codex/Claude turn easily emits
+        // 500–2000 events (one content_delta per token plus tool start/end
+        // pairs). At 128 the receiver lagged behind during normal turns and
+        // tokio dropped events from the middle of the stream, leaving tool
+        // calls visually stuck on `pending` until turn_completed swept them.
+        // 4096 covers a long turn end-to-end with headroom; the lag-recovery
+        // path below reseeds chat-view from `live_session_detail` if a client
+        // ever does fall behind.
+        let (event_tx, _) = broadcast::channel(4096);
 
         let registered: Vec<_> = adapters.keys().map(|k| k.label()).collect();
         tracing::info!(?registered, "Registered provider adapters");
@@ -149,6 +165,7 @@ impl RuntimeCore {
             default_threads_dir,
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
             in_flight_health_checks: Arc::new(Mutex::new(HashSet::new())),
+            in_flight_turns: Arc::new(RwLock::new(HashMap::new())),
             turn_observer,
         }
     }
@@ -159,6 +176,53 @@ impl RuntimeCore {
 
     pub fn publish(&self, event: RuntimeEvent) {
         let _ = self.event_tx.send(event);
+    }
+
+    /// Load a session from persistence and splice the in-flight turn (if
+    /// any) into the returned `SessionDetail.turns`. Replaces by `turn_id`
+    /// if a matching entry already exists, otherwise appends. Used by
+    /// `LoadSession` and by lag-recovery in transports — both want the
+    /// authoritative live view, not whatever happened to be persisted at
+    /// the last `turn_completed`.
+    pub async fn live_session_detail(&self, session_id: &str) -> Option<SessionDetail> {
+        let mut detail = self.persistence.get_session(session_id).await?;
+        let live = self
+            .in_flight_turns
+            .read()
+            .ok()
+            .and_then(|map| map.get(session_id).cloned());
+        if let Some(live_turn) = live {
+            if let Some(slot) = detail
+                .turns
+                .iter_mut()
+                .find(|t| t.turn_id == live_turn.turn_id)
+            {
+                *slot = live_turn;
+            } else {
+                detail.turns.push(live_turn);
+            }
+        }
+        Some(detail)
+    }
+
+    /// Returns the `SessionDetail` for every session that currently has
+    /// an in-flight turn, with the live turn merged in. Transports use
+    /// this on broadcast-lag recovery to atomically reseed any client
+    /// that's mid-stream — without it, the lost ToolCallCompleted events
+    /// would leave tool calls visually stuck on `pending` until the very
+    /// end of the turn.
+    pub async fn active_session_details(&self) -> Vec<SessionDetail> {
+        let session_ids: Vec<String> = match self.in_flight_turns.read() {
+            Ok(map) => map.keys().cloned().collect(),
+            Err(_) => return Vec::new(),
+        };
+        let mut details = Vec::with_capacity(session_ids.len());
+        for sid in session_ids {
+            if let Some(detail) = self.live_session_detail(&sid).await {
+                details.push(detail);
+            }
+        }
+        details
     }
 
     pub async fn snapshot(&self) -> AppSnapshot {
@@ -382,7 +446,7 @@ impl RuntimeCore {
                 snapshot: self.snapshot().await,
             }),
             ClientMessage::LoadSession { session_id } => {
-                match self.persistence.get_session(&session_id).await {
+                match self.live_session_detail(&session_id).await {
                     Some(session) => Some(ServerMessage::SessionLoaded { session }),
                     None => Some(ServerMessage::Error {
                         message: format!("Session `{session_id}` not found."),
@@ -885,6 +949,21 @@ impl RuntimeCore {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         let sid = session.summary.session_id.clone();
         let tid = turn.turn_id.clone();
+        // Seed the in-flight snapshot with the freshly-started turn so any
+        // lag-recovery query before the first event still returns something
+        // sensible (the running turn with empty content).
+        write_in_flight_snapshot(
+            &self.in_flight_turns,
+            &sid,
+            &turn,
+            &accumulated,
+            &reasoning,
+            &tool_calls,
+            &file_changes,
+            &subagents,
+            &plan,
+            &blocks,
+        );
 
         while let Some(ev) = event_rx.recv().await {
             match ev {
@@ -1085,6 +1164,22 @@ impl RuntimeCore {
                     });
                 }
             }
+            // Refresh the live in-flight snapshot after every event so a
+            // client recovering from broadcast lag gets the authoritative
+            // current view of this turn (including any pending tool calls)
+            // even when the events themselves were dropped from the queue.
+            write_in_flight_snapshot(
+                &self.in_flight_turns,
+                &sid,
+                &turn,
+                &accumulated,
+                &reasoning,
+                &tool_calls,
+                &file_changes,
+                &subagents,
+                &plan,
+                &blocks,
+            );
         }
 
         // Join the adapter task.
@@ -1096,6 +1191,14 @@ impl RuntimeCore {
         {
             let mut guard = self.active_sinks.lock().await;
             guard.remove(&sid);
+        }
+
+        // The drain loop has finished, so the in-flight snapshot is now
+        // stale and persistence is about to take over. Drop the entry on
+        // both success and failure exits — done here, before the match,
+        // so it can't be skipped on an early `?` return.
+        if let Ok(mut map) = self.in_flight_turns.write() {
+            map.remove(&sid);
         }
 
         match adapter_result {
@@ -1284,6 +1387,41 @@ fn spawn_model_refresh_detached(
     });
 }
 
+/// Build a `TurnRecord` snapshot from the accumulator's local state and
+/// stash it under `session_id` in the live in-flight map. Called after
+/// every event in the drain loop, so the map always reflects the
+/// latest known state of the running turn — that's what `live_session_detail`
+/// hands back to a client recovering from broadcast lag.
+#[allow(clippy::too_many_arguments)]
+fn write_in_flight_snapshot(
+    in_flight_turns: &Arc<RwLock<HashMap<String, TurnRecord>>>,
+    session_id: &str,
+    base: &TurnRecord,
+    accumulated: &str,
+    reasoning_text: &str,
+    tool_calls: &[ToolCall],
+    file_changes: &[FileChangeRecord],
+    subagents: &[SubagentRecord],
+    plan: &Option<PlanRecord>,
+    blocks: &[ContentBlock],
+) {
+    let mut snap = base.clone();
+    snap.output = accumulated.to_string();
+    snap.reasoning = if reasoning_text.is_empty() {
+        None
+    } else {
+        Some(reasoning_text.to_string())
+    };
+    snap.tool_calls = tool_calls.to_vec();
+    snap.file_changes = file_changes.to_vec();
+    snap.subagents = subagents.to_vec();
+    snap.plan = plan.clone();
+    snap.blocks = blocks.to_vec();
+    if let Ok(mut map) = in_flight_turns.write() {
+        map.insert(session_id.to_string(), snap);
+    }
+}
+
 /// Returns true if the ISO-8601 `fetched_at` timestamp is older than the model
 /// cache TTL. Unparseable timestamps are treated as stale so we'll re-fetch.
 fn is_cache_stale(fetched_at: &str) -> bool {
@@ -1306,7 +1444,7 @@ mod tests {
     use zenui_provider_api::{
         ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind,
         ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput,
-        ReasoningEffort, SessionDetail, TurnEventSink, TurnStatus,
+        ReasoningEffort, SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus,
     };
 
     use super::RuntimeCore;
@@ -1436,6 +1574,184 @@ mod tests {
                 provider_state: None,
             })
         }
+    }
+
+    /// Adapter that emits a tool-call started event, signals the test
+    /// it's "mid-turn", waits for permission, then completes. Lets the
+    /// test inspect `live_session_detail` while the turn is in flight.
+    struct PausingAdapter {
+        mid_turn_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for PausingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+            }
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            _input: &str,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "starting work…".to_string(),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallStarted {
+                    call_id: "stuck-call".to_string(),
+                    name: "search".to_string(),
+                    args: serde_json::json!({}),
+                })
+                .await;
+            // Yield so the runtime drain loop has a chance to process
+            // the events above and write them into in_flight_turns
+            // before we open the gate.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            // Tell the test we're paused mid-turn.
+            if let Some(tx) = self.mid_turn_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            // Wait until the test releases us.
+            if let Some(rx) = self.resume_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+            events
+                .send(ProviderTurnEvent::ToolCallCompleted {
+                    call_id: "stuck-call".to_string(),
+                    output: "ok".to_string(),
+                    error: None,
+                })
+                .await;
+            Ok(ProviderTurnOutput {
+                output: String::new(),
+                provider_state: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn live_session_detail_includes_in_flight_turn() {
+        let (mid_tx, mid_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(PausingAdapter {
+            mid_turn_tx: tokio::sync::Mutex::new(Some(mid_tx)),
+            resume_rx: tokio::sync::Mutex::new(Some(resume_rx)),
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("Live".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        // Kick off the turn in the background — it will pause partway
+        // until we send `resume_tx`.
+        let runtime_clone = runtime.clone();
+        let sid_clone = session_id.clone();
+        let turn_task = tokio::spawn(async move {
+            runtime_clone
+                .handle_client_message(ClientMessage::SendTurn {
+                    session_id: sid_clone,
+                    input: "go".to_string(),
+                    permission_mode: None,
+                    reasoning_effort: None,
+                })
+                .await
+        });
+
+        // Wait for the adapter to signal it's mid-turn.
+        mid_rx
+            .await
+            .expect("adapter should signal mid-turn");
+
+        // While the turn is paused, live_session_detail must already
+        // surface the in-flight turn with its still-pending tool call.
+        // Persistence has nothing for this turn yet — turn_completed
+        // hasn't fired — so without the in-flight tracker this would
+        // return an empty turns vec.
+        let live = runtime
+            .live_session_detail(&session_id)
+            .await
+            .expect("session should exist");
+        assert_eq!(live.turns.len(), 1, "in-flight turn must appear in live detail");
+        let live_turn = &live.turns[0];
+        assert_eq!(live_turn.status, TurnStatus::Running);
+        assert_eq!(live_turn.tool_calls.len(), 1);
+        assert_eq!(live_turn.tool_calls[0].call_id, "stuck-call");
+        assert_eq!(
+            live_turn.tool_calls[0].status,
+            ToolCallStatus::Pending,
+            "tool call should still be pending while the turn is mid-flight"
+        );
+        assert_eq!(live_turn.blocks.len(), 2, "blocks: {:?}", live_turn.blocks);
+
+        // active_session_details should report this session too.
+        let active = runtime.active_session_details().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].summary.session_id, session_id);
+
+        // Release the adapter and let the turn finish.
+        let _ = resume_tx.send(());
+        turn_task.await.expect("turn task should complete");
+
+        // After completion, the in-flight entry must be cleared.
+        let active_after = runtime.active_session_details().await;
+        assert!(
+            active_after.is_empty(),
+            "in_flight_turns should be cleared on completion"
+        );
+
+        // And the persisted detail now reflects the completed tool call.
+        let final_detail = runtime
+            .live_session_detail(&session_id)
+            .await
+            .expect("session should exist");
+        assert_eq!(final_detail.turns.len(), 1);
+        assert_eq!(final_detail.turns[0].status, TurnStatus::Completed);
+        assert_eq!(
+            final_detail.turns[0].tool_calls[0].status,
+            ToolCallStatus::Completed
+        );
     }
 
     #[tokio::test]
