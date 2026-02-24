@@ -12,6 +12,8 @@ import {
   type Options,
   type PermissionResult,
   type CanUseTool,
+  type Query,
+  type PermissionMode as SdkPermissionMode,
 } from '@anthropic-ai/claude-agent-sdk';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
@@ -86,6 +88,15 @@ class ClaudeBridge {
   private resumeSessionId?: string;
   private abortController?: AbortController;
   private inFlight = false;
+  /**
+   * Live handle to the SDK Query object for the in-flight turn, if any.
+   * The SDK exposes mid-turn control methods like `setPermissionMode` and
+   * `interrupt` on this object — we hold onto it so the host can flip
+   * the active permission mode (e.g. when the user approves an
+   * ExitPlanMode and picks "Auto-edit") without restarting the turn.
+   * Cleared in the finally block of `sendPrompt`.
+   */
+  private activeQuery?: Query;
 
   createSession(cwd: string, model?: string, resumeSessionId?: string): string {
     this.cwd = cwd;
@@ -187,8 +198,10 @@ class ClaudeBridge {
     };
 
     let finalText = '';
+    const q = query({ prompt, options });
+    this.activeQuery = q;
     try {
-      for await (const message of query({ prompt, options })) {
+      for await (const message of q) {
         const text = this.handleSdkMessage(message);
         if (text != null) finalText = text;
       }
@@ -204,8 +217,20 @@ class ClaudeBridge {
       throw err;
     } finally {
       this.inFlight = false;
+      this.activeQuery = undefined;
     }
     return finalText;
+  }
+
+  /**
+   * Forward a runtime permission-mode change to the in-flight SDK query.
+   * No-op if no turn is currently running. The host calls this after a
+   * user approves an ExitPlanMode and picks a new mode for the rest of
+   * the turn.
+   */
+  async setPermissionMode(mode: SdkPermissionMode): Promise<void> {
+    if (!this.activeQuery) return;
+    await this.activeQuery.setPermissionMode(mode);
   }
 
   /**
@@ -596,6 +621,29 @@ async function main(): Promise<void> {
       case 'interrupt': {
         bridge.interrupt();
         writeJson({ type: 'interrupted' });
+        break;
+      }
+
+      case 'set_permission_mode': {
+        // Mid-turn permission switch. The Rust runtime sends this when
+        // the user picks "Approve & Auto-edit" (etc.) on an ExitPlanMode
+        // approval. Map our wire mode names to the SDK's enum.
+        const mode = msg.permission_mode as
+          | 'default'
+          | 'acceptEdits'
+          | 'plan'
+          | 'bypassPermissions';
+        (async () => {
+          try {
+            await bridge.setPermissionMode(mode);
+            writeJson({ type: 'permission_mode_set', mode });
+          } catch (err) {
+            writeJson({
+              type: 'error',
+              error: `set_permission_mode failed: ${(err as Error).message}`,
+            });
+          }
+        })();
         break;
       }
 

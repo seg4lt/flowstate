@@ -853,6 +853,16 @@ pub enum ClientMessage {
     InterruptTurn {
         session_id: String,
     },
+    /// Switch the active session's permission mode mid-turn. The runtime
+    /// forwards this to the session's adapter; for Claude Agent SDK
+    /// sessions the bridge calls `query.setPermissionMode` on the live
+    /// SDK Query, so the rest of the in-flight turn runs under the new
+    /// mode. Adapters whose backend doesn't support mid-turn switching
+    /// silently no-op and the new mode applies to the next turn.
+    UpdatePermissionMode {
+        session_id: String,
+        permission_mode: PermissionMode,
+    },
     DeleteSession {
         session_id: String,
     },
@@ -985,6 +995,20 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn interrupt_turn(&self, _session: &SessionDetail) -> Result<String, String> {
         Ok("Interrupt recorded.".to_string())
+    }
+
+    /// Mid-turn permission-mode switch. Adapters that wrap a backend
+    /// supporting live mode changes (currently only the Claude Agent SDK
+    /// via `query.setPermissionMode`) should forward the request; the
+    /// default is a no-op so adapters whose backend takes the mode at
+    /// turn-start time silently ignore the request, and the runtime
+    /// applies it from the next `execute_turn` instead.
+    async fn update_permission_mode(
+        &self,
+        _session: &SessionDetail,
+        _mode: PermissionMode,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// Tear down any long-lived resources held for this session (subprocesses, connections).

@@ -82,6 +82,12 @@ enum BridgeRequest {
     ListModels,
     #[serde(rename = "interrupt")]
     Interrupt,
+    /// Mid-turn permission-mode switch. Bridge calls
+    /// `query.setPermissionMode(...)` on the in-flight SDK Query, which
+    /// applies to the rest of the current turn (and subsequent turns
+    /// until changed again).
+    #[serde(rename = "set_permission_mode")]
+    SetPermissionMode { permission_mode: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +176,16 @@ enum BridgeResponse {
 pub struct ClaudeSdkAdapter {
     working_directory: PathBuf,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<ClaudeBridgeProcess>>>>>,
+    /// Direct, lock-free-from-outside handles to each session's bridge
+    /// stdin. `run_turn` holds the outer `sessions` Mutex guard for the
+    /// duration of the turn (because it owns `&mut process.stdout`), so
+    /// any control message that needs to write to the bridge mid-turn
+    /// (interrupt, set_permission_mode, …) would deadlock if it had to
+    /// re-lock the same outer Mutex. Storing a clone of the inner stdin
+    /// Arc here lets control paths bypass the outer lock entirely; the
+    /// inner stdin Mutex still serializes writes against the writer task
+    /// inside `run_turn`, so the bridge never sees torn JSON lines.
+    session_stdins: Arc<Mutex<HashMap<String, Arc<Mutex<ChildStdin>>>>>,
 }
 
 impl ClaudeSdkAdapter {
@@ -177,7 +193,15 @@ impl ClaudeSdkAdapter {
         Self {
             working_directory,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_stdins: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Lookup the per-session stdin handle without ever touching the
+    /// outer `sessions` Mutex that `run_turn` holds. Returns `None` if
+    /// the session has no live bridge.
+    async fn session_stdin(&self, session_id: &str) -> Option<Arc<Mutex<ChildStdin>>> {
+        self.session_stdins.lock().await.get(session_id).cloned()
     }
 
     async fn spawn_bridge(&self) -> Result<ClaudeBridgeProcess, String> {
@@ -317,7 +341,19 @@ impl ClaudeSdkAdapter {
             }
         }
 
+        // Clone the bridge's stdin Arc into the parallel session_stdins
+        // map BEFORE wrapping the bridge in its outer Mutex. Control
+        // paths (interrupt, set_permission_mode) read from this map
+        // instead of locking the bridge so they don't deadlock against
+        // run_turn, which holds the outer lock for the whole turn.
+        let stdin_clone = bridge.stdin.clone();
         let bridge = Arc::new(Mutex::new(bridge));
+        {
+            let mut stdins = self.session_stdins.lock().await;
+            stdins
+                .entry(session.summary.session_id.clone())
+                .or_insert(stdin_clone);
+        }
         let mut sessions = self.sessions.lock().await;
         Ok(sessions
             .entry(session.summary.session_id.clone())
@@ -326,6 +362,10 @@ impl ClaudeSdkAdapter {
     }
 
     async fn invalidate_session(&self, session_id: &str) {
+        // Drop the parallel stdin handle first so any in-flight control
+        // request that already cloned it sees its writes fail cleanly
+        // when the child process is killed below.
+        self.session_stdins.lock().await.remove(session_id);
         let process = self.sessions.lock().await.remove(session_id);
         if let Some(process) = process {
             let mut process = process.lock().await;
@@ -631,29 +671,58 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         }
     }
 
+    async fn update_permission_mode(
+        &self,
+        session: &SessionDetail,
+        mode: PermissionMode,
+    ) -> Result<(), String> {
+        // Forward a set_permission_mode request to the live bridge. The
+        // bridge calls `query.setPermissionMode(...)` on its held SDK
+        // Query handle, applying the new mode to the rest of the
+        // in-flight turn. No-op (Ok) if no bridge exists yet — the
+        // runtime will pick up the new mode from the next send_turn.
+        //
+        // We grab the stdin handle directly from `session_stdins` rather
+        // than locking `sessions`, because `run_turn` holds the outer
+        // process Mutex for the entire duration of the turn (it owns
+        // `&mut process.stdout`). Going through that lock would block
+        // us until the turn finished — which is exactly when the user
+        // is asking us to switch the mode.
+        let Some(stdin) = self.session_stdin(&session.summary.session_id).await else {
+            return Ok(());
+        };
+        write_request(
+            &stdin,
+            &BridgeRequest::SetPermissionMode {
+                permission_mode: permission_mode_to_str(mode).to_string(),
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
-        // Look up the live bridge process (if any) and send it an `interrupt`
-        // message. The bridge calls `abortController.abort()` on the in-flight
-        // SDK query, which returns `'[interrupted]'` and flips `inFlight = false`
+        // Send an `interrupt` message to the live bridge. The bridge
+        // calls `abortController.abort()` on the in-flight SDK query,
+        // which returns `'[interrupted]'` and flips `inFlight = false`
         // so the bridge is ready to accept the next send_prompt.
         //
-        // We intentionally do NOT invalidate the session — the bridge's in-memory
-        // `resumeSessionId` must survive so the next turn resumes the same Claude
-        // conversation.
-        let process = self
-            .sessions
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned();
-        let Some(process) = process else {
+        // We intentionally do NOT invalidate the session — the bridge's
+        // in-memory `resumeSessionId` must survive so the next turn
+        // resumes the same Claude conversation.
+        //
+        // Uses `session_stdins` rather than the outer `sessions` lock
+        // because `run_turn` holds that outer Mutex for the duration of
+        // the turn; trying to re-lock it here would deadlock until the
+        // turn naturally finished, which defeats the entire point of
+        // interrupt.
+        let Some(stdin) = self.session_stdin(&session.summary.session_id).await else {
             return Ok(format!(
                 "Claude SDK interrupt requested for session `{}` (no active bridge).",
                 session.summary.session_id
             ));
         };
-        let process = process.lock().await;
-        write_request(&process.stdin, &BridgeRequest::Interrupt).await?;
+        write_request(&stdin, &BridgeRequest::Interrupt).await?;
         Ok(format!(
             "Claude SDK turn interrupted for session `{}`.",
             session.summary.session_id

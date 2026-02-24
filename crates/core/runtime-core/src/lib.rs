@@ -485,6 +485,17 @@ impl RuntimeCore {
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
+            ClientMessage::UpdatePermissionMode {
+                session_id,
+                permission_mode,
+            } => {
+                match self.update_permission_mode(session_id, permission_mode).await {
+                    Ok(()) => Some(ServerMessage::Ack {
+                        message: "Permission mode updated.".to_string(),
+                    }),
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
             ClientMessage::DeleteSession { session_id } => {
                 match self.delete_session(session_id).await {
                     Ok(message) => Some(ServerMessage::Ack { message }),
@@ -1276,6 +1287,33 @@ impl RuntimeCore {
                 Err(error)
             }
         }
+    }
+
+    async fn update_permission_mode(
+        &self,
+        session_id: String,
+        mode: PermissionMode,
+    ) -> Result<(), String> {
+        // Look up the session and forward the mode change to its
+        // adapter. Adapters that don't support mid-turn switching no-op;
+        // the mode will still apply to subsequent send_turn requests
+        // because the frontend tracks the chosen mode and sends it on
+        // the next ClientMessage::SendTurn.
+        let session = self
+            .live_session_detail(&session_id)
+            .await
+            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        let adapter = self
+            .adapters
+            .get(&session.summary.provider)
+            .ok_or_else(|| {
+                format!(
+                    "No adapter registered for {}.",
+                    session.summary.provider.label()
+                )
+            })?
+            .clone();
+        adapter.update_permission_mode(&session, mode).await
     }
 
     async fn interrupt_turn(&self, session_id: String) -> Result<String, String> {
