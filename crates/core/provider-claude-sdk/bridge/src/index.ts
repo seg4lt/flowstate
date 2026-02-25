@@ -412,7 +412,11 @@ class ClaudeBridge {
     }
   }
 
-  answerPermission(requestId: string, decision: DecisionString): void {
+  answerPermission(
+    requestId: string,
+    decision: DecisionString,
+    permissionMode?: SdkPermissionMode,
+  ): void {
     const p = pendingPermissions.get(requestId);
     if (!p) return;
     pendingPermissions.delete(requestId);
@@ -420,7 +424,28 @@ class ClaudeBridge {
     if (allow) {
       // Echo the original input — passing {} would replace the tool's
       // args with an empty object and crash inside the tool handler.
-      p.resolve({ behavior: 'allow', updatedInput: p.input });
+      // If a mode override was supplied (used by the host's plan-exit
+      // approve flow), include it in updatedPermissions so the SDK
+      // applies the mode change as part of accepting the tool call.
+      // Without this, switching mode after an ExitPlanMode approval
+      // doesn't make the model continue executing in the new mode
+      // within the same turn — the SDK's plan-mode constraints win.
+      const result: PermissionResult = {
+        behavior: 'allow',
+        updatedInput: p.input,
+      };
+      if (permissionMode) {
+        (result as PermissionResult & {
+          updatedPermissions?: Array<{
+            type: 'setMode';
+            mode: SdkPermissionMode;
+            destination: 'session';
+          }>;
+        }).updatedPermissions = [
+          { type: 'setMode', mode: permissionMode, destination: 'session' },
+        ];
+      }
+      p.resolve(result);
     } else {
       p.resolve({ behavior: 'deny', message: 'User denied' });
     }
@@ -598,9 +623,11 @@ async function main(): Promise<void> {
       }
 
       case 'answer_permission': {
+        const mode = msg.permission_mode as SdkPermissionMode | undefined;
         bridge.answerPermission(
           msg.request_id as string,
           msg.decision as DecisionString,
+          mode,
         );
         break;
       }

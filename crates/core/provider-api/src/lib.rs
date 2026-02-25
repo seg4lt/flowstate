@@ -510,6 +510,13 @@ pub type PermissionPolicy = Arc<Mutex<HashMap<String, PermissionDecision>>>;
 pub struct TurnEventSink {
     tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
     permission_pending: Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>,
+    /// Side-channel for permission mode overrides attached to a
+    /// pending request. Populated by `resolve_permission_with_mode`
+    /// before the oneshot fires; consumed by adapters via
+    /// `take_mode_override` once they wake up. Lets us add
+    /// "approve-and-switch-mode" semantics without changing the
+    /// `PermissionDecision` channel signature that every adapter uses.
+    permission_mode_overrides: Arc<Mutex<HashMap<String, PermissionMode>>>,
     question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
     /// Session-scoped persistent permission decisions. Shared across turns.
     policy: PermissionPolicy,
@@ -533,6 +540,7 @@ impl TurnEventSink {
         Self {
             tx,
             permission_pending: Arc::new(Mutex::new(HashMap::new())),
+            permission_mode_overrides: Arc::new(Mutex::new(HashMap::new())),
             question_pending: Arc::new(Mutex::new(HashMap::new())),
             policy,
         }
@@ -636,10 +644,43 @@ impl TurnEventSink {
 
     /// Host-side: called by the runtime when the user answers a permission request.
     pub async fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) {
+        self.resolve_permission_with_mode(request_id, decision, None)
+            .await;
+    }
+
+    /// Like `resolve_permission`, but also stashes a permission-mode
+    /// override under the same `request_id` before resolving the
+    /// pending oneshot. Adapters that care (currently the Claude Agent
+    /// SDK adapter) call `take_mode_override(request_id)` after
+    /// `request_permission` resolves to read the stashed value and
+    /// forward it to their backend. Adapters that don't care simply
+    /// ignore the side channel; their behavior is unchanged.
+    pub async fn resolve_permission_with_mode(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+        mode_override: Option<PermissionMode>,
+    ) {
+        if let Some(mode) = mode_override {
+            self.permission_mode_overrides
+                .lock()
+                .await
+                .insert(request_id.to_string(), mode);
+        }
         let mut guard = self.permission_pending.lock().await;
         if let Some(sender) = guard.remove(request_id) {
             let _ = sender.send(decision);
         }
+    }
+
+    /// Adapter-side: take and clear any permission-mode override that
+    /// was attached to this request via `resolve_permission_with_mode`.
+    /// Returns `None` if no override was set.
+    pub async fn take_mode_override(&self, request_id: &str) -> Option<PermissionMode> {
+        self.permission_mode_overrides
+            .lock()
+            .await
+            .remove(request_id)
     }
 
     /// Host-side: called by the runtime when the user answers a question.
@@ -870,6 +911,16 @@ pub enum ClientMessage {
         session_id: String,
         request_id: String,
         decision: PermissionDecision,
+        /// Optional permission-mode change to apply alongside the
+        /// approval. The Claude SDK adapter forwards this to the
+        /// bridge, which sets it on the `PermissionResult`'s
+        /// `updatedPermissions` so the SDK applies the mode change
+        /// AS PART OF accepting the tool call. This is the canonical
+        /// way to swap modes when approving an `ExitPlanMode` —
+        /// calling `setPermissionMode` separately doesn't make the
+        /// model continue executing within the same turn.
+        #[serde(default)]
+        permission_mode_override: Option<PermissionMode>,
     },
     AnswerQuestion {
         session_id: String,

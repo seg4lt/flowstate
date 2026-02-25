@@ -70,6 +70,15 @@ enum BridgeRequest {
     AnswerPermission {
         request_id: String,
         decision: String,
+        /// Optional mode change to bundle with the approval. The bridge
+        /// includes this in the SDK `PermissionResult`'s
+        /// `updatedPermissions` so the SDK applies the mode AS PART OF
+        /// accepting the tool call. This is the only path that makes
+        /// the model continue executing in the new mode within the
+        /// same turn — `set_permission_mode` alone is not enough when
+        /// the active turn is `ExitPlanMode`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
     },
     #[serde(rename = "answer_question")]
     AnswerQuestion {
@@ -392,7 +401,8 @@ impl ClaudeSdkAdapter {
         write_request(&process.stdin, &request).await?;
 
         let stdin = process.stdin.clone();
-        let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(String, PermissionDecision)>();
+        let (perm_tx, mut perm_rx) =
+            mpsc::unbounded_channel::<(String, PermissionDecision, Option<PermissionMode>)>();
         let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, QuestionOutcome)>();
 
         // Background task: forwards permission/question answers from the sink helpers back
@@ -401,10 +411,12 @@ impl ClaudeSdkAdapter {
         let writer_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    Some((request_id, decision)) = perm_rx.recv() => {
+                    Some((request_id, decision, mode_override)) = perm_rx.recv() => {
                         let req = BridgeRequest::AnswerPermission {
                             request_id,
                             decision: permission_decision_to_str(decision).to_string(),
+                            permission_mode: mode_override
+                                .map(|m| permission_mode_to_str(m).to_string()),
                         };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
                             warn!("failed to forward permission answer: {e}");
@@ -492,14 +504,25 @@ impl ClaudeSdkAdapter {
                         // writer task still uses the bridge's request_id (`request_id`)
                         // when forwarding the decision back to the bridge, because the
                         // bridge keeps its own pending-permissions map keyed by that id.
+                        //
+                        // After request_permission resolves we also pull any
+                        // mode override that the host stashed alongside the
+                        // decision (via resolve_permission_with_mode). Used by
+                        // the plan-exit "Approve & Auto-edit" flow so the
+                        // bridge can attach updatedPermissions to the SDK
+                        // PermissionResult and the model continues in the
+                        // chosen mode within the same turn.
                         let events_clone = events.clone();
                         let perm_tx = perm_tx.clone();
                         let req_id_for_writer = request_id;
+                        let req_id_for_lookup = req_id_for_writer.clone();
                         tokio::spawn(async move {
                             let decision = events_clone
                                 .request_permission(tool_name, input, suggested)
                                 .await;
-                            let _ = perm_tx.send((req_id_for_writer, decision));
+                            let mode_override =
+                                events_clone.take_mode_override(&req_id_for_lookup).await;
+                            let _ = perm_tx.send((req_id_for_writer, decision, mode_override));
                         });
                     }
                     "user_question" => {

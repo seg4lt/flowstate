@@ -506,8 +506,15 @@ impl RuntimeCore {
                 session_id,
                 request_id,
                 decision,
+                permission_mode_override,
             } => {
-                self.answer_permission(&session_id, &request_id, decision).await;
+                self.answer_permission(
+                    &session_id,
+                    &request_id,
+                    decision,
+                    permission_mode_override,
+                )
+                .await;
                 Some(ServerMessage::Ack {
                     message: "Permission answer recorded.".to_string(),
                 })
@@ -696,10 +703,12 @@ impl RuntimeCore {
         session_id: &str,
         request_id: &str,
         decision: PermissionDecision,
+        mode_override: Option<PermissionMode>,
     ) {
         let sink = self.active_sinks.lock().await.get(session_id).cloned();
         if let Some(sink) = sink {
-            sink.resolve_permission(request_id, decision).await;
+            sink.resolve_permission_with_mode(request_id, decision, mode_override)
+                .await;
         } else {
             tracing::warn!(session_id, request_id, "no active sink for permission answer");
         }
