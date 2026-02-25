@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ChevronRight, Wrench } from "lucide-react";
 import type { ToolCall } from "@/lib/types";
+import { renderToolArgs } from "./tool-renderers";
 
 interface ToolCallCardProps {
   toolCall: ToolCall;
@@ -35,12 +36,7 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
 
       {open && (
         <div className="space-y-2 border-t border-border px-3 py-2">
-          <div>
-            <p className="mb-1 font-medium text-muted-foreground">Args</p>
-            <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]">
-              {JSON.stringify(toolCall.args, null, 2)}
-            </pre>
-          </div>
+          <div>{renderToolArgs(toolCall.name, toolCall.args)}</div>
           {toolCall.output && (
             <div>
               <p className="mb-1 font-medium text-muted-foreground">Output</p>

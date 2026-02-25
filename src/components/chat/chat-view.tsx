@@ -9,11 +9,14 @@ import type {
   PermissionMode,
   ReasoningEffort,
   TurnRecord,
+  UserInputAnswer,
+  UserInputQuestion,
 } from "@/lib/types";
 import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
 import { MessageList } from "./messages/message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
+import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 
@@ -22,6 +25,11 @@ interface PermissionRequest {
   toolName: string;
   input: unknown;
   suggested: string;
+}
+
+interface QuestionRequest {
+  requestId: string;
+  questions: UserInputQuestion[];
 }
 
 // Stream-order block accumulators. Adjacent text deltas coalesce into
@@ -62,6 +70,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [loading, setLoading] = React.useState(true);
   const [pendingPermission, setPendingPermission] =
     React.useState<PermissionRequest | null>(null);
+  const [pendingQuestion, setPendingQuestion] =
+    React.useState<QuestionRequest | null>(null);
   const [effort, setEffort] = React.useState<ReasoningEffort>("high");
   const [permissionMode, setPermissionMode] =
     React.useState<PermissionMode>("accept_edits");
@@ -102,6 +112,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setLoading(true);
     setTurns([]);
     setPendingPermission(null);
+    setPendingQuestion(null);
     setPendingInput(null);
 
     sendMessage({ type: "load_session", session_id: sessionId }).then((res) => {
@@ -268,6 +279,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           break;
         }
 
+        case "user_question_asked":
+          setPendingQuestion({
+            requestId: event.request_id,
+            questions: event.questions,
+          });
+          break;
+
         case "permission_requested":
           setPendingPermission({
             requestId: event.request_id,
@@ -324,6 +342,29 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       decision,
     });
     setPendingPermission(null);
+  }
+
+  async function handleQuestionSubmit(answers: UserInputAnswer[]) {
+    if (!pendingQuestion) return;
+    const requestId = pendingQuestion.requestId;
+    setPendingQuestion(null);
+    await sendMessage({
+      type: "answer_question",
+      session_id: sessionId,
+      request_id: requestId,
+      answers,
+    });
+  }
+
+  async function handleQuestionCancel() {
+    if (!pendingQuestion) return;
+    const requestId = pendingQuestion.requestId;
+    setPendingQuestion(null);
+    await sendMessage({
+      type: "cancel_question",
+      session_id: sessionId,
+      request_id: requestId,
+    });
   }
 
   const isRunning = session?.status === "running";
@@ -417,10 +458,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         pendingInput={pendingInput}
       />
 
+      {pendingQuestion && (
+        <QuestionPrompt
+          questions={pendingQuestion.questions}
+          onSubmit={handleQuestionSubmit}
+          onCancel={handleQuestionCancel}
+        />
+      )}
+
       {pendingPermission && (
         <PermissionPrompt
           toolName={pendingPermission.toolName}
           input={pendingPermission.input}
+          sessionId={sessionId}
+          onSwitchMode={setPermissionMode}
           onDecision={handlePermissionDecision}
         />
       )}

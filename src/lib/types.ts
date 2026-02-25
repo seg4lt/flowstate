@@ -192,6 +192,7 @@ export type ClientMessage =
   | { type: "start_session"; provider: ProviderKind; title?: string; model?: string; project_id?: string }
   | { type: "send_turn"; session_id: string; input: string; permission_mode?: PermissionMode; reasoning_effort?: ReasoningEffort }
   | { type: "interrupt_turn"; session_id: string }
+  | { type: "update_permission_mode"; session_id: string; permission_mode: PermissionMode }
   | { type: "delete_session"; session_id: string }
   | { type: "answer_permission"; session_id: string; request_id: string; decision: PermissionDecision }
   | { type: "answer_question"; session_id: string; request_id: string; answers: UserInputAnswer[] }
