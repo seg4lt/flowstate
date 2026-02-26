@@ -16,6 +16,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
 import { ChatView } from "@/components/chat/chat-view";
+import { Toaster } from "@/components/ui/toaster";
 
 const SIDEBAR_WIDTH_KEY = "flowzen:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -128,6 +129,7 @@ function AppLayout() {
             <Outlet />
           </SidebarInset>
         </SidebarProvider>
+        <Toaster />
       </TooltipProvider>
     </AppProvider>
   );

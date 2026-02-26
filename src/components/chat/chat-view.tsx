@@ -101,13 +101,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [projectPath]);
 
-  // Keyboard shortcut for mode cycling (Tab/Shift+Tab)
+  // Keyboard shortcut for mode cycling (Shift+Tab)
   React.useEffect(() => {
     if (!session) return; // Only active when session exists
 
     const handleKeyDown = (event: KeyboardEvent) => {
-      // Only respond to Tab key
-      if (event.key !== "Tab") return;
+      // Only respond to Shift+Tab
+      if (event.key !== "Tab" || !event.shiftKey) return;
 
       // Don't interfere if user is typing in an input/textarea/contenteditable
       const target = event.target as HTMLElement;
@@ -122,9 +122,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       // Prevent default Tab behavior (focus navigation)
       event.preventDefault();
 
-      // Determine direction based on Shift key
-      const direction = event.shiftKey ? "backward" : "forward";
-      const newMode = cycleMode(permissionMode, direction);
+      // Cycle to next mode
+      const newMode = cycleMode(permissionMode, "forward");
 
       // Update local state
       setPermissionMode(newMode);

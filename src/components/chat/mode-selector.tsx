@@ -7,13 +7,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import type { PermissionMode } from "@/lib/types";
+import { MODE_ORDER, MODE_LABELS } from "@/lib/mode-cycling";
 
-const MODE_OPTIONS: { value: PermissionMode; label: string }[] = [
-  { value: "default", label: "Default" },
-  { value: "accept_edits", label: "Auto-edit" },
-  { value: "plan", label: "Plan" },
-  { value: "bypass", label: "Full access" },
-];
+const MODE_OPTIONS: { value: PermissionMode; label: string }[] =
+  MODE_ORDER.map((mode) => ({ value: mode, label: MODE_LABELS[mode] }));
 
 interface ModeSelectorProps {
   value: PermissionMode;
