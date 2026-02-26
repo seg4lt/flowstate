@@ -194,7 +194,7 @@ export type ClientMessage =
   | { type: "interrupt_turn"; session_id: string }
   | { type: "update_permission_mode"; session_id: string; permission_mode: PermissionMode }
   | { type: "delete_session"; session_id: string }
-  | { type: "answer_permission"; session_id: string; request_id: string; decision: PermissionDecision }
+  | { type: "answer_permission"; session_id: string; request_id: string; decision: PermissionDecision; permission_mode_override?: PermissionMode }
   | { type: "answer_question"; session_id: string; request_id: string; answers: UserInputAnswer[] }
   | { type: "cancel_question"; session_id: string; request_id: string }
   | { type: "accept_plan"; session_id: string; plan_id: string }

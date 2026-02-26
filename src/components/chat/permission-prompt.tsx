@@ -1,17 +1,18 @@
 import * as React from "react";
 import type { PermissionDecision, PermissionMode } from "@/lib/types";
-import { sendMessage } from "@/lib/api";
 import { isPlanExitTool, renderToolArgs } from "./tool-renderers";
 
 interface PermissionPromptProps {
   toolName: string;
   input: unknown;
-  sessionId: string;
-  /** Called when the user approves or denies the request. */
-  onDecision: (decision: PermissionDecision) => void;
-  /** Updates chat-view's local permissionMode state — keeps the toolbar
-   *  picker in sync after a plan-exit approval. */
-  onSwitchMode?: (mode: PermissionMode) => void;
+  /** Called when the user approves or denies the request. The optional
+   *  modeOverride is only set by the plan-exit flow and is bundled into
+   *  the daemon's answer_permission so the SDK applies the mode change
+   *  as part of accepting the tool call. */
+  onDecision: (
+    decision: PermissionDecision,
+    modeOverride?: PermissionMode,
+  ) => void;
 }
 
 const PLAN_EXIT_MODES: { mode: PermissionMode; label: string; hint: string }[] = [
@@ -23,26 +24,19 @@ const PLAN_EXIT_MODES: { mode: PermissionMode; label: string; hint: string }[] =
 function PermissionPromptInner({
   toolName,
   input,
-  sessionId,
   onDecision,
-  onSwitchMode,
 }: PermissionPromptProps) {
   const planExit = isPlanExitTool(toolName);
 
   return (
     <div className="shrink-0 border-t border-amber-500/40 bg-amber-500/5 px-3 py-2.5">
       {planExit ? (
-        <PlanExitPrompt
-          input={input}
-          sessionId={sessionId}
-          onDecision={onDecision}
-          onSwitchMode={onSwitchMode}
-        />
+        <PlanExitPrompt input={input} onDecision={onDecision} />
       ) : (
         <DefaultPrompt
           toolName={toolName}
           input={input}
-          onDecision={onDecision}
+          onDecision={(decision) => onDecision(decision)}
         />
       )}
     </div>
@@ -106,40 +100,30 @@ function DefaultPrompt({
 
 function PlanExitPrompt({
   input,
-  sessionId,
   onDecision,
-  onSwitchMode,
 }: {
   input: unknown;
-  sessionId: string;
-  onDecision: (decision: PermissionDecision) => void;
-  onSwitchMode?: (mode: PermissionMode) => void;
+  onDecision: (
+    decision: PermissionDecision,
+    modeOverride?: PermissionMode,
+  ) => void;
 }) {
   const [pending, setPending] = React.useState(false);
 
-  async function approveWith(mode: PermissionMode) {
+  function approveWith(mode: PermissionMode) {
     if (pending) return;
     setPending(true);
-    // 1. Tell the daemon to switch the active SDK query's mode BEFORE
-    //    we release the permission. The Claude bridge calls
-    //    query.setPermissionMode(mode) on the live Query handle, so the
-    //    rest of this turn runs under the chosen mode. Adapters that
-    //    don't support mid-turn switching no-op silently.
-    // 2. Sync the chat-view local state so the toolbar reflects the
-    //    new mode and subsequent send_turn calls inherit it.
-    // 3. Release the permission gate so the model proceeds.
-    try {
-      await sendMessage({
-        type: "update_permission_mode",
-        session_id: sessionId,
-        permission_mode: mode,
-      });
-    } catch (err) {
-      // Don't block approval on a bridge error — log and continue.
-      console.error("update_permission_mode failed", err);
-    }
-    onSwitchMode?.(mode);
-    onDecision("allow");
+    // Single combined answer_permission with the mode bundled. The
+    // daemon stashes the mode on the sink, the Claude SDK adapter pulls
+    // it via take_mode_override, and the bridge attaches
+    // updatedPermissions: [{ type: 'setMode', mode, destination:
+    // 'session' }] to the canUseTool result. The SDK applies the mode
+    // change AS PART OF accepting the tool call, which is the only
+    // path that makes the model continue executing within the same
+    // turn after exiting plan mode. Calling setPermissionMode
+    // separately and then resolving the permission doesn't work — the
+    // SDK's plan-mode constraints have the model winding down by then.
+    onDecision("allow", mode);
   }
 
   return (

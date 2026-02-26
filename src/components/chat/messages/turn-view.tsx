@@ -68,6 +68,7 @@ function TurnViewInner({ item }: TurnViewProps) {
             return (
               <details
                 key={`reasoning-${idx}`}
+                open
                 className="rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs"
               >
                 <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">

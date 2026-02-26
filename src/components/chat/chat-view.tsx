@@ -13,12 +13,15 @@ import type {
   UserInputQuestion,
 } from "@/lib/types";
 import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
+import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
+import { toast } from "@/hooks/use-toast";
 import { MessageList } from "./messages/message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
+import { WorkingIndicator } from "./working-indicator";
 
 interface PermissionRequest {
   requestId: string;
@@ -97,6 +100,54 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       cancelled = true;
     };
   }, [projectPath]);
+
+  // Keyboard shortcut for mode cycling (Tab/Shift+Tab)
+  React.useEffect(() => {
+    if (!session) return; // Only active when session exists
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Only respond to Tab key
+      if (event.key !== "Tab") return;
+
+      // Don't interfere if user is typing in an input/textarea/contenteditable
+      const target = event.target as HTMLElement;
+      if (
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable
+      ) {
+        return;
+      }
+
+      // Prevent default Tab behavior (focus navigation)
+      event.preventDefault();
+
+      // Determine direction based on Shift key
+      const direction = event.shiftKey ? "backward" : "forward";
+      const newMode = cycleMode(permissionMode, direction);
+
+      // Update local state
+      setPermissionMode(newMode);
+
+      // Send to daemon
+      sendMessage({
+        type: "update_permission_mode",
+        session_id: sessionId,
+        permission_mode: newMode,
+      }).catch((err) => {
+        console.error("Failed to update permission mode", err);
+      });
+
+      // Show toast notification
+      toast({
+        description: `Mode: ${MODE_LABELS[newMode]}`,
+        duration: 2000,
+      });
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [sessionId, session, permissionMode]);
 
   // Set active session
   React.useEffect(() => {
@@ -333,15 +384,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     await sendMessage({ type: "interrupt_turn", session_id: sessionId });
   }
 
-  async function handlePermissionDecision(decision: PermissionDecision) {
+  async function handlePermissionDecision(
+    decision: PermissionDecision,
+    modeOverride?: PermissionMode,
+  ) {
     if (!pendingPermission) return;
     await sendMessage({
       type: "answer_permission",
       session_id: sessionId,
       request_id: pendingPermission.requestId,
       decision,
+      ...(modeOverride ? { permission_mode_override: modeOverride } : {}),
     });
     setPendingPermission(null);
+    if (modeOverride) {
+      // Mirror the chosen mode into local state so the toolbar dropdown
+      // and the next send_turn pick it up. The Claude SDK side already
+      // applies the mode via the bundled updatedPermissions, so this is
+      // purely a UI sync — no second daemon round-trip.
+      setPermissionMode(modeOverride);
+    }
   }
 
   async function handleQuestionSubmit(answers: UserInputAnswer[]) {
@@ -368,6 +430,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }
 
   const isRunning = session?.status === "running";
+  // The in-flight turn (if any). Used to drive the WorkingIndicator's
+  // elapsed-time clock from the daemon-side createdAt timestamp so the
+  // counter doesn't drift between client and server.
+  const runningTurn = React.useMemo(() => {
+    if (!isRunning) return null;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (turns[i].status === "running") return turns[i];
+    }
+    return null;
+  }, [isRunning, turns]);
   const title = session?.title || "New thread";
 
   const [editingTitle, setEditingTitle] = React.useState(false);
@@ -445,9 +517,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           )}
         </div>
         <div className="ml-auto flex items-center gap-2">
-          {isRunning && (
-            <span className="text-xs text-muted-foreground">Running...</span>
-          )}
           <HeaderActions />
         </div>
       </header>
@@ -457,6 +526,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         loading={loading}
         pendingInput={pendingInput}
       />
+
+      {isRunning && session && runningTurn && (
+        <WorkingIndicator
+          provider={session.provider}
+          startedAt={runningTurn.createdAt}
+        />
+      )}
 
       {pendingQuestion && (
         <QuestionPrompt
@@ -470,8 +546,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <PermissionPrompt
           toolName={pendingPermission.toolName}
           input={pendingPermission.input}
-          sessionId={sessionId}
-          onSwitchMode={setPermissionMode}
           onDecision={handlePermissionDecision}
         />
       )}
