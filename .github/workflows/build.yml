@@ -1,0 +1,116 @@
+name: Build
+
+# Build only when a release tag is pushed. Tag format: v<version>
+# (e.g. v0.2.0, v1.0.0-rc1). Pushes to branches and PRs do not trigger
+# this workflow.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon (M1/M2/M3) — produces .app and .dmg under
+          # src-tauri/target/aarch64-apple-darwin/release/bundle/.
+          - name: macos-arm
+            runner: macos-14
+            target: aarch64-apple-darwin
+            tauri-args: --target aarch64-apple-darwin
+            bundle-path: flowzen/src-tauri/target/aarch64-apple-darwin/release/bundle/
+
+          # Windows (.msi + nsis .exe) — disabled for now. Uncomment to enable.
+          # - name: windows-x64
+          #   runner: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   tauri-args: ""
+          #   bundle-path: flowzen/src-tauri/target/release/bundle/
+
+          # Linux (.deb + .AppImage) — disabled for now. Uncomment to enable
+          # AND uncomment the "Install Linux deps" step below.
+          # - name: linux-x64
+          #   runner: ubuntu-22.04
+          #   target: x86_64-unknown-linux-gnu
+          #   tauri-args: ""
+          #   bundle-path: flowzen/src-tauri/target/release/bundle/
+
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # Check out flowzen into ./flowzen and the agent SDK into
+      # ./rs-agent-sdk so the path dependency `../../rs-agent-sdk`
+      # resolves identically to local development.
+      - name: Checkout flowzen
+        uses: actions/checkout@v4
+        with:
+          path: flowzen
+
+      - name: Checkout agent SDK
+        uses: actions/checkout@v4
+        with:
+          repository: seg4lt/rs-agent-sdk
+          path: rs-agent-sdk
+          # If the agent SDK repo is private, set a PAT secret with read
+          # access and uncomment the next line:
+          # token: ${{ secrets.RS_AGENT_SDK_TOKEN }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: flowzen/pnpm-lock.yaml
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: flowzen/src-tauri -> target
+
+      - name: Install bun
+        # The agent SDK provider crates have build.rs scripts that run
+        # `bun install && bun run build` to compile the Claude SDK and
+        # GitHub Copilot bridges. Without bun the bridges won't compile
+        # and the daemon will refuse to start at runtime.
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # - name: Install Linux deps
+      #   if: matrix.runner == 'ubuntu-22.04'
+      #   run: |
+      #     sudo apt-get update
+      #     sudo apt-get install -y \
+      #       libwebkit2gtk-4.1-dev \
+      #       libappindicator3-dev \
+      #       librsvg2-dev \
+      #       patchelf
+
+      - name: Install frontend dependencies
+        working-directory: flowzen
+        run: pnpm install --frozen-lockfile
+
+      - name: Build (pnpm tauri build)
+        working-directory: flowzen
+        run: pnpm tauri build ${{ matrix.tauri-args }}
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowzen-${{ matrix.name }}-${{ github.ref_name }}
+          path: ${{ matrix.bundle-path }}
+          if-no-files-found: error
+          retention-days: 30

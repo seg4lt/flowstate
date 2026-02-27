@@ -93,6 +93,47 @@ export function AppSidebar() {
           </SidebarGroupAction>
           <SidebarGroupContent>
             <SidebarMenu>
+              {/* Folder-less threads */}
+              <Collapsible defaultOpen className="group/collapsible">
+                <SidebarMenuItem className="group/project">
+                  <CollapsibleTrigger asChild>
+                    <SidebarMenuButton tooltip="Threads">
+                      <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                      <MessageSquare />
+                      <span className="flex-1 truncate">Threads</span>
+                    </SidebarMenuButton>
+                  </CollapsibleTrigger>
+                  <div className="absolute right-1 top-1">
+                    <ProviderDropdown />
+                  </div>
+                  <CollapsibleContent>
+                    <SidebarMenuSub>
+                      {unassigned.map((session) => (
+                        <ThreadItem
+                          key={session.sessionId}
+                          sessionId={session.sessionId}
+                          title={session.title}
+                          updatedAt={session.updatedAt}
+                          isActive={
+                            state.activeSessionId === session.sessionId
+                          }
+                          onClick={() =>
+                            handleThreadClick(session.sessionId)
+                          }
+                        />
+                      ))}
+                      {unassigned.length === 0 && (
+                        <SidebarMenuSubItem>
+                          <span className="px-2 py-1 text-xs text-muted-foreground">
+                            No threads yet
+                          </span>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </SidebarMenuItem>
+              </Collapsible>
+
               {state.projects.map((project) => {
                 const threads =
                   sessionsByProject.get(project.projectId) ?? [];
@@ -155,47 +196,6 @@ export function AppSidebar() {
                   </Collapsible>
                 );
               })}
-
-              {/* Folder-less threads */}
-              <Collapsible defaultOpen className="group/collapsible">
-                <SidebarMenuItem className="group/project">
-                  <CollapsibleTrigger asChild>
-                    <SidebarMenuButton tooltip="Threads">
-                      <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
-                      <MessageSquare />
-                      <span className="flex-1 truncate">Threads</span>
-                    </SidebarMenuButton>
-                  </CollapsibleTrigger>
-                  <div className="absolute right-1 top-1">
-                    <ProviderDropdown />
-                  </div>
-                  <CollapsibleContent>
-                    <SidebarMenuSub>
-                      {unassigned.map((session) => (
-                        <ThreadItem
-                          key={session.sessionId}
-                          sessionId={session.sessionId}
-                          title={session.title}
-                          updatedAt={session.updatedAt}
-                          isActive={
-                            state.activeSessionId === session.sessionId
-                          }
-                          onClick={() =>
-                            handleThreadClick(session.sessionId)
-                          }
-                        />
-                      ))}
-                      {unassigned.length === 0 && (
-                        <SidebarMenuSubItem>
-                          <span className="px-2 py-1 text-xs text-muted-foreground">
-                            No threads yet
-                          </span>
-                        </SidebarMenuSubItem>
-                      )}
-                    </SidebarMenuSub>
-                  </CollapsibleContent>
-                </SidebarMenuItem>
-              </Collapsible>
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
