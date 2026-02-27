@@ -22,6 +22,14 @@ import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { WorkingIndicator } from "./working-indicator";
+import { StuckBanner } from "./stuck-banner";
+
+// Trip the watchdog after this many seconds of silence while a tool
+// call is pending. Picked to be well past a normal tool round-trip
+// (even a slow Bash / Git command rarely exceeds 15–20s) but short
+// enough that a user who just clicked Allow doesn't sit for a minute
+// wondering if anything is happening.
+const STUCK_TIMEOUT_MS = 45_000;
 
 interface PermissionRequest {
   requestId: string;
@@ -79,6 +87,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [permissionMode, setPermissionMode] =
     React.useState<PermissionMode>("accept_edits");
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
+  // Watchdog state: `lastEventAt` bumps on every stream event for this
+  // session so the 45s inactivity timer resets. `stuckSince` is set
+  // when the timer fires and a pending tool call exists; rendering the
+  // StuckBanner keys off it.
+  const [lastEventAt, setLastEventAt] = React.useState<number>(() =>
+    Date.now(),
+  );
+  const [stuckSince, setStuckSince] = React.useState<number | null>(null);
 
   const session = state.sessions.get(sessionId);
   const projectPath = React.useMemo(() => {
@@ -164,6 +180,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setPendingPermission(null);
     setPendingQuestion(null);
     setPendingInput(null);
+    setLastEventAt(Date.now());
+    setStuckSince(null);
 
     sendMessage({ type: "load_session", session_id: sessionId }).then((res) => {
       if (cancelled) return;
@@ -195,6 +213,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         if (message.session.summary.sessionId === sessionId) {
           setTurns(message.session.turns);
           setPendingInput(null);
+          setLastEventAt(Date.now());
+          setStuckSince(null);
         }
         return;
       }
@@ -202,6 +222,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       const event = message.event;
 
       if (!("session_id" in event) || event.session_id !== sessionId) return;
+
+      // Any event for this session proves the backend is still
+      // talking. Reset the stuck-watchdog timer on every tick so it
+      // only fires after genuine silence.
+      setLastEventAt(Date.now());
+      setStuckSince(null);
 
       switch (event.type) {
         case "turn_started":
@@ -439,6 +465,38 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
     return null;
   }, [isRunning, turns]);
+
+  // Is there at least one tool call on the running turn still waiting
+  // for its completion event? That's the precondition for the
+  // stuck-watchdog: we don't care about ordinary model thinking
+  // latency, only about cases where a tool is visibly in "pending"
+  // and nothing is moving.
+  const hasPendingToolCall = React.useMemo(() => {
+    if (!runningTurn) return false;
+    return (runningTurn.toolCalls ?? []).some((tc) => tc.status === "pending");
+  }, [runningTurn]);
+
+  // Arm the stuck-watchdog. We only trip it when the session is
+  // running *and* at least one tool call is pending, so idle
+  // pre-tool "Thinking…" periods don't falsely flag as stuck. The
+  // timer is rearmed by `lastEventAt` bumping on each event.
+  React.useEffect(() => {
+    if (!isRunning || !hasPendingToolCall) {
+      setStuckSince(null);
+      return;
+    }
+    const now = Date.now();
+    const elapsed = now - lastEventAt;
+    if (elapsed >= STUCK_TIMEOUT_MS) {
+      setStuckSince(lastEventAt);
+      return;
+    }
+    const id = setTimeout(() => {
+      setStuckSince(lastEventAt);
+    }, STUCK_TIMEOUT_MS - elapsed);
+    return () => clearTimeout(id);
+  }, [isRunning, hasPendingToolCall, lastEventAt]);
+
   const title = session?.title || "New thread";
 
   const [editingTitle, setEditingTitle] = React.useState(false);
@@ -546,6 +604,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           toolName={pendingPermission.toolName}
           input={pendingPermission.input}
           onDecision={handlePermissionDecision}
+        />
+      )}
+
+      {stuckSince !== null && !pendingPermission && !pendingQuestion && (
+        <StuckBanner
+          elapsedSeconds={Math.floor((Date.now() - stuckSince) / 1000)}
+          onInterrupt={() => {
+            setStuckSince(null);
+            handleInterrupt();
+          }}
+          onReload={() => {
+            setStuckSince(null);
+            sendMessage({ type: "load_session", session_id: sessionId });
+          }}
         />
       )}
 
