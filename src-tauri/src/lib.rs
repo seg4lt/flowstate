@@ -30,9 +30,22 @@ struct AppLifecycle {
     lifecycle: Arc<DaemonLifecycle>,
 }
 
-/// Initialize tracing to stderr + a log file so the Tauri backend logs
-/// are visible. The log file lives alongside the daemon log.
+/// Initialize tracing. Debug builds stream to stderr so `cargo tauri dev`
+/// surfaces logs in the terminal; release builds keep writing to a log
+/// file alongside the daemon log.
 fn init_tracing() {
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("flowzen=info,zenui=info,warn"));
+
+    if cfg!(debug_assertions) {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+        eprintln!("flowzen: dev build, logging to stderr");
+        return;
+    }
+
     let log_dir = std::env::temp_dir().join("flowzen").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("flowzen.log");
@@ -43,15 +56,12 @@ fn init_tracing() {
         .open(&log_path)
         .ok();
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("flowzen=info,zenui=info,warn"));
-
     if let Some(file) = file {
-        let subscriber = tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false);
-        let _ = subscriber.try_init();
+            .with_ansi(false)
+            .try_init();
         eprintln!("flowzen: logging to {}", log_path.display());
     } else {
         let _ = tracing_subscriber::fmt()

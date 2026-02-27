@@ -204,7 +204,10 @@ export function AppSidebar() {
       <SidebarFooter className="border-t border-sidebar-border">
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton tooltip="Settings">
+            <SidebarMenuButton
+              tooltip="Settings"
+              onClick={() => navigate({ to: "/settings" })}
+            >
               <Settings />
               <span>Settings</span>
             </SidebarMenuButton>

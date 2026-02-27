@@ -16,6 +16,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
 import { ChatView } from "@/components/chat/chat-view";
+import { SettingsView } from "@/components/settings/settings-view";
 import { Toaster } from "@/components/ui/toaster";
 
 const SIDEBAR_WIDTH_KEY = "flowzen:sidebar-width";
@@ -166,7 +167,13 @@ const chatRoute = createRoute({
   },
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, chatRoute]);
+const settingsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/settings",
+  component: SettingsView,
+});
+
+const routeTree = rootRoute.addChildren([indexRoute, chatRoute, settingsRoute]);
 
 export const router = createRouter({ routeTree });
 

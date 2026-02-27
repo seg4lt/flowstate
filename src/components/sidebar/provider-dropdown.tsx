@@ -117,9 +117,6 @@ export function ProviderDropdown({ projectId }: ProviderDropdownProps) {
                   New {label} thread
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent>
-                  <DropdownMenuItem onClick={() => createThread(kind)}>
-                    Default model
-                  </DropdownMenuItem>
                   {info.models.map((model) => (
                     <DropdownMenuItem
                       key={model.value}
