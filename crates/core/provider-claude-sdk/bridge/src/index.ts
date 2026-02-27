@@ -242,11 +242,19 @@ class ClaudeBridge {
       case 'system': {
         const sub = (msg as { subtype?: string }).subtype;
         if (sub === 'init') {
-          const sid = (msg as { session_id?: string }).session_id;
-          if (sid) {
-            this.resumeSessionId = sid;
-            writeStream({ event: 'info', message: `Claude session ${sid}` });
+          const init = msg as { session_id?: string; model?: string };
+          if (init.session_id) {
+            this.resumeSessionId = init.session_id;
+            writeStream({ event: 'info', message: `Claude session ${init.session_id}` });
           }
+          // Surface the model the SDK actually resolved. If the requested
+          // model string is rejected or remapped, this is the only place
+          // the truth shows up — the bridge sends what the Rust adapter
+          // asked for, but the SDK/CLI may silently substitute.
+          writeStream({
+            event: 'info',
+            message: `Claude model: requested=${this.model ?? '<default>'} resolved=${init.model ?? '<unknown>'}`,
+          });
         }
         return null;
       }
@@ -254,7 +262,7 @@ class ClaudeBridge {
         // Incremental token streaming. With `includePartialMessages: true`, the SDK
         // emits Anthropic raw stream events. We forward `content_block_delta` chunks
         // as small text/reasoning deltas so the UI updates token-by-token.
-        const sm = msg as {
+        const sm = msg as unknown as {
           event: Record<string, unknown>;
           parent_tool_use_id?: string | null;
         };
@@ -287,7 +295,7 @@ class ClaudeBridge {
         return null;
       }
       case 'assistant': {
-        const m = msg as {
+        const m = msg as unknown as {
           message: { content: Array<Record<string, unknown>> };
           parent_tool_use_id?: string | null;
         };
@@ -364,7 +372,7 @@ class ClaudeBridge {
         return null;
       }
       case 'user': {
-        const m = msg as {
+        const m = msg as unknown as {
           message: { content: Array<Record<string, unknown>> };
           parent_tool_use_id?: string | null;
         };
@@ -418,6 +426,13 @@ class ClaudeBridge {
     permissionMode?: SdkPermissionMode,
   ): void {
     const p = pendingPermissions.get(requestId);
+    // stderr is teed into the Rust daemon log via the adapter's stderr
+    // reader, so this single line is the authoritative "did the bridge
+    // receive the answer for this request_id" signal when diagnosing a
+    // stuck-pending tool card.
+    console.error(
+      `[bridge] answer_permission request_id=${requestId} decision=${decision} mode=${permissionMode ?? '-'} found=${!!p}`,
+    );
     if (!p) return;
     pendingPermissions.delete(requestId);
     const allow = decision === 'allow' || decision === 'allow_always';

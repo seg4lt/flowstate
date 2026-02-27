@@ -436,7 +436,11 @@ impl GitHubCopilotAdapter {
                         let perm_tx = perm_tx.clone();
                         let req_id_for_writer = request_id;
                         tokio::spawn(async move {
-                            let decision = events_clone
+                            // The Copilot bridge doesn't honor a mid-answer
+                            // permission-mode change, so drop that part of the
+                            // tuple. Adapters that do want it (Claude SDK) keep
+                            // both halves.
+                            let (decision, _mode_override) = events_clone
                                 .request_permission(tool_name, input, suggested)
                                 .await;
                             let _ = perm_tx.send((req_id_for_writer, decision));

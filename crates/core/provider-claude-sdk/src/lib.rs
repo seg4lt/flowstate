@@ -404,36 +404,56 @@ impl ClaudeSdkAdapter {
         let (perm_tx, mut perm_rx) =
             mpsc::unbounded_channel::<(String, PermissionDecision, Option<PermissionMode>)>();
         let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, QuestionOutcome)>();
+        // Single-item channel the writer task uses to abort the main
+        // read loop when it fails to forward a permission / question
+        // answer to the bridge. Without this the main loop would keep
+        // blocking on read_response while the SDK's canUseTool Promise
+        // sits forever on an answer that will never arrive — which is
+        // exactly the "card stuck on pending" bug we are fixing.
+        let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<String>();
 
         // Background task: forwards permission/question answers from the sink helpers back
         // into the bridge stdin while the turn is in flight.
         let stdin_for_writer = stdin.clone();
+        let shutdown_tx_for_writer = shutdown_tx.clone();
         let writer_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some((request_id, decision, mode_override)) = perm_rx.recv() => {
                         let req = BridgeRequest::AnswerPermission {
-                            request_id,
+                            request_id: request_id.clone(),
                             decision: permission_decision_to_str(decision).to_string(),
                             permission_mode: mode_override
                                 .map(|m| permission_mode_to_str(m).to_string()),
                         };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
-                            warn!("failed to forward permission answer: {e}");
+                            let msg = format!(
+                                "failed to forward permission answer for {request_id} to bridge: {e}"
+                            );
+                            warn!("{msg}");
+                            let _ = shutdown_tx_for_writer.send(msg);
                             break;
                         }
+                        info!(
+                            bridge_request_id = %request_id,
+                            "claude-sdk writer forwarded permission answer to bridge stdin"
+                        );
                     }
                     Some((request_id, outcome)) = q_rx.recv() => {
                         let req = match outcome {
                             QuestionOutcome::Answered(answers) => {
-                                BridgeRequest::AnswerQuestion { request_id, answers }
+                                BridgeRequest::AnswerQuestion { request_id: request_id.clone(), answers }
                             }
                             QuestionOutcome::Cancelled => {
-                                BridgeRequest::CancelQuestion { request_id }
+                                BridgeRequest::CancelQuestion { request_id: request_id.clone() }
                             }
                         };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
-                            warn!("failed to forward question outcome: {e}");
+                            let msg = format!(
+                                "failed to forward question outcome for {request_id} to bridge: {e}"
+                            );
+                            warn!("{msg}");
+                            let _ = shutdown_tx_for_writer.send(msg);
                             break;
                         }
                     }
@@ -445,15 +465,35 @@ impl ClaudeSdkAdapter {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS);
 
+        // Reason supplied by the writer task if it shuts down early
+        // because it couldn't forward an answer to the bridge. We
+        // capture it here and kill the bridge child *after* the select
+        // arm drops so there's no mutable-borrow overlap with the
+        // concurrent `process.read_response()` future.
+        let mut writer_shutdown_reason: Option<String> = None;
+
         let result = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break Err("Claude SDK turn timed out".to_string());
             }
-            let line = match tokio::time::timeout(remaining, process.read_response()).await {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => break Err(format!("Bridge read error: {e}")),
-                Err(_) => break Err("Claude SDK turn timed out".to_string()),
+            // Race the bridge stdout against the writer's shutdown
+            // signal. `biased` ensures we check the shutdown arm first
+            // so a write failure never loses to an incoming bridge
+            // line — we always break out with the original reason.
+            let line = tokio::select! {
+                biased;
+                Some(reason) = shutdown_rx.recv() => {
+                    writer_shutdown_reason = Some(reason);
+                    break Err(String::new());
+                }
+                read = tokio::time::timeout(remaining, process.read_response()) => {
+                    match read {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(e)) => break Err(format!("Bridge read error: {e}")),
+                        Err(_) => break Err("Claude SDK turn timed out".to_string()),
+                    }
+                }
             };
 
             match line {
@@ -505,23 +545,23 @@ impl ClaudeSdkAdapter {
                         // when forwarding the decision back to the bridge, because the
                         // bridge keeps its own pending-permissions map keyed by that id.
                         //
-                        // After request_permission resolves we also pull any
-                        // mode override that the host stashed alongside the
-                        // decision (via resolve_permission_with_mode). Used by
-                        // the plan-exit "Approve & Auto-edit" flow so the
-                        // bridge can attach updatedPermissions to the SDK
-                        // PermissionResult and the model continues in the
-                        // chosen mode within the same turn.
+                        // The optional PermissionMode override rides atomically
+                        // with the decision through the oneshot in provider-api,
+                        // so there is no side channel to read here — the
+                        // plan-exit "Approve & Auto-edit" flow Just Works.
                         let events_clone = events.clone();
                         let perm_tx = perm_tx.clone();
                         let req_id_for_writer = request_id;
-                        let req_id_for_lookup = req_id_for_writer.clone();
                         tokio::spawn(async move {
-                            let decision = events_clone
+                            let (decision, mode_override) = events_clone
                                 .request_permission(tool_name, input, suggested)
                                 .await;
-                            let mode_override =
-                                events_clone.take_mode_override(&req_id_for_lookup).await;
+                            tracing::info!(
+                                bridge_request_id = %req_id_for_writer,
+                                ?decision,
+                                has_mode_override = mode_override.is_some(),
+                                "claude-sdk adapter: forwarding permission answer to writer"
+                            );
                             let _ = perm_tx.send((req_id_for_writer, decision, mode_override));
                         });
                     }
@@ -583,6 +623,16 @@ impl ClaudeSdkAdapter {
         drop(perm_tx);
         drop(q_tx);
         let _ = writer_task.await;
+
+        // If the writer tripped its shutdown signal, the turn loop
+        // broke with a placeholder Err. Kill the bridge child so its
+        // stdout closes (future reads would otherwise hang on a dead
+        // pipe), and return a real Err so runtime-core transitions
+        // the turn to Failed and publishes a RuntimeEvent::Error.
+        if let Some(reason) = writer_shutdown_reason {
+            let _ = process.child.start_kill();
+            return Err(format!("Claude SDK bridge write path failed: {reason}"));
+        }
 
         result
     }
@@ -1067,16 +1117,24 @@ async fn forward_stream(
 fn claude_models() -> Vec<ProviderModel> {
     vec![
         ProviderModel {
-            value: "sonnet".to_string(),
-            label: "Claude Sonnet".to_string(),
+            value: "claude-opus-4-6".to_string(),
+            label: "Claude Opus 4.6".to_string(),
         },
         ProviderModel {
-            value: "opus".to_string(),
-            label: "Claude Opus".to_string(),
+            value: "claude-sonnet-4-6".to_string(),
+            label: "Claude Sonnet 4.6".to_string(),
         },
         ProviderModel {
-            value: "haiku".to_string(),
-            label: "Claude Haiku".to_string(),
+            value: "claude-haiku-4-5".to_string(),
+            label: "Claude Haiku 4.5".to_string(),
+        },
+        ProviderModel {
+            value: "claude-opus-4-5".to_string(),
+            label: "Claude Opus 4.5".to_string(),
+        },
+        ProviderModel {
+            value: "claude-sonnet-4-5".to_string(),
+            label: "Claude Sonnet 4.5".to_string(),
         },
     ]
 }

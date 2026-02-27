@@ -753,30 +753,34 @@ async fn handle_callback(
                 .unwrap_or("")
                 .to_string();
 
-            // Decide permission based on mode.
+            // Decide permission based on mode. The Copilot CLI adapter
+            // doesn't consume a mid-answer permission-mode switch, so the
+            // `_mode_override` half of the tuple is dropped.
             let decision = match permission_mode {
                 PermissionMode::Bypass => PermissionDecision::Allow,
                 PermissionMode::AcceptEdits | PermissionMode::Plan => {
                     if matches!(kind, "read" | "write") {
                         PermissionDecision::Allow
                     } else {
-                        events
+                        let (d, _mode_override) = events
                             .request_permission(
                                 kind.to_string(),
                                 perm_req.clone(),
                                 PermissionDecision::Allow,
                             )
-                            .await
+                            .await;
+                        d
                     }
                 }
                 PermissionMode::Default => {
-                    events
+                    let (d, _mode_override) = events
                         .request_permission(
                             kind.to_string(),
                             perm_req.clone(),
                             PermissionDecision::Allow,
                         )
-                        .await
+                        .await;
+                    d
                 }
             };
 

@@ -707,6 +707,13 @@ impl RuntimeCore {
     ) {
         let sink = self.active_sinks.lock().await.get(session_id).cloned();
         if let Some(sink) = sink {
+            tracing::info!(
+                session_id,
+                request_id,
+                ?decision,
+                has_mode_override = mode_override.is_some(),
+                "runtime-core routing answer_permission to sink"
+            );
             sink.resolve_permission_with_mode(request_id, decision, mode_override)
                 .await;
         } else {

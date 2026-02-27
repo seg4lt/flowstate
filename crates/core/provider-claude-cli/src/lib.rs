@@ -522,7 +522,10 @@ impl ClaudeCliAdapter {
                             warn!("Failed to write AskUserQuestion response: {e}");
                         }
                     } else {
-                        let decision = events
+                        // The legacy Claude CLI permission channel doesn't
+                        // carry a mode switch; drop the mode_override half of
+                        // the tuple.
+                        let (decision, _mode_override) = events
                             .request_permission(
                                 tool_name,
                                 tool_input,
@@ -589,7 +592,9 @@ impl ClaudeCliAdapter {
                                     warn!("Failed to write AskUserQuestion control_response: {e}");
                                 }
                             } else {
-                                let decision = events
+                                // control_request path doesn't thread a mode
+                                // switch either; drop the mode_override half.
+                                let (decision, _mode_override) = events
                                     .request_permission(
                                         tool_name,
                                         tool_input.clone(),

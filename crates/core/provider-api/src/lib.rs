@@ -509,14 +509,13 @@ pub type PermissionPolicy = Arc<Mutex<HashMap<String, PermissionDecision>>>;
 #[derive(Clone)]
 pub struct TurnEventSink {
     tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
-    permission_pending: Arc<Mutex<HashMap<String, oneshot::Sender<PermissionDecision>>>>,
-    /// Side-channel for permission mode overrides attached to a
-    /// pending request. Populated by `resolve_permission_with_mode`
-    /// before the oneshot fires; consumed by adapters via
-    /// `take_mode_override` once they wake up. Lets us add
-    /// "approve-and-switch-mode" semantics without changing the
-    /// `PermissionDecision` channel signature that every adapter uses.
-    permission_mode_overrides: Arc<Mutex<HashMap<String, PermissionMode>>>,
+    /// Oneshot per outstanding permission request, keyed by the
+    /// internal `perm-N` id. The payload is `(decision, mode_override)`
+    /// so "approve and switch mode" is delivered atomically with the
+    /// decision itself — no side channel, no id-lookup mistakes.
+    permission_pending: Arc<
+        Mutex<HashMap<String, oneshot::Sender<(PermissionDecision, Option<PermissionMode>)>>>,
+    >,
     question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
     /// Session-scoped persistent permission decisions. Shared across turns.
     policy: PermissionPolicy,
@@ -540,7 +539,6 @@ impl TurnEventSink {
         Self {
             tx,
             permission_pending: Arc::new(Mutex::new(HashMap::new())),
-            permission_mode_overrides: Arc::new(Mutex::new(HashMap::new())),
             question_pending: Arc::new(Mutex::new(HashMap::new())),
             policy,
         }
@@ -552,22 +550,29 @@ impl TurnEventSink {
     }
 
     /// Ask the host to decide on a tool invocation. Emits a PermissionRequest event
-    /// and awaits the host's answer. Returns Deny if the channel closes.
+    /// and awaits the host's answer. Returns `(Deny, None)` if the channel closes.
+    ///
+    /// The second tuple element is an optional `PermissionMode` the host
+    /// wants applied alongside the approval — used by the plan-exit
+    /// approve-and-switch flow. Adapters that don't care about mode
+    /// switches can simply ignore it; there is no separate side channel
+    /// to forget to read.
     ///
     /// Short-circuits the host prompt entirely if a previous turn in this
     /// session already answered `AllowAlways` or `DenyAlways` for the same
-    /// tool name.
+    /// tool name. The cached fast path always returns `None` for the mode
+    /// override — "always" decisions are tool-scoped, not mode-scoped.
     pub async fn request_permission(
         &self,
         tool_name: String,
         input: Value,
         suggested: PermissionDecision,
-    ) -> PermissionDecision {
+    ) -> (PermissionDecision, Option<PermissionMode>) {
         // Fast path: prior "always" decision in this session.
         {
             let policy = self.policy.lock().await;
             if let Some(decision) = policy.get(&tool_name).copied() {
-                return decision;
+                return (decision, None);
             }
         }
 
@@ -584,19 +589,19 @@ impl TurnEventSink {
             suggested_decision: suggested,
         })
         .await;
-        let decision = match receiver.await {
-            Ok(decision) => decision,
+        let (decision, mode_override) = match receiver.await {
+            Ok(payload) => payload,
             Err(_) => {
                 let mut guard = self.permission_pending.lock().await;
                 guard.remove(&request_id);
-                return PermissionDecision::Deny;
+                return (PermissionDecision::Deny, None);
             }
         };
 
         // Persist "always" decisions before normalizing the return value.
         // The provider only sees Allow/Deny — the "always" suffix is purely
         // a host-side hint that we should remember the answer.
-        match decision {
+        let normalized = match decision {
             PermissionDecision::AllowAlways => {
                 self.policy
                     .lock()
@@ -612,7 +617,8 @@ impl TurnEventSink {
                 PermissionDecision::Deny
             }
             other => other,
-        }
+        };
+        (normalized, mode_override)
     }
 
     /// Ask the user one or more structured clarifying questions and await their
@@ -648,39 +654,38 @@ impl TurnEventSink {
             .await;
     }
 
-    /// Like `resolve_permission`, but also stashes a permission-mode
-    /// override under the same `request_id` before resolving the
-    /// pending oneshot. Adapters that care (currently the Claude Agent
-    /// SDK adapter) call `take_mode_override(request_id)` after
-    /// `request_permission` resolves to read the stashed value and
-    /// forward it to their backend. Adapters that don't care simply
-    /// ignore the side channel; their behavior is unchanged.
+    /// Like `resolve_permission`, but also attaches an optional
+    /// permission-mode override that travels atomically with the
+    /// decision through the oneshot. Used by the plan-exit
+    /// approve-and-switch flow so the Claude SDK adapter can include
+    /// `updatedPermissions` in the bridge's `PermissionResult` within
+    /// the same wake-up that delivers the decision. Logs a warning if
+    /// there is no pending sender for the id — that almost always
+    /// means a stale or mis-routed answer.
     pub async fn resolve_permission_with_mode(
         &self,
         request_id: &str,
         decision: PermissionDecision,
         mode_override: Option<PermissionMode>,
     ) {
-        if let Some(mode) = mode_override {
-            self.permission_mode_overrides
-                .lock()
-                .await
-                .insert(request_id.to_string(), mode);
-        }
         let mut guard = self.permission_pending.lock().await;
-        if let Some(sender) = guard.remove(request_id) {
-            let _ = sender.send(decision);
+        match guard.remove(request_id) {
+            Some(sender) => {
+                tracing::info!(
+                    request_id,
+                    ?decision,
+                    has_mode_override = mode_override.is_some(),
+                    "resolve_permission firing oneshot"
+                );
+                let _ = sender.send((decision, mode_override));
+            }
+            None => {
+                tracing::warn!(
+                    request_id,
+                    "resolve_permission found no pending sender — stale or mis-routed answer"
+                );
+            }
         }
-    }
-
-    /// Adapter-side: take and clear any permission-mode override that
-    /// was attached to this request via `resolve_permission_with_mode`.
-    /// Returns `None` if no override was set.
-    pub async fn take_mode_override(&self, request_id: &str) -> Option<PermissionMode> {
-        self.permission_mode_overrides
-            .lock()
-            .await
-            .remove(request_id)
     }
 
     /// Host-side: called by the runtime when the user answers a question.
