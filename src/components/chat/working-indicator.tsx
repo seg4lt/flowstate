@@ -6,6 +6,7 @@ interface WorkingIndicatorProps {
   provider: ProviderKind;
   /** ISO-8601 timestamp the turn started at (turn.createdAt). */
   startedAt: string;
+  onInterrupt: () => void;
 }
 
 // Claude Code's CLI cycles through a long list of cute gerunds while
@@ -70,7 +71,7 @@ function formatElapsed(elapsedMs: number): string {
   return `${minutes}m ${rem}s`;
 }
 
-function WorkingIndicatorInner({ provider, startedAt }: WorkingIndicatorProps) {
+function WorkingIndicatorInner({ provider, startedAt, onInterrupt }: WorkingIndicatorProps) {
   // Re-render every second so the timer ticks. We deliberately don't
   // useState(now) because that re-creates a closure on every render —
   // useReducer with a counter is the cheapest way to force a tick.
@@ -99,9 +100,9 @@ function WorkingIndicatorInner({ provider, startedAt }: WorkingIndicatorProps) {
       <span className="ml-auto font-mono tabular-nums">{elapsedLabel}</span>
       <button
         type="button"
-        className="text-muted-foreground/60 hover:text-foreground"
-        title="Esc to interrupt"
-        tabIndex={-1}
+        onClick={onInterrupt}
+        className="rounded px-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
+        title="Interrupt (Esc)"
       >
         esc
       </button>

@@ -164,6 +164,28 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [sessionId, session, permissionMode]);
 
+  // Escape interrupts the in-flight turn. Mirrors the "esc" hint shown in
+  // the working indicator. The title-rename Escape handler is scoped to
+  // its own input element, so this window-level listener doesn't clobber
+  // it when a rename is in progress.
+  React.useEffect(() => {
+    if (!session) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (session.status !== "running") return;
+      event.preventDefault();
+      sendMessage({ type: "interrupt_turn", session_id: sessionId }).catch(
+        (err) => {
+          console.error("Failed to interrupt turn", err);
+        },
+      );
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [sessionId, session]);
+
   // Set active session
   React.useEffect(() => {
     dispatch({ type: "set_active_session", sessionId });
@@ -588,6 +610,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <WorkingIndicator
           provider={session.provider}
           startedAt={runningTurn.createdAt}
+          onInterrupt={handleInterrupt}
         />
       )}
 
@@ -624,7 +647,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       <ChatInput
         onSend={handleSend}
         onInterrupt={handleInterrupt}
-        isRunning={isRunning}
+        sessionStatus={session?.status}
         disabled={loading}
         toolbar={toolbar}
       />
