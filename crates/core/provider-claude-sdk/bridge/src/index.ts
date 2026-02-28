@@ -238,6 +238,19 @@ class ClaudeBridge {
    * if this message is a `result` (so the caller can capture canonical output).
    */
   private handleSdkMessage(msg: SDKMessage): string | null {
+    // Non-delta SDK message dispatch log. Stream_event messages are
+    // high-volume (one per token) so we suppress them to keep the log
+    // readable; everything else — assistant, user, result, system,
+    // tool_progress, tool_use_summary — gets a single line so the
+    // "did a user/tool_result message arrive after the permission
+    // answer" question is answerable from the log alone.
+    if (msg.type !== 'stream_event') {
+      const subtype =
+        (msg as { subtype?: string }).subtype !== undefined
+          ? `.${(msg as { subtype?: string }).subtype}`
+          : '';
+      console.error(`[bridge] sdk msg type=${msg.type}${subtype}`);
+    }
     switch (msg.type) {
       case 'system': {
         const sub = (msg as { subtype?: string }).subtype;
@@ -296,13 +309,24 @@ class ClaudeBridge {
       }
       case 'assistant': {
         const m = msg as unknown as {
-          message: { content: Array<Record<string, unknown>> };
+          message: { content: unknown };
           parent_tool_use_id?: string | null;
         };
+        const rawContent = m.message?.content;
+        if (!Array.isArray(rawContent)) {
+          console.error(
+            `[bridge] assistant message content is not an array: type=${typeof rawContent}`,
+          );
+          return null;
+        }
+        const blockTypes = rawContent
+          .map((b) => (b as { type?: string }).type ?? '?')
+          .join(',');
+        console.error(`[bridge] assistant blocks=[${blockTypes}]`);
         // Text and thinking blocks were already streamed via `stream_event`, so
         // skip them here to avoid duplicating the full message body. We still
         // process `tool_use` blocks because those only arrive complete.
-        for (const block of m.message.content) {
+        for (const block of rawContent as Array<Record<string, unknown>>) {
           const t = block.type as string;
           if (t === 'tool_use') {
             const callId = block.id as string | undefined;
@@ -373,10 +397,26 @@ class ClaudeBridge {
       }
       case 'user': {
         const m = msg as unknown as {
-          message: { content: Array<Record<string, unknown>> };
+          message: { content: unknown };
           parent_tool_use_id?: string | null;
         };
-        for (const block of m.message.content) {
+        const rawContent = m.message?.content;
+        if (!Array.isArray(rawContent)) {
+          console.error(
+            `[bridge] user message content is not an array: type=${typeof rawContent}`,
+          );
+          return null;
+        }
+        const blockSummary = rawContent
+          .map((b) => {
+            const bb = b as { type?: string; tool_use_id?: string };
+            return bb.type === 'tool_result'
+              ? `tool_result(${bb.tool_use_id ?? '?'})`
+              : (bb.type ?? '?');
+          })
+          .join(',');
+        console.error(`[bridge] user blocks=[${blockSummary}]`);
+        for (const block of rawContent as Array<Record<string, unknown>>) {
           if (block.type === 'tool_result') {
             const cid = (block.tool_use_id as string) ?? '';
             const raw = block.content as unknown;

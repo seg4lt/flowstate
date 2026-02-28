@@ -259,7 +259,12 @@ impl ClaudeSdkAdapter {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.trim().is_empty() {
-                        info!(target: "claude-sdk-bridge", "{}", line);
+                        // Log under this crate's module path (rather
+                        // than a custom `target:`) so the normal
+                        // `zenui=info` env filter catches bridge
+                        // stderr lines. Custom targets fall back to
+                        // the default warn level and would be dropped.
+                        info!("[bridge-stderr] {}", line);
                     }
                 }
             });
@@ -529,7 +534,15 @@ impl ClaudeSdkAdapter {
                     steps,
                     raw,
                     nested_event,
-                } => match event.as_str() {
+                } => {
+                    // Log every non-delta stream event so "stuck"
+                    // bugs are diagnosable from the log alone: if the
+                    // bridge stops emitting after a permission answer,
+                    // this is where the silence becomes visible.
+                    if !matches!(event.as_str(), "text_delta" | "reasoning_delta") {
+                        info!(event = %event, "bridge stream event");
+                    }
+                    match event.as_str() {
                     "permission_request" => {
                         let request_id = request_id.unwrap_or_default();
                         let tool_name = tool_name.unwrap_or_default();
@@ -612,7 +625,8 @@ impl ClaudeSdkAdapter {
                         )
                         .await;
                     }
-                },
+                    }
+                }
                 other => {
                     debug!("Unexpected mid-stream bridge message: {:?}", other);
                 }
@@ -1015,6 +1029,7 @@ async fn forward_stream(
         }
         "tool_started" => {
             if let (Some(cid), Some(n)) = (call_id, name) {
+                info!(call_id = %cid, name = %n, "bridge tool_started");
                 events
                     .send(ProviderTurnEvent::ToolCallStarted {
                         call_id: cid,
@@ -1022,10 +1037,18 @@ async fn forward_stream(
                         args: args.unwrap_or(Value::Null),
                     })
                     .await;
+            } else {
+                warn!("bridge tool_started missing call_id/name");
             }
         }
         "tool_completed" => {
             if let Some(cid) = call_id {
+                info!(
+                    call_id = %cid,
+                    has_error = error.is_some(),
+                    output_len = output.as_ref().map(|s| s.len()).unwrap_or(0),
+                    "bridge tool_completed"
+                );
                 events
                     .send(ProviderTurnEvent::ToolCallCompleted {
                         call_id: cid,
@@ -1033,6 +1056,8 @@ async fn forward_stream(
                         error,
                     })
                     .await;
+            } else {
+                warn!("bridge tool_completed missing call_id");
             }
         }
         "file_change" => {
