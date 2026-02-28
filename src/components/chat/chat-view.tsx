@@ -79,8 +79,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const navigate = useNavigate();
   const [turns, setTurns] = React.useState<TurnRecord[]>([]);
   const [loading, setLoading] = React.useState(true);
-  const [pendingPermission, setPendingPermission] =
-    React.useState<PermissionRequest | null>(null);
+  // FIFO queue of outstanding permission requests. Parallel tool
+  // calls from the Claude Agent SDK fire multiple canUseTool
+  // callbacks in the same turn, and each one hits the runtime as a
+  // separate PermissionRequested event. Storing one at a time would
+  // overwrite older prompts and leave their canUseTool Promises
+  // blocking forever (the original "stuck pending" bug). The user
+  // sees the head of the queue; clicking Allow/Deny pops it and the
+  // next prompt slides in.
+  const [pendingPermissions, setPendingPermissions] = React.useState<
+    PermissionRequest[]
+  >([]);
   const [pendingQuestion, setPendingQuestion] =
     React.useState<QuestionRequest | null>(null);
   const [effort, setEffort] = React.useState<ReasoningEffort>("high");
@@ -199,7 +208,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     let cancelled = false;
     setLoading(true);
     setTurns([]);
-    setPendingPermission(null);
+    setPendingPermissions([]);
     setPendingQuestion(null);
     setPendingInput(null);
     setLastEventAt(Date.now());
@@ -385,11 +394,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           break;
 
         case "permission_requested":
-          setPendingPermission({
-            requestId: event.request_id,
-            toolName: event.tool_name,
-            input: event.input,
-            suggested: event.suggested,
+          // Append to the FIFO queue. Dedupe on request_id because
+          // the daemon-side lag-recovery path can replay events, and
+          // a parallel canUseTool burst must not create N copies of
+          // the same prompt. The head of the queue is the prompt the
+          // user currently sees.
+          setPendingPermissions((prev) => {
+            if (prev.some((p) => p.requestId === event.request_id)) {
+              return prev;
+            }
+            return [
+              ...prev,
+              {
+                requestId: event.request_id,
+                toolName: event.tool_name,
+                input: event.input,
+                suggested: event.suggested,
+              },
+            ];
           });
           break;
 
@@ -435,15 +457,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
   ) {
-    if (!pendingPermission) return;
+    // Always act on the head of the queue — that's what the user
+    // just clicked on. Pop it before the await so a rapid double
+    // click can't answer the same request twice, and so the next
+    // queued prompt becomes visible immediately.
+    const head = pendingPermissions[0];
+    if (!head) return;
+    setPendingPermissions((prev) => prev.slice(1));
     await sendMessage({
       type: "answer_permission",
       session_id: sessionId,
-      request_id: pendingPermission.requestId,
+      request_id: head.requestId,
       decision,
       ...(modeOverride ? { permission_mode_override: modeOverride } : {}),
     });
-    setPendingPermission(null);
     if (modeOverride) {
       // Mirror the chosen mode into local state so the toolbar dropdown
       // and the next send_turn pick it up. The Claude SDK side already
@@ -622,15 +649,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         />
       )}
 
-      {pendingPermission && (
+      {pendingPermissions.length > 0 && (
         <PermissionPrompt
-          toolName={pendingPermission.toolName}
-          input={pendingPermission.input}
+          // Head-of-queue. The `key` forces React to remount the
+          // prompt so any local component state (e.g. the plan-exit
+          // mode picker's `pending` flag) resets between queued
+          // prompts and the user can't accidentally double-answer
+          // the next one with stale state.
+          key={pendingPermissions[0].requestId}
+          toolName={pendingPermissions[0].toolName}
+          input={pendingPermissions[0].input}
           onDecision={handlePermissionDecision}
+          queueDepth={pendingPermissions.length}
         />
       )}
 
-      {stuckSince !== null && !pendingPermission && !pendingQuestion && (
+      {stuckSince !== null && pendingPermissions.length === 0 && !pendingQuestion && (
         <StuckBanner
           elapsedSeconds={Math.floor((Date.now() - stuckSince) / 1000)}
           onInterrupt={() => {

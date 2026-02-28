@@ -13,6 +13,12 @@ interface PermissionPromptProps {
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
   ) => void;
+  /** Total number of queued prompts including this one. When the SDK
+   *  fires parallel canUseTool callbacks (e.g. three Grep calls in one
+   *  assistant turn), every answer pops one prompt and the next one
+   *  slides in; showing "1 of 3" tells the user why clicking Allow
+   *  doesn't make the prompt disappear. Defaults to 1. */
+  queueDepth?: number;
 }
 
 const PLAN_EXIT_MODES: { mode: PermissionMode; label: string; hint: string }[] = [
@@ -25,11 +31,17 @@ function PermissionPromptInner({
   toolName,
   input,
   onDecision,
+  queueDepth = 1,
 }: PermissionPromptProps) {
   const planExit = isPlanExitTool(toolName);
 
   return (
     <div className="shrink-0 border-t border-amber-500/40 bg-amber-500/5 px-3 py-2.5">
+      {queueDepth > 1 && (
+        <div className="mb-1.5 text-[11px] font-medium uppercase tracking-wide text-amber-600 dark:text-amber-400">
+          {queueDepth} permissions queued
+        </div>
+      )}
       {planExit ? (
         <PlanExitPrompt input={input} onDecision={onDecision} />
       ) : (
