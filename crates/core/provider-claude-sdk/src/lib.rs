@@ -1029,12 +1029,18 @@ async fn forward_stream(
         }
         "tool_started" => {
             if let (Some(cid), Some(n)) = (call_id, name) {
-                info!(call_id = %cid, name = %n, "bridge tool_started");
+                info!(
+                    call_id = %cid,
+                    name = %n,
+                    parent = ?parent_call_id,
+                    "bridge tool_started"
+                );
                 events
                     .send(ProviderTurnEvent::ToolCallStarted {
                         call_id: cid,
                         name: n,
                         args: args.unwrap_or(Value::Null),
+                        parent_call_id,
                     })
                     .await;
             } else {

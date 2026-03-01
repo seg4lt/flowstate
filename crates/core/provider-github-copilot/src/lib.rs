@@ -398,6 +398,7 @@ impl GitHubCopilotAdapter {
                                     call_id: cid,
                                     name: n,
                                     args: args.unwrap_or(serde_json::Value::Null),
+                                    parent_call_id: None,
                                 })
                                 .await;
                         }

@@ -400,6 +400,7 @@ impl ClaudeCliAdapter {
                                     call_id: call_id.clone(),
                                     name: name.clone(),
                                     args: args.clone(),
+                                    parent_call_id: None,
                                 })
                                 .await;
 

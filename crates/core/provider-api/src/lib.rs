@@ -239,6 +239,12 @@ pub struct ToolCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub status: ToolCallStatus,
+    /// When this tool call was issued from inside a sub-agent (the SDK's
+    /// Task/Agent dispatch), this is the `call_id` of the parent Task
+    /// tool_use that spawned the sub-agent. `None` means the call was
+    /// issued directly by the main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_call_id: Option<String>,
 }
 
 /// One element of an assistant turn's ordered content stream.
@@ -445,6 +451,9 @@ pub enum ProviderTurnEvent {
         call_id: String,
         name: String,
         args: Value,
+        /// Parent Task/Agent call_id when this tool call originates
+        /// from a sub-agent; `None` for main-agent calls.
+        parent_call_id: Option<String>,
     },
     ToolCallCompleted {
         call_id: String,
@@ -755,6 +764,8 @@ pub enum RuntimeEvent {
         call_id: String,
         name: String,
         args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
     },
     ToolCallCompleted {
         session_id: String,

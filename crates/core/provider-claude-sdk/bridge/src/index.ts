@@ -319,10 +319,18 @@ class ClaudeBridge {
           );
           return null;
         }
+        // Assistant messages from sub-agents (spawned via the Task/Agent
+        // tool) carry a non-null parent_tool_use_id pointing back at the
+        // spawner's call_id. Propagate it onto every tool_started we
+        // forward from this message so the frontend can group tool calls
+        // by the agent that actually ran them.
+        const parentToolUseId = m.parent_tool_use_id ?? undefined;
         const blockTypes = rawContent
           .map((b) => (b as { type?: string }).type ?? '?')
           .join(',');
-        console.error(`[bridge] assistant blocks=[${blockTypes}]`);
+        console.error(
+          `[bridge] assistant blocks=[${blockTypes}] parent=${parentToolUseId ?? '-'}`,
+        );
         // Text and thinking blocks were already streamed via `stream_event`, so
         // skip them here to avoid duplicating the full message body. We still
         // process `tool_use` blocks because those only arrive complete.
@@ -347,6 +355,7 @@ class ClaudeBridge {
               call_id: callId,
               name,
               args: input,
+              ...(parentToolUseId ? { parent_call_id: parentToolUseId } : {}),
             });
 
             // Structured file-change extraction for Write/Edit/Delete tools.

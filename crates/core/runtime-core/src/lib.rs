@@ -1019,7 +1019,12 @@ impl RuntimeCore {
                         delta,
                     });
                 }
-                ProviderTurnEvent::ToolCallStarted { call_id, name, args } => {
+                ProviderTurnEvent::ToolCallStarted {
+                    call_id,
+                    name,
+                    args,
+                    parent_call_id,
+                } => {
                     tool_calls.push(ToolCall {
                         call_id: call_id.clone(),
                         name: name.clone(),
@@ -1027,6 +1032,7 @@ impl RuntimeCore {
                         output: None,
                         error: None,
                         status: ToolCallStatus::Pending,
+                        parent_call_id: parent_call_id.clone(),
                     });
                     blocks.push(ContentBlock::ToolCall {
                         call_id: call_id.clone(),
@@ -1037,6 +1043,7 @@ impl RuntimeCore {
                         call_id,
                         name,
                         args,
+                        parent_call_id,
                     });
                 }
                 ProviderTurnEvent::ToolCallCompleted { call_id, output, error } => {
@@ -1589,6 +1596,7 @@ mod tests {
                     call_id: "call-a".to_string(),
                     name: "search".to_string(),
                     args: serde_json::json!({"q": "x"}),
+                    parent_call_id: None,
                 })
                 .await;
             events
@@ -1608,6 +1616,7 @@ mod tests {
                     call_id: "call-b".to_string(),
                     name: "edit".to_string(),
                     args: serde_json::json!({"path": "f"}),
+                    parent_call_id: None,
                 })
                 .await;
             events
@@ -1675,6 +1684,7 @@ mod tests {
                     call_id: "stuck-call".to_string(),
                     name: "search".to_string(),
                     args: serde_json::json!({}),
+                    parent_call_id: None,
                 })
                 .await;
             // Yield so the runtime drain loop has a chance to process

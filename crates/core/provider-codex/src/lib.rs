@@ -1080,7 +1080,12 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
                 let args = tool_item_args(item).unwrap_or(Value::Null);
                 if !call_id.is_empty() {
                     events
-                        .send(ProviderTurnEvent::ToolCallStarted { call_id, name, args })
+                        .send(ProviderTurnEvent::ToolCallStarted {
+                            call_id,
+                            name,
+                            args,
+                            parent_call_id: None,
+                        })
                         .await;
                 }
             }

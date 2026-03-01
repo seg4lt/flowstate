@@ -659,6 +659,7 @@ async fn handle_session_event(
                     call_id,
                     name,
                     args,
+                    parent_call_id: None,
                 })
                 .await;
         }
