@@ -64,6 +64,10 @@ export interface ToolCall {
   output?: string;
   error?: string;
   status: ToolCallStatus;
+  // Parent Task/Agent call_id when this tool call was issued from
+  // inside a sub-agent. Undefined for main-agent calls. Used by the
+  // turn view to segment the tool-call stream into per-agent groups.
+  parentCallId?: string;
 }
 
 // Mirrors `zenui_provider_api::ContentBlock` — the canonical ordered
@@ -228,7 +232,7 @@ export type RuntimeEvent =
   | { type: "turn_started"; session_id: string; turn: TurnRecord }
   | { type: "content_delta"; session_id: string; turn_id: string; delta: string; accumulated_output: string }
   | { type: "reasoning_delta"; session_id: string; turn_id: string; delta: string }
-  | { type: "tool_call_started"; session_id: string; turn_id: string; call_id: string; name: string; args: unknown }
+  | { type: "tool_call_started"; session_id: string; turn_id: string; call_id: string; name: string; args: unknown; parent_call_id?: string }
   | { type: "tool_call_completed"; session_id: string; turn_id: string; call_id: string; output: string; error?: string }
   | { type: "turn_completed"; session_id: string; session: SessionSummary; turn: TurnRecord }
   | { type: "session_interrupted"; session: SessionSummary; message: string }

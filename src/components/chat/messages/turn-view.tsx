@@ -1,8 +1,146 @@
 import * as React from "react";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import type { ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
 import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
+
+const GROUP_DEFAULT_VISIBLE = 5;
+
+// A render-layer block that consolidates consecutive `tool_call`
+// blocks issued by the same agent into a single group. A change in
+// `parentCallId` (main → sub-agent, sub-agent → main, or between two
+// different sub-agents) starts a new group, as does any intervening
+// text/reasoning block.
+type RenderBlock =
+  | { kind: "text"; text: string; key: string }
+  | { kind: "reasoning"; text: string; key: string }
+  | {
+      kind: "tool_call_group";
+      callIds: string[];
+      parentCallId: string | undefined;
+      key: string;
+    };
+
+function groupBlocks(
+  blocks: ContentBlock[],
+  callsById: Map<string, ToolCall>,
+): RenderBlock[] {
+  const result: RenderBlock[] = [];
+  let currentGroup:
+    | {
+        kind: "tool_call_group";
+        callIds: string[];
+        parentCallId: string | undefined;
+        key: string;
+      }
+    | null = null;
+  blocks.forEach((block, idx) => {
+    if (block.kind === "tool_call") {
+      const parent = callsById.get(block.callId)?.parentCallId;
+      if (currentGroup && currentGroup.parentCallId === parent) {
+        currentGroup.callIds.push(block.callId);
+        return;
+      }
+      // Key the group by the first callId so the expanded state stays
+      // stable across streaming updates as more calls get appended.
+      currentGroup = {
+        kind: "tool_call_group",
+        callIds: [block.callId],
+        parentCallId: parent,
+        key: `tg-${block.callId}`,
+      };
+      result.push(currentGroup);
+      return;
+    }
+    currentGroup = null;
+    if (block.kind === "text") {
+      result.push({ kind: "text", text: block.text, key: `text-${idx}` });
+    } else if (block.kind === "reasoning") {
+      result.push({
+        kind: "reasoning",
+        text: block.text,
+        key: `reasoning-${idx}`,
+      });
+    }
+  });
+  return result;
+}
+
+function ToolCallGroup({
+  callIds,
+  parentCallId,
+  callsById,
+}: {
+  callIds: string[];
+  parentCallId: string | undefined;
+  callsById: Map<string, ToolCall>;
+}) {
+  const [expanded, setExpanded] = React.useState(false);
+
+  const calls = React.useMemo(() => {
+    const out: ToolCall[] = [];
+    for (const id of callIds) {
+      const tc = callsById.get(id);
+      if (tc) out.push(tc);
+    }
+    return out;
+  }, [callIds, callsById]);
+
+  if (calls.length === 0) return null;
+
+  const overflow = calls.length - GROUP_DEFAULT_VISIBLE;
+  const hasOverflow = overflow > 0;
+  const visible =
+    expanded || !hasOverflow ? calls : calls.slice(0, GROUP_DEFAULT_VISIBLE);
+
+  // Sub-agent groups get a visible header so the user can see which
+  // Task dispatch issued them. Main-agent groups render bare.
+  const isSubagent = parentCallId !== undefined;
+  const parentCall = isSubagent ? callsById.get(parentCallId) : undefined;
+  const parentLabel = parentCall?.name ?? "Subagent";
+
+  const body = (
+    <div className="space-y-1">
+      {visible.map((tc) => (
+        <ToolCallCard key={tc.callId} toolCall={tc} />
+      ))}
+      {hasOverflow && (
+        <button
+          type="button"
+          onClick={() => setExpanded((e) => !e)}
+          className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+        >
+          {expanded ? (
+            <>
+              <ChevronUp className="h-3 w-3" />
+              Show top {GROUP_DEFAULT_VISIBLE}
+            </>
+          ) : (
+            <>
+              <ChevronDown className="h-3 w-3" />
+              Show {overflow} more
+            </>
+          )}
+        </button>
+      )}
+    </div>
+  );
+
+  if (isSubagent) {
+    return (
+      <div className="rounded-md border border-border/50 bg-muted/20 px-2 py-1.5">
+        <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          <span>↳ {parentLabel}</span>
+          <span className="text-muted-foreground/60">· {calls.length}</span>
+        </div>
+        {body}
+      </div>
+    );
+  }
+
+  return <div className="pl-2">{body}</div>;
+}
 
 // Normalized shape that covers both completed TurnRecords and the
 // synthetic streaming row. `input` is null for streaming items because
@@ -32,14 +170,20 @@ function TurnViewInner({ item }: TurnViewProps) {
     return map;
   }, [item.toolCalls]);
 
-  // Find the trailing text block so the blinking cursor only attaches
-  // to the very last text run while the turn is still streaming.
-  const lastTextIdx = React.useMemo(() => {
-    for (let i = item.blocks.length - 1; i >= 0; i--) {
-      if (item.blocks[i].kind === "text") return i;
+  const renderBlocks = React.useMemo(
+    () => groupBlocks(item.blocks, callsById),
+    [item.blocks, callsById],
+  );
+
+  // Index of the trailing text block in the grouped stream so the
+  // blinking cursor only attaches to the very last text run while
+  // the turn is still streaming.
+  const lastTextRenderIdx = React.useMemo(() => {
+    for (let i = renderBlocks.length - 1; i >= 0; i--) {
+      if (renderBlocks[i].kind === "text") return i;
     }
     return -1;
-  }, [item.blocks]);
+  }, [renderBlocks]);
 
   const hasAnyContent = item.blocks.length > 0;
 
@@ -53,21 +197,21 @@ function TurnViewInner({ item }: TurnViewProps) {
         </div>
       )}
 
-      {item.blocks.map((block, idx) => {
+      {renderBlocks.map((block, idx) => {
         switch (block.kind) {
           case "text":
             return (
               <AgentMessage
-                key={`text-${idx}`}
+                key={block.key}
                 output={block.text}
-                streaming={item.streaming && idx === lastTextIdx}
+                streaming={item.streaming && idx === lastTextRenderIdx}
                 status={item.status}
               />
             );
           case "reasoning":
             return (
               <details
-                key={`reasoning-${idx}`}
+                key={block.key}
                 open
                 className="rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs"
               >
@@ -79,15 +223,15 @@ function TurnViewInner({ item }: TurnViewProps) {
                 </p>
               </details>
             );
-          case "tool_call": {
-            const tc = callsById.get(block.callId);
-            if (!tc) return null;
+          case "tool_call_group":
             return (
-              <div key={`tool-${block.callId}`} className="pl-2">
-                <ToolCallCard toolCall={tc} />
-              </div>
+              <ToolCallGroup
+                key={block.key}
+                callIds={block.callIds}
+                parentCallId={block.parentCallId}
+                callsById={callsById}
+              />
             );
-          }
         }
       })}
     </div>

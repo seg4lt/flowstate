@@ -345,6 +345,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                         name: callEvent.name,
                         args: callEvent.args,
                         status: "pending" as const,
+                        parentCallId: callEvent.parent_call_id,
                       },
                     ],
                     blocks: [
