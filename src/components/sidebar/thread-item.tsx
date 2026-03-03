@@ -1,10 +1,9 @@
 import * as React from "react";
-import { Archive, Ellipsis, Trash2 } from "lucide-react";
+import { Archive, EllipsisVertical, Trash2 } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -82,7 +81,7 @@ export function ThreadItem({
         />
       ) : (
         <SidebarMenuSubButton
-          className="h-7 w-full min-w-0 rounded-r-none pr-8"
+          className="h-7 w-full min-w-0 rounded-r-none pr-12"
           isActive={isActive}
           onClick={onClick}
           onDoubleClick={(e) => {
@@ -106,29 +105,30 @@ export function ThreadItem({
       {/* Actions — fades in on hover, stays visible when dropdown is open */}
       {!editing && (
         <div
-          className="absolute right-1 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
+          className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => e.stopPropagation()}
         >
+          <button
+            type="button"
+            title="Archive"
+            className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
+            onClick={() =>
+              send({ type: "archive_session", session_id: sessionId })
+            }
+          >
+            <Archive className="h-3 w-3" />
+          </button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
                 type="button"
-                className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-sidebar-accent text-sidebar-foreground outline-none hover:bg-sidebar-border"
+                className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
               >
-                <Ellipsis className="h-3 w-3" />
+                <EllipsisVertical className="h-3 w-3" />
               </button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="start" className="min-w-32">
-              <DropdownMenuItem
-                onClick={() =>
-                  send({ type: "archive_session", session_id: sessionId })
-                }
-              >
-                <Archive className="mr-2 h-3.5 w-3.5" />
-                Archive
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
               <DropdownMenuItem
                 variant="destructive"
                 onClick={() =>

@@ -12,6 +12,7 @@ import type {
 interface AppState {
   providers: ProviderStatus[];
   sessions: Map<string, SessionSummary>;
+  archivedSessions: SessionSummary[];
   projects: ProjectRecord[];
   activeSessionId: string | null;
   ready: boolean;
@@ -69,6 +70,10 @@ function handleServerMessage(
       return { ...state, sessions };
     }
 
+    case "archived_sessions_list": {
+      return { ...state, archivedSessions: message.sessions };
+    }
+
     case "event":
       return handleRuntimeEvent(state, message.event);
 
@@ -91,6 +96,9 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       return {
         ...state,
         sessions,
+        archivedSessions: state.archivedSessions.filter(
+          (s) => s.sessionId !== event.session_id,
+        ),
         activeSessionId:
           state.activeSessionId === event.session_id
             ? null
@@ -182,10 +190,14 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
 
     case "session_archived": {
       const sessions = new Map(state.sessions);
+      const archived = state.sessions.get(event.session_id);
       sessions.delete(event.session_id);
       return {
         ...state,
         sessions,
+        archivedSessions: archived
+          ? [archived, ...state.archivedSessions]
+          : state.archivedSessions,
         activeSessionId:
           state.activeSessionId === event.session_id
             ? null
@@ -196,7 +208,13 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
     case "session_unarchived": {
       const sessions = new Map(state.sessions);
       sessions.set(event.session.sessionId, event.session);
-      return { ...state, sessions };
+      return {
+        ...state,
+        sessions,
+        archivedSessions: state.archivedSessions.filter(
+          (s) => s.sessionId !== event.session.sessionId,
+        ),
+      };
     }
 
     default:
@@ -207,6 +225,7 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
 const initialState: AppState = {
   providers: [],
   sessions: new Map(),
+  archivedSessions: [],
   projects: [],
   activeSessionId: null,
   ready: false,

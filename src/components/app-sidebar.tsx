@@ -1,13 +1,23 @@
 import { useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  Archive,
+  ArchiveRestore,
   ChevronRight,
+  EllipsisVertical,
   FolderIcon,
   FolderMinus,
   Plus,
   Settings,
   MessageSquare,
+  Trash2,
 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Collapsible,
   CollapsibleContent,
@@ -26,6 +36,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarMenuSub,
+  SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarRail,
 } from "@/components/ui/sidebar";
@@ -63,10 +74,6 @@ export function AppSidebar() {
   }
 
   async function handleRemoveProject(projectId: string) {
-    const threads = sessionsByProject.get(projectId) ?? [];
-    for (const session of threads) {
-      await send({ type: "archive_session", session_id: session.sessionId });
-    }
     await send({ type: "delete_project", project_id: projectId });
   }
 
@@ -196,6 +203,94 @@ export function AppSidebar() {
                   </Collapsible>
                 );
               })}
+              {/* Archived threads */}
+              <Collapsible
+                className="group/collapsible"
+                onOpenChange={(open) => {
+                  if (open) {
+                    send({ type: "list_archived_sessions" });
+                  }
+                }}
+              >
+                <SidebarMenuItem>
+                  <CollapsibleTrigger asChild>
+                    <SidebarMenuButton tooltip="Archived">
+                      <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                      <Archive />
+                      <span className="flex-1 truncate">Archived</span>
+                    </SidebarMenuButton>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <SidebarMenuSub>
+                      {state.archivedSessions.map((session) => (
+                        <SidebarMenuSubItem
+                          key={session.sessionId}
+                          className="group/thread -mr-6"
+                        >
+                          <SidebarMenuSubButton className="h-7 w-full min-w-0 rounded-r-none pr-12">
+                            <span className="flex-1 truncate text-xs">
+                              {session.title || "New thread"}
+                            </span>
+                          </SidebarMenuSubButton>
+                          <div
+                            className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
+                            onClick={(e) => e.stopPropagation()}
+                            onKeyDown={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              title="Unarchive"
+                              className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
+                              onClick={() =>
+                                send({
+                                  type: "unarchive_session",
+                                  session_id: session.sessionId,
+                                })
+                              }
+                            >
+                              <ArchiveRestore className="h-3 w-3" />
+                            </button>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
+                                >
+                                  <EllipsisVertical className="h-3 w-3" />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent
+                                align="start"
+                                className="min-w-32"
+                              >
+                                <DropdownMenuItem
+                                  variant="destructive"
+                                  onClick={() =>
+                                    send({
+                                      type: "delete_session",
+                                      session_id: session.sessionId,
+                                    })
+                                  }
+                                >
+                                  <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                  Delete
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
+                        </SidebarMenuSubItem>
+                      ))}
+                      {state.archivedSessions.length === 0 && (
+                        <SidebarMenuSubItem>
+                          <span className="px-2 py-1 text-xs text-muted-foreground">
+                            No archived threads
+                          </span>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </SidebarMenuItem>
+              </Collapsible>
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
