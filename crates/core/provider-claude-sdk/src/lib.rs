@@ -633,6 +633,18 @@ impl ClaudeSdkAdapter {
             }
         };
 
+        // Drain any permission/question oneshots still sitting in the
+        // sink's pending maps — e.g. tool calls whose canUseTool
+        // Promise was resolved by drainPendingOnAbort on the bridge
+        // side during an interrupt, but whose Rust-side spawned task
+        // is still awaiting an answer the user will never click.
+        // Dropping the Senders wakes those tasks with Err and lets
+        // them return so they don't leak. Must happen before we drop
+        // the mpsc senders so the tasks can still forward their
+        // synthetic Deny to the writer (which will then either write
+        // it or the writer will exit naturally).
+        events.drain_pending().await;
+
         // Drain the writer task. Dropping the senders closes the channels and lets it exit.
         drop(perm_tx);
         drop(q_tx);

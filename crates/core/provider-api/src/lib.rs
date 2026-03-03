@@ -590,6 +590,12 @@ impl TurnEventSink {
         {
             let mut guard = self.permission_pending.lock().await;
             guard.insert(request_id.clone(), sender);
+            tracing::info!(
+                request_id = %request_id,
+                tool_name = %tool_name,
+                pending_count = guard.len(),
+                "permission request registered in pending map"
+            );
         }
         self.send(ProviderTurnEvent::PermissionRequest {
             request_id: request_id.clone(),
@@ -601,6 +607,10 @@ impl TurnEventSink {
         let (decision, mode_override) = match receiver.await {
             Ok(payload) => payload,
             Err(_) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "permission oneshot receiver got Err — sender dropped before answer (turn probably ended mid-prompt)"
+                );
                 let mut guard = self.permission_pending.lock().await;
                 guard.remove(&request_id);
                 return (PermissionDecision::Deny, None);
@@ -694,6 +704,39 @@ impl TurnEventSink {
                     "resolve_permission found no pending sender — stale or mis-routed answer"
                 );
             }
+        }
+    }
+
+    /// Unblock every permission and question oneshot that is still
+    /// sitting in this sink's pending maps. Dropping the sender side
+    /// causes the receiver inside `request_permission` / `ask_user`
+    /// to wake with Err and return a synthetic Deny / None, which
+    /// unwinds any spawned task still waiting on a user answer.
+    ///
+    /// The adapter must call this at the very end of `run_turn` so
+    /// orphaned permission tasks (e.g. from an interrupt that tore
+    /// down the bridge before the user answered every prompt) don't
+    /// live forever holding the sink's `permission_pending` map and
+    /// leaking memory.
+    pub async fn drain_pending(&self) {
+        let drained_perms = {
+            let mut guard = self.permission_pending.lock().await;
+            let n = guard.len();
+            guard.clear();
+            n
+        };
+        let drained_qs = {
+            let mut guard = self.question_pending.lock().await;
+            let n = guard.len();
+            guard.clear();
+            n
+        };
+        if drained_perms > 0 || drained_qs > 0 {
+            tracing::info!(
+                drained_permissions = drained_perms,
+                drained_questions = drained_qs,
+                "sink drain_pending: released orphaned oneshots"
+            );
         }
     }
 
