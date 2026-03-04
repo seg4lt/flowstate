@@ -1,66 +1,10 @@
 import * as React from "react";
 import { Loader2 } from "lucide-react";
-import type { ProviderKind } from "@/lib/types";
 
 interface WorkingIndicatorProps {
-  provider: ProviderKind;
   /** ISO-8601 timestamp the turn started at (turn.createdAt). */
   startedAt: string;
   onInterrupt: () => void;
-}
-
-// Claude Code's CLI cycles through a long list of cute gerunds while
-// the model is thinking. We do the same here for the Claude providers
-// so the wait feels less dead. Other providers get a simple "Working".
-const CLAUDE_PHRASES = [
-  "Cogitating",
-  "Pondering",
-  "Manifesting",
-  "Synthesizing",
-  "Conjuring",
-  "Brewing",
-  "Channeling",
-  "Crunching",
-  "Distilling",
-  "Ideating",
-  "Mulling",
-  "Reasoning",
-  "Reflecting",
-  "Ruminating",
-  "Speculating",
-  "Theorizing",
-  "Wondering",
-  "Vibing",
-  "Noodling",
-  "Hatching",
-  "Percolating",
-  "Marinating",
-  "Simmering",
-  "Spelunking",
-  "Tinkering",
-  "Concocting",
-  "Doodling",
-  "Forging",
-  "Imagining",
-  "Investigating",
-  "Plotting",
-  "Puzzling",
-  "Scheming",
-  "Sleuthing",
-  "Surveying",
-  "Visualizing",
-  "Whirring",
-];
-
-const PHRASE_ROTATION_MS = 3000;
-
-function pickPhrase(provider: ProviderKind, elapsedMs: number): string {
-  if (provider === "claude" || provider === "claude_cli") {
-    const idx =
-      Math.floor(elapsedMs / PHRASE_ROTATION_MS) % CLAUDE_PHRASES.length;
-    return CLAUDE_PHRASES[idx];
-  }
-  return "Working";
 }
 
 function formatElapsed(elapsedMs: number): string {
@@ -71,7 +15,7 @@ function formatElapsed(elapsedMs: number): string {
   return `${minutes}m ${rem}s`;
 }
 
-function WorkingIndicatorInner({ provider, startedAt, onInterrupt }: WorkingIndicatorProps) {
+function WorkingIndicatorInner({ startedAt, onInterrupt }: WorkingIndicatorProps) {
   // Re-render every second so the timer ticks. We deliberately don't
   // useState(now) because that re-creates a closure on every render —
   // useReducer with a counter is the cheapest way to force a tick.
@@ -86,22 +30,19 @@ function WorkingIndicatorInner({ provider, startedAt, onInterrupt }: WorkingIndi
     return Number.isFinite(parsed) ? parsed : Date.now();
   }, [startedAt]);
 
-  const elapsedMs = Date.now() - startMs;
-  const phrase = pickPhrase(provider, elapsedMs);
-  const elapsedLabel = formatElapsed(elapsedMs);
+  const elapsedLabel = formatElapsed(Date.now() - startMs);
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-t border-border/60 bg-muted/30 px-4 py-1.5 text-xs text-muted-foreground">
       <Loader2 className="h-3 w-3 animate-spin" />
       <span>
-        {phrase}
-        <span className="animate-pulse">…</span>
+        Thinking<span className="animate-pulse">…</span>{" "}
+        <span className="font-mono tabular-nums">{elapsedLabel}</span>
       </span>
-      <span className="ml-auto font-mono tabular-nums">{elapsedLabel}</span>
       <button
         type="button"
         onClick={onInterrupt}
-        className="rounded px-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
+        className="ml-auto rounded px-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
         title="Interrupt (Esc)"
       >
         esc

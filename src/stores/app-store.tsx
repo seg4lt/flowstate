@@ -112,6 +112,20 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       return { ...state, sessions };
     }
 
+    case "turn_started": {
+      // The runtime flips session.status to Running server-side in
+      // orchestration::start_turn but only broadcasts session_id + turn
+      // on TurnStarted (no SessionSummary), so the store would otherwise
+      // sit at the previous turn's "ready" status for the entire
+      // duration of the new turn. Optimistically mirror the running
+      // state here — turn_completed/session_interrupted will overwrite
+      // with the authoritative summary when the turn ends.
+      const sessions = new Map(state.sessions);
+      const s = sessions.get(event.session_id);
+      if (s) sessions.set(event.session_id, { ...s, status: "running" });
+      return { ...state, sessions };
+    }
+
     case "turn_completed": {
       const sessions = new Map(state.sessions);
       sessions.set(event.session.sessionId, event.session);
