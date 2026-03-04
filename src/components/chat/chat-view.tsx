@@ -93,8 +93,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [pendingQuestion, setPendingQuestion] =
     React.useState<QuestionRequest | null>(null);
   const [effort, setEffort] = React.useState<ReasoningEffort>("high");
+  const permissionStorageKey = `flowzen:permissionMode:${sessionId}`;
   const [permissionMode, setPermissionMode] =
-    React.useState<PermissionMode>("accept_edits");
+    React.useState<PermissionMode>(
+      () =>
+        (sessionStorage.getItem(permissionStorageKey) as PermissionMode) ??
+        "accept_edits",
+    );
+
+  // Persist permission mode to sessionStorage so it survives navigation
+  // (e.g. Settings → back) without losing the user's choice.
+  React.useEffect(() => {
+    sessionStorage.setItem(permissionStorageKey, permissionMode);
+  }, [permissionStorageKey, permissionMode]);
+
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
   // Watchdog state: `lastEventAt` bumps on every stream event for this
   // session so the 45s inactivity timer resets. `stuckSince` is set
@@ -218,6 +230,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       if (cancelled) return;
       if (res && res.type === "session_loaded") {
         setTurns(res.session.turns);
+        // Restore permission mode from the most recent turn when there is
+        // no sessionStorage entry yet (e.g. after a full page refresh).
+        if (
+          !sessionStorage.getItem(permissionStorageKey) &&
+          res.session.turns.length > 0
+        ) {
+          const lastMode = [...res.session.turns]
+            .reverse()
+            .find((t) => t.permissionMode)?.permissionMode;
+          if (lastMode) {
+            setPermissionMode(lastMode);
+          }
+        }
       }
       setLoading(false);
     });
@@ -592,6 +617,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
   }
 
+  const handlePermissionModeChange = React.useCallback(
+    (mode: PermissionMode) => {
+      setPermissionMode(mode);
+      sendMessage({
+        type: "update_permission_mode",
+        session_id: sessionId,
+        permission_mode: mode,
+      }).catch((err) => {
+        console.error("Failed to update permission mode", err);
+      });
+    },
+    [sessionId],
+  );
+
   const toolbar = session ? (
     <ChatToolbar
       sessionId={sessionId}
@@ -600,12 +639,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       effort={effort}
       onEffortChange={setEffort}
       permissionMode={permissionMode}
-      onPermissionModeChange={setPermissionMode}
+      onPermissionModeChange={handlePermissionModeChange}
     />
   ) : null;
 
   return (
-    <div className="flex h-svh flex-col">
+    <div className="flex h-svh min-w-0 flex-col overflow-hidden">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
         <SidebarTrigger />
         <div className="flex min-w-0 flex-col leading-tight">
