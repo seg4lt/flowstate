@@ -267,6 +267,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           // pending row covers the gap between sendMessage being called
           // and this event arriving — clear it now.
           setPendingInput(null);
+          // A brand-new turn means any permission prompts still in the
+          // queue belong to a previous (probably interrupted) turn and
+          // are un-answerable by the backend — its sink either no
+          // longer exists or has already drained their oneshots.
+          // Leaving them visible would let the user click on a stale
+          // prompt that routes an `answer_permission` to the new
+          // turn's sink, which produces the "resolve_permission found
+          // no pending sender" warning.
+          setPendingPermissions([]);
           setTurns((prev) => {
             const exists = prev.some((t) => t.turnId === event.turn.turnId);
             if (exists) {
@@ -280,6 +289,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
         case "turn_completed":
           setPendingInput(null);
+          // Symmetric to turn_started: once the turn has ended, any
+          // permission prompts still queued are for tool calls the
+          // backend will never ask us about again. Drop them so the
+          // UI doesn't sit on a stale prompt the user can't actually
+          // answer, and so the stuck-state watchdog doesn't trip on
+          // them.
+          setPendingPermissions([]);
           setTurns((prev) => {
             const exists = prev.some((t) => t.turnId === event.turn.turnId);
             if (exists) {
@@ -636,7 +652,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
       {isRunning && session && runningTurn && (
         <WorkingIndicator
-          provider={session.provider}
           startedAt={runningTurn.createdAt}
           onInterrupt={handleInterrupt}
         />
