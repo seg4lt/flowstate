@@ -27,7 +27,12 @@ function groupBlocks(
   callsById: Map<string, ToolCall>,
 ): RenderBlock[] {
   const result: RenderBlock[] = [];
-  let currentGroup:
+
+  // Main-agent grouping: sequential, breaks on any non-tool block or
+  // when a sub-agent tool call interrupts the streak. The reference is
+  // mutated in place — pushing once into result and then appending to
+  // .callIds keeps the box stable across streaming updates.
+  let currentMainGroup:
     | {
         kind: "tool_call_group";
         callIds: string[];
@@ -35,25 +40,73 @@ function groupBlocks(
         key: string;
       }
     | null = null;
+
+  // Sub-agent boxes: one per parentCallId, deduped via this Map. The
+  // first time a sub-agent's tool call appears in the stream, its box
+  // is created and pushed into result at that position; every later
+  // tool call from the SAME sub-agent — even if other content
+  // (main-agent tools, text, reasoning) intervenes — appends to the
+  // same in-place callIds array, so the user sees one persistent box
+  // per sub-agent that collects all of its activity in stream order.
+  // Parallel sub-agents land in separate boxes because each has a
+  // different parentCallId.
+  const subagentBoxes = new Map<
+    string,
+    {
+      kind: "tool_call_group";
+      callIds: string[];
+      parentCallId: string | undefined;
+      key: string;
+    }
+  >();
+
   blocks.forEach((block, idx) => {
     if (block.kind === "tool_call") {
       const parent = callsById.get(block.callId)?.parentCallId;
-      if (currentGroup && currentGroup.parentCallId === parent) {
-        currentGroup.callIds.push(block.callId);
+
+      if (parent === undefined) {
+        // Main agent — sequential grouping.
+        if (currentMainGroup) {
+          currentMainGroup.callIds.push(block.callId);
+          return;
+        }
+        currentMainGroup = {
+          kind: "tool_call_group",
+          callIds: [block.callId],
+          parentCallId: undefined,
+          key: `tg-${block.callId}`,
+        };
+        result.push(currentMainGroup);
         return;
       }
-      // Key the group by the first callId so the expanded state stays
-      // stable across streaming updates as more calls get appended.
-      currentGroup = {
-        kind: "tool_call_group",
+
+      // Sub-agent — find or create the persistent box for this parent.
+      // A sub-agent block always breaks the current main-agent streak,
+      // so the next main tool call starts fresh.
+      currentMainGroup = null;
+      const existing = subagentBoxes.get(parent);
+      if (existing) {
+        existing.callIds.push(block.callId);
+        return;
+      }
+      const box = {
+        kind: "tool_call_group" as const,
         callIds: [block.callId],
         parentCallId: parent,
-        key: `tg-${block.callId}`,
+        // Keyed by parentCallId so the expanded state stays stable as
+        // more tool calls get appended over the life of the sub-agent.
+        key: `tg-sub-${parent}`,
       };
-      result.push(currentGroup);
+      subagentBoxes.set(parent, box);
+      result.push(box);
       return;
     }
-    currentGroup = null;
+
+    // Any non-tool block (text, reasoning) breaks the main-agent
+    // streak. Sub-agent boxes are unaffected — they keep collecting
+    // across these interruptions because their identity is the
+    // parentCallId, not stream contiguity.
+    currentMainGroup = null;
     if (block.kind === "text") {
       result.push({ kind: "text", text: block.text, key: `text-${idx}` });
     } else if (block.kind === "reasoning") {
