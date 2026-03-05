@@ -126,7 +126,15 @@ function AppLayout() {
           )}
           <AppSidebar />
           <DragHandle width={width} onResize={setWidth} />
-          <SidebarInset>
+          {/* min-w-0 + overflow-hidden are essential here. SidebarInset is a
+              flex item in the SidebarProvider row, and without min-w-0 its
+              default `min-width: auto` lets any wide child (code block,
+              tool card with long path, working indicator on a narrow
+              window) push the panel past the Tauri window edge, breaking
+              the layout for every sibling. overflow-hidden makes any
+              residual horizontal overflow clip cleanly inside the panel
+              instead of producing a window-level scrollbar. */}
+          <SidebarInset className="min-w-0 overflow-hidden">
             <Outlet />
           </SidebarInset>
         </SidebarProvider>
