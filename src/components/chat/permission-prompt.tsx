@@ -64,7 +64,7 @@ function DefaultPrompt({
   input: unknown;
   onDecision: (decision: PermissionDecision) => void;
 }) {
-  const [showArgs, setShowArgs] = React.useState(false);
+  const [showArgs, setShowArgs] = React.useState(true);
   return (
     <>
       <div className="flex items-center justify-between gap-3">
