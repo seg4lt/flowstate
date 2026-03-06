@@ -175,6 +175,7 @@ export function AppSidebar() {
                           isActive={
                             state.activeSessionId === session.sessionId
                           }
+                          running={session.status === "running"}
                           onClick={() =>
                             handleThreadClick(session.sessionId)
                           }
@@ -236,6 +237,7 @@ export function AppSidebar() {
                               isActive={
                                 state.activeSessionId === session.sessionId
                               }
+                              running={session.status === "running"}
                               onClick={() =>
                                 handleThreadClick(session.sessionId)
                               }

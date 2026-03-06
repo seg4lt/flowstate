@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Archive, EllipsisVertical, Trash2 } from "lucide-react";
+import { Archive, EllipsisVertical, Loader2, Trash2 } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -28,6 +28,10 @@ interface ThreadItemProps {
   title: string;
   updatedAt: string;
   isActive: boolean;
+  /** True while the session has an in-flight turn. Renders a small
+   *  spinner next to the title so the user can see at a glance which
+   *  threads are working without having to open them. */
+  running: boolean;
   onClick: () => void;
 }
 
@@ -36,6 +40,7 @@ export function ThreadItem({
   title,
   updatedAt,
   isActive,
+  running,
   onClick,
 }: ThreadItemProps) {
   const { send } = useApp();
@@ -89,6 +94,9 @@ export function ThreadItem({
             setEditing(true);
           }}
         >
+          {running && (
+            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />
+          )}
           <span className="flex-1 truncate text-xs">
             {title || "New thread"}
           </span>
