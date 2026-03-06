@@ -148,10 +148,20 @@ function ToolCallGroup({
     expanded || !hasOverflow ? calls : calls.slice(0, GROUP_DEFAULT_VISIBLE);
 
   // Sub-agent groups get a visible header so the user can see which
-  // Task dispatch issued them. Main-agent groups render bare.
+  // dispatch issued them and which agent type is running. The agent
+  // type lives in the spawning Task tool's args (`subagent_type`),
+  // and that Task tool call is in callsById keyed by parentCallId
+  // because parentCallId is the call_id of the Task that spawned
+  // this sub-agent. Falls back to the tool name and finally to
+  // "Subagent" if neither is available (e.g. a sub-agent whose
+  // parent Task call hasn't streamed in yet).
   const isSubagent = parentCallId !== undefined;
   const parentCall = isSubagent ? callsById.get(parentCallId) : undefined;
-  const parentLabel = parentCall?.name ?? "Subagent";
+  const subagentType = isSubagent
+    ? (parentCall?.args as { subagent_type?: string } | undefined)
+        ?.subagent_type
+    : undefined;
+  const agentLabel = subagentType ?? parentCall?.name ?? "Subagent";
 
   const body = (
     <div className="space-y-1">
@@ -184,7 +194,7 @@ function ToolCallGroup({
     return (
       <div className="rounded-md border border-border/50 bg-muted/20 px-2 py-1.5">
         <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-          <span>↳ {parentLabel}</span>
+          <span>↳ {agentLabel}</span>
           <span className="text-muted-foreground/60">· {calls.length}</span>
         </div>
         {body}

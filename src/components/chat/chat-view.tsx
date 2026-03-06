@@ -14,6 +14,7 @@ import type {
 } from "@/lib/types";
 import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
+import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
 import { MessageList } from "./messages/message-list";
 import { ChatInput } from "./chat-input";
@@ -75,7 +76,7 @@ function appendReasoningDelta(
 }
 
 export function ChatView({ sessionId }: { sessionId: string }) {
-  const { state, dispatch } = useApp();
+  const { state, dispatch, send } = useApp();
   const navigate = useNavigate();
   const [turns, setTurns] = React.useState<TurnRecord[]>([]);
   const [loading, setLoading] = React.useState(true);
@@ -473,6 +474,39 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, [sessionId, navigate]);
 
   async function handleSend(input: string) {
+    // --- Slash command interception ---
+    const resolved = resolveCommand(input);
+    if (resolved) {
+      if (!resolved.command) {
+        toast({
+          description: `Unknown command: ${resolved.raw}`,
+          duration: 3000,
+        });
+        return;
+      }
+      if (session?.status === "running") {
+        toast({
+          description: "Cannot run commands while a turn is in progress",
+          duration: 3000,
+        });
+        return;
+      }
+      if (!session) {
+        toast({ description: "No active session", duration: 3000 });
+        return;
+      }
+      const ctx: SlashCommandContext = {
+        sessionId,
+        session,
+        send,
+        navigate,
+        toast,
+      };
+      await resolved.command.execute(ctx, resolved.args);
+      return;
+    }
+
+    // --- Normal message flow ---
     // Optimistic: show the user's message immediately, then await the
     // round-trip. turn_started will clear this and replace it with the
     // real turn from the daemon.
@@ -691,7 +725,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
       {isRunning && session && runningTurn && (
         <WorkingIndicator
-          startedAt={runningTurn.createdAt}
+          lastActivityAt={lastEventAt}
           onInterrupt={handleInterrupt}
         />
       )}
@@ -734,11 +768,23 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       )}
 
       <ChatInput
+        // Key on sessionId so ChatInput remounts on every session
+        // switch. ChatView itself stays mounted across /chat/$id route
+        // changes (same component, new param) so without this key the
+        // input's local state -- the textarea draft AND the
+        // pendingSend queue flag -- would leak from the previous
+        // session into the next one. The leak was particularly nasty
+        // for pendingSend: a queued message in session A would
+        // auto-flush against session B the moment B's status flipped
+        // from running to ready, sending phantom input the user never
+        // typed in that thread.
+        key={sessionId}
         onSend={handleSend}
         onInterrupt={handleInterrupt}
         sessionStatus={session?.status}
         disabled={loading}
         toolbar={toolbar}
+        commands={COMMAND_META}
       />
     </div>
   );

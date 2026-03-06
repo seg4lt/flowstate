@@ -7,6 +7,47 @@ interface ToolCallCardProps {
   toolCall: ToolCall;
 }
 
+// One-line preview of what a tool call is doing, shown inline next to
+// the tool name on the COLLAPSED header so users don't have to expand
+// every card to see what happened. Only short, descriptive fields are
+// surfaced here -- never the raw command, full file path, output, or
+// any other potentially long blob. Those still live behind the toggle
+// in the expanded view. CSS truncate clips anything that does run wide.
+function toolPreview(name: string, args: unknown): string | null {
+  if (!args || typeof args !== "object") return null;
+  const a = args as Record<string, unknown>;
+  const str = (key: string) =>
+    typeof a[key] === "string" ? (a[key] as string) : undefined;
+  // For paths, show the basename so the most informative part fits in
+  // a narrow card. The full path lives in the expanded args view.
+  const basename = (path: string | undefined) => {
+    if (!path) return undefined;
+    const slash = path.lastIndexOf("/");
+    return slash >= 0 ? path.slice(slash + 1) : path;
+  };
+
+  switch (name) {
+    case "Bash":
+      // Description only -- the raw command can be hundreds of chars.
+      return str("description") ?? null;
+    case "Read":
+    case "Write":
+    case "Edit":
+    case "NotebookEdit":
+      return basename(str("file_path")) ?? null;
+    case "Glob":
+    case "Grep":
+      return str("pattern") ?? null;
+    case "Task":
+    case "Agent":
+      return str("description") ?? null;
+    case "WebSearch":
+      return str("query") ?? null;
+    default:
+      return null;
+  }
+}
+
 export function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const [open, setOpen] = React.useState(false);
 
@@ -16,6 +57,8 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
       : toolCall.status === "failed"
         ? "text-destructive"
         : "text-muted-foreground";
+
+  const preview = toolPreview(toolCall.name, toolCall.args);
 
   return (
     <div className="rounded-md border border-border text-xs">
@@ -28,8 +71,13 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
           className={`h-3 w-3 shrink-0 transition-transform ${open ? "rotate-90" : ""}`}
         />
         <Wrench className="h-3 w-3 shrink-0" />
-        <span className="truncate font-medium">{toolCall.name}</span>
-        <span className={`ml-auto shrink-0 ${statusColor}`}>
+        <span className="min-w-0 flex-1 truncate">
+          <span className="font-medium">{toolCall.name}</span>
+          {preview && (
+            <span className="ml-1.5 text-muted-foreground">{preview}</span>
+          )}
+        </span>
+        <span className={`ml-2 shrink-0 ${statusColor}`}>
           {toolCall.status}
         </span>
       </button>

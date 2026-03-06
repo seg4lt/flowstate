@@ -1,6 +1,8 @@
 import * as React from "react";
-import { Send, Square } from "lucide-react";
+import { Clock, Send, Square, X } from "lucide-react";
 import type { SessionStatus } from "@/lib/types";
+import { getCompletions } from "@/lib/slash-commands";
+import { SlashCommandPopup } from "./slash-command-popup";
 
 interface ChatInputProps {
   onSend: (input: string) => void;
@@ -8,6 +10,23 @@ interface ChatInputProps {
   sessionStatus: SessionStatus | undefined;
   disabled: boolean;
   toolbar?: React.ReactNode;
+  /** Command metadata for the autocomplete popup. */
+  commands?: { name: string; description: string }[];
+}
+
+interface QueuedMessage {
+  id: string;
+  text: string;
+}
+
+function newQueueId(): string {
+  // crypto.randomUUID() is available in modern browsers and the Tauri
+  // webview. The Math.random fallback only runs in test environments
+  // that stub crypto out.
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `q-${Math.random().toString(36).slice(2)}-${Date.now()}`;
 }
 
 export function ChatInput({
@@ -18,10 +37,22 @@ export function ChatInput({
   toolbar,
 }: ChatInputProps) {
   const [value, setValue] = React.useState("");
-  const [pendingSend, setPendingSend] = React.useState(false);
+  const [queued, setQueued] = React.useState<QueuedMessage[]>([]);
+  const [popupIndex, setPopupIndex] = React.useState(0);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
 
   const isRunning = sessionStatus === "running";
+
+  // --- Slash command autocomplete ---
+  // Show popup when the input starts with "/" and the session isn't busy.
+  const inputToken = value.trim().split(/\s/)[0] ?? "";
+  const showPopup = inputToken.startsWith("/") && !isRunning && !disabled;
+  const matches = showPopup ? getCompletions(inputToken) : [];
+
+  // Reset the highlighted index when the match list changes.
+  React.useEffect(() => {
+    setPopupIndex(0);
+  }, [matches.length, inputToken]);
 
   function resetHeight() {
     if (textareaRef.current) {
@@ -29,52 +60,107 @@ export function ChatInput({
     }
   }
 
-  // Flush the queued send when the current turn ends. If the turn was
-  // interrupted (user pressed Stop/Esc), drop the queue — the interrupt
-  // is an explicit "stop everything" signal, so firing a follow-up turn
-  // right after would be surprising. A natural "ready" transition fires
-  // whatever text is currently in the textarea at that moment (user may
-  // have kept typing while waiting).
+  // Drain the queue when the current turn ends. We watch for the
+  // running -> ready transition specifically (via a prevStatus ref)
+  // rather than firing whenever sessionStatus === "ready", because
+  // after we send the first queued message we'll re-enter this effect
+  // with status still "ready" until the new turn flips it back to
+  // "running" -- without the transition guard we'd drain the entire
+  // queue in one synchronous burst and the runtime would reject
+  // overlapping send_turn calls. The explicit interrupt path leaves
+  // the queue intact (status flips to "interrupted", not "ready"),
+  // so the user can choose whether to drain by sending one more
+  // message themselves or to clear chips manually.
+  const prevStatusRef = React.useRef(sessionStatus);
   React.useEffect(() => {
-    if (!pendingSend) return;
-    if (sessionStatus === "running") return;
-    if (sessionStatus === "interrupted") {
-      setPendingSend(false);
-      return;
-    }
-    const trimmed = value.trim();
-    if (!trimmed) {
-      setPendingSend(false);
-      return;
-    }
-    onSend(trimmed);
-    setValue("");
-    setPendingSend(false);
-    resetHeight();
-  }, [sessionStatus, pendingSend, value, onSend]);
+    const wasRunning = prevStatusRef.current === "running";
+    const nowReady = sessionStatus === "ready";
+    prevStatusRef.current = sessionStatus;
+    if (!wasRunning || !nowReady) return;
+    if (queued.length === 0) return;
+    const [first, ...rest] = queued;
+    onSend(first.text);
+    setQueued(rest);
+  }, [sessionStatus, queued, onSend]);
+
+  function enqueue(text: string) {
+    setQueued((q) => [...q, { id: newQueueId(), text }]);
+  }
+
+  function removeQueued(id: string) {
+    setQueued((q) => q.filter((item) => item.id !== id));
+  }
 
   function handleSubmit() {
     const trimmed = value.trim();
-    if (isRunning) {
-      // While a turn is running, Send queues the current textarea
-      // contents to fire when the turn ends. Clicking again toggles
-      // the queue back off so the user can change their mind.
-      if (pendingSend) {
-        setPendingSend(false);
-        return;
-      }
-      if (!trimmed) return;
-      setPendingSend(true);
+    if (!trimmed) return;
+    // While a turn is running OR earlier messages are still queued,
+    // append this one to the queue. Clearing the textarea immediately
+    // mirrors what the user just did ("send"), and the queued chip
+    // above the input shows what's pending. The earlier UX kept the
+    // text in the textarea which felt like the message hadn't been
+    // accepted at all.
+    if (isRunning || queued.length > 0) {
+      enqueue(trimmed);
+      setValue("");
+      resetHeight();
       return;
     }
-    if (!trimmed) return;
     onSend(trimmed);
     setValue("");
-    setPendingSend(false);
     resetHeight();
   }
 
+  function handlePopupSelect(name: string) {
+    // Fill the command and immediately submit.
+    const cmd = `/${name}`;
+    setValue("");
+    resetHeight();
+    onSend(cmd);
+  }
+
   function handleKeyDown(e: React.KeyboardEvent) {
+    // --- Autocomplete keyboard navigation ---
+    if (showPopup && matches.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setPopupIndex((i) => (i + 1) % matches.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setPopupIndex((i) => (i - 1 + matches.length) % matches.length);
+        return;
+      }
+      if (e.key === "Tab") {
+        // Tab fills the command name into the textarea (user can append args).
+        e.preventDefault();
+        const selected = matches[popupIndex];
+        if (selected) {
+          setValue(`/${selected.name} `);
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        // Close the popup by clearing the slash prefix.
+        e.preventDefault();
+        e.stopPropagation(); // prevent ChatView's Escape-to-interrupt
+        setValue("");
+        resetHeight();
+        return;
+      }
+      // Enter with popup open — submit the highlighted command.
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const selected = matches[popupIndex];
+        if (selected) {
+          handlePopupSelect(selected.name);
+        }
+        return;
+      }
+    }
+
+    // --- Default Enter handling ---
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSubmit();
@@ -89,23 +175,66 @@ export function ChatInput({
   }
 
   const hasContent = value.trim().length > 0;
-  // Stop button shows only when the turn is running AND the user has
-  // nothing queued — an empty textarea with no pending message means
-  // the primary action the user wants is to cancel.
-  const showStop = isRunning && !hasContent && !pendingSend;
-  const sendDisabled = (!hasContent && !pendingSend) || disabled;
+  // Stop button shows whenever the turn is running and the user isn't
+  // mid-compose. Queued chips are intentionally NOT a precondition --
+  // interrupting only stops the current turn and leaves the queue
+  // intact, so the user can always reach the stop affordance.
+  const showStop = isRunning && !hasContent;
+  const sendDisabled = !hasContent || disabled;
 
   return (
     <div className="shrink-0 border-t border-border px-3 pb-2 pt-3">
       <div className="mx-auto max-w-3xl">
-        <div className="flex items-end gap-2">
+        {queued.length > 0 && (
+          <div className="mb-2 space-y-1">
+            {queued.map((item, idx) => (
+              <div
+                key={item.id}
+                className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs"
+              >
+                <Clock className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Queued{queued.length > 1 ? ` · ${idx + 1} of ${queued.length}` : ""}
+                  </div>
+                  <div className="mt-0.5 break-words whitespace-pre-wrap text-foreground/85">
+                    {item.text}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => removeQueued(item.id)}
+                  className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                  title="Remove from queue"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="relative flex items-end gap-2">
+          {/* Autocomplete popup — positioned above the textarea */}
+          {showPopup && matches.length > 0 && (
+            <SlashCommandPopup
+              matches={matches}
+              selectedIndex={popupIndex}
+              onSelect={handlePopupSelect}
+            />
+          )}
+
           <textarea
             ref={textareaRef}
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={handleKeyDown}
             onInput={handleInput}
-            placeholder="Send a message..."
+            placeholder={
+              queued.length > 0
+                ? "Compose another message…"
+                : "Send a message..."
+            }
             disabled={disabled}
             rows={1}
             className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
@@ -125,26 +254,17 @@ export function ChatInput({
               type="button"
               onClick={handleSubmit}
               disabled={sendDisabled}
-              className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50 ${
-                pendingSend ? "ring-2 ring-primary/60" : ""
-              }`}
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
               title={
-                pendingSend
-                  ? "Queued — click to cancel"
-                  : isRunning
-                    ? "Queue send (fires when turn ends)"
-                    : "Send"
+                isRunning || queued.length > 0
+                  ? "Add to queue (fires when current turn ends)"
+                  : "Send"
               }
             >
               <Send className="h-4 w-4" />
             </button>
           )}
         </div>
-        {pendingSend && (
-          <div className="mt-1 text-[11px] text-muted-foreground">
-            Queued — will send when the current turn ends
-          </div>
-        )}
         {toolbar && <div className="mt-1.5">{toolbar}</div>}
       </div>
     </div>

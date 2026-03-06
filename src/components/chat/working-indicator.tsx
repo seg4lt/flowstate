@@ -2,8 +2,15 @@ import * as React from "react";
 import { Loader2 } from "lucide-react";
 
 interface WorkingIndicatorProps {
-  /** ISO-8601 timestamp the turn started at (turn.createdAt). */
-  startedAt: string;
+  /**
+   * Epoch ms of the most recent stream event for this session. The
+   * displayed timer is `now - lastActivityAt` so it represents idle
+   * time since the provider last said anything -- it ticks back to
+   * "0s" every time a text delta, tool start, reasoning chunk, or
+   * any other event arrives. The full turn duration isn't useful;
+   * what the user wants to know is "is something stuck right now".
+   */
+  lastActivityAt: number;
   onInterrupt: () => void;
 }
 
@@ -15,7 +22,7 @@ function formatElapsed(elapsedMs: number): string {
   return `${minutes}m ${rem}s`;
 }
 
-function WorkingIndicatorInner({ startedAt, onInterrupt }: WorkingIndicatorProps) {
+function WorkingIndicatorInner({ lastActivityAt, onInterrupt }: WorkingIndicatorProps) {
   // Re-render every second so the timer ticks. We deliberately don't
   // useState(now) because that re-creates a closure on every render —
   // useReducer with a counter is the cheapest way to force a tick.
@@ -25,12 +32,7 @@ function WorkingIndicatorInner({ startedAt, onInterrupt }: WorkingIndicatorProps
     return () => clearInterval(id);
   }, []);
 
-  const startMs = React.useMemo(() => {
-    const parsed = Date.parse(startedAt);
-    return Number.isFinite(parsed) ? parsed : Date.now();
-  }, [startedAt]);
-
-  const elapsedLabel = formatElapsed(Date.now() - startMs);
+  const elapsedLabel = formatElapsed(Date.now() - lastActivityAt);
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-t border-border/60 bg-muted/30 px-4 py-1.5 text-xs text-muted-foreground">
