@@ -19,8 +19,6 @@ use zenui_provider_api::{
     UserInputOption, UserInputQuestion,
 };
 
-const BRIDGE_TIMEOUT_MS: u64 = 600_000;
-
 fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
     session
         .cwd
@@ -467,9 +465,6 @@ impl ClaudeSdkAdapter {
             }
         });
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS);
-
         // Reason supplied by the writer task if it shuts down early
         // because it couldn't forward an answer to the bridge. We
         // capture it here and kill the bridge child *after* the select
@@ -477,11 +472,18 @@ impl ClaudeSdkAdapter {
         // concurrent `process.read_response()` future.
         let mut writer_shutdown_reason: Option<String> = None;
 
+        // No artificial per-turn deadline here on purpose. The model
+        // can take as long as it needs to answer; long Bash commands,
+        // big edits, slow networks, or just a very chewy prompt are
+        // all legitimate reasons for the bridge to stay quiet for
+        // many minutes. The user retains the manual escape hatch via
+        // the Stop button / Esc key (interrupt_turn), and a real
+        // bridge crash still surfaces as `Bridge read error` because
+        // `read_response` returns Err on stdout EOF. The only way the
+        // bridge silently hangs forever is if the SDK itself
+        // deadlocks, which is a bug to fix at the source rather than
+        // paper over with a kill-the-bridge timeout.
         let result = loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break Err("Claude SDK turn timed out".to_string());
-            }
             // Race the bridge stdout against the writer's shutdown
             // signal. `biased` ensures we check the shutdown arm first
             // so a write failure never loses to an incoming bridge
@@ -492,11 +494,10 @@ impl ClaudeSdkAdapter {
                     writer_shutdown_reason = Some(reason);
                     break Err(String::new());
                 }
-                read = tokio::time::timeout(remaining, process.read_response()) => {
+                read = process.read_response() => {
                     match read {
-                        Ok(Ok(resp)) => resp,
-                        Ok(Err(e)) => break Err(format!("Bridge read error: {e}")),
-                        Err(_) => break Err("Claude SDK turn timed out".to_string()),
+                        Ok(resp) => resp,
+                        Err(e) => break Err(format!("Bridge read error: {e}")),
                     }
                 }
             };
