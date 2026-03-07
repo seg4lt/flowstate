@@ -16,6 +16,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
 import { ChatView } from "@/components/chat/chat-view";
+import { CodeView } from "@/components/code/code-view";
 import { SettingsView } from "@/components/settings/settings-view";
 import { Toaster } from "@/components/ui/toaster";
 
@@ -175,13 +176,27 @@ const chatRoute = createRoute({
   },
 });
 
+const codeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/code/$sessionId",
+  component: function CodePage() {
+    const { sessionId } = useParams({ from: "/code/$sessionId" });
+    return <CodeView sessionId={sessionId} />;
+  },
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
   component: SettingsView,
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, chatRoute, settingsRoute]);
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  chatRoute,
+  codeRoute,
+  settingsRoute,
+]);
 
 export const router = createRouter({ routeTree });
 

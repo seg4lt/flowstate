@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useNavigate } from "@tanstack/react-router";
 import {
   Diff,
   FolderOpen,
@@ -9,16 +10,19 @@ import { Button } from "@/components/ui/button";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 
 interface HeaderActionsProps {
+  sessionId: string;
   diffs: AggregatedFileDiff[];
   diffOpen: boolean;
   onToggleDiff: () => void;
 }
 
 export function HeaderActions({
+  sessionId,
   diffs,
   diffOpen,
   onToggleDiff,
 }: HeaderActionsProps) {
+  const navigate = useNavigate();
   const { additions, deletions } = React.useMemo(() => {
     let a = 0;
     let d = 0;
@@ -66,9 +70,10 @@ export function HeaderActions({
       <Button
         variant="outline"
         size="xs"
-        onClick={() => {
-          // TODO: implement open
-        }}
+        onClick={() =>
+          navigate({ to: "/code/$sessionId", params: { sessionId } })
+        }
+        title="Open the project file browser"
       >
         <FolderOpen className="h-3 w-3" />
         Open

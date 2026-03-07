@@ -55,3 +55,20 @@ export function getGitDiffFile(
 ): Promise<GitFileContents> {
   return invoke<GitFileContents>("get_git_diff_file", { path, file });
 }
+
+// Every file in `path` that isn't ignored by .gitignore / .ignore,
+// returned as forward-slash relative paths. Used by the /code
+// editor view's Cmd+P-style picker. Capped at 20k entries on the
+// Rust side so huge monorepos don't blow up the IPC bridge.
+export function listProjectFiles(path: string): Promise<string[]> {
+  return invoke<string[]>("list_project_files", { path });
+}
+
+// Read a single project file as a UTF-8 string. Rejects on:
+//   * file outside the project root (canonicalisation escape)
+//   * file above CODE_VIEW_MAX_FILE_BYTES (4 MiB)
+//   * non-UTF-8 content
+// Callers should `.catch` to render a friendly placeholder.
+export function readProjectFile(path: string, file: string): Promise<string> {
+  return invoke<string>("read_project_file", { path, file });
+}

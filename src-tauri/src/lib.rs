@@ -220,6 +220,108 @@ fn get_git_diff_file(path: String, file: String) -> GitFileContents {
     GitFileContents { before, after }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// /code editor view — file picker + single-file read
+// ─────────────────────────────────────────────────────────────────
+
+/// Cap the picker list so we never send a million entries to the
+/// frontend for a huge repo. 20k is more than enough for a Cmd+P
+/// picker — anyone with more than that would already be using real
+/// file search (see fff-search upgrade path in follow-ups).
+const PROJECT_FILE_LIST_MAX: usize = 20_000;
+
+/// Maximum file size we'll inline into the code view. The editor
+/// uses @pierre/diffs' Virtualizer so a 10k-line plain-text file is
+/// fine, but anything past this is probably generated / binary /
+/// not useful to read inline and we return a placeholder marker.
+const CODE_VIEW_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// List every file in `path` that isn't ignored by .gitignore,
+/// .ignore, etc. Respects hidden-file convention (skips dotfiles)
+/// and avoids the usual suspects (node_modules, target, dist, …)
+/// via `ignore::WalkBuilder`'s standard filters. Returns relative
+/// paths (forward-slash), sorted, capped at PROJECT_FILE_LIST_MAX.
+#[tauri::command]
+fn list_project_files(path: String) -> Vec<String> {
+    let project_path = Path::new(&path);
+    if !project_path.is_dir() {
+        return Vec::new();
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    // `WalkBuilder::new(root).build()` honors .gitignore, .ignore,
+    // and (by default) skips hidden files. That's exactly the
+    // "project files" mental model — same as what a user sees in
+    // VS Code's file explorer.
+    for result in ignore::WalkBuilder::new(project_path)
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .parents(true)
+        .build()
+    {
+        if entries.len() >= PROJECT_FILE_LIST_MAX {
+            break;
+        }
+        let Ok(entry) = result else { continue };
+        // Only files — directories get walked into automatically.
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let abs = entry.path();
+        let Ok(rel) = abs.strip_prefix(project_path) else {
+            continue;
+        };
+        // Forward-slash path, platform-normalised, so the frontend
+        // can pattern-match without caring about Windows back-slashes.
+        let rel_str = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_str.is_empty() {
+            continue;
+        }
+        entries.push(rel_str);
+    }
+
+    entries.sort();
+    entries
+}
+
+/// Return the contents of a single project file as a UTF-8 string.
+/// Used by the /code editor view when the user opens a file from
+/// the picker. Caps the payload so opening a binary / generated
+/// mega-file doesn't freeze the bridge.
+#[tauri::command]
+fn read_project_file(path: String, file: String) -> Result<String, String> {
+    let project_path = Path::new(&path);
+    let abs = project_path.join(&file);
+    // Canonicalise both and make sure the requested file is
+    // actually inside the project root. Without this, a crafted
+    // `file = "../../etc/passwd"` could escape — not a big deal
+    // for a local-only desktop app but cheap to defend against.
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let abs_canon = abs
+        .canonicalize()
+        .map_err(|e| format!("file path: {e}"))?;
+    if !abs_canon.starts_with(&project_canon) {
+        return Err("file is outside the project root".into());
+    }
+    let meta = std::fs::metadata(&abs_canon)
+        .map_err(|e| format!("metadata: {e}"))?;
+    if meta.len() > CODE_VIEW_MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large to inline: {} bytes (max {})",
+            meta.len(),
+            CODE_VIEW_MAX_FILE_BYTES
+        ));
+    }
+    std::fs::read_to_string(&abs_canon).map_err(|e| format!("read: {e}"))
+}
+
 struct AppLifecycle {
     lifecycle: Arc<DaemonLifecycle>,
 }
@@ -328,6 +430,8 @@ pub fn run() {
             get_git_branch,
             get_git_diff_summary,
             get_git_diff_file,
+            list_project_files,
+            read_project_file,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
