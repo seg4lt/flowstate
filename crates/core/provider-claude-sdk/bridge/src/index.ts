@@ -184,12 +184,40 @@ class ClaudeBridge {
       }
     })();
 
+    // In plan mode the model is investigating, not changing anything.
+    // Prompting for every Read / Grep / Glob / WebSearch / TodoWrite is
+    // pure friction -- those calls can't damage anything and the user
+    // already opted into "let the model look around" by entering plan
+    // mode. Pass them via the SDK's built-in allowedTools so canUseTool
+    // is never even invoked for them. ExitPlanMode is intentionally
+    // NOT in the list -- that's THE prompt that matters in plan mode
+    // (the plan approval). Bash, Write, Edit, NotebookEdit, and any
+    // unknown tool keep going through canUseTool because they can
+    // mutate state (Bash can run rm/git push/etc., the rest are
+    // explicitly modifying). Task/Agent dispatches a sub-agent which
+    // inherits the same plan-mode constraints, so we auto-allow it
+    // too -- otherwise the user would get prompted just to let the
+    // model spawn an investigator.
+    const planModeAllowedTools = [
+      'Read',
+      'Grep',
+      'Glob',
+      'WebFetch',
+      'WebSearch',
+      'TodoWrite',
+      'Task',
+      'Agent',
+    ];
+
     const options: Options = {
       cwd: this.cwd,
       permissionMode,
       canUseTool,
       abortController: this.abortController,
       includePartialMessages: true,
+      ...(permissionMode === 'plan'
+        ? { allowedTools: planModeAllowedTools }
+        : {}),
       ...(this.model ? { model: this.model } : {}),
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingBudget !== null && thinkingBudget > 0
