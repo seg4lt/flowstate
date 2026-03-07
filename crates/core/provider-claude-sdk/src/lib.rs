@@ -118,6 +118,12 @@ enum BridgeResponse {
     #[serde(rename = "interrupted")]
     #[allow(dead_code)]
     Interrupted,
+    /// Ack emitted by the bridge after `query.setPermissionMode(...)` resolves.
+    /// Fire-and-forget on the Rust side: nothing awaits this, we just need a
+    /// variant so serde doesn't fail the whole turn on an unknown `type`.
+    #[serde(rename = "permission_mode_set")]
+    #[allow(dead_code)]
+    PermissionModeSet { mode: String },
     #[serde(rename = "error")]
     Error { error: String },
     /// Streaming event emitted during send_prompt.
