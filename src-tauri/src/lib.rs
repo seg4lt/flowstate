@@ -3,7 +3,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
 use zenui_daemon_core::{
@@ -490,13 +490,48 @@ impl grep_searcher::Sink for BlockSink {
     }
 }
 
+/// Per-search options sent from the frontend's advanced controls.
+/// Defaults intentionally match "boring literal case-sensitive
+/// search with no path filtering" so omitting the field on the
+/// frontend behaves like the old two-arg command.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ContentSearchOptions {
+    /// When true the query is treated as a `regex` crate regex,
+    /// matching ripgrep's default dialect. When false the query
+    /// is passed to grep-regex with `.fixed_strings(true)` so
+    /// users can paste raw code fragments without escaping.
+    #[serde(default)]
+    use_regex: bool,
+    /// Default true (matches the user's expectation that "Foo"
+    /// doesn't match "foo" out of the box). The `aA` toggle in
+    /// the UI flips this off.
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    /// Glob patterns to RESTRICT the walk to (ripgrep
+    /// OverrideBuilder includes). Empty list means "everywhere".
+    #[serde(default)]
+    includes: Vec<String>,
+    /// Glob patterns to EXCLUDE from the walk. The frontend sends
+    /// plain globs; we prefix them with `!` for OverrideBuilder
+    /// since that's the convention it expects.
+    #[serde(default)]
+    excludes: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Live content search across the project, ripgrep-style. Walks
-/// the same gitignore-aware tree as `list_project_files` and runs
-/// each file through ripgrep's own `Searcher` with a literal-string
-/// matcher (`.fixed_strings(true)`), so users can paste raw code
-/// fragments like `fn foo(` or `->` without escaping. Case-
-/// insensitive when the query is all lowercase (smart-case), case-
-/// sensitive otherwise — same convention as `rg`.
+/// the same gitignore-aware tree as `list_project_files` (with
+/// optional include/exclude glob overrides) and runs each file
+/// through ripgrep's own `Searcher`. The query is literal by
+/// default (`fixed_strings(true)`) so users can paste raw code
+/// fragments like `fn foo(` or `->` without escaping; flipping
+/// `useRegex` switches into the full `regex` crate dialect.
+/// `caseSensitive` defaults to true; flip it off for an
+/// `aA`-style insensitive search.
 ///
 /// Returns one `ContentBlock` per disjoint match group per file:
 /// each block is the match line(s) plus 3 lines of context on
@@ -506,9 +541,11 @@ impl grep_searcher::Sink for BlockSink {
 fn search_file_contents(
     path: String,
     query: String,
+    options: ContentSearchOptions,
 ) -> Result<Vec<ContentBlock>, String> {
     use grep_regex::RegexMatcherBuilder;
     use grep_searcher::SearcherBuilder;
+    use ignore::overrides::OverrideBuilder;
 
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -519,10 +556,9 @@ fn search_file_contents(
         return Ok(Vec::new());
     }
 
-    let smart_case_insensitive = trimmed.chars().all(|c| !c.is_uppercase());
     let matcher = RegexMatcherBuilder::new()
-        .case_insensitive(smart_case_insensitive)
-        .fixed_strings(true)
+        .case_insensitive(!options.case_sensitive)
+        .fixed_strings(!options.use_regex)
         .build(trimmed)
         .map_err(|e| format!("regex build: {e}"))?;
 
@@ -532,16 +568,54 @@ fn search_file_contents(
         .after_context(CONTENT_SEARCH_CONTEXT_LINES)
         .build();
 
+    // Build glob overrides from include/exclude lists, if any.
+    // OverrideBuilder treats a leading `!` as "exclude" and bare
+    // patterns as "include" — we hide that detail from users and
+    // let them type plain globs in the exclude box.
+    let overrides = if !options.includes.is_empty() || !options.excludes.is_empty() {
+        let mut ob = OverrideBuilder::new(project_path);
+        for inc in &options.includes {
+            let trimmed = inc.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            ob.add(trimmed)
+                .map_err(|e| format!("include glob `{trimmed}`: {e}"))?;
+        }
+        for exc in &options.excludes {
+            let trimmed = exc.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let pat = if trimmed.starts_with('!') {
+                trimmed.to_string()
+            } else {
+                format!("!{trimmed}")
+            };
+            ob.add(&pat)
+                .map_err(|e| format!("exclude glob `{trimmed}`: {e}"))?;
+        }
+        Some(
+            ob.build()
+                .map_err(|e| format!("override build: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    let mut wb = ignore::WalkBuilder::new(project_path);
+    wb.hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .parents(true);
+    if let Some(ov) = overrides {
+        wb.overrides(ov);
+    }
+
     let mut all_blocks: Vec<ContentBlock> = Vec::new();
     let mut lines_remaining = CONTENT_SEARCH_MAX_TOTAL_LINES;
 
-    'walk: for result in ignore::WalkBuilder::new(project_path)
-        .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .parents(true)
-        .build()
-    {
+    'walk: for result in wb.build() {
         if lines_remaining == 0 {
             break;
         }

@@ -2,16 +2,28 @@ import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { File as PierreFile } from "@pierre/diffs/react";
 import { Virtualizer } from "@pierre/diffs/react";
-import { ArrowLeft, FileText, Search } from "lucide-react";
+import {
+  ArrowLeft,
+  CaseSensitive,
+  FileText,
+  PanelLeft,
+  PanelLeftClose,
+  Regex,
+  Search,
+  SlidersHorizontal,
+} from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { useApp } from "@/stores/app-store";
 import {
+  defaultContentSearchOptions,
   listProjectFiles,
   readProjectFile,
   searchFileContents,
   type ContentBlock,
+  type ContentSearchOptions,
 } from "@/lib/api";
+import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
 import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
 
@@ -47,9 +59,32 @@ const PICKER_RESULT_LIMIT = 50;
 const CONTENT_SEARCH_DEBOUNCE_MS = 600;
 
 const TREE_WIDTH_KEY = "flowzen:code-tree-width";
+const TREE_COLLAPSED_KEY = "flowzen:code-tree-collapsed";
 const TREE_DEFAULT_WIDTH = 260;
 const TREE_MIN_WIDTH = 160;
 const TREE_MAX_WIDTH = 520;
+// Width of the collapsed-tree strip — just wide enough for a
+// single icon button, narrow enough to cede most of the
+// horizontal space back to the right pane.
+const TREE_COLLAPSED_WIDTH = 28;
+
+interface ContentSearchUiOptions {
+  advancedOpen: boolean;
+  include: string;
+  exclude: string;
+  useRegex: boolean;
+  caseSensitive: boolean;
+}
+
+function defaultContentSearchUiOptions(): ContentSearchUiOptions {
+  return {
+    advancedOpen: false,
+    include: "",
+    exclude: "",
+    useRegex: false,
+    caseSensitive: true,
+  };
+}
 
 type SearchMode = "files" | "content";
 
@@ -66,7 +101,7 @@ export function CodeView({ sessionId }: { sessionId: string }) {
     );
   }, [session?.projectId, state.projects]);
 
-  // ─── tree resize state ───────────────────────────────────────
+  // ─── tree resize / collapse state ────────────────────────────
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
   const [treeWidth, setTreeWidth] = React.useState<number>(() => {
     try {
@@ -82,6 +117,24 @@ export function CodeView({ sessionId }: { sessionId: string }) {
     }
     return TREE_DEFAULT_WIDTH;
   });
+  const [treeCollapsed, setTreeCollapsed] = React.useState<boolean>(() => {
+    try {
+      return window.localStorage.getItem(TREE_COLLAPSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const toggleTreeCollapsed = React.useCallback(() => {
+    setTreeCollapsed((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem(TREE_COLLAPSED_KEY, next ? "1" : "0");
+      } catch {
+        /* storage may be unavailable */
+      }
+      return next;
+    });
+  }, []);
 
   // ─── file list / picker state ────────────────────────────────
   const [files, setFiles] = React.useState<string[]>([]);
@@ -97,6 +150,8 @@ export function CodeView({ sessionId }: { sessionId: string }) {
   const [contentSearchError, setContentSearchError] = React.useState<
     string | null
   >(null);
+  const [contentOptions, setContentOptions] =
+    React.useState<ContentSearchUiOptions>(defaultContentSearchUiOptions);
 
   // ─── viewer state ────────────────────────────────────────────
   const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
@@ -146,12 +201,17 @@ export function CodeView({ sessionId }: { sessionId: string }) {
   }, [projectPath]);
 
   // ─── filename filter (client-side, instant) ─────────────────
+  // Glob + comma-list aware. Plain queries fall back to substring
+  // matching so users don't have to remember `**/foo*` for the
+  // common "type half a name" case. See lib/glob.ts.
   const filteredFiles = React.useMemo(() => {
     if (searchMode !== "files") return [];
-    const q = query.trim().toLowerCase();
-    if (!q) return files.slice(0, PICKER_RESULT_LIMIT);
+    const trimmed = query.trim();
+    if (!trimmed) return files.slice(0, PICKER_RESULT_LIMIT);
+    const patterns = parsePatterns(trimmed);
+    if (patterns.length === 0) return files.slice(0, PICKER_RESULT_LIMIT);
     return files
-      .filter((f) => f.toLowerCase().includes(q))
+      .filter((f) => matchesAnyPattern(f, patterns))
       .slice(0, PICKER_RESULT_LIMIT);
   }, [files, query, searchMode]);
 
@@ -170,11 +230,21 @@ export function CodeView({ sessionId }: { sessionId: string }) {
       setContentSearching(false);
       return;
     }
+    // Build the rust-side options snapshot. Comma-split the
+    // include / exclude inputs into clean string lists so the
+    // OverrideBuilder on the rust side gets one glob per entry.
+    const apiOptions: ContentSearchOptions = {
+      ...defaultContentSearchOptions(),
+      useRegex: contentOptions.useRegex,
+      caseSensitive: contentOptions.caseSensitive,
+      includes: splitGlobList(contentOptions.include),
+      excludes: splitGlobList(contentOptions.exclude),
+    };
     let cancelled = false;
     setContentSearching(true);
     setContentSearchError(null);
     const handle = window.setTimeout(() => {
-      searchFileContents(projectPath, q)
+      searchFileContents(projectPath, q, apiOptions)
         .then((blocks) => {
           if (cancelled) return;
           setContentBlocks(blocks);
@@ -193,7 +263,15 @@ export function CodeView({ sessionId }: { sessionId: string }) {
       cancelled = true;
       window.clearTimeout(handle);
     };
-  }, [searchMode, query, projectPath]);
+  }, [
+    searchMode,
+    query,
+    projectPath,
+    contentOptions.useRegex,
+    contentOptions.caseSensitive,
+    contentOptions.include,
+    contentOptions.exclude,
+  ]);
 
   // Aggregate match count across all blocks for the header badge.
   const contentMatchCount = React.useMemo(() => {
@@ -263,26 +341,43 @@ export function CodeView({ sessionId }: { sessionId: string }) {
   }, [projectPath, selectedPath]);
 
   // Cmd/Ctrl+P focuses the picker in `files` mode; Cmd/Ctrl+Shift+F
-  // focuses it in `content` mode. Mirrors VS Code.
+  // focuses it in `content` mode; Cmd/Ctrl+B toggles the file tree
+  // collapse. Mirrors VS Code muscle memory across all three.
   React.useEffect(() => {
+    function isInTextInput(target: EventTarget | null): boolean {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        target.isContentEditable === true
+      );
+    }
     function onKeyDown(e: KeyboardEvent) {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod) return;
-      if (e.shiftKey && e.key.toLowerCase() === "f") {
+      const key = e.key.toLowerCase();
+      if (e.shiftKey && key === "f") {
         e.preventDefault();
         setSearchMode("content");
         inputRef.current?.focus();
         inputRef.current?.select();
-      } else if (!e.shiftKey && e.key.toLowerCase() === "p") {
+      } else if (!e.shiftKey && key === "p") {
         e.preventDefault();
         setSearchMode("files");
         inputRef.current?.focus();
         inputRef.current?.select();
+      } else if (!e.shiftKey && key === "b") {
+        // Skip when typing in a real text input so the shortcut
+        // doesn't clobber things like Cmd+B-as-bold in textareas.
+        if (isInTextInput(e.target)) return;
+        e.preventDefault();
+        toggleTreeCollapsed();
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [toggleTreeCollapsed]);
 
   function openFromPickerIndex(index: number) {
     // Files mode only — content mode uses the multibuffer, where
@@ -359,42 +454,71 @@ export function CodeView({ sessionId }: { sessionId: string }) {
       </header>
 
       <div ref={splitContainerRef} className="flex min-h-0 min-w-0 flex-1">
-        {/* ── LEFT: file tree column ─────────────────────────── */}
-        <aside
-          className="flex shrink-0 flex-col border-r border-border bg-background"
-          style={{ width: treeWidth }}
-        >
-          <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2 text-[10px] uppercase tracking-wide text-muted-foreground">
-            Files
-            {filesLoading && <span>· indexing…</span>}
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto">
-            {filesError ? (
-              <div className="px-3 py-3 text-[11px] text-destructive">
-                {filesError}
+        {/* ── LEFT: file tree column (collapsed or expanded) ── */}
+        {treeCollapsed ? (
+          <aside
+            className="flex shrink-0 flex-col items-center border-r border-border bg-background py-1.5"
+            style={{ width: TREE_COLLAPSED_WIDTH }}
+            aria-label="File tree (collapsed)"
+          >
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={toggleTreeCollapsed}
+              title="Show file tree (Cmd/Ctrl+B)"
+              aria-label="Show file tree"
+            >
+              <PanelLeft className="h-3 w-3" />
+            </Button>
+          </aside>
+        ) : (
+          <>
+            <aside
+              className="flex shrink-0 flex-col border-r border-border bg-background"
+              style={{ width: treeWidth }}
+            >
+              <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={toggleTreeCollapsed}
+                  title="Hide file tree (Cmd/Ctrl+B)"
+                  aria-label="Hide file tree"
+                >
+                  <PanelLeftClose className="h-3 w-3" />
+                </Button>
+                <span>Files</span>
+                {filesLoading && <span>· indexing…</span>}
               </div>
-            ) : !projectPath ? (
-              <div className="px-3 py-3 text-[11px] text-muted-foreground">
-                No project for this session.
+              <div className="min-h-0 flex-1 overflow-auto">
+                {filesError ? (
+                  <div className="px-3 py-3 text-[11px] text-destructive">
+                    {filesError}
+                  </div>
+                ) : !projectPath ? (
+                  <div className="px-3 py-3 text-[11px] text-muted-foreground">
+                    No project for this session.
+                  </div>
+                ) : (
+                  <FileTree
+                    files={files}
+                    selectedPath={selectedPath}
+                    onSelect={(p) => {
+                      setSelectedPath(p);
+                      setQuery("");
+                    }}
+                  />
+                )}
               </div>
-            ) : (
-              <FileTree
-                files={files}
-                selectedPath={selectedPath}
-                onSelect={(p) => {
-                  setSelectedPath(p);
-                  setQuery("");
-                }}
-              />
-            )}
-          </div>
-        </aside>
+            </aside>
 
-        <TreeDragHandle
-          containerRef={splitContainerRef}
-          width={treeWidth}
-          onResize={setTreeWidth}
-        />
+            <TreeDragHandle
+              containerRef={splitContainerRef}
+              width={treeWidth}
+              onResize={setTreeWidth}
+            />
+          </>
+        )}
 
         {/* ── RIGHT: search + viewer column ──────────────────── */}
         <div className="flex min-w-0 flex-1 flex-col">
@@ -417,6 +541,28 @@ export function CodeView({ sessionId }: { sessionId: string }) {
               className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-muted-foreground"
             />
             <SearchModeToggle mode={searchMode} onChange={setSearchMode} />
+            {searchMode === "content" && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-pressed={contentOptions.advancedOpen}
+                onClick={() =>
+                  setContentOptions((prev) => ({
+                    ...prev,
+                    advancedOpen: !prev.advancedOpen,
+                  }))
+                }
+                title="Advanced search options"
+                aria-label="Toggle advanced search options"
+                className={
+                  contentOptions.advancedOpen
+                    ? "bg-muted text-foreground"
+                    : undefined
+                }
+              >
+                <SlidersHorizontal className="h-3 w-3" />
+              </Button>
+            )}
             <SearchStatusBadge
               mode={searchMode}
               filesLoading={filesLoading}
@@ -426,6 +572,13 @@ export function CodeView({ sessionId }: { sessionId: string }) {
               contentMatchCount={contentMatchCount}
             />
           </div>
+
+          {searchMode === "content" && contentOptions.advancedOpen && (
+            <ContentSearchAdvancedRow
+              options={contentOptions}
+              onChange={setContentOptions}
+            />
+          )}
 
           {/* Files-mode picker dropdown stays as-is — it's the
               quick Cmd+P jumper. Content-mode results are shown
@@ -493,6 +646,76 @@ export function CodeView({ sessionId }: { sessionId: string }) {
 interface SearchModeToggleProps {
   mode: SearchMode;
   onChange: (m: SearchMode) => void;
+}
+
+interface ContentSearchAdvancedRowProps {
+  options: ContentSearchUiOptions;
+  onChange: React.Dispatch<React.SetStateAction<ContentSearchUiOptions>>;
+}
+
+// Second row that appears below the search bar when the user
+// clicks the SlidersHorizontal toggle in content-search mode.
+// Contains the include + exclude glob inputs and the regex /
+// case-sensitivity toggles. Same comma-separated glob syntax
+// as the file picker (passed through splitGlobList on its way
+// to the rust side).
+function ContentSearchAdvancedRow({
+  options,
+  onChange,
+}: ContentSearchAdvancedRowProps) {
+  return (
+    <div className="flex shrink-0 items-center gap-2 border-b border-border bg-background/60 px-2 py-1.5">
+      <input
+        type="text"
+        value={options.include}
+        onChange={(e) =>
+          onChange((prev) => ({ ...prev, include: e.target.value }))
+        }
+        placeholder="include: src/**/*.ts, !*.test.ts"
+        className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] outline-none placeholder:text-muted-foreground/70 focus:border-foreground/30"
+      />
+      <input
+        type="text"
+        value={options.exclude}
+        onChange={(e) =>
+          onChange((prev) => ({ ...prev, exclude: e.target.value }))
+        }
+        placeholder="exclude: node_modules/**, *.lock"
+        className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] outline-none placeholder:text-muted-foreground/70 focus:border-foreground/30"
+      />
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        aria-pressed={options.useRegex}
+        onClick={() =>
+          onChange((prev) => ({ ...prev, useRegex: !prev.useRegex }))
+        }
+        title="Use regex (.*)"
+        aria-label="Toggle regex matching"
+        className={options.useRegex ? "bg-muted text-foreground" : undefined}
+      >
+        <Regex className="h-3 w-3" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        aria-pressed={options.caseSensitive}
+        onClick={() =>
+          onChange((prev) => ({
+            ...prev,
+            caseSensitive: !prev.caseSensitive,
+          }))
+        }
+        title="Case sensitive (aA)"
+        aria-label="Toggle case sensitivity"
+        className={
+          options.caseSensitive ? "bg-muted text-foreground" : undefined
+        }
+      >
+        <CaseSensitive className="h-3 w-3" />
+      </Button>
+    </div>
+  );
 }
 
 function SearchModeToggle({ mode, onChange }: SearchModeToggleProps) {

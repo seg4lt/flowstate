@@ -95,16 +95,49 @@ export interface ContentBlock {
   lines: BlockLine[];
 }
 
-// Live content search across the project, ripgrep-style. Treats
-// the query as a literal string (no regex escaping needed),
-// smart-case (lower → case-insensitive), gitignore-aware. Each
-// returned block is one disjoint match group with ±3 lines of
-// surrounding context — designed for a Zed-style multibuffer
-// renderer. Total lines streamed are capped server-side so
-// pathological queries can't flood the bridge.
+// Per-search options forwarded to the rust side's content-search
+// command. Defaults map to the boring case-sensitive literal
+// behavior with no path filtering — callers that don't care about
+// the advanced options can pass `defaultContentSearchOptions()`.
+export interface ContentSearchOptions {
+  /** Treat the query as a `regex` crate regex instead of a
+   *  literal string. Default false. */
+  useRegex: boolean;
+  /** Default true. The `aA` toggle in the UI flips this off. */
+  caseSensitive: boolean;
+  /** Glob patterns restricting which files the walker visits. */
+  includes: string[];
+  /** Glob patterns excluded from the walker (rust prefixes them
+   *  with `!` for OverrideBuilder so the user types plain globs). */
+  excludes: string[];
+}
+
+export function defaultContentSearchOptions(): ContentSearchOptions {
+  return {
+    useRegex: false,
+    caseSensitive: true,
+    includes: [],
+    excludes: [],
+  };
+}
+
+// Live content search across the project, ripgrep-style. The
+// `options` arg controls regex vs literal matching, case
+// sensitivity, and include/exclude glob filters (all defaulted
+// to the conservative "search everything literally, case-
+// sensitive" behavior). Returns one ContentBlock per disjoint
+// match group with ±3 lines of surrounding context — designed
+// for a Zed-style multibuffer renderer. Total lines streamed
+// are capped server-side so pathological queries can't flood
+// the bridge.
 export function searchFileContents(
   path: string,
   query: string,
+  options: ContentSearchOptions,
 ): Promise<ContentBlock[]> {
-  return invoke<ContentBlock[]>("search_file_contents", { path, query });
+  return invoke<ContentBlock[]>("search_file_contents", {
+    path,
+    query,
+    options,
+  });
 }
