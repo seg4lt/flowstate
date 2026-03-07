@@ -24,6 +24,12 @@ serde_json = "1"
 # .gitignore automatically so we don't walk into node_modules/
 # target/ etc.
 ignore = "0.4"
+# ripgrep's matcher + line searcher. Same lineage as `ignore`,
+# powers the editor view's content-search command. Pure library,
+# no `rg` binary or subprocess.
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
 
 # Daemon core + Tauri transport (embedded daemon)
 zenui-daemon-core = { path = "../../rs-agent-sdk/crates/middleman/daemon-core" }

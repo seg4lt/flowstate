@@ -72,3 +72,39 @@ export function listProjectFiles(path: string): Promise<string[]> {
 export function readProjectFile(path: string, file: string): Promise<string> {
   return invoke<string>("read_project_file", { path, file });
 }
+
+export interface BlockLine {
+  // 1-based line number, matching ripgrep / editor convention.
+  line: number;
+  // Line text, trimmed of trailing newline and clipped server-side
+  // so a single huge minified line can't blow up the IPC payload.
+  text: string;
+  // True if this line was a match for the query; false if it's
+  // surrounding-context only.
+  isMatch: boolean;
+}
+
+export interface ContentBlock {
+  path: string;
+  // 1-based line of the first entry in `lines` — convenient for
+  // the gutter even though every line carries its own number.
+  startLine: number;
+  // Match line(s) plus surrounding context, in source order.
+  // Adjacent matches share a single block (ripgrep's
+  // context_break is the boundary).
+  lines: BlockLine[];
+}
+
+// Live content search across the project, ripgrep-style. Treats
+// the query as a literal string (no regex escaping needed),
+// smart-case (lower → case-insensitive), gitignore-aware. Each
+// returned block is one disjoint match group with ±3 lines of
+// surrounding context — designed for a Zed-style multibuffer
+// renderer. Total lines streamed are capped server-side so
+// pathological queries can't flood the bridge.
+export function searchFileContents(
+  path: string,
+  query: string,
+): Promise<ContentBlock[]> {
+  return invoke<ContentBlock[]>("search_file_contents", { path, query });
+}

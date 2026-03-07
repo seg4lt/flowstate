@@ -322,6 +322,261 @@ fn read_project_file(path: String, file: String) -> Result<String, String> {
     std::fs::read_to_string(&abs_canon).map_err(|e| format!("read: {e}"))
 }
 
+/// One line inside a `ContentBlock`. `is_match` distinguishes the
+/// matching line(s) from the surrounding context lines so the
+/// frontend can highlight them.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockLine {
+    line: u64,
+    text: String,
+    is_match: bool,
+}
+
+/// A contiguous run of lines from one file that contains at least
+/// one match plus its surrounding context. Matches close together
+/// in the same file share a single block (`grep_searcher` issues
+/// a `context_break` between disjoint groups, which we use as the
+/// block boundary).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContentBlock {
+    path: String,
+    /// 1-based line number of the first line in `lines` — handy
+    /// for the frontend gutter even though every line carries its
+    /// own `line` field too.
+    start_line: u64,
+    lines: Vec<BlockLine>,
+}
+
+/// How many context lines to capture on each side of every match.
+/// Three is the Zed multibuffer default and it's what the picker
+/// header explains as "top 3 / bottom 3". Expand-to-more is a
+/// next-step item.
+const CONTENT_SEARCH_CONTEXT_LINES: usize = 3;
+
+/// Soft cap on total lines streamed across all blocks for one
+/// query. Bounds the IPC payload so a pathological query (`a`)
+/// can't ship megabytes through the bridge. Each line averages
+/// around 60–80 chars, so 3000 lines ≈ ~200 KB of JSON.
+const CONTENT_SEARCH_MAX_TOTAL_LINES: usize = 3_000;
+
+/// Per-line truncation. Long lines (minified bundles, lockfiles)
+/// get clipped + ellipsised so a single 100k-char line can't blow
+/// up the payload either.
+const CONTENT_SEARCH_MAX_LINE_LEN: usize = 240;
+
+/// Custom `grep_searcher::Sink` that builds `ContentBlock`s as it
+/// receives lines from the searcher. The default `sinks::UTF8`
+/// only forwards match lines; we need both match AND context, so
+/// we implement Sink ourselves and use `context_break` events to
+/// separate disjoint match groups within a file.
+struct BlockSink {
+    rel_path: String,
+    finished_blocks: Vec<ContentBlock>,
+    current: Option<ContentBlock>,
+    /// Shared budget across all files for one query. Decremented
+    /// on every line we accept; once it hits zero we tell the
+    /// searcher to stop by returning `Ok(false)`.
+    line_budget_remaining: usize,
+}
+
+impl BlockSink {
+    fn new(rel_path: String, line_budget_remaining: usize) -> Self {
+        Self {
+            rel_path,
+            finished_blocks: Vec::new(),
+            current: None,
+            line_budget_remaining,
+        }
+    }
+
+    fn push_line(&mut self, line_number: u64, text: String, is_match: bool) {
+        if self.current.is_none() {
+            self.current = Some(ContentBlock {
+                path: self.rel_path.clone(),
+                start_line: line_number,
+                lines: Vec::new(),
+            });
+        }
+        if let Some(block) = self.current.as_mut() {
+            block.lines.push(BlockLine {
+                line: line_number,
+                text,
+                is_match,
+            });
+            self.line_budget_remaining =
+                self.line_budget_remaining.saturating_sub(1);
+        }
+    }
+
+    fn flush_current(&mut self) {
+        if let Some(block) = self.current.take() {
+            // Only keep blocks that actually contain at least one
+            // match. A pure-context block (no matched lines) means
+            // the searcher emitted before/after context for a match
+            // we already accounted for in a previous block — skip.
+            if block.lines.iter().any(|l| l.is_match) {
+                self.finished_blocks.push(block);
+            }
+        }
+    }
+}
+
+fn truncate_line(raw: &[u8]) -> String {
+    let text = std::str::from_utf8(raw).unwrap_or("");
+    let text = text.trim_end_matches(['\n', '\r']);
+    if text.len() > CONTENT_SEARCH_MAX_LINE_LEN {
+        // Find a char boundary at or before the cap so we don't
+        // split a multi-byte character mid-codepoint.
+        let mut cut = CONTENT_SEARCH_MAX_LINE_LEN;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut t = text[..cut].to_string();
+        t.push('…');
+        t
+    } else {
+        text.to_string()
+    }
+}
+
+impl grep_searcher::Sink for BlockSink {
+    type Error = std::io::Error;
+
+    fn matched(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        mat: &grep_searcher::SinkMatch<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self.line_budget_remaining == 0 {
+            return Ok(false);
+        }
+        let line_number = mat.line_number().unwrap_or(0);
+        let text = truncate_line(mat.bytes());
+        self.push_line(line_number, text, true);
+        Ok(self.line_budget_remaining > 0)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        ctx: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        if self.line_budget_remaining == 0 {
+            return Ok(false);
+        }
+        let line_number = ctx.line_number().unwrap_or(0);
+        let text = truncate_line(ctx.bytes());
+        self.push_line(line_number, text, false);
+        Ok(self.line_budget_remaining > 0)
+    }
+
+    fn context_break(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+    ) -> Result<bool, Self::Error> {
+        self.flush_current();
+        Ok(self.line_budget_remaining > 0)
+    }
+
+    fn finish(
+        &mut self,
+        _searcher: &grep_searcher::Searcher,
+        _finish: &grep_searcher::SinkFinish,
+    ) -> Result<(), Self::Error> {
+        self.flush_current();
+        Ok(())
+    }
+}
+
+/// Live content search across the project, ripgrep-style. Walks
+/// the same gitignore-aware tree as `list_project_files` and runs
+/// each file through ripgrep's own `Searcher` with a literal-string
+/// matcher (`.fixed_strings(true)`), so users can paste raw code
+/// fragments like `fn foo(` or `->` without escaping. Case-
+/// insensitive when the query is all lowercase (smart-case), case-
+/// sensitive otherwise — same convention as `rg`.
+///
+/// Returns one `ContentBlock` per disjoint match group per file:
+/// each block is the match line(s) plus 3 lines of context on
+/// either side. The frontend renders these as Zed-style
+/// multibuffer chunks.
+#[tauri::command]
+fn search_file_contents(
+    path: String,
+    query: String,
+) -> Result<Vec<ContentBlock>, String> {
+    use grep_regex::RegexMatcherBuilder;
+    use grep_searcher::SearcherBuilder;
+
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let project_path = Path::new(&path);
+    if !project_path.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let smart_case_insensitive = trimmed.chars().all(|c| !c.is_uppercase());
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(smart_case_insensitive)
+        .fixed_strings(true)
+        .build(trimmed)
+        .map_err(|e| format!("regex build: {e}"))?;
+
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .before_context(CONTENT_SEARCH_CONTEXT_LINES)
+        .after_context(CONTENT_SEARCH_CONTEXT_LINES)
+        .build();
+
+    let mut all_blocks: Vec<ContentBlock> = Vec::new();
+    let mut lines_remaining = CONTENT_SEARCH_MAX_TOTAL_LINES;
+
+    'walk: for result in ignore::WalkBuilder::new(project_path)
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .parents(true)
+        .build()
+    {
+        if lines_remaining == 0 {
+            break;
+        }
+        let Ok(entry) = result else { continue };
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let abs = entry.path();
+        let Ok(rel) = abs.strip_prefix(project_path) else {
+            continue;
+        };
+        let rel_str = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if rel_str.is_empty() {
+            continue;
+        }
+
+        let mut sink = BlockSink::new(rel_str, lines_remaining);
+        let _ = searcher.search_path(&matcher, abs, &mut sink);
+        // The sink decrements its own budget; carry the remainder
+        // into the next file's sink so the global cap holds.
+        lines_remaining = sink.line_budget_remaining;
+        all_blocks.append(&mut sink.finished_blocks);
+
+        if lines_remaining == 0 {
+            break 'walk;
+        }
+    }
+
+    Ok(all_blocks)
+}
+
 struct AppLifecycle {
     lifecycle: Arc<DaemonLifecycle>,
 }
@@ -432,6 +687,7 @@ pub fn run() {
             get_git_diff_file,
             list_project_files,
             read_project_file,
+            search_file_contents,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

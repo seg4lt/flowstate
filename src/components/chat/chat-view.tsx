@@ -221,14 +221,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setDiffRefreshTick((t) => t + 1);
   }, []);
 
-  // Diff panel state. The pane is open by default — flowzen is
-  // primarily an "agent edits files" surface, so the diff is the
-  // most useful view to land on. The user can close it manually
-  // via the X button. `diffWidth` and `diffStyle` are user
+  // Diff panel state. Closed by default — open it from the chat
+  // header's "Show diff" button when you want to see what the
+  // session changed. `diffWidth` and `diffStyle` are user
   // preferences persisted to localStorage so they survive
   // restarts.
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
-  const [diffOpen, setDiffOpen] = React.useState(true);
+  const [diffOpen, setDiffOpen] = React.useState(false);
   const [diffWidth, setDiffWidth] = React.useState<number>(() => {
     try {
       const saved = window.localStorage.getItem(DIFF_WIDTH_KEY);
