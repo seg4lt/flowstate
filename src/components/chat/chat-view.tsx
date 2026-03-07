@@ -12,7 +12,12 @@ import type {
   UserInputAnswer,
   UserInputQuestion,
 } from "@/lib/types";
-import { connectStream, getGitBranch, sendMessage } from "@/lib/api";
+import {
+  connectStream,
+  getGitBranch,
+  getGitDiffSummary,
+  sendMessage,
+} from "@/lib/api";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
 import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
@@ -24,6 +29,8 @@ import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { WorkingIndicator } from "./working-indicator";
 import { StuckBanner } from "./stuck-banner";
+import { DiffPanel, type DiffStyle } from "./diff-panel";
+import type { AggregatedFileDiff } from "@/lib/session-diff";
 
 // Trip the watchdog after this many seconds of silence while a tool
 // call is pending. Picked to be well past a normal tool round-trip
@@ -31,6 +38,14 @@ import { StuckBanner } from "./stuck-banner";
 // enough that a user who just clicked Allow doesn't sit for a minute
 // wondering if anything is happening.
 const STUCK_TIMEOUT_MS = 45_000;
+
+// Diff-panel sizing. Clamped so neither the chat column nor the diff
+// pane can collapse to nothing when the user drags the handle.
+const DIFF_WIDTH_KEY = "flowzen:diff-width";
+const DIFF_STYLE_KEY = "flowzen:diff-style";
+const DIFF_MIN_WIDTH = 360;
+const DIFF_DEFAULT_WIDTH = 560;
+const DIFF_CHAT_MIN_WIDTH = 420;
 
 interface PermissionRequest {
   requestId: string;
@@ -75,6 +90,81 @@ function appendReasoningDelta(
   return [...list, { kind: "reasoning", text: delta }];
 }
 
+// Vertical drag handle between the chat column and the diff pane.
+// Mirrors the sidebar DragHandle pattern in router.tsx but measures
+// against the split container's right edge so the panel grows from
+// the right as the mouse moves left. The handle lives inline between
+// the two flex children (not absolutely positioned) to avoid z-index
+// fights with the sidebar handle and other overlays.
+function DiffDragHandle({
+  containerRef,
+  width,
+  onResize,
+}: {
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  width: number;
+  onResize: (w: number) => void;
+}) {
+  const draggingRef = React.useRef(false);
+  const latestWidthRef = React.useRef(width);
+
+  React.useEffect(() => {
+    latestWidthRef.current = width;
+  }, [width]);
+
+  React.useEffect(() => {
+    function onMove(e: MouseEvent) {
+      if (!draggingRef.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const maxWidth = Math.max(
+        DIFF_MIN_WIDTH,
+        Math.floor(rect.width - DIFF_CHAT_MIN_WIDTH),
+      );
+      const next = Math.max(
+        DIFF_MIN_WIDTH,
+        Math.min(maxWidth, Math.round(rect.right - e.clientX)),
+      );
+      latestWidthRef.current = next;
+      onResize(next);
+    }
+    function onUp() {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      try {
+        window.localStorage.setItem(
+          DIFF_WIDTH_KEY,
+          String(latestWidthRef.current),
+        );
+      } catch {
+        /* storage may be unavailable; width is still live in state */
+      }
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [containerRef, onResize]);
+
+  return (
+    <div
+      role="separator"
+      aria-label="Resize diff panel"
+      aria-orientation="vertical"
+      className="w-1 shrink-0 cursor-col-resize bg-border/50 hover:bg-border"
+      onMouseDown={(e) => {
+        e.preventDefault();
+        draggingRef.current = true;
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+      }}
+    />
+  );
+}
+
 export function ChatView({ sessionId }: { sessionId: string }) {
   const { state, dispatch, send } = useApp();
   const navigate = useNavigate();
@@ -117,6 +207,59 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     Date.now(),
   );
   const [stuckSince, setStuckSince] = React.useState<number | null>(null);
+
+  // The diff view is sourced directly from `git diff HEAD` against
+  // the project's working tree (plus untracked files). It refreshes
+  // on session load, on every `turn_completed` event, and whenever
+  // the user opens the panel — so each turn shows its cumulative
+  // effect without us instrumenting individual tool calls.
+  // `diffRefreshTick` is the cheap dependency that lets the fetch
+  // effect rerun whenever the WS handler bumps it.
+  const [diffs, setDiffs] = React.useState<AggregatedFileDiff[]>([]);
+  const [diffRefreshTick, setDiffRefreshTick] = React.useState(0);
+  const refreshDiffs = React.useCallback(() => {
+    setDiffRefreshTick((t) => t + 1);
+  }, []);
+
+  // Diff panel state. The pane is open by default — flowzen is
+  // primarily an "agent edits files" surface, so the diff is the
+  // most useful view to land on. The user can close it manually
+  // via the X button. `diffWidth` and `diffStyle` are user
+  // preferences persisted to localStorage so they survive
+  // restarts.
+  const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
+  const [diffOpen, setDiffOpen] = React.useState(true);
+  const [diffWidth, setDiffWidth] = React.useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem(DIFF_WIDTH_KEY);
+      if (saved) {
+        const parsed = Number.parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= DIFF_MIN_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      /* storage may be unavailable */
+    }
+    return DIFF_DEFAULT_WIDTH;
+  });
+  const [diffStyle, setDiffStyleState] = React.useState<DiffStyle>(() => {
+    try {
+      const saved = window.localStorage.getItem(DIFF_STYLE_KEY);
+      if (saved === "split" || saved === "unified") return saved;
+    } catch {
+      /* storage may be unavailable */
+    }
+    return "split";
+  });
+  const setDiffStyle = React.useCallback((s: DiffStyle) => {
+    setDiffStyleState(s);
+    try {
+      window.localStorage.setItem(DIFF_STYLE_KEY, s);
+    } catch {
+      /* storage may be unavailable */
+    }
+  }, []);
 
   const session = state.sessions.get(sessionId);
   const projectPath = React.useMemo(() => {
@@ -272,6 +415,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           setPendingInput(null);
           setLastEventAt(Date.now());
           setStuckSince(null);
+          refreshDiffs();
         }
         return;
       }
@@ -331,6 +475,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             }
             return [...prev, event.turn];
           });
+          // Turn-wise refresh: every completed turn re-runs `git diff
+          // HEAD` so the panel reflects exactly what this turn left
+          // on disk. Cheaper than instrumenting individual tools and
+          // catches every file the agent touched.
+          refreshDiffs();
           break;
 
         case "content_delta": {
@@ -471,7 +620,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => {
       active = false;
     };
-  }, [sessionId, navigate]);
+  }, [sessionId, navigate, refreshDiffs]);
 
   async function handleSend(input: string) {
     // --- Slash command interception ---
@@ -677,6 +826,27 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     />
   ) : null;
 
+  React.useEffect(() => {
+    if (!projectPath) {
+      setDiffs([]);
+      return;
+    }
+    let cancelled = false;
+    getGitDiffSummary(projectPath)
+      .then((entries) => {
+        if (cancelled) return;
+        setDiffs(entries);
+      })
+      .catch((err) => {
+        console.error("get_git_diff_summary failed", err);
+        if (!cancelled) setDiffs([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectPath, sessionId, diffRefreshTick]);
+
+
   return (
     <div className="flex h-svh min-w-0 flex-col overflow-hidden">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
@@ -713,79 +883,127 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           )}
         </div>
         <div className="ml-auto flex items-center gap-2">
-          <HeaderActions />
+          <HeaderActions
+            diffs={diffs}
+            diffOpen={diffOpen}
+            onToggleDiff={() => {
+              setDiffOpen((v) => {
+                // Force a fresh git diff whenever the panel opens so
+                // changes the user made outside the agent (manual
+                // edits, external tools) show up without a reload.
+                if (!v) refreshDiffs();
+                return !v;
+              });
+            }}
+          />
         </div>
       </header>
 
-      <MessageList
-        turns={turns}
-        loading={loading}
-        pendingInput={pendingInput}
-      />
+      {/* Horizontal split: chat column on the left, optional diff pane
+          on the right. min-w-0 on the outer row lets the left column
+          shrink below its content's intrinsic width so wide messages
+          or code blocks don't push the diff pane off-screen. */}
+      <div
+        ref={splitContainerRef}
+        className="flex min-h-0 min-w-0 flex-1"
+      >
+        <div className="flex min-w-0 flex-1 flex-col">
+          <MessageList
+            turns={turns}
+            loading={loading}
+            pendingInput={pendingInput}
+          />
 
-      {isRunning && session && runningTurn && (
-        <WorkingIndicator
-          lastActivityAt={lastEventAt}
-          onInterrupt={handleInterrupt}
-        />
-      )}
+          {isRunning && session && runningTurn && (
+            <WorkingIndicator
+              lastActivityAt={lastEventAt}
+              onInterrupt={handleInterrupt}
+            />
+          )}
 
-      {pendingQuestion && (
-        <QuestionPrompt
-          questions={pendingQuestion.questions}
-          onSubmit={handleQuestionSubmit}
-          onCancel={handleQuestionCancel}
-        />
-      )}
+          {pendingQuestion && (
+            <QuestionPrompt
+              questions={pendingQuestion.questions}
+              onSubmit={handleQuestionSubmit}
+              onCancel={handleQuestionCancel}
+            />
+          )}
 
-      {pendingPermissions.length > 0 && (
-        <PermissionPrompt
-          // Head-of-queue. The `key` forces React to remount the
-          // prompt so any local component state (e.g. the plan-exit
-          // mode picker's `pending` flag) resets between queued
-          // prompts and the user can't accidentally double-answer
-          // the next one with stale state.
-          key={pendingPermissions[0].requestId}
-          toolName={pendingPermissions[0].toolName}
-          input={pendingPermissions[0].input}
-          onDecision={handlePermissionDecision}
-          queueDepth={pendingPermissions.length}
-        />
-      )}
+          {pendingPermissions.length > 0 && (
+            <PermissionPrompt
+              // Head-of-queue. The `key` forces React to remount the
+              // prompt so any local component state (e.g. the plan-exit
+              // mode picker's `pending` flag) resets between queued
+              // prompts and the user can't accidentally double-answer
+              // the next one with stale state.
+              key={pendingPermissions[0].requestId}
+              toolName={pendingPermissions[0].toolName}
+              input={pendingPermissions[0].input}
+              onDecision={handlePermissionDecision}
+              queueDepth={pendingPermissions.length}
+            />
+          )}
 
-      {stuckSince !== null && pendingPermissions.length === 0 && !pendingQuestion && (
-        <StuckBanner
-          elapsedSeconds={Math.floor((Date.now() - stuckSince) / 1000)}
-          onInterrupt={() => {
-            setStuckSince(null);
-            handleInterrupt();
-          }}
-          onReload={() => {
-            setStuckSince(null);
-            sendMessage({ type: "load_session", session_id: sessionId });
-          }}
-        />
-      )}
+          {stuckSince !== null &&
+            pendingPermissions.length === 0 &&
+            !pendingQuestion && (
+              <StuckBanner
+                elapsedSeconds={Math.floor((Date.now() - stuckSince) / 1000)}
+                onInterrupt={() => {
+                  setStuckSince(null);
+                  handleInterrupt();
+                }}
+                onReload={() => {
+                  setStuckSince(null);
+                  sendMessage({ type: "load_session", session_id: sessionId });
+                }}
+              />
+            )}
 
-      <ChatInput
-        // Key on sessionId so ChatInput remounts on every session
-        // switch. ChatView itself stays mounted across /chat/$id route
-        // changes (same component, new param) so without this key the
-        // input's local state -- the textarea draft AND the
-        // pendingSend queue flag -- would leak from the previous
-        // session into the next one. The leak was particularly nasty
-        // for pendingSend: a queued message in session A would
-        // auto-flush against session B the moment B's status flipped
-        // from running to ready, sending phantom input the user never
-        // typed in that thread.
-        key={sessionId}
-        onSend={handleSend}
-        onInterrupt={handleInterrupt}
-        sessionStatus={session?.status}
-        disabled={loading}
-        toolbar={toolbar}
-        commands={COMMAND_META}
-      />
+          <ChatInput
+            // Key on sessionId so ChatInput remounts on every session
+            // switch. ChatView itself stays mounted across /chat/$id
+            // route changes (same component, new param) so without
+            // this key the input's local state -- the textarea draft
+            // AND the pendingSend queue flag -- would leak from the
+            // previous session into the next one. The leak was
+            // particularly nasty for pendingSend: a queued message in
+            // session A would auto-flush against session B the moment
+            // B's status flipped from running to ready, sending
+            // phantom input the user never typed in that thread.
+            key={sessionId}
+            onSend={handleSend}
+            onInterrupt={handleInterrupt}
+            sessionStatus={session?.status}
+            disabled={loading}
+            toolbar={toolbar}
+            commands={COMMAND_META}
+          />
+        </div>
+
+        {diffOpen && (
+          <>
+            <DiffDragHandle
+              containerRef={splitContainerRef}
+              width={diffWidth}
+              onResize={setDiffWidth}
+            />
+            <aside
+              className="shrink-0 border-l border-border bg-background"
+              style={{ width: diffWidth }}
+            >
+              <DiffPanel
+                projectPath={projectPath}
+                diffs={diffs}
+                refreshKey={diffRefreshTick}
+                style={diffStyle}
+                onStyleChange={setDiffStyle}
+                onClose={() => setDiffOpen(false)}
+              />
+            </aside>
+          </>
+        )}
+      </div>
     </div>
   );
 }

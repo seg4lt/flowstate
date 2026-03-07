@@ -1,9 +1,58 @@
-import { Plus, FolderOpen, GitCommitVertical } from "lucide-react";
+import * as React from "react";
+import {
+  Diff,
+  FolderOpen,
+  GitCommitVertical,
+  Plus,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import type { AggregatedFileDiff } from "@/lib/session-diff";
 
-export function HeaderActions() {
+interface HeaderActionsProps {
+  diffs: AggregatedFileDiff[];
+  diffOpen: boolean;
+  onToggleDiff: () => void;
+}
+
+export function HeaderActions({
+  diffs,
+  diffOpen,
+  onToggleDiff,
+}: HeaderActionsProps) {
+  const { additions, deletions } = React.useMemo(() => {
+    let a = 0;
+    let d = 0;
+    for (const diff of diffs) {
+      a += diff.additions;
+      d += diff.deletions;
+    }
+    return { additions: a, deletions: d };
+  }, [diffs]);
+
+  const hasChanges = diffs.length > 0;
+
   return (
     <div className="flex items-center gap-1">
+      {hasChanges && (
+        <Button
+          variant={diffOpen ? "secondary" : "outline"}
+          size="xs"
+          onClick={onToggleDiff}
+          aria-pressed={diffOpen}
+          title={
+            diffOpen ? "Hide diff panel" : "Show diff panel for this session"
+          }
+        >
+          <Diff className="h-3 w-3" />
+          Show diff
+          <span className="ml-0.5 tabular-nums text-green-600 dark:text-green-400">
+            +{additions}
+          </span>
+          <span className="tabular-nums text-red-600 dark:text-red-400">
+            −{deletions}
+          </span>
+        </Button>
+      )}
       <Button
         variant="outline"
         size="xs"

@@ -11,6 +11,16 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
 
+  // @pierre/diffs' worker entry uses ES-module code splitting under
+  // the hood. Vite's default IIFE format for workers rejects that
+  // ("UMD and IIFE output formats are not supported for
+  // code-splitting builds"), so we switch the worker build to ES
+  // modules. Modern browsers and the Tauri webview both support
+  // `new Worker(url, { type: "module" })`.
+  worker: {
+    format: "es",
+  },
+
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
