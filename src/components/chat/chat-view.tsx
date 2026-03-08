@@ -884,6 +884,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <div className="ml-auto flex items-center gap-2">
           <HeaderActions
             sessionId={sessionId}
+            projectPath={projectPath}
             diffs={diffs}
             diffOpen={diffOpen}
             onToggleDiff={() => {

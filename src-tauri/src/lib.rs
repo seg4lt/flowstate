@@ -322,6 +322,34 @@ fn read_project_file(path: String, file: String) -> Result<String, String> {
     std::fs::read_to_string(&abs_canon).map_err(|e| format!("read: {e}"))
 }
 
+/// Launch an external code editor on `path` (the project root)
+/// by shelling out to `editor` with the path as the only arg.
+/// Standard editor launchers — `zed`, `code`, `cursor`, `idea`,
+/// `subl` — all accept a directory positional arg and open it as
+/// a project. Doesn't wait for the child to exit (we don't want
+/// to block the bridge), just spawns and detaches.
+///
+/// Returns `Err` with a readable message when:
+///   * `path` isn't a directory (no project to open)
+///   * the editor binary isn't on `$PATH` (e.g. user picked
+///     "Zed" but never installed Zed's `zed` CLI helper)
+#[tauri::command]
+fn open_in_editor(editor: String, path: String) -> Result<(), String> {
+    let trimmed = editor.trim();
+    if trimmed.is_empty() {
+        return Err("no editor configured".into());
+    }
+    let project_path = Path::new(&path);
+    if !project_path.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    Command::new(trimmed)
+        .arg(&path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to launch `{trimmed}`: {e}"))
+}
+
 /// One line inside a `ContentBlock`. `is_match` distinguishes the
 /// matching line(s) from the surrounding context lines so the
 /// frontend can highlight them.
@@ -762,6 +790,7 @@ pub fn run() {
             list_project_files,
             read_project_file,
             search_file_contents,
+            open_in_editor,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {

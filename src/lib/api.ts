@@ -121,6 +121,15 @@ export function defaultContentSearchOptions(): ContentSearchOptions {
   };
 }
 
+// Spawn an external code editor (`zed`, `code`, `cursor`, `idea`,
+// `subl`, …) on the project root. The rust side calls the binary
+// with the path as a positional arg and detaches; the promise
+// rejects when the binary isn't on $PATH or the path isn't a
+// directory so the frontend can show a friendly toast.
+export function openInEditor(editor: string, path: string): Promise<void> {
+  return invoke<void>("open_in_editor", { editor, path });
+}
+
 // Live content search across the project, ripgrep-style. The
 // `options` arg controls regex vs literal matching, case
 // sensitivity, and include/exclude glob filters (all defaulted
