@@ -221,6 +221,30 @@ impl PersistenceService {
             .unwrap_or(false)
     }
 
+    pub fn delete_archived_session(&self, session_id: &str) -> bool {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let tx = match connection.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(_) => return false,
+        };
+        let _ = tx.execute(
+            "DELETE FROM archived_turns WHERE session_id = ?1",
+            params![session_id],
+        );
+        let removed = tx
+            .execute(
+                "DELETE FROM archived_sessions WHERE session_id = ?1",
+                params![session_id],
+            )
+            .map(|affected| affected > 0)
+            .unwrap_or(false);
+        if removed {
+            tx.commit().is_ok()
+        } else {
+            false
+        }
+    }
+
     /// Returns the cached models for a provider along with the ISO-8601 timestamp
     /// they were fetched at, or None if no entry exists.
     pub async fn get_cached_models(

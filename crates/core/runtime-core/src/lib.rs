@@ -1367,23 +1367,21 @@ impl RuntimeCore {
     }
 
     async fn delete_session(&self, session_id: String) -> Result<String, String> {
-        let session = self
-            .persistence
-            .get_session(&session_id)
-            .await
-            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        if let Some(session) = self.persistence.get_session(&session_id).await {
+            let adapter = self.adapters.get(&session.summary.provider).cloned();
 
-        let adapter = self.adapters.get(&session.summary.provider).cloned();
-
-        // Best-effort teardown of the provider's long-lived resources.
-        if let Some(adapter) = adapter {
-            if let Err(e) = adapter.end_session(&session).await {
-                tracing::warn!("end_session error for {session_id}: {e}");
+            // Best-effort teardown of the provider's long-lived resources.
+            if let Some(adapter) = adapter {
+                if let Err(e) = adapter.end_session(&session).await {
+                    tracing::warn!("end_session error for {session_id}: {e}");
+                }
             }
-        }
 
-        if !self.persistence.delete_session(&session_id) {
-            return Err(format!("Session `{session_id}` could not be deleted."));
+            if !self.persistence.delete_session(&session_id) {
+                return Err(format!("Session `{session_id}` could not be deleted."));
+            }
+        } else if !self.persistence.delete_archived_session(&session_id) {
+            return Err(format!("Unknown session `{session_id}`."));
         }
 
         // Drop the session's permission policy so it doesn't grow forever.
