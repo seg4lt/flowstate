@@ -322,12 +322,16 @@ fn read_project_file(path: String, file: String) -> Result<String, String> {
     std::fs::read_to_string(&abs_canon).map_err(|e| format!("read: {e}"))
 }
 
-/// Launch an external code editor on `path` (the project root)
-/// by shelling out to `editor` with the path as the only arg.
-/// Standard editor launchers — `zed`, `code`, `cursor`, `idea`,
-/// `subl` — all accept a directory positional arg and open it as
-/// a project. Doesn't wait for the child to exit (we don't want
-/// to block the bridge), just spawns and detaches.
+/// Launch an external code editor on `path` (the project root) by
+/// running `<editor> .` with the child's cwd set to `path`. All the
+/// standard editor launchers — `zed`, `code`, `cursor`, `idea`,
+/// `subl` — treat `.` relative to cwd as "open this directory as a
+/// project", and some of them behave better with `.` than with an
+/// absolute path positional.
+///
+/// We spawn and detach a reaper thread that calls `wait()` on the
+/// child so it doesn't sit around as a `<defunct>` zombie after it
+/// exits. We intentionally don't kill the editor when flowzen quits.
 ///
 /// Returns `Err` with a readable message when:
 ///   * `path` isn't a directory (no project to open)
@@ -343,11 +347,15 @@ fn open_in_editor(editor: String, path: String) -> Result<(), String> {
     if !project_path.is_dir() {
         return Err(format!("not a directory: {path}"));
     }
-    Command::new(trimmed)
-        .arg(&path)
+    let mut child = Command::new(trimmed)
+        .arg(".")
+        .current_dir(project_path)
         .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("failed to launch `{trimmed}`: {e}"))
+        .map_err(|e| format!("failed to launch `{trimmed}`: {e}"))?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 /// One line inside a `ContentBlock`. `is_match` distinguishes the
