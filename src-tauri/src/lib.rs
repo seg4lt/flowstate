@@ -5,12 +5,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
+use tauri::ipc::Channel;
+use tauri::State;
 use tracing_subscriber::EnvFilter;
 use zenui_daemon_core::{
     DaemonConfig, DaemonLifecycle, Transport, bootstrap_core, graceful_shutdown,
 };
 use zenui_runtime_core::ConnectionObserver;
 use zenui_transport_tauri::TauriTransport;
+
+mod pty;
+use pty::{PtyId, PtyManager};
 
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
@@ -731,6 +736,43 @@ fn init_tracing() {
     }
 }
 
+#[tauri::command]
+fn pty_open(
+    manager: State<'_, PtyManager>,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+    shell: Option<String>,
+    on_data: Channel<Vec<u8>>,
+) -> Result<PtyId, String> {
+    manager.open(cols, rows, cwd, shell, on_data)
+}
+
+#[tauri::command]
+fn pty_write(manager: State<'_, PtyManager>, id: PtyId, data: Vec<u8>) -> Result<(), String> {
+    manager.write(id, &data)
+}
+
+#[tauri::command]
+fn pty_resize(manager: State<'_, PtyManager>, id: PtyId, cols: u16, rows: u16) -> Result<(), String> {
+    manager.resize(id, cols, rows)
+}
+
+#[tauri::command]
+fn pty_pause(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
+    manager.pause(id)
+}
+
+#[tauri::command]
+fn pty_resume(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
+    manager.resume(id)
+}
+
+#[tauri::command]
+fn pty_kill(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
+    manager.kill(id)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
@@ -738,6 +780,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(PtyManager::new())
         .setup(|app| {
             let app_handle = app.handle().clone();
             let flowzen_root = dirs::home_dir()
@@ -799,9 +842,18 @@ pub fn run() {
             read_project_file,
             search_file_contents,
             open_in_editor,
+            pty_open,
+            pty_write,
+            pty_resize,
+            pty_pause,
+            pty_resume,
+            pty_kill,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                if let Some(pty) = window.try_state::<PtyManager>() {
+                    pty.kill_all();
+                }
                 if let Some(state) = window.try_state::<AppLifecycle>() {
                     state.lifecycle.request_shutdown();
                 }

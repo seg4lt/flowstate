@@ -43,3 +43,8 @@ zenui-runtime-core = { path = "../../rs-agent-sdk/crates/core/runtime-core" }
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Integrated terminal — PTY allocation and process spawn. Powers the
+# Cmd+J dock. Cross-platform (UNIX openpty, Windows ConPTY) via
+# wezterm's battle-tested abstraction.
+portable-pty = "0.9"

@@ -1,0 +1,257 @@
+import * as React from "react";
+import { useMatches } from "@tanstack/react-router";
+import { Plus, X } from "lucide-react";
+import { useApp } from "@/stores/app-store";
+import { NO_PROJECT_KEY, useTerminal } from "@/stores/terminal-store";
+import { TerminalTab } from "./TerminalTab";
+import "@xterm/xterm/css/xterm.css";
+
+const DOCK_MIN_HEIGHT = 120;
+const DOCK_MAX_HEIGHT = 900;
+
+interface ActiveProject {
+  projectKey: string;
+  cwd: string | null;
+  /** True once we can trust the answer. If there's a sessionId in
+   *  the URL but the daemon hasn't sent its snapshot yet, we keep
+   *  this `false` so the auto-open effect waits rather than
+   *  spawning a shell in $HOME under NO_PROJECT_KEY. */
+  resolved: boolean;
+}
+
+function useActiveProject(): ActiveProject {
+  const { state } = useApp();
+  const matches = useMatches();
+
+  let sessionId: string | null = null;
+  for (const m of matches) {
+    const params = m.params as Record<string, string> | undefined;
+    if (params?.sessionId) {
+      sessionId = params.sessionId;
+      break;
+    }
+  }
+
+  // No session in the URL → we know this is NO_PROJECT_KEY. That
+  // answer is stable, so resolved is true.
+  if (!sessionId) {
+    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+  }
+
+  // sessionId is in the URL but the daemon snapshot hasn't arrived
+  // yet. Report unresolved so the dock holds off on auto-opening.
+  if (!state.ready) {
+    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: false };
+  }
+
+  const session =
+    state.sessions.get(sessionId) ??
+    state.archivedSessions.find((s) => s.sessionId === sessionId);
+  // Snapshot is loaded but the session still isn't there — it may
+  // arrive via a later event. Hold off.
+  if (!session) {
+    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: false };
+  }
+  if (!session.projectId) {
+    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+  }
+
+  const project = state.projects.find((p) => p.projectId === session.projectId);
+  if (!project) {
+    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+  }
+
+  return {
+    projectKey: project.projectId,
+    cwd: project.path ?? null,
+    resolved: true,
+  };
+}
+
+export function TerminalDock() {
+  const { state, dispatch } = useTerminal();
+  const { state: appState } = useApp();
+  const { projectKey, cwd, resolved } = useActiveProject();
+
+  // Prune terminals for projects that no longer exist in app state
+  // (user deleted the folder). Keeps NO_PROJECT_KEY alive.
+  React.useEffect(() => {
+    const keep = new Set(appState.projects.map((p) => p.projectId));
+    dispatch({ type: "prune_projects", keep });
+  }, [appState.projects, dispatch]);
+
+  const projectState = state.projects.get(projectKey);
+
+  // Auto-open a first tab when the dock is shown for a project
+  // that has none yet. Gated on `resolved` so we don't create a
+  // throwaway $HOME shell during the brief window between mount
+  // and the daemon snapshot arriving.
+  React.useEffect(() => {
+    if (!state.dockOpen) return;
+    if (!resolved) return;
+    const current = state.projects.get(projectKey);
+    if (!current || current.tabs.length === 0) {
+      dispatch({
+        type: "open_tab",
+        projectKey,
+        cwd: cwd ?? "",
+      });
+    }
+  }, [state.dockOpen, resolved, projectKey, cwd, dispatch, state.projects]);
+
+  const handleResize = React.useCallback(
+    (startY: number, startHeight: number) => {
+      function onMove(e: MouseEvent) {
+        const delta = startY - e.clientY;
+        const next = Math.max(
+          DOCK_MIN_HEIGHT,
+          Math.min(DOCK_MAX_HEIGHT, startHeight + delta),
+        );
+        dispatch({ type: "set_dock_height", height: next });
+      }
+      function onUp() {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        document.body.style.cursor = "";
+        document.body.style.userSelect = "";
+      }
+      document.body.style.cursor = "row-resize";
+      document.body.style.userSelect = "none";
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
+    },
+    [dispatch],
+  );
+
+  const activeTab = projectState?.tabs[projectState.activeTabIndex];
+
+  // NB: we do NOT early-return on !dockOpen. Unmounting the subtree
+  // would dispose every xterm instance and kill every PTY, which
+  // violates the "background instances stay alive" requirement.
+  // Instead we toggle `display` so React keeps the tab components
+  // mounted; the WebGL addon is released via the isVisible prop
+  // below so hidden tabs don't hold a GPU context.
+  return (
+    <div
+      className="absolute bottom-0 left-0 right-0 z-20 flex flex-col border-t border-border bg-[#0f0f10] text-xs"
+      style={{
+        height: state.dockHeight,
+        display: state.dockOpen ? "flex" : "none",
+      }}
+    >
+      {/* Drag handle */}
+      <div
+        role="separator"
+        aria-label="Resize terminal"
+        className="absolute -top-[3px] left-0 right-0 h-[6px] cursor-row-resize hover:bg-primary/30"
+        onMouseDown={(e) => {
+          e.preventDefault();
+          handleResize(e.clientY, state.dockHeight);
+        }}
+      />
+
+      {/* Tab strip */}
+      <div className="flex h-8 shrink-0 items-center gap-0.5 border-b border-border px-1 text-muted-foreground">
+        {projectState?.tabs.map((tab, idx) => {
+          const active = idx === projectState.activeTabIndex;
+          return (
+            <div
+              key={tab.id}
+              className={`group/tab flex h-6 items-center gap-1 rounded-sm px-2 text-[11px] ${
+                active
+                  ? "bg-background text-foreground"
+                  : "hover:bg-background/50"
+              }`}
+            >
+              <button
+                type="button"
+                className="max-w-[160px] truncate"
+                onClick={() =>
+                  dispatch({
+                    type: "set_active_tab",
+                    projectKey,
+                    tabId: tab.id,
+                  })
+                }
+              >
+                {tab.title}
+              </button>
+              <button
+                type="button"
+                aria-label="Close tab"
+                className="opacity-0 hover:text-foreground group-hover/tab:opacity-100"
+                onClick={() =>
+                  dispatch({
+                    type: "close_tab",
+                    projectKey,
+                    tabId: tab.id,
+                  })
+                }
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          );
+        })}
+        <button
+          type="button"
+          aria-label="New terminal"
+          className="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-background/50"
+          onClick={() =>
+            dispatch({
+              type: "open_tab",
+              projectKey,
+              cwd: cwd ?? "",
+            })
+          }
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
+        <div className="flex-1" />
+        <button
+          type="button"
+          aria-label="Hide terminal"
+          className="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-background/50"
+          onClick={() => dispatch({ type: "set_dock_open", open: false })}
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      </div>
+
+      {/* Terminal grid area — all tabs mounted, only active is shown */}
+      <div className="relative min-h-0 flex-1">
+        {projectState?.tabs.map((tab) => {
+          const isActive = tab.id === activeTab?.id;
+          return (
+          <div
+            key={tab.id}
+            className="absolute inset-0 p-1"
+            style={{ display: isActive ? "block" : "none" }}
+          >
+            <TerminalTab
+              tabId={tab.id}
+              cwd={tab.cwd || cwd || ""}
+              isVisible={state.dockOpen && isActive}
+              onTitleChange={(title) =>
+                dispatch({
+                  type: "set_tab_title",
+                  projectKey,
+                  tabId: tab.id,
+                  title,
+                })
+              }
+              onExit={() =>
+                dispatch({
+                  type: "close_tab",
+                  projectKey,
+                  tabId: tab.id,
+                })
+              }
+            />
+          </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

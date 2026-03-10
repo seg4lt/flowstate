@@ -15,6 +15,8 @@ import {
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
+import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
+import { TerminalDock } from "@/components/terminal/TerminalDock";
 import { ChatView } from "@/components/chat/chat-view";
 import { CodeView } from "@/components/code/code-view";
 import { SettingsView } from "@/components/settings/settings-view";
@@ -99,7 +101,27 @@ function DragHandle({
   );
 }
 
-function AppLayout() {
+// Cmd+J (Ctrl+J on non-mac) toggles the integrated terminal dock.
+// Intentionally no isInTextInput guard — the dock is chrome and the
+// user expects the shortcut to fire even while typing in the
+// composer, matching VS Code behavior.
+function useTerminalShortcut() {
+  const { dispatch } = useTerminal();
+  React.useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.altKey || e.shiftKey) return;
+      if (e.key.toLowerCase() !== "j") return;
+      e.preventDefault();
+      dispatch({ type: "toggle_dock" });
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [dispatch]);
+}
+
+function AppShell() {
+  useTerminalShortcut();
   const [width, setWidth] = React.useState<number>(() => {
     const saved = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
     if (!saved) return SIDEBAR_DEFAULT_WIDTH;
@@ -113,34 +135,43 @@ function AppLayout() {
   }, [width]);
 
   return (
+    <TooltipProvider>
+      <SidebarProvider
+        style={{ "--sidebar-width": `${width}px` } as React.CSSProperties}
+      >
+        {import.meta.env.DEV && (
+          <div className="pointer-events-none fixed top-1 left-1/2 z-50 -translate-x-1/2 rounded bg-amber-500/90 px-2 py-0.5 text-[10px] font-medium text-black shadow-sm">
+            DEV BUILD
+          </div>
+        )}
+        <AppSidebar />
+        <DragHandle width={width} onResize={setWidth} />
+        {/* min-w-0 + overflow-hidden are essential here. SidebarInset is a
+            flex item in the SidebarProvider row, and without min-w-0 its
+            default `min-width: auto` lets any wide child (code block,
+            tool card with long path, working indicator on a narrow
+            window) push the panel past the Tauri window edge, breaking
+            the layout for every sibling. overflow-hidden makes any
+            residual horizontal overflow clip cleanly inside the panel
+            instead of producing a window-level scrollbar. The `relative`
+            anchor is what the TerminalDock positions itself against
+            (absolute bottom). */}
+        <SidebarInset className="relative min-w-0 overflow-hidden">
+          <Outlet />
+          <TerminalDock />
+        </SidebarInset>
+      </SidebarProvider>
+      <Toaster />
+    </TooltipProvider>
+  );
+}
+
+function AppLayout() {
+  return (
     <AppProvider>
-      <TooltipProvider>
-        <SidebarProvider
-          style={
-            { "--sidebar-width": `${width}px` } as React.CSSProperties
-          }
-        >
-          {import.meta.env.DEV && (
-            <div className="pointer-events-none fixed top-1 left-1/2 z-50 -translate-x-1/2 rounded bg-amber-500/90 px-2 py-0.5 text-[10px] font-medium text-black shadow-sm">
-              DEV BUILD
-            </div>
-          )}
-          <AppSidebar />
-          <DragHandle width={width} onResize={setWidth} />
-          {/* min-w-0 + overflow-hidden are essential here. SidebarInset is a
-              flex item in the SidebarProvider row, and without min-w-0 its
-              default `min-width: auto` lets any wide child (code block,
-              tool card with long path, working indicator on a narrow
-              window) push the panel past the Tauri window edge, breaking
-              the layout for every sibling. overflow-hidden makes any
-              residual horizontal overflow clip cleanly inside the panel
-              instead of producing a window-level scrollbar. */}
-          <SidebarInset className="min-w-0 overflow-hidden">
-            <Outlet />
-          </SidebarInset>
-        </SidebarProvider>
-        <Toaster />
-      </TooltipProvider>
+      <TerminalProvider>
+        <AppShell />
+      </TerminalProvider>
     </AppProvider>
   );
 }
