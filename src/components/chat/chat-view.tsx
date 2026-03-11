@@ -451,22 +451,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       // Prevent default Tab behavior (focus navigation)
       event.preventDefault();
 
-      // Cycle to next mode
+      // Cycle to next mode. Local state only — the new mode rides out on
+      // the next `send_turn`. Pushing `update_permission_mode` to the
+      // daemon mid-stream flips the live SDK Query and drops the running
+      // turn from view, which is exactly what we're avoiding here.
       const newMode = cycleMode(permissionMode, "forward");
-
-      // Update local state
       setPermissionMode(newMode);
 
-      // Send to daemon
-      sendMessage({
-        type: "update_permission_mode",
-        session_id: sessionId,
-        permission_mode: newMode,
-      }).catch((err) => {
-        console.error("Failed to update permission mode", err);
-      });
-
-      // Show toast notification
       toast({
         description: `Mode: ${MODE_LABELS[newMode]}`,
         duration: 2000,
@@ -475,7 +466,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [sessionId, session, permissionMode]);
+  }, [session, permissionMode]);
 
   // Escape interrupts the in-flight turn. Mirrors the "esc" hint shown in
   // the working indicator. The title-rename Escape handler is scoped to
@@ -851,18 +842,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
   }
 
+  // Mode changes are local-only: the new mode rides out on the next
+  // `send_turn`, so the running turn stays untouched. Plan-exit mode
+  // switches go through `handlePermissionDecision` /
+  // `permission_mode_override`, which is the sanctioned atomic path.
   const handlePermissionModeChange = React.useCallback(
     (mode: PermissionMode) => {
       setPermissionMode(mode);
-      sendMessage({
-        type: "update_permission_mode",
-        session_id: sessionId,
-        permission_mode: mode,
-      }).catch((err) => {
-        console.error("Failed to update permission mode", err);
-      });
     },
-    [sessionId],
+    [],
   );
 
   const toolbar = session ? (
