@@ -8,6 +8,11 @@ interface MessageListProps {
   turns: TurnRecord[];
   loading: boolean;
   pendingInput: string | null;
+  /** Identity of the currently-visible session. Used as the
+   *  scroll-reset trigger so switching threads always lands the
+   *  user at the bottom-most (latest) message, even though
+   *  MessageList itself doesn't remount between sessions. */
+  sessionId: string;
   /** Number of older turns the daemon still has that haven't been
    *  fetched yet. Zero means the full history is in memory. Non-zero
    *  turns on the "Load older" button above the message list. */
@@ -55,6 +60,7 @@ export function MessageList({
   turns,
   loading,
   pendingInput,
+  sessionId,
   hiddenOlderCount = 0,
   loadingOlder = false,
   onLoadOlder,
@@ -73,6 +79,33 @@ export function MessageList({
     }
     return items;
   }, [turns, pendingInput]);
+
+  // Jump to the latest message whenever the user navigates to a
+  // new thread. MessageList doesn't remount between sessions (that
+  // design decision is what makes re-visits render instantly), so
+  // Virtuoso's `initialTopMostItemIndex` — which only applies on
+  // mount — can't do this on its own. A ref-tracked sessionId
+  // drives the imperative scroll once the target session's items
+  // are actually in the list; without the length check the first
+  // render after a click would try to scroll an empty virtuoso
+  // and the call silently no-ops.
+  const scrolledForSessionRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (displayItems.length === 0) return;
+    if (scrolledForSessionRef.current === sessionId) return;
+    scrolledForSessionRef.current = sessionId;
+    // Defer one frame so Virtuoso has a chance to measure the
+    // items that just arrived. Without the frame the scrollToIndex
+    // call fires before layout and gets dropped.
+    const raf = requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: "LAST",
+        align: "end",
+        behavior: "auto",
+      });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [sessionId, displayItems.length]);
 
   // Cold-cache case: no turns in hand yet AND the daemon hasn't
   // replied. Render a small loader inline in the scroll region

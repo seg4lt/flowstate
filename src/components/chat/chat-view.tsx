@@ -9,6 +9,7 @@ import type {
   PermissionDecision,
   PermissionMode,
   ReasoningEffort,
+  RuntimeEvent,
   TurnRecord,
   UserInputAnswer,
   UserInputQuestion,
@@ -94,6 +95,96 @@ function appendReasoningDelta(
   return [...list, { kind: "reasoning", text: delta }];
 }
 
+// Apply a single runtime event to a turns array and return the
+// next-state turns. Used by the stream handler to update the
+// query cache entry for the event's session — because this is a
+// pure function over `prev`, we can run it inside a
+// `queryClient.setQueryData` updater and route every event
+// directly to the right session's cache entry without any
+// cross-session state leakage. Returns the same array reference
+// when the event doesn't apply to any known turn, so the
+// updater can bail out and avoid a wasted re-render.
+function applyEventToTurns(
+  prev: TurnRecord[],
+  event: RuntimeEvent,
+): TurnRecord[] {
+  switch (event.type) {
+    case "turn_started":
+    case "turn_completed": {
+      const exists = prev.some((t) => t.turnId === event.turn.turnId);
+      if (exists) {
+        return prev.map((t) =>
+          t.turnId === event.turn.turnId ? event.turn : t,
+        );
+      }
+      return [...prev, event.turn];
+    }
+    case "content_delta":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              output: event.accumulated_output,
+              blocks: appendTextDelta(t.blocks, event.delta),
+            }
+          : t,
+      );
+    case "reasoning_delta":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              reasoning: (t.reasoning ?? "") + event.delta,
+              blocks: appendReasoningDelta(t.blocks, event.delta),
+            }
+          : t,
+      );
+    case "tool_call_started":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              toolCalls: [
+                ...(t.toolCalls ?? []),
+                {
+                  callId: event.call_id,
+                  name: event.name,
+                  args: event.args,
+                  status: "pending" as const,
+                  parentCallId: event.parent_call_id,
+                },
+              ],
+              blocks: [
+                ...(t.blocks ?? []),
+                { kind: "tool_call", callId: event.call_id },
+              ],
+            }
+          : t,
+      );
+    case "tool_call_completed":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.toolCalls) return t;
+        return {
+          ...t,
+          toolCalls: t.toolCalls.map((tc) =>
+            tc.callId === event.call_id
+              ? {
+                  ...tc,
+                  output: event.output,
+                  error: event.error,
+                  status: event.error
+                    ? ("failed" as const)
+                    : ("completed" as const),
+                }
+              : tc,
+          ),
+        };
+      });
+    default:
+      return prev;
+  }
+}
+
 // Vertical drag handle between the chat column and the diff pane.
 // Mirrors the sidebar DragHandle pattern in router.tsx but measures
 // against the split container's right edge so the panel grows from
@@ -169,50 +260,42 @@ function DiffDragHandle({
   );
 }
 
+// ChatView is stable across thread switches — we deliberately do
+// *not* key it on `sessionId`. Instead, `turns` is derived directly
+// from the tanstack query cache entry for the active session, and
+// streaming events write straight into that cache via setQueryData
+// (keyed by `event.session_id`). This gives us two properties:
+//
+//  1. Cross-session isolation is free. Every session has its own
+//     cache entry; an event for thread A can never touch thread B.
+//     That replaces the ref-juggling and defensive setTurns guards
+//     an earlier iteration needed, and eliminates the whole class
+//     of "two threads at once" races.
+//
+//  2. Re-visits are instant with no full re-render. Going A → B → A
+//     returns the *same* cached turns array reference, so React's
+//     reconciliation of MessageList is near-free — TurnView/
+//     MarkdownContent/CodeBlock all keep their rendered output
+//     under Virtuoso's key-based item reconciliation. The previous
+//     keyed-remount design correctly isolated state but paid the
+//     full render cost on every click, which is why threads felt
+//     slow to load even on warm cache.
 export function ChatView({ sessionId }: { sessionId: string }) {
   const { state, dispatch, send } = useApp();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  // The query cache is the source of truth for *persisted* session
-  // state — what the daemon last told us about this thread. `turns`
-  // mirrors it into local component state so the stream handler can
-  // apply deltas synchronously per render, and so `setTurns` updaters
-  // stay O(1) during high-frequency content_delta bursts. The cache
-  // is kept in sync on every mutation via `writeTurnsToCache`, so
-  // flipping back to a previously viewed thread restores the full
-  // latest turn list without a round-trip.
   const sessionQuery = useQuery(sessionQueryOptions(sessionId));
-  const [turns, setTurns] = React.useState<TurnRecord[]>(
-    () => sessionQuery.data?.detail.turns ?? [],
-  );
-  // Track which session the current `turns` state was seeded for.
-  // Without this, a background refetch that resolves while the user
-  // is still on the same session would clobber in-flight streaming
-  // state (content_delta updates mid-turn) with the older server
-  // snapshot. We only re-seed when `sessionId` actually changes.
-  const seededForRef = React.useRef<string | null>(null);
+  const turns: TurnRecord[] = sessionQuery.data?.detail.turns ?? [];
   const loading = sessionQuery.isLoading && !sessionQuery.data;
 
-  // Write the current turn list back to the session cache entry so
-  // a later re-visit (or a prefetch from hover) reads up-to-date
-  // state without refetching. Keeps `loadedTurns` / `totalTurns` in
-  // lockstep with the local list.
-  const writeTurnsToCache = React.useCallback(
-    (nextTurns: TurnRecord[]) => {
-      queryClient.setQueryData<SessionPage>(sessionQueryKey(sessionId), (prev) => {
-        if (!prev) return prev;
-        const total = Math.max(prev.totalTurns, nextTurns.length);
-        return {
-          ...prev,
-          detail: { ...prev.detail, turns: nextTurns },
-          loadedTurns: nextTurns.length,
-          totalTurns: total,
-          hasMoreOlder: nextTurns.length < total,
-        };
-      });
-    },
-    [queryClient, sessionId],
-  );
+  // Ref tracking the currently-visible session. Used by the stream
+  // handler to decide whether an incoming event should mutate
+  // *current-view* UI state (pending input, permission queue, etc.)
+  // in addition to the session-specific cache update. Events for
+  // inactive sessions still update their own cache entry but don't
+  // touch the current view's transient state.
+  const sessionIdRef = React.useRef(sessionId);
+  sessionIdRef.current = sessionId;
 
   // "Load older" state. The paginated initial load returns at most
   // SESSION_PAGE_SIZE turns from the tail; older turns are fetched
@@ -228,12 +311,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (loadingOlder) return;
     setLoadingOlder(true);
     try {
-      const page = await loadFullSession(queryClient, sessionId);
-      // Re-seed local `turns` with the full history. The seed latch
-      // is keyed on sessionId, so manually applying here is the
-      // right way to force a re-seed for the same session without
-      // forgetting the in-flight streaming state.
-      setTurns(page.detail.turns);
+      // loadFullSession writes the complete turn history into the
+      // cache entry itself; useQuery notifies and the view re-renders
+      // against the fatter `sessionQuery.data` automatically.
+      await loadFullSession(queryClient, sessionId);
     } finally {
       setLoadingOlder(false);
     }
@@ -426,83 +507,68 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [sessionId, dispatch]);
 
-  // Reset per-session transient UI state whenever the user navigates
-  // to a different thread. The cached `turns` may already be visible
-  // from the query cache at this point — that's the whole point of
-  // useQuery here — but queued prompts, pending optimistic input,
-  // and stuck-watchdog timers belong to the previous session and
-  // must not leak into the next one.
+  // Restore permission mode from the last persisted turn when the
+  // user lands on a session with no sessionStorage entry (a full
+  // page refresh, or the very first visit). Doesn't need to be
+  // synchronous — the toolbar picker tolerates a one-frame delay,
+  // and we don't want to clobber an explicit choice the user made
+  // in sessionStorage by racing them on render.
   React.useEffect(() => {
+    const data = sessionQuery.data;
+    if (!data || data.detail.turns.length === 0) return;
+    if (sessionStorage.getItem(permissionStorageKey)) return;
+    const lastMode = [...data.detail.turns]
+      .reverse()
+      .find((t) => t.permissionMode)?.permissionMode;
+    if (lastMode) {
+      setPermissionMode(lastMode);
+    }
+  }, [sessionQuery.data, permissionStorageKey]);
+
+  // Reset per-view transient UI state on every thread switch.
+  // These are "what the user sees right now" state values — they
+  // don't belong to any specific session long-term, but they must
+  // not leak from the session the user is leaving. (Per-session
+  // *turns* don't need to reset because they live in the query
+  // cache, keyed by sessionId.)
+  React.useEffect(() => {
+    setPendingInput(null);
     setPendingPermissions([]);
     setPendingQuestion(null);
-    setPendingInput(null);
     setLastEventAt(Date.now());
     setStuckSince(null);
   }, [sessionId]);
 
-  // Seed local `turns` from the query cache whenever the *session*
-  // changes. We do NOT re-seed on background refetches of the same
-  // session — those arrive as a fresh `data` reference but the local
-  // stream handler has typically moved further ahead (streaming
-  // deltas), so clobbering with the refetched snapshot would drop
-  // in-flight output. `seededForRef` is the latch that enforces
-  // "seed once per sessionId".
-  React.useEffect(() => {
-    const data = sessionQuery.data;
-    if (!data) return;
-    if (seededForRef.current === sessionId) return;
-    seededForRef.current = sessionId;
-    setTurns(data.detail.turns);
-    if (
-      !sessionStorage.getItem(permissionStorageKey) &&
-      data.detail.turns.length > 0
-    ) {
-      const lastMode = [...data.detail.turns]
-        .reverse()
-        .find((t) => t.permissionMode)?.permissionMode;
-      if (lastMode) {
-        setPermissionMode(lastMode);
-      }
-    }
-  }, [sessionId, sessionQuery.data, permissionStorageKey]);
-
-  // When the user navigates to a session we haven't seen yet, reset
-  // local turns so we don't briefly render the previous session's
-  // history while the query is still loading. Re-visits skip this
-  // because the query already has cached data at render time, so
-  // `turns` got seeded on the first render pass above.
-  React.useEffect(() => {
-    if (sessionQuery.data) return;
-    if (seededForRef.current === sessionId) return;
-    setTurns([]);
-  }, [sessionId, sessionQuery.data]);
-
-  // Mirror local `turns` into the query cache so a later visit (or
-  // a background prefetch) reads what we last observed — including
-  // turns that arrived via the streaming handler after the initial
-  // load. Gated on `seededForRef` so the initial empty-state render
-  // doesn't wipe the cache before the query has resolved.
-  React.useEffect(() => {
-    if (seededForRef.current !== sessionId) return;
-    writeTurnsToCache(turns);
-  }, [turns, sessionId, writeTurnsToCache]);
-
-  // Listen for session-specific events via a dedicated stream
+  // Single stream listener for the lifetime of ChatView. It
+  // *never* reads sessionId from a closure — turn updates go into
+  // the query cache entry identified by `event.session_id`, and
+  // per-view side effects (pending input, permission prompts)
+  // check against the `sessionIdRef` so only events for the
+  // currently-visible thread touch transient UI state. That's
+  // what makes cross-session isolation structural: a thread-A
+  // content_delta that lands after the user has clicked over to
+  // thread B writes into cache[A], updates exactly nothing on
+  // screen, and silently waits for the user to come back to A.
   React.useEffect(() => {
     let active = true;
 
     connectStream((message) => {
       if (!active) return;
-      // SessionLoaded arrives outside the event stream — both as a
-      // direct response to load_session and as a daemon-pushed reseed
-      // when the broadcast subscriber lagged and dropped events. In
-      // both cases, if it's for the active session we treat its
-      // turns[] as authoritative and replace local state. This is the
-      // recovery path for tool calls that would otherwise be stuck on
-      // pending after a dropped tool_call_completed event.
+
       if (message.type === "session_loaded") {
-        if (message.session.summary.sessionId === sessionId) {
-          setTurns(message.session.turns);
+        // Replace the cache entry for the target session outright —
+        // this is the lag-recovery path, where the daemon is telling
+        // us "here is the authoritative state of session X right now".
+        const detail = message.session;
+        const targetId = detail.summary.sessionId;
+        const totalTurns = detail.summary.turnCount ?? detail.turns.length;
+        queryClient.setQueryData<SessionPage>(sessionQueryKey(targetId), {
+          detail,
+          loadedTurns: detail.turns.length,
+          totalTurns,
+          hasMoreOlder: detail.turns.length < totalTurns,
+        });
+        if (targetId === sessionIdRef.current) {
           setPendingInput(null);
           setLastEventAt(Date.now());
           setStuckSince(null);
@@ -510,164 +576,62 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         }
         return;
       }
+
       if (message.type !== "event") return;
       const event = message.event;
+      if (!("session_id" in event)) return;
+      const eventSessionId = event.session_id;
 
-      if (!("session_id" in event) || event.session_id !== sessionId) return;
+      // Route turn mutations to the event's session cache. Events
+      // whose session isn't in the cache (the user has never
+      // visited) silently no-op — when the user eventually opens
+      // that thread, useQuery fetches fresh data from the daemon.
+      queryClient.setQueryData<SessionPage>(
+        sessionQueryKey(eventSessionId),
+        (prev) => {
+          if (!prev) return prev;
+          const nextTurns = applyEventToTurns(prev.detail.turns, event);
+          if (nextTurns === prev.detail.turns) return prev;
+          const total = Math.max(prev.totalTurns, nextTurns.length);
+          return {
+            ...prev,
+            detail: { ...prev.detail, turns: nextTurns },
+            loadedTurns: nextTurns.length,
+            totalTurns: total,
+            hasMoreOlder: nextTurns.length < total,
+          };
+        },
+      );
 
-      // Any event for this session proves the backend is still
-      // talking. Reset the stuck-watchdog timer on every tick so it
-      // only fires after genuine silence.
+      // Per-view UI state only moves for events on the currently-
+      // visible session. Everything below here is "reset pending
+      // chrome" / "scroll-to-bottom hints" / "router navigation" —
+      // all current-view concerns.
+      if (eventSessionId !== sessionIdRef.current) return;
+
       setLastEventAt(Date.now());
       setStuckSince(null);
 
       switch (event.type) {
         case "turn_started":
-          // Push the partial turn (with input set, output empty) so the
-          // user message becomes visible immediately. The optimistic
-          // pending row covers the gap between sendMessage being called
-          // and this event arriving — clear it now.
+          // Clear the optimistic pending row now that the real turn
+          // has been appended to the cache. Drop any queued permission
+          // prompts left over from a previous (probably interrupted)
+          // turn — the backend's sink for those is gone, and letting
+          // the user click on a stale prompt produces the old
+          // "resolve_permission found no pending sender" warning.
           setPendingInput(null);
-          // A brand-new turn means any permission prompts still in the
-          // queue belong to a previous (probably interrupted) turn and
-          // are un-answerable by the backend — its sink either no
-          // longer exists or has already drained their oneshots.
-          // Leaving them visible would let the user click on a stale
-          // prompt that routes an `answer_permission` to the new
-          // turn's sink, which produces the "resolve_permission found
-          // no pending sender" warning.
           setPendingPermissions([]);
-          setTurns((prev) => {
-            const exists = prev.some((t) => t.turnId === event.turn.turnId);
-            if (exists) {
-              return prev.map((t) =>
-                t.turnId === event.turn.turnId ? event.turn : t,
-              );
-            }
-            return [...prev, event.turn];
-          });
           break;
 
         case "turn_completed":
           setPendingInput(null);
-          // Symmetric to turn_started: once the turn has ended, any
-          // permission prompts still queued are for tool calls the
-          // backend will never ask us about again. Drop them so the
-          // UI doesn't sit on a stale prompt the user can't actually
-          // answer, and so the stuck-state watchdog doesn't trip on
-          // them.
           setPendingPermissions([]);
-          setTurns((prev) => {
-            const exists = prev.some((t) => t.turnId === event.turn.turnId);
-            if (exists) {
-              return prev.map((t) =>
-                t.turnId === event.turn.turnId ? event.turn : t,
-              );
-            }
-            return [...prev, event.turn];
-          });
           // Turn-wise refresh: every completed turn re-runs `git diff
           // HEAD` so the panel reflects exactly what this turn left
-          // on disk. Cheaper than instrumenting individual tools and
-          // catches every file the agent touched.
+          // on disk.
           refreshDiffs();
           break;
-
-        case "content_delta": {
-          // Extend the trailing text block of the matching turn with
-          // the new delta, or push a new text block if the previous
-          // block was something else (e.g. a tool call). This is what
-          // preserves stream order in the rendered view.
-          const deltaEvent = event;
-          setTurns((prev) =>
-            prev.map((t) =>
-              t.turnId === deltaEvent.turn_id
-                ? {
-                    ...t,
-                    output: deltaEvent.accumulated_output,
-                    blocks: appendTextDelta(t.blocks, deltaEvent.delta),
-                  }
-                : t,
-            ),
-          );
-          break;
-        }
-
-        case "reasoning_delta": {
-          const deltaEvent = event;
-          setTurns((prev) =>
-            prev.map((t) =>
-              t.turnId === deltaEvent.turn_id
-                ? {
-                    ...t,
-                    reasoning: (t.reasoning ?? "") + deltaEvent.delta,
-                    blocks: appendReasoningDelta(t.blocks, deltaEvent.delta),
-                  }
-                : t,
-            ),
-          );
-          break;
-        }
-
-        case "tool_call_started": {
-          // Append the new tool call to the matching turn so it appears
-          // immediately rather than waiting for turn_completed. The
-          // block records the stream position; toolCalls[] holds the
-          // mutable status/output that tool_call_completed updates.
-          const callEvent = event;
-          setTurns((prev) =>
-            prev.map((t) =>
-              t.turnId === callEvent.turn_id
-                ? {
-                    ...t,
-                    toolCalls: [
-                      ...(t.toolCalls ?? []),
-                      {
-                        callId: callEvent.call_id,
-                        name: callEvent.name,
-                        args: callEvent.args,
-                        status: "pending" as const,
-                        parentCallId: callEvent.parent_call_id,
-                      },
-                    ],
-                    blocks: [
-                      ...(t.blocks ?? []),
-                      { kind: "tool_call", callId: callEvent.call_id },
-                    ],
-                  }
-                : t,
-            ),
-          );
-          break;
-        }
-
-        case "tool_call_completed": {
-          // Update the matching tool call with its output/error and
-          // flip status. New arrays so memoization detects the change.
-          // No blocks change — the block is just a position reference.
-          const callEvent = event;
-          setTurns((prev) =>
-            prev.map((t) => {
-              if (t.turnId !== callEvent.turn_id || !t.toolCalls) return t;
-              return {
-                ...t,
-                toolCalls: t.toolCalls.map((tc) =>
-                  tc.callId === callEvent.call_id
-                    ? {
-                        ...tc,
-                        output: callEvent.output,
-                        error: callEvent.error,
-                        status: callEvent.error
-                          ? ("failed" as const)
-                          : ("completed" as const),
-                      }
-                    : tc,
-                ),
-              };
-            }),
-          );
-          break;
-        }
 
         case "user_question_asked":
           setPendingQuestion({
@@ -678,10 +642,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
         case "permission_requested":
           // Append to the FIFO queue. Dedupe on request_id because
-          // the daemon-side lag-recovery path can replay events, and
-          // a parallel canUseTool burst must not create N copies of
-          // the same prompt. The head of the queue is the prompt the
-          // user currently sees.
+          // the daemon-side lag-recovery path can replay events.
           setPendingPermissions((prev) => {
             if (prev.some((p) => p.requestId === event.request_id)) {
               return prev;
@@ -700,9 +661,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
         case "session_deleted":
         case "session_archived":
-          // The active thread was deleted or archived from the sidebar
-          // (or another window). Get out of the chat view so the user
-          // isn't staring at a stale title with no data behind it.
+          // Active thread deleted / archived from elsewhere — bail
+          // out so the user isn't staring at a title with no data.
           navigate({ to: "/" });
           break;
       }
@@ -711,7 +671,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => {
       active = false;
     };
-  }, [sessionId, navigate, refreshDiffs]);
+  }, [queryClient, navigate, refreshDiffs]);
 
   async function handleSend(input: string) {
     // --- Slash command interception ---
@@ -981,6 +941,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       >
         <div className="flex min-w-0 flex-1 flex-col">
           <MessageList
+            sessionId={sessionId}
             turns={turns}
             loading={loading}
             pendingInput={pendingInput}
@@ -1032,10 +993,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                   setStuckSince(null);
                   // Invalidate the cache entry and force a refetch so
                   // the next render re-seeds `turns` with whatever the
-                  // daemon has now. Clearing `seededForRef` is what
-                  // re-arms the seed effect for the same sessionId.
-                  seededForRef.current = null;
-                  queryClient.invalidateQueries({
+                  // daemon has now. The fetched `SessionPage` replaces
+                  // the cache entry, and the streaming handler picks
+                  // up from there on the next session_loaded reseed.
+                  void queryClient.invalidateQueries({
                     queryKey: sessionQueryKey(sessionId),
                     refetchType: "active",
                   });
@@ -1044,16 +1005,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             )}
 
           <ChatInput
-            // Key on sessionId so ChatInput remounts on every session
-            // switch. ChatView itself stays mounted across /chat/$id
-            // route changes (same component, new param) so without
-            // this key the input's local state -- the textarea draft
-            // AND the pendingSend queue flag -- would leak from the
-            // previous session into the next one. The leak was
-            // particularly nasty for pendingSend: a queued message in
-            // session A would auto-flush against session B the moment
-            // B's status flipped from running to ready, sending
-            // phantom input the user never typed in that thread.
+            // Remount the composer on every thread switch so its
+            // internal state (textarea draft, pendingSend queue
+            // flag, slash-command popup) resets cleanly. Without
+            // the key the draft from session A would leak into
+            // session B; the old pendingSend bug — where a queued
+            // message in A auto-flushed against B the moment B's
+            // status flipped to ready — is the scarier version
+            // of the same leak.
             key={sessionId}
             onSend={handleSend}
             onInterrupt={handleInterrupt}
