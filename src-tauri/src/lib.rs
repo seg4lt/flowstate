@@ -254,15 +254,17 @@ fn list_project_files(path: String) -> Vec<String> {
     }
 
     let mut entries: Vec<String> = Vec::new();
-    // `WalkBuilder::new(root).build()` honors .gitignore, .ignore,
-    // and (by default) skips hidden files. That's exactly the
-    // "project files" mental model — same as what a user sees in
-    // VS Code's file explorer.
+    // Match `git status` visibility: honor .gitignore (local, global,
+    // and .git/info/exclude), but don't silently drop dotfolders or
+    // `.ignore` files the way ripgrep does by default.
     for result in ignore::WalkBuilder::new(project_path)
-        .hidden(true)
+        .hidden(false)
+        .ignore(false)
         .git_ignore(true)
+        .git_global(true)
         .git_exclude(true)
         .parents(true)
+        .require_git(false)
         .build()
     {
         if entries.len() >= PROJECT_FILE_LIST_MAX {
@@ -645,10 +647,13 @@ fn search_file_contents(
     };
 
     let mut wb = ignore::WalkBuilder::new(project_path);
-    wb.hidden(true)
+    wb.hidden(false)
+        .ignore(false)
         .git_ignore(true)
+        .git_global(true)
         .git_exclude(true)
-        .parents(true);
+        .parents(true)
+        .require_git(false);
     if let Some(ov) = overrides {
         wb.overrides(ov);
     }
