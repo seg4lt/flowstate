@@ -192,7 +192,7 @@ export interface UserInputAnswer {
 export type ClientMessage =
   | { type: "ping" }
   | { type: "load_snapshot" }
-  | { type: "load_session"; session_id: string }
+  | { type: "load_session"; session_id: string; limit?: number }
   | { type: "start_session"; provider: ProviderKind; title?: string; model?: string; project_id?: string }
   | { type: "send_turn"; session_id: string; input: string; permission_mode?: PermissionMode; reasoning_effort?: ReasoningEffort }
   | { type: "interrupt_turn"; session_id: string }

@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Archive, EllipsisVertical, Loader2, Trash2 } from "lucide-react";
 import {
   DropdownMenu,
@@ -11,6 +12,7 @@ import {
   SidebarMenuSubItem,
 } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
+import { prefetchSession } from "@/lib/queries";
 
 function formatTimeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -44,9 +46,20 @@ export function ThreadItem({
   onClick,
 }: ThreadItemProps) {
   const { send } = useApp();
+  const queryClient = useQueryClient();
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(title);
   const inputRef = React.useRef<HTMLInputElement>(null);
+  // Hover prefetch: warm the session cache the moment the pointer
+  // enters this row so the click itself only has to consume cached
+  // data. A few hundred ms of hover — normal human targeting time —
+  // is usually enough to cover the full `load_session` round-trip.
+  // tanstack query dedupes repeated prefetches and skips entirely
+  // when the cache is already warm, so this is a no-op on
+  // re-entry or on the active thread.
+  const handleMouseEnter = React.useCallback(() => {
+    prefetchSession(queryClient, sessionId);
+  }, [queryClient, sessionId]);
 
   React.useEffect(() => {
     setDraft(title);
@@ -68,7 +81,10 @@ export function ThreadItem({
   }
 
   return (
-    <SidebarMenuSubItem className="group/thread -mr-6">
+    <SidebarMenuSubItem
+      className="group/thread -mr-6"
+      onMouseEnter={handleMouseEnter}
+    >
       {editing ? (
         <input
           ref={inputRef}

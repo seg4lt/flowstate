@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { GitBranch } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
@@ -12,12 +13,15 @@ import type {
   UserInputAnswer,
   UserInputQuestion,
 } from "@/lib/types";
+import { connectStream, sendMessage } from "@/lib/api";
 import {
-  connectStream,
-  getGitBranch,
-  getGitDiffSummary,
-  sendMessage,
-} from "@/lib/api";
+  gitBranchQueryOptions,
+  gitDiffSummaryQueryOptions,
+  loadFullSession,
+  sessionQueryKey,
+  sessionQueryOptions,
+  type SessionPage,
+} from "@/lib/queries";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
 import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
@@ -168,8 +172,72 @@ function DiffDragHandle({
 export function ChatView({ sessionId }: { sessionId: string }) {
   const { state, dispatch, send } = useApp();
   const navigate = useNavigate();
-  const [turns, setTurns] = React.useState<TurnRecord[]>([]);
-  const [loading, setLoading] = React.useState(true);
+  const queryClient = useQueryClient();
+  // The query cache is the source of truth for *persisted* session
+  // state — what the daemon last told us about this thread. `turns`
+  // mirrors it into local component state so the stream handler can
+  // apply deltas synchronously per render, and so `setTurns` updaters
+  // stay O(1) during high-frequency content_delta bursts. The cache
+  // is kept in sync on every mutation via `writeTurnsToCache`, so
+  // flipping back to a previously viewed thread restores the full
+  // latest turn list without a round-trip.
+  const sessionQuery = useQuery(sessionQueryOptions(sessionId));
+  const [turns, setTurns] = React.useState<TurnRecord[]>(
+    () => sessionQuery.data?.detail.turns ?? [],
+  );
+  // Track which session the current `turns` state was seeded for.
+  // Without this, a background refetch that resolves while the user
+  // is still on the same session would clobber in-flight streaming
+  // state (content_delta updates mid-turn) with the older server
+  // snapshot. We only re-seed when `sessionId` actually changes.
+  const seededForRef = React.useRef<string | null>(null);
+  const loading = sessionQuery.isLoading && !sessionQuery.data;
+
+  // Write the current turn list back to the session cache entry so
+  // a later re-visit (or a prefetch from hover) reads up-to-date
+  // state without refetching. Keeps `loadedTurns` / `totalTurns` in
+  // lockstep with the local list.
+  const writeTurnsToCache = React.useCallback(
+    (nextTurns: TurnRecord[]) => {
+      queryClient.setQueryData<SessionPage>(sessionQueryKey(sessionId), (prev) => {
+        if (!prev) return prev;
+        const total = Math.max(prev.totalTurns, nextTurns.length);
+        return {
+          ...prev,
+          detail: { ...prev.detail, turns: nextTurns },
+          loadedTurns: nextTurns.length,
+          totalTurns: total,
+          hasMoreOlder: nextTurns.length < total,
+        };
+      });
+    },
+    [queryClient, sessionId],
+  );
+
+  // "Load older" state. The paginated initial load returns at most
+  // SESSION_PAGE_SIZE turns from the tail; older turns are fetched
+  // in a single additional round-trip that replaces the cache entry
+  // with the full history. `loadingOlder` flips while the request
+  // is in flight so the banner can show a spinner.
+  const [loadingOlder, setLoadingOlder] = React.useState(false);
+  const hiddenOlderCount = Math.max(
+    0,
+    (sessionQuery.data?.totalTurns ?? 0) - turns.length,
+  );
+  const handleLoadOlder = React.useCallback(async () => {
+    if (loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await loadFullSession(queryClient, sessionId);
+      // Re-seed local `turns` with the full history. The seed latch
+      // is keyed on sessionId, so manually applying here is the
+      // right way to force a re-seed for the same session without
+      // forgetting the in-flight streaming state.
+      setTurns(page.detail.turns);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [loadingOlder, queryClient, sessionId]);
   // FIFO queue of outstanding permission requests. Parallel tool
   // calls from the Claude Agent SDK fire multiple canUseTool
   // callbacks in the same turn, and each one hits the runtime as a
@@ -213,9 +281,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // on session load, on every `turn_completed` event, and whenever
   // the user opens the panel — so each turn shows its cumulative
   // effect without us instrumenting individual tool calls.
-  // `diffRefreshTick` is the cheap dependency that lets the fetch
-  // effect rerun whenever the WS handler bumps it.
-  const [diffs, setDiffs] = React.useState<AggregatedFileDiff[]>([]);
+  // `diffRefreshTick` bumps the queryKey so tanstack query refetches
+  // the diff summary while still caching identical `(path, tick)`
+  // pairs across session switches in the same project.
   const [diffRefreshTick, setDiffRefreshTick] = React.useState(0);
   const refreshDiffs = React.useCallback(() => {
     setDiffRefreshTick((t) => t + 1);
@@ -265,21 +333,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
   }, [session?.projectId, state.projects]);
-  const [gitBranch, setGitBranch] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    if (!projectPath) {
-      setGitBranch(null);
-      return;
-    }
-    let cancelled = false;
-    getGitBranch(projectPath).then((branch) => {
-      if (!cancelled) setGitBranch(branch);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [projectPath]);
+  // Branch + diff summary are fetched via project-scoped queries,
+  // so switching between threads in the same project reuses the
+  // cached values rather than re-shelling out to git on every
+  // navigation. Both queries sit behind `enabled: !!path`, so the
+  // cache read is a no-op for folder-less (null-project) sessions
+  // where there's nothing to diff against.
+  const gitBranchQuery = useQuery(gitBranchQueryOptions(projectPath));
+  const gitBranch = gitBranchQuery.data ?? null;
+  const gitDiffQuery = useQuery(
+    gitDiffSummaryQueryOptions(projectPath, diffRefreshTick),
+  );
+  const diffs = React.useMemo<AggregatedFileDiff[]>(
+    () => gitDiffQuery.data ?? [],
+    [gitDiffQuery.data],
+  );
 
   // Keyboard shortcut for mode cycling (Shift+Tab)
   React.useEffect(() => {
@@ -358,42 +426,66 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [sessionId, dispatch]);
 
-  // Load session detail
+  // Reset per-session transient UI state whenever the user navigates
+  // to a different thread. The cached `turns` may already be visible
+  // from the query cache at this point — that's the whole point of
+  // useQuery here — but queued prompts, pending optimistic input,
+  // and stuck-watchdog timers belong to the previous session and
+  // must not leak into the next one.
   React.useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setTurns([]);
     setPendingPermissions([]);
     setPendingQuestion(null);
     setPendingInput(null);
     setLastEventAt(Date.now());
     setStuckSince(null);
-
-    sendMessage({ type: "load_session", session_id: sessionId }).then((res) => {
-      if (cancelled) return;
-      if (res && res.type === "session_loaded") {
-        setTurns(res.session.turns);
-        // Restore permission mode from the most recent turn when there is
-        // no sessionStorage entry yet (e.g. after a full page refresh).
-        if (
-          !sessionStorage.getItem(permissionStorageKey) &&
-          res.session.turns.length > 0
-        ) {
-          const lastMode = [...res.session.turns]
-            .reverse()
-            .find((t) => t.permissionMode)?.permissionMode;
-          if (lastMode) {
-            setPermissionMode(lastMode);
-          }
-        }
-      }
-      setLoading(false);
-    });
-
-    return () => {
-      cancelled = true;
-    };
   }, [sessionId]);
+
+  // Seed local `turns` from the query cache whenever the *session*
+  // changes. We do NOT re-seed on background refetches of the same
+  // session — those arrive as a fresh `data` reference but the local
+  // stream handler has typically moved further ahead (streaming
+  // deltas), so clobbering with the refetched snapshot would drop
+  // in-flight output. `seededForRef` is the latch that enforces
+  // "seed once per sessionId".
+  React.useEffect(() => {
+    const data = sessionQuery.data;
+    if (!data) return;
+    if (seededForRef.current === sessionId) return;
+    seededForRef.current = sessionId;
+    setTurns(data.detail.turns);
+    if (
+      !sessionStorage.getItem(permissionStorageKey) &&
+      data.detail.turns.length > 0
+    ) {
+      const lastMode = [...data.detail.turns]
+        .reverse()
+        .find((t) => t.permissionMode)?.permissionMode;
+      if (lastMode) {
+        setPermissionMode(lastMode);
+      }
+    }
+  }, [sessionId, sessionQuery.data, permissionStorageKey]);
+
+  // When the user navigates to a session we haven't seen yet, reset
+  // local turns so we don't briefly render the previous session's
+  // history while the query is still loading. Re-visits skip this
+  // because the query already has cached data at render time, so
+  // `turns` got seeded on the first render pass above.
+  React.useEffect(() => {
+    if (sessionQuery.data) return;
+    if (seededForRef.current === sessionId) return;
+    setTurns([]);
+  }, [sessionId, sessionQuery.data]);
+
+  // Mirror local `turns` into the query cache so a later visit (or
+  // a background prefetch) reads what we last observed — including
+  // turns that arrived via the streaming handler after the initial
+  // load. Gated on `seededForRef` so the initial empty-state render
+  // doesn't wipe the cache before the query has resolved.
+  React.useEffect(() => {
+    if (seededForRef.current !== sessionId) return;
+    writeTurnsToCache(turns);
+  }, [turns, sessionId, writeTurnsToCache]);
 
   // Listen for session-specific events via a dedicated stream
   React.useEffect(() => {
@@ -825,27 +917,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     />
   ) : null;
 
-  React.useEffect(() => {
-    if (!projectPath) {
-      setDiffs([]);
-      return;
-    }
-    let cancelled = false;
-    getGitDiffSummary(projectPath)
-      .then((entries) => {
-        if (cancelled) return;
-        setDiffs(entries);
-      })
-      .catch((err) => {
-        console.error("get_git_diff_summary failed", err);
-        if (!cancelled) setDiffs([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [projectPath, sessionId, diffRefreshTick]);
-
-
   return (
     <div className="flex h-svh min-w-0 flex-col overflow-hidden">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
@@ -913,6 +984,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             turns={turns}
             loading={loading}
             pendingInput={pendingInput}
+            hiddenOlderCount={hiddenOlderCount}
+            loadingOlder={loadingOlder}
+            onLoadOlder={handleLoadOlder}
           />
 
           {isRunning && session && runningTurn && (
@@ -956,7 +1030,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 }}
                 onReload={() => {
                   setStuckSince(null);
-                  sendMessage({ type: "load_session", session_id: sessionId });
+                  // Invalidate the cache entry and force a refetch so
+                  // the next render re-seeds `turns` with whatever the
+                  // daemon has now. Clearing `seededForRef` is what
+                  // re-arms the seed effect for the same sessionId.
+                  seededForRef.current = null;
+                  queryClient.invalidateQueries({
+                    queryKey: sessionQueryKey(sessionId),
+                    refetchType: "active",
+                  });
                 }}
               />
             )}

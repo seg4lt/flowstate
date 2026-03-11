@@ -1,10 +1,29 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { RouterProvider } from "@tanstack/react-router";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { WorkerPoolContextProvider } from "@pierre/diffs/react";
 import { router } from "./router";
 import { createPierreDiffsWorker } from "@/lib/pierre-diffs-worker";
 import "./index.css";
+
+// Single QueryClient for the whole app. Defaults chosen for a
+// local-first desktop app where we want perceived-instant thread
+// switches: never auto-refetch on mount or focus, keep cached
+// sessions around long enough to be useful across back-and-forth
+// navigation, but let each query opt in to its own staleTime.
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: Infinity,
+      gcTime: 30 * 60 * 1000,
+      refetchOnWindowFocus: false,
+      refetchOnMount: false,
+      refetchOnReconnect: false,
+      retry: false,
+    },
+  },
+});
 
 // Wrap the router in @pierre/diffs' worker pool so every diff view
 // (currently just the chat-side DiffPanel) tokenises and diffs off
@@ -13,6 +32,7 @@ import "./index.css";
 // cheap and is shared across every route / session switch.
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
+    <QueryClientProvider client={queryClient}>
     <WorkerPoolContextProvider
       poolOptions={{
         workerFactory: createPierreDiffsWorker,
@@ -53,5 +73,6 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     >
       <RouterProvider router={router} />
     </WorkerPoolContextProvider>
+    </QueryClientProvider>
   </React.StrictMode>,
 );
