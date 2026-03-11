@@ -185,7 +185,25 @@ impl RuntimeCore {
     /// authoritative live view, not whatever happened to be persisted at
     /// the last `turn_completed`.
     pub async fn live_session_detail(&self, session_id: &str) -> Option<SessionDetail> {
-        let mut detail = self.persistence.get_session(session_id).await?;
+        self.live_session_detail_limited(session_id, None).await
+    }
+
+    /// Paginated version of [`live_session_detail`]. When `limit` is
+    /// `Some(n)`, only the most recent `n` persisted turns are returned —
+    /// the in-flight turn (if any) is still spliced in regardless, so a
+    /// currently-running turn always appears in the response even if it
+    /// would otherwise have fallen outside the page. Callers can tell
+    /// whether more older turns exist by comparing `detail.turns.len()`
+    /// to `detail.summary.turn_count`.
+    pub async fn live_session_detail_limited(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Option<SessionDetail> {
+        let mut detail = self
+            .persistence
+            .get_session_limited(session_id, limit)
+            .await?;
         let live = self
             .in_flight_turns
             .read()
@@ -445,8 +463,8 @@ impl RuntimeCore {
             ClientMessage::LoadSnapshot => Some(ServerMessage::Snapshot {
                 snapshot: self.snapshot().await,
             }),
-            ClientMessage::LoadSession { session_id } => {
-                match self.live_session_detail(&session_id).await {
+            ClientMessage::LoadSession { session_id, limit } => {
+                match self.live_session_detail_limited(&session_id, limit).await {
                     Some(session) => Some(ServerMessage::SessionLoaded { session }),
                     None => Some(ServerMessage::Error {
                         message: format!("Session `{session_id}` not found."),

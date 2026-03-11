@@ -933,6 +933,14 @@ pub enum ClientMessage {
     LoadSnapshot,
     LoadSession {
         session_id: String,
+        /// Cap the number of turns returned to the most recent `limit`.
+        /// Absent (the default) means "return every turn" — callers that
+        /// don't care about long-thread payload size can keep using the
+        /// original shape. Transports and UIs that want perceived-fast
+        /// thread opens should pass a small positive value (e.g. 50)
+        /// and lazy-load older turns on demand.
+        #[serde(default)]
+        limit: Option<usize>,
     },
     StartSession {
         provider: ProviderKind,

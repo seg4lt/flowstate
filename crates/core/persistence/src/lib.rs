@@ -160,7 +160,22 @@ impl PersistenceService {
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        load_session(&connection, session_id).ok().flatten()
+        load_session(&connection, session_id, None).ok().flatten()
+    }
+
+    /// Like `get_session` but returns only the most recent `limit` turns
+    /// (in ascending order) when `limit` is `Some`. Used by the paginated
+    /// `LoadSession` path so opening a long thread doesn't pay for the
+    /// full history on the first render. The `summary.turn_count` stays
+    /// set to the session's true turn count so callers can tell when more
+    /// older turns exist server-side.
+    pub async fn get_session_limited(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Option<SessionDetail> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        load_session(&connection, session_id, limit).ok().flatten()
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionDetail> {
@@ -172,7 +187,7 @@ impl PersistenceService {
 
         session_ids
             .into_iter()
-            .filter_map(|session_id| load_session(&connection, &session_id).ok().flatten())
+            .filter_map(|session_id| load_session(&connection, &session_id, None).ok().flatten())
             .collect()
     }
 
@@ -742,7 +757,11 @@ fn list_session_ids(connection: &Connection) -> Result<Vec<String>> {
         .context("failed to collect session ids")
 }
 
-fn load_session(connection: &Connection, session_id: &str) -> Result<Option<SessionDetail>> {
+fn load_session(
+    connection: &Connection,
+    session_id: &str,
+    limit: Option<usize>,
+) -> Result<Option<SessionDetail>> {
     let summary = connection
         .query_row(
             "SELECT session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model, project_id
@@ -770,68 +789,103 @@ fn load_session(connection: &Connection, session_id: &str) -> Result<Option<Sess
         return Ok(None);
     };
 
-    let mut statement = connection
-        .prepare(
+    // When limit is absent we load the full history in ascending order
+    // (what the rest of the runtime expects). When limit is present we
+    // flip the SQL to `ORDER BY created_at DESC LIMIT n` — this is the
+    // only way sqlite will actually touch only the tail of the `turns`
+    // table — and then reverse the resulting Vec so the caller still
+    // sees turns in chronological order.
+    let (sql, turn_limit_param): (String, Option<i64>) = if let Some(n) = limit {
+        (
             "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
                     tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
                     reasoning_effort, blocks_json
-             FROM turns WHERE session_id = ?1 ORDER BY created_at ASC",
+             FROM turns WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2"
+                .to_string(),
+            Some(n as i64),
         )
+    } else {
+        (
+            "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
+                    tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
+                    reasoning_effort, blocks_json
+             FROM turns WHERE session_id = ?1 ORDER BY created_at ASC"
+                .to_string(),
+            None,
+        )
+    };
+    let mut statement = connection
+        .prepare(&sql)
         .context("failed to prepare turn query")?;
-    let turns = statement
-        .query_map(params![session_id], |row| {
-            let output: String = row.get(2)?;
-            let reasoning: Option<String> = row.get(6)?;
-            let tool_calls_json: Option<String> = row.get(7)?;
-            let file_changes_json: Option<String> = row.get(8)?;
-            let subagents_json: Option<String> = row.get(9)?;
-            let plan_json: Option<String> = row.get(10)?;
-            let permission_mode_str: Option<String> = row.get(11)?;
-            let reasoning_effort_str: Option<String> = row.get(12)?;
-            let blocks_json: Option<String> = row.get(13)?;
-            let tool_calls: Vec<ToolCall> = tool_calls_json
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default();
-            let file_changes: Vec<FileChangeRecord> = file_changes_json
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default();
-            let subagents: Vec<SubagentRecord> = subagents_json
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_default();
-            let plan: Option<PlanRecord> =
-                plan_json.and_then(|j| serde_json::from_str(&j).ok());
-            let permission_mode: Option<PermissionMode> =
-                permission_mode_str.as_deref().map(permission_mode_from_str);
-            let reasoning_effort: Option<ReasoningEffort> =
-                reasoning_effort_str.as_deref().and_then(reasoning_effort_from_str);
-            // Prefer the persisted ordered blocks. For historical rows
-            // (no blocks_json), synthesize a plausible block list from
-            // the legacy columns: reasoning, then text, then tool calls,
-            // matching the old text-then-tools UI so historic turns keep
-            // rendering through the same code path as new ones.
-            let blocks: Vec<ContentBlock> = blocks_json
-                .and_then(|j| serde_json::from_str(&j).ok())
-                .unwrap_or_else(|| synthesize_blocks(reasoning.as_deref(), &output, &tool_calls));
-            Ok(TurnRecord {
-                turn_id: row.get(0)?,
-                input: row.get(1)?,
-                output,
-                status: turn_status_from_str(&row.get::<_, String>(3)?),
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                reasoning,
-                tool_calls,
-                file_changes,
-                subagents,
-                plan,
-                permission_mode,
-                reasoning_effort,
-                blocks,
-            })
+    let row_mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<TurnRecord> {
+        let output: String = row.get(2)?;
+        let reasoning: Option<String> = row.get(6)?;
+        let tool_calls_json: Option<String> = row.get(7)?;
+        let file_changes_json: Option<String> = row.get(8)?;
+        let subagents_json: Option<String> = row.get(9)?;
+        let plan_json: Option<String> = row.get(10)?;
+        let permission_mode_str: Option<String> = row.get(11)?;
+        let reasoning_effort_str: Option<String> = row.get(12)?;
+        let blocks_json: Option<String> = row.get(13)?;
+        let tool_calls: Vec<ToolCall> = tool_calls_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        let file_changes: Vec<FileChangeRecord> = file_changes_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        let subagents: Vec<SubagentRecord> = subagents_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        let plan: Option<PlanRecord> = plan_json.and_then(|j| serde_json::from_str(&j).ok());
+        let permission_mode: Option<PermissionMode> =
+            permission_mode_str.as_deref().map(permission_mode_from_str);
+        let reasoning_effort: Option<ReasoningEffort> = reasoning_effort_str
+            .as_deref()
+            .and_then(reasoning_effort_from_str);
+        // Prefer the persisted ordered blocks. For historical rows
+        // (no blocks_json), synthesize a plausible block list from
+        // the legacy columns: reasoning, then text, then tool calls,
+        // matching the old text-then-tools UI so historic turns keep
+        // rendering through the same code path as new ones.
+        let blocks: Vec<ContentBlock> = blocks_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_else(|| synthesize_blocks(reasoning.as_deref(), &output, &tool_calls));
+        Ok(TurnRecord {
+            turn_id: row.get(0)?,
+            input: row.get(1)?,
+            output,
+            status: turn_status_from_str(&row.get::<_, String>(3)?),
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
+            reasoning,
+            tool_calls,
+            file_changes,
+            subagents,
+            plan,
+            permission_mode,
+            reasoning_effort,
+            blocks,
         })
-        .context("failed to query turns")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to collect turns")?;
+    };
+    let mut turns: Vec<TurnRecord> = match turn_limit_param {
+        Some(n) => statement
+            .query_map(params![session_id, n], row_mapper)
+            .context("failed to query turns")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect turns")?,
+        None => statement
+            .query_map(params![session_id], row_mapper)
+            .context("failed to query turns")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect turns")?,
+    };
+    // Limited queries come out of sqlite in descending order so the
+    // LIMIT clause picks the tail. Flip to ascending here so the
+    // caller sees a single consistent ordering regardless of which
+    // SQL branch ran.
+    if turn_limit_param.is_some() {
+        turns.reverse();
+    }
 
     let provider_state = connection
         .query_row(
