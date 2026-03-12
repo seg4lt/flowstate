@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::transport::TransportAddressInfo;
+use zenui_runtime_core::transport::TransportAddressInfo;
 
 /// Ready file format version. ZenUI is pre-release; this is the only
 /// format we've ever written on disk. The field is kept for future

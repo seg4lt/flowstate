@@ -5964,6 +5964,8 @@ dependencies = [
  "zenui-provider-github-copilot",
  "zenui-provider-github-copilot-cli",
  "zenui-runtime-core",
+ "zenui-transport-http",
+ "zenui-transport-tauri",
 ]
 
 [[package]]
@@ -6083,6 +6085,7 @@ dependencies = [
 name = "zenui-runtime-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "futures",
@@ -6115,7 +6118,6 @@ dependencies = [
  "zenui-daemon-client",
  "zenui-daemon-core",
  "zenui-provider-api",
- "zenui-transport-http",
 ]
 
 [[package]]
@@ -6133,7 +6135,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "zenui-daemon-core",
  "zenui-provider-api",
  "zenui-runtime-core",
 ]
@@ -6147,7 +6148,6 @@ dependencies = [
  "tauri",
  "tokio",
  "tracing",
- "zenui-daemon-core",
  "zenui-provider-api",
  "zenui-runtime-core",
 ]

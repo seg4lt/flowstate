@@ -24,7 +24,6 @@ mod config;
 mod lifecycle;
 mod ready_file;
 mod shutdown;
-pub mod transport;
 
 use std::sync::Arc;
 
@@ -32,11 +31,24 @@ use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
-use zenui_provider_api::{ProviderAdapter, ProviderKind, RuntimeEvent};
+use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
+#[cfg(any(
+    feature = "provider-codex",
+    feature = "provider-claude-sdk",
+    feature = "provider-claude-cli",
+    feature = "provider-github-copilot",
+    feature = "provider-github-copilot-cli",
+))]
+use zenui_provider_api::ProviderKind;
+#[cfg(feature = "provider-claude-cli")]
 use zenui_provider_claude_cli::ClaudeCliAdapter;
+#[cfg(feature = "provider-claude-sdk")]
 use zenui_provider_claude_sdk::ClaudeSdkAdapter;
+#[cfg(feature = "provider-codex")]
 use zenui_provider_codex::CodexAdapter;
+#[cfg(feature = "provider-github-copilot")]
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
+#[cfg(feature = "provider-github-copilot-cli")]
 use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore, TurnLifecycleObserver};
 
@@ -44,7 +56,21 @@ pub use config::DaemonConfig;
 pub use lifecycle::{DaemonLifecycle, IdleShutdownReason, idle_watchdog};
 pub use ready_file::{ReadyFile, ReadyFileContent};
 pub use shutdown::graceful_shutdown;
-pub use transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
+// Transport traits now live in `runtime-core` so transport crates can
+// depend on them without pulling in daemon-core (which would create a
+// cycle when daemon-core takes optional deps on concrete transports).
+// Re-exported here for API stability.
+pub use zenui_runtime_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
+
+// Concrete transport crates, re-exported under stable module aliases.
+// Consumers opt in via the matching Cargo feature (`transport-tauri`,
+// `transport-http`, or the `all-transports` meta feature) and then
+// import via `zenui_daemon_core::transport_tauri::…` etc. — same
+// centralised entry-point pattern as the provider crates above.
+#[cfg(feature = "transport-tauri")]
+pub use zenui_transport_tauri as transport_tauri;
+#[cfg(feature = "transport-http")]
+pub use zenui_transport_http as transport_http;
 
 /// Headless runtime handle returned by [`bootstrap_core`]. Owns the tokio
 /// runtime, the `RuntimeCore`, and the `DaemonLifecycle`. Callers use
@@ -76,21 +102,13 @@ pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
 
     let lifecycle = DaemonLifecycle::new(config.idle_timeout);
 
-    let mut adapters: Vec<Arc<dyn ProviderAdapter>> = Vec::new();
-    for &kind in &config.enabled_providers {
-        let adapter: Arc<dyn ProviderAdapter> = match kind {
-            ProviderKind::Codex => Arc::new(CodexAdapter::new(working_directory.clone())),
-            ProviderKind::Claude => Arc::new(ClaudeSdkAdapter::new(working_directory.clone())),
-            ProviderKind::GitHubCopilot => {
-                Arc::new(GitHubCopilotAdapter::new(working_directory.clone()))
-            }
-            ProviderKind::ClaudeCli => Arc::new(ClaudeCliAdapter::new(working_directory.clone())),
-            ProviderKind::GitHubCopilotCli => {
-                Arc::new(GitHubCopilotCliAdapter::new(working_directory.clone()))
-            }
-        };
-        adapters.push(adapter);
-    }
+    // Provider adapter construction. Delegated to `build_adapters`
+    // which is feature-gated — when no provider features are enabled it
+    // collapses to an empty-vec stub that doesn't even reference the
+    // ProviderKind enum. That keeps the zero-provider build warning-free
+    // for embedders who want to bring their own adapters or test the
+    // transport layer in isolation.
+    let adapters = build_adapters(&working_directory, &config.enabled_providers);
     let orchestration = Arc::new(OrchestrationService::new());
     let persistence = Arc::new(
         PersistenceService::new(database_path)
@@ -119,6 +137,76 @@ pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
         runtime_core,
         lifecycle,
     })
+}
+
+/// Walk `config.enabled_providers` and instantiate the subset that has
+/// been compiled in. Each match arm is gated on its Cargo feature, so a
+/// disabled provider's adapter code is stripped from the binary
+/// entirely. Variants requested at runtime but not compiled in fall
+/// through to the catch-all and log a warning.
+#[cfg(any(
+    feature = "provider-codex",
+    feature = "provider-claude-sdk",
+    feature = "provider-claude-cli",
+    feature = "provider-github-copilot",
+    feature = "provider-github-copilot-cli",
+))]
+fn build_adapters(
+    working_directory: &std::path::PathBuf,
+    enabled: &[zenui_provider_api::ProviderKind],
+) -> Vec<Arc<dyn ProviderAdapter>> {
+    let mut adapters: Vec<Arc<dyn ProviderAdapter>> = Vec::new();
+    for &kind in enabled {
+        let adapter: Arc<dyn ProviderAdapter> = match kind {
+            #[cfg(feature = "provider-codex")]
+            ProviderKind::Codex => Arc::new(CodexAdapter::new(working_directory.clone())),
+            #[cfg(feature = "provider-claude-sdk")]
+            ProviderKind::Claude => Arc::new(ClaudeSdkAdapter::new(working_directory.clone())),
+            #[cfg(feature = "provider-github-copilot")]
+            ProviderKind::GitHubCopilot => {
+                Arc::new(GitHubCopilotAdapter::new(working_directory.clone()))
+            }
+            #[cfg(feature = "provider-claude-cli")]
+            ProviderKind::ClaudeCli => Arc::new(ClaudeCliAdapter::new(working_directory.clone())),
+            #[cfg(feature = "provider-github-copilot-cli")]
+            ProviderKind::GitHubCopilotCli => {
+                Arc::new(GitHubCopilotCliAdapter::new(working_directory.clone()))
+            }
+            #[allow(unreachable_patterns)]
+            kind => {
+                tracing::warn!(
+                    ?kind,
+                    "provider requested in enabled_providers but disabled at compile time; skipping"
+                );
+                continue;
+            }
+        };
+        adapters.push(adapter);
+    }
+    adapters
+}
+
+/// Zero-provider fallback. Used when the crate is built with no
+/// `provider-*` features — typically by integration-test harnesses or
+/// embedders that inject their own adapters via a custom bootstrap.
+#[cfg(not(any(
+    feature = "provider-codex",
+    feature = "provider-claude-sdk",
+    feature = "provider-claude-cli",
+    feature = "provider-github-copilot",
+    feature = "provider-github-copilot-cli",
+)))]
+fn build_adapters(
+    _working_directory: &std::path::PathBuf,
+    enabled: &[zenui_provider_api::ProviderKind],
+) -> Vec<Arc<dyn ProviderAdapter>> {
+    if !enabled.is_empty() {
+        tracing::warn!(
+            provider_count = enabled.len(),
+            "daemon-core built without any provider features; ignoring enabled_providers"
+        );
+    }
+    Vec::new()
 }
 
 pub fn init_tracing() {

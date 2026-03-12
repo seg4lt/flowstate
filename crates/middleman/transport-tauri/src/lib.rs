@@ -1,7 +1,7 @@
 //! Tauri IPC transport for the ZenUI daemon.
 //!
-//! Implements `zenui_daemon_core::Transport` using Tauri's in-process
-//! IPC. The transport manages the daemon lifecycle hooks
+//! Implements `zenui_runtime_core::transport::Transport` using Tauri's
+//! in-process IPC. The transport manages the daemon lifecycle hooks
 //! (connected/disconnected) and exposes the `RuntimeCore` + observer
 //! via [`TauriDaemonState`] for Tauri commands to drive streaming.
 //!
@@ -37,7 +37,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
-use zenui_daemon_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
+use zenui_runtime_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 
 pub mod commands;

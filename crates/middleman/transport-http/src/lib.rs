@@ -1,6 +1,6 @@
 //! HTTP + WebSocket transport for the ZenUI daemon.
 //!
-//! Implements `zenui_daemon_core::Transport` via a two-stage
+//! Implements `zenui_runtime_core::transport::Transport` via a two-stage
 //! `HttpTransport` → `HttpBound` → `HttpHandle` lifecycle. `bind()` runs on
 //! the host thread and claims the TCP listener synchronously (so
 //! port-in-use errors surface at daemon startup, not later). `serve()`
@@ -30,10 +30,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
-use zenui_daemon_core::{Bound, Transport, TransportAddressInfo, TransportHandle};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, HealthPayload, ServerMessage,
 };
+use zenui_runtime_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 
 /// Frontend bundle embedded into the binary at build time. The path is

@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use zenui_daemon_core::{
-    DaemonConfig, ReadyFile, Transport, TransportAddressInfo, run_blocking,
+    DaemonConfig, ReadyFile, Transport, TransportAddressInfo, run_blocking, transport_http,
 };
 use zenui_provider_api::ProviderKind;
-use zenui_transport_http::HttpTransport;
+use transport_http::HttpTransport;
 
 #[derive(Debug, Parser)]
 #[command(

@@ -5,6 +5,8 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
 chrono.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -16,5 +18,4 @@ zenui-persistence = { path = "../persistence" }
 zenui-provider-api = { path = "../provider-api" }
 
 [dev-dependencies]
-async-trait.workspace = true
 serde_json.workspace = true

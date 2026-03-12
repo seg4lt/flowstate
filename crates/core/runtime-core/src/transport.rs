@@ -1,10 +1,16 @@
-//! Transport-composition contract for `daemon-core`.
+//! Transport-composition contract.
 //!
 //! A `Transport` is a wire adapter that exposes `RuntimeCore` to
 //! out-of-process clients (HTTP, Unix socket, Tauri IPC, wry custom
 //! protocol — whatever). `daemon-core::run_blocking` accepts a
 //! `Vec<Box<dyn Transport>>` and drives each one's lifecycle alongside
 //! the shared runtime and idle watchdog.
+//!
+//! This module lives in `runtime-core` (rather than `daemon-core`) so
+//! transport crates can depend on it without pulling in `daemon-core`.
+//! That inversion is what lets `daemon-core` take *optional* feature-
+//! gated dependencies on concrete transport crates and re-export them,
+//! without introducing a dependency cycle.
 //!
 //! # Two-stage lifecycle
 //!
@@ -48,7 +54,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
+
+use crate::{ConnectionObserver, RuntimeCore};
 
 /// A configured transport that has not yet claimed any OS resources.
 /// Constructed by the app in its `main()` function.
