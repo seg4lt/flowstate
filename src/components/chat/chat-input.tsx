@@ -183,10 +183,14 @@ export function ChatInput({
   const sendDisabled = !hasContent || disabled;
 
   return (
-    <div className="shrink-0 border-t border-border px-3 pb-2 pt-3">
-      <div className="mx-auto max-w-3xl">
-        {queued.length > 0 && (
-          <div className="mb-2 space-y-1">
+    // Queued chips live OUTSIDE the bordered composer so they float above
+    // the divider in the chat area, not inside the composer box. When the
+    // queue is empty the extra wrapper collapses and the composer renders
+    // exactly as it did before.
+    <div className="shrink-0">
+      {queued.length > 0 && (
+        <div className="px-3 pb-1 pt-2">
+          <div className="mx-auto max-w-3xl space-y-1">
             {queued.map((item, idx) => (
               <div
                 key={item.id}
@@ -212,60 +216,63 @@ export function ChatInput({
               </div>
             ))}
           </div>
-        )}
-
-        <div className="relative flex items-end gap-2">
-          {/* Autocomplete popup — positioned above the textarea */}
-          {showPopup && matches.length > 0 && (
-            <SlashCommandPopup
-              matches={matches}
-              selectedIndex={popupIndex}
-              onSelect={handlePopupSelect}
-            />
-          )}
-
-          <textarea
-            ref={textareaRef}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onInput={handleInput}
-            placeholder={
-              queued.length > 0
-                ? "Compose another message…"
-                : "Send a message..."
-            }
-            disabled={disabled}
-            rows={1}
-            className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-          />
-
-          {showStop ? (
-            <button
-              type="button"
-              onClick={onInterrupt}
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              title="Interrupt (Esc)"
-            >
-              <Square className="h-4 w-4" />
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={handleSubmit}
-              disabled={sendDisabled}
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
-              title={
-                isRunning || queued.length > 0
-                  ? "Add to queue (fires when current turn ends)"
-                  : "Send"
-              }
-            >
-              <Send className="h-4 w-4" />
-            </button>
-          )}
         </div>
-        {toolbar && <div className="mt-1.5">{toolbar}</div>}
+      )}
+      <div className="border-t border-border px-3 pb-2 pt-3">
+        <div className="mx-auto max-w-3xl">
+          <div className="relative flex items-end gap-2">
+            {/* Autocomplete popup — positioned above the textarea */}
+            {showPopup && matches.length > 0 && (
+              <SlashCommandPopup
+                matches={matches}
+                selectedIndex={popupIndex}
+                onSelect={handlePopupSelect}
+              />
+            )}
+
+            <textarea
+              ref={textareaRef}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onInput={handleInput}
+              placeholder={
+                queued.length > 0
+                  ? "Compose another message…"
+                  : "Send a message..."
+              }
+              disabled={disabled}
+              rows={1}
+              className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+            />
+
+            {showStop ? (
+              <button
+                type="button"
+                onClick={onInterrupt}
+                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                title="Interrupt (Esc)"
+              >
+                <Square className="h-4 w-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleSubmit}
+                disabled={sendDisabled}
+                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
+                title={
+                  isRunning || queued.length > 0
+                    ? "Add to queue (fires when current turn ends)"
+                    : "Send"
+                }
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            )}
+          </div>
+          {toolbar && <div className="mt-1.5">{toolbar}</div>}
+        </div>
       </div>
     </div>
   );
