@@ -895,6 +895,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                         .to_string(),
                 ),
                 models: copilot_cli_models(),
+                enabled: true,
             };
         }
 
@@ -917,6 +918,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     status: ProviderStatusLevel::Error,
                     message: Some(format!("Failed to start copilot CLI: {e}")),
                     models: copilot_cli_models(),
+                    enabled: true,
                 };
             }
             Err(_) => {
@@ -929,6 +931,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     status: ProviderStatusLevel::Error,
                     message: Some("Timed out starting copilot CLI".to_string()),
                     models: copilot_cli_models(),
+                    enabled: true,
                 };
             }
         };
@@ -975,6 +978,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                         .to_string(),
                 ),
                 models: copilot_cli_models(),
+                enabled: true,
             };
         }
 
@@ -1001,6 +1005,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             status,
             message,
             models: copilot_cli_models(),
+            enabled: true,
         }
     }
 

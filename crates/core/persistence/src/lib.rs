@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -332,6 +333,46 @@ impl PersistenceService {
             })
     }
 
+    /// Load the full provider-enablement map. Keys are every row in
+    /// `provider_enablement`; providers whose kind has no row are treated
+    /// as enabled by the caller (runtime-core defaults to `true` on miss).
+    pub async fn get_provider_enablement(&self) -> HashMap<ProviderKind, bool> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = match connection
+            .prepare("SELECT provider, enabled FROM provider_enablement")
+        {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+        let rows = statement.query_map([], |row| {
+            let provider: String = row.get(0)?;
+            let enabled: i64 = row.get(1)?;
+            Ok((provider, enabled != 0))
+        });
+        match rows {
+            Ok(iter) => iter
+                .filter_map(|r| r.ok())
+                .map(|(provider, enabled)| (provider_kind_from_str(&provider), enabled))
+                .collect(),
+            Err(_) => HashMap::new(),
+        }
+    }
+
+    /// Upsert a provider's runtime-enabled flag. Called from the
+    /// `SetProviderEnabled` handler.
+    pub async fn set_provider_enabled(&self, kind: ProviderKind, enabled: bool) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let _ = connection.execute(
+            "INSERT INTO provider_enablement (provider, enabled, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(provider) DO UPDATE SET
+                enabled = excluded.enabled,
+                updated_at = excluded.updated_at",
+            params![provider_kind_to_str(kind), enabled as i64, now],
+        );
+    }
+
     /// Persist the health status for a provider with `now` as the checked_at timestamp.
     pub async fn set_cached_health(&self, kind: ProviderKind, status: &ProviderStatus) {
         let json = match serde_json::to_string(status) {
@@ -563,6 +604,12 @@ impl PersistenceService {
                 provider TEXT PRIMARY KEY,
                 checked_at TEXT NOT NULL,
                 status_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS provider_enablement (
+                provider TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
             );
             ",
             )

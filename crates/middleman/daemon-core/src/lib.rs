@@ -128,9 +128,14 @@ pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
         threads_dir,
     ));
 
-    // Reclaim any sessions stuck at `Running` from a prior crash before
-    // we serve any clients.
-    tokio_runtime.block_on(runtime_core.reconcile_startup());
+    // Reclaim any sessions stuck at `Running` from a prior crash, and
+    // seed the provider enablement map from persistence, before we
+    // serve any clients. Both are single-shot async reads over the
+    // already-open SQLite handle — cheap and idempotent.
+    tokio_runtime.block_on(async {
+        runtime_core.reconcile_startup().await;
+        runtime_core.seed_provider_enablement().await;
+    });
 
     Ok(BootstrappedCore {
         tokio_runtime,

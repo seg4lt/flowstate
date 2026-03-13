@@ -716,6 +716,7 @@ async fn probe_cli(
                         },
                         message,
                         models,
+                        enabled: true,
                     }
                 }
                 Err(error) => ProviderStatus {
@@ -729,6 +730,7 @@ async fn probe_cli(
                         "{label} CLI is installed, but auth probing failed: {error}"
                     )),
                     models,
+                    enabled: true,
                 },
             }
         }
@@ -741,6 +743,7 @@ async fn probe_cli(
             status: ProviderStatusLevel::Error,
             message: Some(format!("{label} CLI is unavailable: {error}")),
             models,
+            enabled: true,
         },
     }
 }

@@ -749,6 +749,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
                     "claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
                 )),
                 models: vec![],
+                enabled: true,
             };
         }
 
@@ -795,6 +796,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
             status,
             message,
             models: claude_cli_models(),
+            enabled: true,
         }
     }
 

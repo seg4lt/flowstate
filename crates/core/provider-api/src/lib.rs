@@ -295,6 +295,17 @@ pub struct ProviderStatus {
     pub message: Option<String>,
     #[serde(default)]
     pub models: Vec<ProviderModel>,
+    /// Runtime toggle — when `false`, the daemon refuses new turns
+    /// for this provider and the frontend greys it out in Settings and
+    /// hides it from the new-session picker. Adapters themselves
+    /// always emit `true`; runtime-core overwrites with the persisted
+    /// value from the `provider_enablement` table before broadcasting.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1008,6 +1019,15 @@ pub enum ClientMessage {
     },
     RefreshModels {
         provider: ProviderKind,
+    },
+    /// Flip a provider's runtime enabled flag. Persisted to the
+    /// `provider_enablement` table and broadcast via
+    /// `ProviderHealthUpdated` so every connected client sees the
+    /// new state. Disabled providers skip health checks and reject
+    /// `SendTurn` — see `runtime-core::handle_client_message`.
+    SetProviderEnabled {
+        provider: ProviderKind,
+        enabled: bool,
     },
     CreateProject {
         name: String,

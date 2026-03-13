@@ -695,6 +695,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 status: ProviderStatusLevel::Error,
                 message: Some(format!("embedded Node.js extraction failed: {err:?}")),
                 models: claude_models(),
+                enabled: true,
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -707,6 +708,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 status: ProviderStatusLevel::Error,
                 message: Some(format!("Claude SDK bridge extraction failed: {err:?}")),
                 models: claude_models(),
+                enabled: true,
             };
         }
 
@@ -719,6 +721,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             status: ProviderStatusLevel::Ready,
             message: Some("Claude Agent SDK bridge ready".to_string()),
             models: claude_models(),
+            enabled: true,
         }
     }
 

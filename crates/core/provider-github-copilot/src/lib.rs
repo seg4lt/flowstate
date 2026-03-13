@@ -633,6 +633,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 status: ProviderStatusLevel::Error,
                 message: Some(format!("embedded Node.js extraction failed: {err:?}")),
                 models: copilot_models(),
+                enabled: true,
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -645,6 +646,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 status: ProviderStatusLevel::Error,
                 message: Some(format!("Copilot bridge extraction failed: {err:?}")),
                 models: copilot_models(),
+                enabled: true,
             };
         }
 
@@ -668,6 +670,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 status: ProviderStatusLevel::Ready,
                 message: Some(format!("Copilot SDK ready (found at {})", path)),
                 models: copilot_models(),
+                enabled: true,
             },
             None => ProviderStatus {
                 kind,
@@ -681,6 +684,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                         .to_string(),
                 ),
                 models: copilot_models(),
+                enabled: true,
             },
         }
     }

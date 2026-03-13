@@ -100,6 +100,13 @@ pub struct RuntimeCore {
     /// the broadcast queue would otherwise be invisible until the very end.
     /// Cleared in both the success and failure exit paths.
     in_flight_turns: Arc<RwLock<HashMap<String, TurnRecord>>>,
+    /// Runtime enabled/disabled flag per provider. Seeded from the
+    /// `provider_enablement` persistence table on boot and mutated via
+    /// `ClientMessage::SetProviderEnabled`. Missing entries default to
+    /// `true` — newly-added providers are enabled until the user says
+    /// otherwise. Read by `bootstrap`, `spawn_health_check`, and
+    /// `handle_send_turn` to gate downstream behavior.
+    provider_enablement: Arc<RwLock<HashMap<ProviderKind, bool>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
@@ -168,8 +175,67 @@ impl RuntimeCore {
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
             in_flight_health_checks: Arc::new(Mutex::new(HashSet::new())),
             in_flight_turns: Arc::new(RwLock::new(HashMap::new())),
+            provider_enablement: Arc::new(RwLock::new(HashMap::new())),
             turn_observer,
         }
+    }
+
+    /// Populate `provider_enablement` from the persistence table. Called
+    /// once at daemon startup from `daemon-core::bootstrap_core` after
+    /// `RuntimeCore::new`. Providers without a row in the table default
+    /// to enabled on the read side, so this is idempotent and safe to
+    /// call multiple times.
+    pub async fn seed_provider_enablement(&self) {
+        let map = self.persistence.get_provider_enablement().await;
+        if let Ok(mut lock) = self.provider_enablement.write() {
+            *lock = map;
+        }
+    }
+
+    /// Read-side helper. Returns `true` when the provider has no row in
+    /// the `provider_enablement` table or its row is `enabled = 1`,
+    /// `false` only when the user has explicitly disabled it.
+    pub fn is_provider_enabled(&self, kind: ProviderKind) -> bool {
+        self.provider_enablement
+            .read()
+            .ok()
+            .and_then(|lock| lock.get(&kind).copied())
+            .unwrap_or(true)
+    }
+
+    /// Mutation side of the provider-enablement toggle. Writes through
+    /// to persistence, updates the in-memory lock, and broadcasts a
+    /// fresh `ProviderHealthUpdated` event so every connected client
+    /// re-renders without needing a full reload.
+    ///
+    /// The broadcast uses the cached health status as a base and
+    /// overwrites just the `enabled` field — we don't re-run the
+    /// expensive health probe on a toggle. If there's no cached status
+    /// yet (first-boot edge case), we synthesise a minimal one.
+    async fn set_provider_enabled(&self, kind: ProviderKind, enabled: bool) {
+        self.persistence.set_provider_enabled(kind, enabled).await;
+        if let Ok(mut lock) = self.provider_enablement.write() {
+            lock.insert(kind, enabled);
+        }
+
+        let status = match self.persistence.get_cached_health(kind).await {
+            Some((_, mut status)) => {
+                status.enabled = enabled;
+                status
+            }
+            None => ProviderStatus {
+                kind,
+                label: kind.label().to_string(),
+                installed: false,
+                authenticated: false,
+                version: None,
+                status: zenui_provider_api::ProviderStatusLevel::Warning,
+                message: Some("No health check yet".to_string()),
+                models: Vec::new(),
+                enabled,
+            },
+        };
+        self.publish(RuntimeEvent::ProviderHealthUpdated { status });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {
@@ -338,15 +404,22 @@ impl RuntimeCore {
         // (>24h) or missing, spawn a background health check to refresh.
         // If fresh, skip the expensive health check entirely — next launch
         // will still see the cached entry.
+        //
+        // The runtime `enabled` flag is stamped onto each ProviderStatus
+        // here — adapters always emit `true`, persistence caches whatever
+        // they emitted, but the authoritative enablement state lives in
+        // `self.provider_enablement` so we overwrite on read. Same rule
+        // applies to `spawn_health_check`.
         let mut cached_providers: Vec<ProviderStatus> = Vec::new();
         for &kind in self.adapters.keys() {
             match self.persistence.get_cached_health(kind).await {
-                Some((checked_at, status)) => {
+                Some((checked_at, mut status)) => {
                     tracing::info!(
                         ?kind,
                         ?checked_at,
                         "loaded cached provider health"
                     );
+                    status.enabled = self.is_provider_enabled(kind);
                     cached_providers.push(status);
                     if is_cache_stale(&checked_at) {
                         self.spawn_health_check(kind);
@@ -371,6 +444,14 @@ impl RuntimeCore {
     /// result, kicks off a model refresh if stale, and broadcasts a
     /// `ProviderHealthUpdated` event when done. Deduped per provider.
     fn spawn_health_check(&self, kind: ProviderKind) {
+        // Skip the probe entirely when the provider is toggled off —
+        // the frontend greys it out based on the `enabled` flag
+        // regardless of health status, and the probe itself can be
+        // expensive (spawns a bridge, extracts a node runtime, etc.).
+        if !self.is_provider_enabled(kind) {
+            tracing::debug!(?kind, "provider disabled; skipping health check");
+            return;
+        }
         let Some(adapter) = self.adapters.get(&kind).cloned() else {
             return;
         };
@@ -378,6 +459,7 @@ impl RuntimeCore {
         let event_tx = self.event_tx.clone();
         let in_flight = self.in_flight_health_checks.clone();
         let in_flight_models = self.in_flight_model_fetches.clone();
+        let enablement = self.provider_enablement.clone();
 
         tokio::spawn(async move {
             // Dedupe: skip if another health check for this provider is running.
@@ -413,6 +495,16 @@ impl RuntimeCore {
                     true
                 }
             };
+
+            // Stamp the runtime enablement flag onto the fresh status
+            // before persisting / broadcasting. Adapters always emit
+            // `true`, so without this overwrite a disabled provider
+            // would reappear as enabled after its next health check.
+            status.enabled = enablement
+                .read()
+                .ok()
+                .and_then(|lock| lock.get(&kind).copied())
+                .unwrap_or(true);
 
             // Persist the freshly-checked health so the next daemon start
             // can return it in the bootstrap payload without re-running
@@ -576,6 +668,16 @@ impl RuntimeCore {
                 self.spawn_model_refresh(provider);
                 Some(ServerMessage::Ack {
                     message: format!("Refreshing models for {}.", provider.label()),
+                })
+            }
+            ClientMessage::SetProviderEnabled { provider, enabled } => {
+                self.set_provider_enabled(provider, enabled).await;
+                Some(ServerMessage::Ack {
+                    message: format!(
+                        "{} {}.",
+                        provider.label(),
+                        if enabled { "enabled" } else { "disabled" }
+                    ),
                 })
             }
             ClientMessage::CreateProject { name, path } => {
@@ -887,6 +989,16 @@ impl RuntimeCore {
             .get_session(&session_id)
             .await
             .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        // Runtime enablement gate. Reject before we touch orchestration
+        // so a disabled provider can't start a turn mid-stream. Previous
+        // turns on this session stay visible (read-only) — that's the
+        // "badge + history preserved" contract from Phase 5.
+        if !self.is_provider_enabled(session.summary.provider) {
+            return Err(format!(
+                "{} is disabled. Re-enable it in Settings to send new messages.",
+                session.summary.provider.label()
+            ));
+        }
         self.resolve_session_cwd(&mut session).await;
         let adapter = self
             .adapters
