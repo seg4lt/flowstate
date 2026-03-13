@@ -10,9 +10,10 @@ use tauri::State;
 use tracing_subscriber::EnvFilter;
 use zenui_daemon_core::{
     DaemonConfig, DaemonLifecycle, Transport, bootstrap_core, graceful_shutdown,
+    transport_tauri,
 };
 use zenui_runtime_core::ConnectionObserver;
-use zenui_transport_tauri::TauriTransport;
+use transport_tauri::TauriTransport;
 
 mod pty;
 use pty::{PtyId, PtyManager};
@@ -838,8 +839,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            zenui_transport_tauri::commands::connect,
-            zenui_transport_tauri::commands::handle_message,
+            transport_tauri::commands::connect,
+            transport_tauri::commands::handle_message,
             get_git_branch,
             get_git_diff_summary,
             get_git_diff_file,

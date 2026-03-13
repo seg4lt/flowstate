@@ -31,9 +31,11 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 grep-matcher = "0.1"
 
-# Daemon core + Tauri transport (embedded daemon)
-zenui-daemon-core = { path = "../../rs-agent-sdk/crates/middleman/daemon-core" }
-zenui-transport-tauri = { path = "../../rs-agent-sdk/crates/middleman/transport-tauri" }
+# Daemon core with opted-in features: every provider adapter, plus
+# the Tauri transport. flowzen ships with all providers compiled in
+# and lets users toggle them at runtime from Settings. transport-tauri
+# is re-exported by daemon-core as `zenui_daemon_core::transport_tauri`.
+zenui-daemon-core = { path = "../../rs-agent-sdk/crates/middleman/daemon-core", features = ["all-providers", "transport-tauri"] }
 
 # Types used in Tauri commands
 zenui-provider-api = { path = "../../rs-agent-sdk/crates/core/provider-api" }
