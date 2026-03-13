@@ -2,6 +2,7 @@ import * as React from "react";
 import { Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SidebarTrigger } from "@/components/ui/sidebar";
+import { Switch } from "@/components/ui/switch";
 import { useApp } from "@/stores/app-store";
 import { toast } from "@/hooks/use-toast";
 import type { ProviderKind, ProviderStatus } from "@/lib/types";
@@ -59,26 +60,38 @@ function ProviderRow({
   provider,
   onRefresh,
   refreshing,
+  onToggleEnabled,
 }: {
   kind: ProviderKind;
   provider: ProviderStatus | undefined;
   onRefresh: () => void;
   refreshing: boolean;
+  onToggleEnabled: (enabled: boolean) => void;
 }) {
   const label = PROVIDER_LABELS[kind];
   const modelCount = provider?.models.length ?? 0;
   const isReady = provider?.status === "ready";
-  const statusText = provider
-    ? provider.status === "ready"
-      ? `${modelCount} model${modelCount === 1 ? "" : "s"}`
-      : (provider.message ?? provider.status)
-    : "checking...";
+  // Provider entries from the daemon always carry an `enabled` flag
+  // after Phase 2, but during the cold-start bootstrap window we can
+  // render before the first `welcome` lands, so default to true.
+  const enabled = provider?.enabled ?? true;
+  const statusText = !enabled
+    ? "Disabled"
+    : provider
+      ? provider.status === "ready"
+        ? `${modelCount} model${modelCount === 1 ? "" : "s"}`
+        : (provider.message ?? provider.status)
+      : "checking...";
 
   return (
-    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+    <div
+      className={`flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0 ${
+        !enabled ? "opacity-60" : ""
+      }`}
+    >
       <span
         className={`inline-block h-2 w-2 shrink-0 rounded-full ${
-          isReady ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"
+          isReady && enabled ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"
         }`}
       />
       <div className="min-w-0 flex-1">
@@ -90,16 +103,17 @@ function ProviderRow({
       <Button
         variant="outline"
         size="sm"
-        disabled={!isReady || refreshing}
+        disabled={!isReady || refreshing || !enabled}
         onClick={onRefresh}
       >
-        {refreshing ? (
-          <Loader2 className="animate-spin" />
-        ) : (
-          <RefreshCw />
-        )}
+        {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}
         Refresh models
       </Button>
+      <Switch
+        checked={enabled}
+        onCheckedChange={onToggleEnabled}
+        aria-label={`${enabled ? "Disable" : "Enable"} ${label}`}
+      />
     </div>
   );
 }
@@ -151,6 +165,21 @@ export function SettingsView() {
     }
   }
 
+  async function handleToggleEnabled(kind: ProviderKind, enabled: boolean) {
+    try {
+      await send({ type: "set_provider_enabled", provider: kind, enabled });
+      toast({
+        description: `${PROVIDER_LABELS[kind]} ${enabled ? "enabled" : "disabled"}`,
+        duration: 2000,
+      });
+    } catch (err) {
+      toast({
+        description: `Failed to update ${PROVIDER_LABELS[kind]}: ${(err as Error).message}`,
+        duration: 4000,
+      });
+    }
+  }
+
   return (
     <div className="flex h-svh flex-col">
       <header className="flex h-12 items-center gap-2 border-b border-border px-2 text-sm">
@@ -161,7 +190,7 @@ export function SettingsView() {
         <div className="mx-auto max-w-2xl px-6 py-8">
           <SettingsGroup
             title="Providers"
-            description="Refresh the cached model list for each provider. Models are cached for 24 hours by default."
+            description="Toggle which providers are available, and refresh their cached model lists. Models are cached for 24 hours by default."
           >
             {PROVIDER_ORDER.map((kind) => (
               <ProviderRow
@@ -170,6 +199,7 @@ export function SettingsView() {
                 provider={providerMap.get(kind)}
                 onRefresh={() => handleRefresh(kind)}
                 refreshing={refreshingKind === kind}
+                onToggleEnabled={(enabled) => handleToggleEnabled(kind, enabled)}
               />
             ))}
           </SettingsGroup>

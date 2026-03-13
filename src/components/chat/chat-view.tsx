@@ -410,6 +410,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, []);
 
   const session = state.sessions.get(sessionId);
+  // Runtime enablement lookup for the session's provider. When the
+  // user disables a provider from Settings, existing sessions stay
+  // visible (history preserved) but the chat header shows a badge
+  // and the composer's send button is forced off. A disabled provider
+  // is also `undefined` here if its health check hasn't arrived yet,
+  // which matches the "start optimistic, reconcile on welcome" flow
+  // the rest of the view already uses.
+  const providerDisabled = React.useMemo(() => {
+    if (!session) return false;
+    const provider = state.providers.find((p) => p.kind === session.provider);
+    return provider?.enabled === false;
+  }, [session, state.providers]);
   const projectPath = React.useMemo(() => {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
@@ -893,12 +905,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               {title}
             </span>
           )}
-          {gitBranch && (
-            <span className="inline-flex items-center gap-1 truncate text-[11px] text-muted-foreground">
-              <GitBranch className="h-3 w-3 shrink-0" />
-              {gitBranch}
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {gitBranch && (
+              <span className="inline-flex items-center gap-1 truncate text-[11px] text-muted-foreground">
+                <GitBranch className="h-3 w-3 shrink-0" />
+                {gitBranch}
+              </span>
+            )}
+            {providerDisabled && (
+              <span className="inline-flex shrink-0 items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                Provider disabled
+              </span>
+            )}
+          </div>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <HeaderActions
@@ -1006,6 +1025,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             onInterrupt={handleInterrupt}
             sessionStatus={session?.status}
             disabled={loading}
+            providerDisabled={providerDisabled}
             toolbar={toolbar}
             commands={COMMAND_META}
           />

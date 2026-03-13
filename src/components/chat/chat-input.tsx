@@ -9,6 +9,11 @@ interface ChatInputProps {
   onInterrupt: () => void;
   sessionStatus: SessionStatus | undefined;
   disabled: boolean;
+  /** When true, the session's provider has been toggled off in
+   *  Settings — the composer is locked read-only until the user
+   *  re-enables it. Distinct from `disabled` which is about transient
+   *  loading states. */
+  providerDisabled?: boolean;
   toolbar?: React.ReactNode;
   /** Command metadata for the autocomplete popup. */
   commands?: { name: string; description: string }[];
@@ -34,6 +39,7 @@ export function ChatInput({
   onInterrupt,
   sessionStatus,
   disabled,
+  providerDisabled = false,
   toolbar,
 }: ChatInputProps) {
   const [value, setValue] = React.useState("");
@@ -92,6 +98,7 @@ export function ChatInput({
   }
 
   function handleSubmit() {
+    if (providerDisabled) return;
     const trimmed = value.trim();
     if (!trimmed) return;
     // While a turn is running OR earlier messages are still queued,
@@ -179,8 +186,8 @@ export function ChatInput({
   // mid-compose. Queued chips are intentionally NOT a precondition --
   // interrupting only stops the current turn and leaves the queue
   // intact, so the user can always reach the stop affordance.
-  const showStop = isRunning && !hasContent;
-  const sendDisabled = !hasContent || disabled;
+  const showStop = isRunning && !hasContent && !providerDisabled;
+  const sendDisabled = !hasContent || disabled || providerDisabled;
 
   return (
     // Queued chips live OUTSIDE the bordered composer so they float above
@@ -237,11 +244,13 @@ export function ChatInput({
               onKeyDown={handleKeyDown}
               onInput={handleInput}
               placeholder={
-                queued.length > 0
-                  ? "Compose another message…"
-                  : "Send a message..."
+                providerDisabled
+                  ? "Provider disabled — re-enable it in Settings to send"
+                  : queued.length > 0
+                    ? "Compose another message…"
+                    : "Send a message..."
               }
-              disabled={disabled}
+              disabled={disabled || providerDisabled}
               rows={1}
               className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             />

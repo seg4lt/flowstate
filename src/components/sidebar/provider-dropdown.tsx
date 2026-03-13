@@ -104,6 +104,11 @@ export function ProviderDropdown({ projectId }: ProviderDropdownProps) {
 
         {ALL_PROVIDERS.map(({ kind, label }) => {
           const info = providerMap.get(kind);
+          // Disabled providers are hidden from the new-session picker
+          // entirely. Users re-enable them from Settings, which updates
+          // `state.providers` via `provider_health_updated` and they
+          // reappear here without a reload.
+          if (info && info.enabled === false) return null;
           const isReady = info?.status === "ready";
           const hasModels = info && info.models.length > 0;
 
