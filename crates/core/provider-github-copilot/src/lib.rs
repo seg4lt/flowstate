@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -47,6 +49,67 @@ struct CopilotBridgeProcess {
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Lines<BufReader<ChildStdout>>,
     bridge_session_id: String,
+}
+
+/// Idle timeout: a cached bridge with no in-flight turn is killed after
+/// this many seconds of inactivity.
+const BRIDGE_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Watchdog tick interval. Determines the worst-case delay between a
+/// bridge crossing the idle threshold and actually being killed.
+const BRIDGE_WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Cached bridge entry with activity tracking. Wraps the long-lived
+/// bridge process with two atomics so a background watchdog can safely
+/// cull idle entries without racing against `bridge_request_streaming`.
+#[derive(Debug, Clone)]
+struct CachedBridge {
+    process: Arc<Mutex<CopilotBridgeProcess>>,
+    /// Unix epoch seconds at which the last turn finished (or the bridge
+    /// was created). Only consulted when `in_flight == 0`.
+    last_activity: Arc<AtomicU64>,
+    /// Number of turns currently running on this bridge. Incremented at
+    /// turn start and decremented via RAII in `ActivityGuard::drop`.
+    in_flight: Arc<AtomicU32>,
+}
+
+impl CachedBridge {
+    fn new(process: CopilotBridgeProcess) -> Self {
+        Self {
+            process: Arc::new(Mutex::new(process)),
+            last_activity: Arc::new(AtomicU64::new(unix_now())),
+            in_flight: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    fn activity_guard(&self) -> ActivityGuard {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        ActivityGuard {
+            in_flight: self.in_flight.clone(),
+            last_activity: self.last_activity.clone(),
+        }
+    }
+}
+
+/// RAII guard held for the duration of a turn. On drop, decrements the
+/// in-flight counter and stamps `last_activity = now`, starting the
+/// idle clock.
+struct ActivityGuard {
+    in_flight: Arc<AtomicU32>,
+    last_activity: Arc<AtomicU64>,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        self.last_activity.store(unix_now(), Ordering::Release);
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// ZenUI Bridge Protocol Messages (Rust → TS)
@@ -158,7 +221,10 @@ enum BridgeResponse {
 #[derive(Debug, Clone)]
 pub struct GitHubCopilotAdapter {
     working_directory: PathBuf,
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CopilotBridgeProcess>>>>>,
+    sessions: Arc<Mutex<HashMap<String, CachedBridge>>>,
+    /// Latches true the first time `ensure_session_process` runs so the
+    /// idle-kill watchdog is spawned exactly once per adapter instance.
+    watchdog_started: Arc<AtomicBool>,
 }
 
 impl GitHubCopilotAdapter {
@@ -166,7 +232,61 @@ impl GitHubCopilotAdapter {
         Self {
             working_directory,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            watchdog_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Spawn the idle-kill watchdog exactly once. Called lazily from
+    /// `ensure_session_process` (rather than `new()`) so we don't rely
+    /// on `tokio::spawn` being available at adapter construction time.
+    ///
+    /// Ticks every 30s, scans the sessions map, and kills any bridge
+    /// whose `in_flight == 0` and whose `last_activity` is older than
+    /// 2 minutes. Removal happens under the outer `sessions` Mutex so a
+    /// concurrent `ensure_session_process` either wins the race or
+    /// misses and spawns a fresh bridge — no torn state.
+    fn ensure_watchdog(&self) {
+        if self.watchdog_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(
+                BRIDGE_WATCHDOG_INTERVAL_SECS,
+            ));
+            // Consume the immediate first tick so we don't cull on boot.
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let now = unix_now();
+                let victims: Vec<(String, CachedBridge)> = {
+                    let mut map = sessions.lock().await;
+                    let stale: Vec<String> = map
+                        .iter()
+                        .filter(|(_, c)| {
+                            c.in_flight.load(Ordering::Acquire) == 0
+                                && now.saturating_sub(
+                                    c.last_activity.load(Ordering::Acquire),
+                                ) > BRIDGE_IDLE_TIMEOUT_SECS
+                        })
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    stale
+                        .into_iter()
+                        .filter_map(|k| map.remove(&k).map(|c| (k, c)))
+                        .collect()
+                };
+                for (sid, cached) in victims {
+                    info!(
+                        session_id = %sid,
+                        "copilot bridge idle {}s, killing",
+                        BRIDGE_IDLE_TIMEOUT_SECS
+                    );
+                    let mut process = cached.process.lock().await;
+                    let _ = process.child.start_kill();
+                }
+            }
+        });
     }
 
     /// Spawn the Node.js bridge process
@@ -539,7 +659,8 @@ impl GitHubCopilotAdapter {
     async fn ensure_session_process(
         &self,
         session: &SessionDetail,
-    ) -> Result<Arc<Mutex<CopilotBridgeProcess>>, String> {
+    ) -> Result<CachedBridge, String> {
+        self.ensure_watchdog();
         if let Some(existing) = self
             .sessions
             .lock()
@@ -591,19 +712,19 @@ impl GitHubCopilotAdapter {
             }
         }
 
-        let bridge = Arc::new(Mutex::new(bridge));
+        let cached = CachedBridge::new(bridge);
         let mut sessions = self.sessions.lock().await;
         Ok(sessions
             .entry(session.summary.session_id.clone())
-            .or_insert_with(|| bridge.clone())
+            .or_insert_with(|| cached.clone())
             .clone())
     }
 
     /// Remove a session's bridge from the cache and kill its process.
     async fn invalidate_session(&self, session_id: &str) {
-        let process = self.sessions.lock().await.remove(session_id);
-        if let Some(process) = process {
-            let mut process = process.lock().await;
+        let cached = self.sessions.lock().await.remove(session_id);
+        if let Some(cached) = cached {
+            let mut process = cached.process.lock().await;
             let _ = process.child.start_kill();
         }
     }
@@ -736,9 +857,13 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             permission_mode, reasoning_effort
         );
 
-        let process = self.ensure_session_process(session).await?;
+        let cached = self.ensure_session_process(session).await?;
+        // Held for the entire turn. Drops after `process` is released,
+        // decrementing in_flight and stamping last_activity = now so the
+        // 2-minute idle timer starts ticking.
+        let _activity = cached.activity_guard();
         let result = {
-            let mut process = process.lock().await;
+            let mut process = cached.process.lock().await;
             // Capture the bridge session id BEFORE the streaming call so
             // we can return it as native_thread_id even on first turn.
             // ensure_session_process populates it during CreateSession.
@@ -813,20 +938,20 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         // and calls `session.interrupt()` on the Copilot SDK. We deliberately
         // do NOT drop the session — the bridge's in-memory `this.session`
         // must survive so the next send_prompt continues the same conversation.
-        let process = self
+        let cached = self
             .sessions
             .lock()
             .await
             .get(&session.summary.session_id)
             .cloned();
-        let Some(process) = process else {
+        let Some(cached) = cached else {
             return Ok(format!(
                 "GitHub Copilot interrupt requested for session '{}' (no active bridge).",
                 session.summary.title
             ));
         };
         let stdin = {
-            let guard = process.lock().await;
+            let guard = cached.process.lock().await;
             guard.stdin.clone()
         };
         write_request(&stdin, &BridgeRequest::Interrupt).await?;
