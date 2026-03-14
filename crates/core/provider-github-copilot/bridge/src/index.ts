@@ -132,13 +132,16 @@ class CopilotBridge {
     console.error('[bridge] Connected to Copilot CLI');
   }
 
-  async createSession(cwd: string, model?: string): Promise<string> {
+  async createSession(
+    cwd: string,
+    model?: string,
+    resumeSessionId?: string,
+  ): Promise<string> {
     if (!this.client) {
       throw new Error('Client not started');
     }
 
     const selectedModel = model ?? 'gpt-4o';
-    console.error(`[bridge] Creating session in: ${cwd} (model: ${selectedModel})`);
 
     const permissionHandler = async (
       req: PermissionRequest,
@@ -185,12 +188,49 @@ class CopilotBridge {
     // `assistant.reasoning` events and the UI sees only the complete
     // response in one shot. See
     // https://github.com/github/copilot-sdk README.
-    this.session = await this.client.createSession({
+    const baseConfig = {
       model: selectedModel,
       streaming: true,
       onPermissionRequest: permissionHandler,
       onUserInputRequest: userInputHandler,
-    } as Parameters<typeof this.client.createSession>[0]);
+    };
+
+    // Resume path: if the Rust adapter handed us a previously-persisted
+    // native_thread_id, try to rehydrate that Copilot-server-side
+    // session so the model sees the full prior conversation. If the
+    // upstream doesn't recognise the id (expired / deleted / stale
+    // after a server-side purge) we log a warning and fall through to
+    // a fresh createSession. The Rust side captures whichever
+    // sessionId we ultimately return and overwrites
+    // provider_state.native_thread_id on the next turn_completed, so a
+    // stale id self-heals after one round-trip.
+    if (resumeSessionId) {
+      console.error(
+        `[bridge] Resuming session ${resumeSessionId} in: ${cwd} (model: ${selectedModel})`,
+      );
+      try {
+        this.session = await this.client.resumeSession(
+          resumeSessionId,
+          baseConfig as Parameters<typeof this.client.resumeSession>[1],
+        );
+      } catch (err) {
+        console.error(
+          `[bridge] Resume failed for ${resumeSessionId}, falling back to fresh session: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        this.session = undefined;
+      }
+    }
+
+    if (!this.session) {
+      console.error(
+        `[bridge] Creating session in: ${cwd} (model: ${selectedModel})`,
+      );
+      this.session = await this.client.createSession(
+        baseConfig as Parameters<typeof this.client.createSession>[0],
+      );
+    }
 
     // Plan-mode visibility: when the model decides to exit plan mode, surface
     // the proposed plan to ZenUI as a read-only plan card. NOTE: the SDK
@@ -209,8 +249,16 @@ class CopilotBridge {
       });
     });
 
-    const sessionId = this.session.id ?? this.session.sessionId ?? 'default-session';
-    console.error(`[bridge] Session created: ${sessionId}`);
+    // CopilotSession exposes a non-optional `sessionId: string` per the
+    // SDK's type definition. If the SDK ever violates that contract we
+    // want a loud error, not a silent fallback to a dead label string.
+    const sessionId = this.session.sessionId;
+    if (!sessionId) {
+      throw new Error(
+        'Copilot SDK returned a session without a sessionId — upstream SDK contract broken',
+      );
+    }
+    console.error(`[bridge] Session ready: ${sessionId}`);
 
     return sessionId;
   }
@@ -422,7 +470,8 @@ async function main(): Promise<void> {
           case 'create_session': {
             const cwd = (msg.cwd as string) ?? process.cwd();
             const model = msg.model as string | undefined;
-            const sessionId = await bridge.createSession(cwd, model);
+            const resumeSessionId = msg.resume_session_id as string | undefined;
+            const sessionId = await bridge.createSession(cwd, model, resumeSessionId);
             process.stdout.write(
               JSON.stringify({ type: 'session_created', session_id: sessionId }) + '\n',
             );

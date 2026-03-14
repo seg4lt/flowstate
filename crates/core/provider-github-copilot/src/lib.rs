@@ -58,6 +58,14 @@ enum BridgeRequest {
         cwd: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// When `Some`, the bridge calls `client.resumeSession(id, …)`
+        /// and only falls back to a fresh create if the SDK rejects the
+        /// resume (session expired, deleted, or the upstream Copilot CLI
+        /// doesn't recognise it). Sourced from
+        /// `session.provider_state.native_thread_id`, which we stamp
+        /// after the first successful turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resume_session_id: Option<String>,
     },
     #[serde(rename = "send_prompt")]
     SendPrompt {
@@ -544,6 +552,19 @@ impl GitHubCopilotAdapter {
 
         let mut bridge = self.spawn_bridge().await?;
 
+        // If we've persisted a native_thread_id from a prior run, hand
+        // it to the bridge so it calls `client.resumeSession(...)` and
+        // picks up the Copilot server's stored conversation. On a cold
+        // session or after a resume failure the bridge silently falls
+        // back to createSession and returns a fresh id — we then write
+        // the fresh id back into provider_state at the end of
+        // `execute_turn`, so the next restart resumes against that.
+        let resume_session_id = session
+            .provider_state
+            .as_ref()
+            .and_then(|s| s.native_thread_id.clone())
+            .filter(|s| !s.is_empty());
+
         let response = self
             .bridge_request(
                 &mut bridge,
@@ -552,6 +573,7 @@ impl GitHubCopilotAdapter {
                         .display()
                         .to_string(),
                     model: session.summary.model.clone(),
+                    resume_session_id,
                 },
             )
             .await?;

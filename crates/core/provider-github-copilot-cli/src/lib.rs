@@ -417,36 +417,52 @@ impl GitHubCopilotCliAdapter {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let (method, params) = if needs_create {
-            (
-                "session.create",
-                serde_json::json!({
-                    "sessionId": native_session_id,
-                    "model": model,
-                    "workingDirectory": cwd,
-                    "requestPermission": true,
-                    "requestUserInput": true,
-                    "streaming": true,
-                }),
-            )
-        } else {
-            (
-                "session.resume",
-                serde_json::json!({
-                    "sessionId": native_session_id,
-                    "requestPermission": true,
-                    "requestUserInput": true,
-                    "streaming": true,
-                }),
-            )
-        };
+        let create_params = serde_json::json!({
+            "sessionId": native_session_id,
+            "model": model,
+            "workingDirectory": cwd,
+            "requestPermission": true,
+            "requestUserInput": true,
+            "streaming": true,
+        });
+        let resume_params = serde_json::json!({
+            "sessionId": native_session_id,
+            "requestPermission": true,
+            "requestUserInput": true,
+            "streaming": true,
+        });
 
-        process.call(method, params).await.map_err(|e| {
-            format!(
-                "Failed to {}: {e}",
-                if method == "session.resume" { "resume" } else { "create" }
-            )
-        })?;
+        // Restored sessions try `session.resume` first. If the upstream
+        // CLI has lost the session (upgrade, state wipe, `~/.copilot`
+        // cleared, expired on the server) we fall back to
+        // `session.create` with the same sessionId so the user keeps
+        // the same zenui-visible native_thread_id but gets a fresh
+        // upstream conversation — matching the self-healing behaviour
+        // the other four provider adapters already have.
+        if needs_create {
+            process
+                .call("session.create", create_params)
+                .await
+                .map_err(|e| format!("Failed to create: {e}"))?;
+        } else {
+            match process.call("session.resume", resume_params).await {
+                Ok(_) => {}
+                Err(resume_err) => {
+                    warn!(
+                        "copilot CLI: resume failed for {}, falling back to fresh create: {}",
+                        native_session_id, resume_err
+                    );
+                    process
+                        .call("session.create", create_params)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "Failed to resume ({resume_err}) and fallback create also failed: {e}"
+                            )
+                        })?;
+                }
+            }
+        }
 
         info!("copilot CLI: session ready ({})", native_session_id);
 
