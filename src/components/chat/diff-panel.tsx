@@ -1,6 +1,6 @@
 import * as React from "react";
 import { MultiFileDiff } from "@pierre/diffs/react";
-import { ChevronDown, ChevronRight, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Maximize2, Minimize2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getGitDiffFile, type GitFileContents } from "@/lib/api";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
@@ -24,6 +24,8 @@ interface DiffPanelProps {
   style: DiffStyle;
   onStyleChange: (s: DiffStyle) => void;
   onClose: () => void;
+  isFullscreen: boolean;
+  onToggleFullscreen: () => void;
 }
 
 type CacheEntry =
@@ -50,6 +52,8 @@ export function DiffPanel({
   style,
   onStyleChange,
   onClose,
+  isFullscreen,
+  onToggleFullscreen,
 }: DiffPanelProps) {
   // Cache lives in a ref so mutations don't force re-renders of the
   // whole tree. `cacheVersion` state triggers the re-render we DO
@@ -153,6 +157,19 @@ export function DiffPanel({
               Unified
             </button>
           </div>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={onToggleFullscreen}
+            aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+            title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+          >
+            {isFullscreen ? (
+              <Minimize2 className="h-3 w-3" />
+            ) : (
+              <Maximize2 className="h-3 w-3" />
+            )}
+          </Button>
           <Button
             variant="ghost"
             size="icon-xs"

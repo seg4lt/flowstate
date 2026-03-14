@@ -3,6 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { GitBranch } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
+import { cn } from "@/lib/utils";
 import { useApp } from "@/stores/app-store";
 import type {
   ContentBlock,
@@ -377,6 +378,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // restarts.
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
   const [diffOpen, setDiffOpen] = React.useState(false);
+  const [diffFullscreen, setDiffFullscreen] = React.useState(false);
   const [diffWidth, setDiffWidth] = React.useState<number>(() => {
     try {
       const saved = window.localStorage.getItem(DIFF_WIDTH_KEY);
@@ -946,7 +948,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         ref={splitContainerRef}
         className="flex min-h-0 min-w-0 flex-1"
       >
-        <div className="flex min-w-0 flex-1 flex-col">
+        <div
+          className={cn(
+            "flex min-w-0 flex-col",
+            diffFullscreen ? "hidden" : "flex-1",
+          )}
+        >
           <MessageList
             sessionId={sessionId}
             turns={turns}
@@ -1033,14 +1040,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
         {diffOpen && (
           <>
-            <DiffDragHandle
-              containerRef={splitContainerRef}
-              width={diffWidth}
-              onResize={setDiffWidth}
-            />
+            {!diffFullscreen && (
+              <DiffDragHandle
+                containerRef={splitContainerRef}
+                width={diffWidth}
+                onResize={setDiffWidth}
+              />
+            )}
             <aside
-              className="shrink-0 border-l border-border bg-background"
-              style={{ width: diffWidth }}
+              className={cn(
+                "border-l border-border bg-background",
+                diffFullscreen ? "flex-1" : "shrink-0",
+              )}
+              style={diffFullscreen ? undefined : { width: diffWidth }}
             >
               <DiffPanel
                 projectPath={projectPath}
@@ -1048,7 +1060,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 refreshKey={diffRefreshTick}
                 style={diffStyle}
                 onStyleChange={setDiffStyle}
-                onClose={() => setDiffOpen(false)}
+                onClose={() => {
+                  setDiffOpen(false);
+                  setDiffFullscreen(false);
+                }}
+                isFullscreen={diffFullscreen}
+                onToggleFullscreen={() => setDiffFullscreen((v) => !v)}
               />
             </aside>
           </>
