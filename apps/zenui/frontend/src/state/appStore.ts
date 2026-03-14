@@ -731,7 +731,9 @@ export interface ProjectGroup {
 /**
  * Groups sessions by project, sorted by project.sort_order, with an
  * "Unassigned" bucket (project = null) for sessions without a project_id.
- * Sessions within each group are sorted by updatedAt DESC.
+ * Sessions within each group are sorted by createdAt DESC — the position
+ * of a thread in the list is fixed at creation time and never changes in
+ * response to activity. The only way a thread leaves its slot is archive.
  */
 export function selectProjectGroups(state: AppState): ProjectGroup[] {
   const byProjectId = new Map<string | null, SessionDetail[]>();
@@ -743,7 +745,7 @@ export function selectProjectGroups(state: AppState): ProjectGroup[] {
   }
   for (const sessions of byProjectId.values()) {
     sessions.sort((a, b) =>
-      b.summary.updatedAt.localeCompare(a.summary.updatedAt),
+      b.summary.createdAt.localeCompare(a.summary.createdAt),
     );
   }
   const projectGroups: ProjectGroup[] = state.snapshot.projects.map((project) => ({

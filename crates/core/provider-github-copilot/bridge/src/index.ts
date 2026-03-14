@@ -188,9 +188,17 @@ class CopilotBridge {
     // `assistant.reasoning` events and the UI sees only the complete
     // response in one shot. See
     // https://github.com/github/copilot-sdk README.
+    //
+    // `workingDirectory` MUST be set explicitly. Without it, the SDK
+    // defaults tool operations (bash, file reads, edits, …) to the
+    // bridge's own cwd — i.e. the rust-embed extraction dir under
+    // `~/Library/Caches/zenui/copilot-bridge-<hash>/`, which is not a
+    // project at all. The Rust adapter passes the zenui session cwd via
+    // the `cwd` parameter on this call; forward it here.
     const baseConfig = {
       model: selectedModel,
       streaming: true,
+      workingDirectory: cwd,
       onPermissionRequest: permissionHandler,
       onUserInputRequest: userInputHandler,
     };

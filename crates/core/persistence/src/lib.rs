@@ -202,7 +202,7 @@ impl PersistenceService {
         let mut statement = match connection.prepare(
             "SELECT session_id, provider, title, status, created_at, updated_at,
                     last_turn_preview, turn_count, model, project_id
-             FROM sessions ORDER BY updated_at DESC",
+             FROM sessions ORDER BY created_at DESC",
         ) {
             Ok(statement) => statement,
             Err(_) => return Vec::new(),
@@ -767,7 +767,7 @@ impl PersistenceService {
         let mut stmt = match connection.prepare(
             "SELECT session_id, provider, title, status, created_at, updated_at,
                     last_turn_preview, turn_count, model, project_id
-             FROM archived_sessions ORDER BY updated_at DESC",
+             FROM archived_sessions ORDER BY created_at DESC",
         ) {
             Ok(stmt) => stmt,
             Err(_) => return Vec::new(),
@@ -794,7 +794,7 @@ impl PersistenceService {
 
 fn list_session_ids(connection: &Connection) -> Result<Vec<String>> {
     let mut statement = connection
-        .prepare("SELECT session_id FROM sessions ORDER BY updated_at DESC")
+        .prepare("SELECT session_id FROM sessions ORDER BY created_at DESC")
         .context("failed to prepare session list query")?;
     let rows = statement
         .query_map([], |row| row.get::<_, String>(0))
