@@ -308,6 +308,67 @@ fn default_true() -> bool {
     true
 }
 
+/// Multimodal user input for a single turn. Adapters that only
+/// support text use `input.text` and silently drop `images` after
+/// logging a one-line `warn!`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserInput {
+    pub text: String,
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
+}
+
+impl UserInput {
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+}
+
+/// Raw image payload carried across the trait boundary while a turn
+/// is in flight. The Claude SDK bridge needs the bytes to build
+/// multimodal content blocks; the runtime also persists them to disk
+/// before calling the adapter so they survive across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ImageAttachment {
+    /// MIME type, e.g. `"image/png"`.
+    pub media_type: String,
+    /// Standard base64 (no `data:` prefix).
+    pub data_base64: String,
+    /// Display name, e.g. `"image.png"`. Not forwarded to the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Lightweight reference to a persisted image. Sent to the frontend
+/// on session load in place of the raw bytes, so opening a thread
+/// with lots of attachments stays cheap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentRef {
+    /// UUID — also the filename (sans extension) on disk.
+    pub id: String,
+    pub media_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub size_bytes: u64,
+}
+
+/// On-demand attachment payload, returned by the `get_attachment`
+/// client message. Carries the full bytes; fetched lazily when the
+/// user clicks a persisted chip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentData {
+    pub media_type: String,
+    pub data_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnRecord {
@@ -336,6 +397,11 @@ pub struct TurnRecord {
     /// that want to render interleaved content correctly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<ContentBlock>,
+    /// References to images the user pasted on this turn. Lightweight
+    /// metadata only — the full bytes live on disk and are fetched
+    /// lazily via `get_attachment` when the user clicks a chip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_attachments: Vec<AttachmentRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

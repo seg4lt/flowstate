@@ -1,43 +1,91 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Utc;
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 use zenui_provider_api::{
-    ContentBlock, FileChangeRecord, PermissionMode, PlanRecord, ProjectRecord, ProviderKind,
-    ProviderModel, ProviderStatus, ReasoningEffort, SessionDetail, SessionStatus, SessionSummary,
-    SubagentRecord, ToolCall, TurnRecord, TurnStatus,
+    AttachmentData, AttachmentRef, ContentBlock, FileChangeRecord, PermissionMode, PlanRecord,
+    ProjectRecord, ProviderKind, ProviderModel, ProviderStatus, ReasoningEffort, SessionDetail,
+    SessionStatus, SessionSummary, SubagentRecord, ToolCall, TurnRecord, TurnStatus,
 };
+
+/// Hard cap on the size of a single image attachment, in bytes. Mirrors
+/// the frontend cap so an oversized payload is rejected before we touch
+/// the disk.
+pub const ATTACHMENT_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Allowed image MIME types. Anything else is rejected at the runtime
+/// boundary so the on-disk file extension is always one of these.
+pub const ATTACHMENT_ALLOWED_MEDIA_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+];
+
+fn ext_for_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
 
 #[derive(Debug)]
 pub struct PersistenceService {
     connection: Mutex<Connection>,
+    attachments_dir: PathBuf,
 }
 
 impl PersistenceService {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent).context("failed to create persistence directory")?;
-        }
+        let parent = path
+            .as_ref()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        std::fs::create_dir_all(&parent).context("failed to create persistence directory")?;
+        let attachments_dir = parent.join("attachments");
+        std::fs::create_dir_all(&attachments_dir)
+            .context("failed to create attachments directory")?;
 
         let connection = Connection::open(path).context("failed to open sqlite database")?;
         let service = Self {
             connection: Mutex::new(connection),
+            attachments_dir,
         };
         service.migrate()?;
         Ok(service)
     }
 
     pub fn in_memory() -> Result<Self> {
+        // Tests don't typically exercise the file-backed attachment
+        // path; give them a unique tempdir so any test that does write
+        // an attachment doesn't collide with sibling tests.
+        let attachments_dir = std::env::temp_dir()
+            .join(format!("zenui-test-attachments-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&attachments_dir)
+            .context("failed to create in-memory attachments directory")?;
         let connection = Connection::open_in_memory().context("failed to open in-memory sqlite")?;
         let service = Self {
             connection: Mutex::new(connection),
+            attachments_dir,
         };
         service.migrate()?;
         Ok(service)
+    }
+
+    /// Directory where attachment files are written. Located alongside
+    /// the SQLite database; created on construction.
+    pub fn attachments_dir(&self) -> &Path {
+        &self.attachments_dir
     }
 
     pub async fn upsert_session(&self, session: SessionDetail) {
@@ -230,6 +278,11 @@ impl PersistenceService {
     }
 
     pub fn delete_session(&self, session_id: &str) -> bool {
+        // Best-effort attachment cleanup before the session row delete.
+        // The `turns` rows cascade off the FK so they're handled by
+        // sqlite below; attachment files don't have a FK so we delete
+        // them here explicitly.
+        self.delete_attachments_for_session_blocking(session_id);
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
             .execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])
@@ -238,6 +291,8 @@ impl PersistenceService {
     }
 
     pub fn delete_archived_session(&self, session_id: &str) -> bool {
+        // Best-effort attachment cleanup before the row delete.
+        self.delete_attachments_for_session_blocking(session_id);
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let tx = match connection.unchecked_transaction() {
             Ok(tx) => tx,
@@ -259,6 +314,163 @@ impl PersistenceService {
         } else {
             false
         }
+    }
+
+    /// Persist a single image attachment to disk and record its
+    /// metadata in `turn_attachments`. Decodes the base64 payload,
+    /// validates the size + media type, writes the file, then inserts
+    /// the row. Returns the lightweight reference the frontend will
+    /// see on session load.
+    pub async fn write_attachment(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        media_type: &str,
+        name: Option<&str>,
+        data_base64: &str,
+    ) -> Result<AttachmentRef, String> {
+        if !ATTACHMENT_ALLOWED_MEDIA_TYPES.contains(&media_type) {
+            return Err(format!("unsupported image media type: {media_type}"));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(data_base64.as_bytes())
+            .map_err(|e| format!("base64 decode failed: {e}"))?;
+        if bytes.len() > ATTACHMENT_MAX_BYTES {
+            return Err(format!(
+                "attachment exceeds {} byte limit ({} bytes)",
+                ATTACHMENT_MAX_BYTES,
+                bytes.len()
+            ));
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let ext = ext_for_media_type(media_type);
+        let file_path = self.attachments_dir.join(format!("{id}.{ext}"));
+        std::fs::write(&file_path, &bytes)
+            .map_err(|e| format!("failed to write attachment file: {e}"))?;
+
+        let now = Utc::now().to_rfc3339();
+        let size_bytes = bytes.len() as i64;
+        {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            if let Err(e) = connection.execute(
+                "INSERT INTO turn_attachments
+                    (id, turn_id, session_id, media_type, name, size_bytes, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, turn_id, session_id, media_type, name, size_bytes, now],
+            ) {
+                // Roll back the on-disk file so we don't leak it.
+                let _ = std::fs::remove_file(&file_path);
+                return Err(format!("failed to insert attachment row: {e}"));
+            }
+        }
+
+        Ok(AttachmentRef {
+            id,
+            media_type: media_type.to_string(),
+            name: name.map(str::to_string),
+            size_bytes: size_bytes as u64,
+        })
+    }
+
+    /// Read the full bytes of a persisted attachment back from disk.
+    /// Called only on user click — never on session load.
+    pub async fn read_attachment(&self, attachment_id: &str) -> Result<AttachmentData, String> {
+        let (media_type, name) = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            connection
+                .query_row(
+                    "SELECT media_type, name FROM turn_attachments WHERE id = ?1",
+                    params![attachment_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("failed to look up attachment: {e}"))?
+                .ok_or_else(|| format!("attachment {attachment_id} not found"))?
+        };
+
+        let ext = ext_for_media_type(&media_type);
+        let file_path = self.attachments_dir.join(format!("{attachment_id}.{ext}"));
+        let bytes = std::fs::read(&file_path)
+            .map_err(|e| format!("failed to read attachment file: {e}"))?;
+        let data_base64 = BASE64_STANDARD.encode(&bytes);
+        Ok(AttachmentData {
+            media_type,
+            data_base64,
+            name,
+        })
+    }
+
+    /// Fetch all attachment refs for a single turn, ordered oldest
+    /// first. Used by the session-load path to hydrate
+    /// `TurnRecord.input_attachments` without reading any file bytes.
+    pub fn list_attachments_for_turn(&self, turn_id: &str) -> Vec<AttachmentRef> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut stmt = match connection.prepare(
+            "SELECT id, media_type, name, size_bytes
+             FROM turn_attachments WHERE turn_id = ?1 ORDER BY created_at ASC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![turn_id], |row| {
+            Ok(AttachmentRef {
+                id: row.get(0)?,
+                media_type: row.get(1)?,
+                name: row.get(2)?,
+                size_bytes: row.get::<_, i64>(3)? as u64,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// Synchronous best-effort cleanup of all attachment files + rows
+    /// for a session. Called from the synchronous `delete_session` /
+    /// `delete_archived_session` paths. Failed unlinks are logged and
+    /// the DB row delete proceeds regardless — a stranded file on
+    /// disk is preferable to a half-deleted session.
+    fn delete_attachments_for_session_blocking(&self, session_id: &str) {
+        let rows: Vec<(String, String)> = {
+            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let mut stmt = match connection.prepare(
+                "SELECT id, media_type FROM turn_attachments WHERE session_id = ?1",
+            ) {
+                Ok(stmt) => stmt,
+                Err(_) => return,
+            };
+            let mapped = stmt.query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            });
+            match mapped {
+                Ok(iter) => iter.filter_map(Result::ok).collect(),
+                Err(_) => return,
+            }
+        };
+        for (id, media_type) in &rows {
+            let ext = ext_for_media_type(media_type);
+            let file_path = self.attachments_dir.join(format!("{id}.{ext}"));
+            if let Err(e) = std::fs::remove_file(&file_path) {
+                tracing::warn!(
+                    attachment_id = %id,
+                    path = %file_path.display(),
+                    error = %e,
+                    "failed to unlink attachment file during session delete"
+                );
+            }
+        }
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let _ = connection.execute(
+            "DELETE FROM turn_attachments WHERE session_id = ?1",
+            params![session_id],
+        );
     }
 
     /// Returns the cached models for a provider along with the ISO-8601 timestamp
@@ -611,6 +823,28 @@ impl PersistenceService {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
+
+            -- Image attachments pasted by the user on a turn. The bytes
+            -- live on disk under <data_dir>/attachments/<id>.<ext>;
+            -- this table holds only metadata so opening a thread doesn't
+            -- pull MBs of binary into memory. Cascade is handled
+            -- explicitly in delete_session / delete_archived_session
+            -- (no FOREIGN KEY because turn_id may live in either
+            -- `turns` or `archived_turns`).
+            CREATE TABLE IF NOT EXISTS turn_attachments (
+                id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                name TEXT,
+                size_bytes INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_turn_attachments_turn_id
+                ON turn_attachments(turn_id);
+            CREATE INDEX IF NOT EXISTS idx_turn_attachments_session_id
+                ON turn_attachments(session_id);
             ",
             )
             .context("failed to run sqlite migrations")?;
@@ -912,6 +1146,9 @@ fn load_session(
             permission_mode,
             reasoning_effort,
             blocks,
+            // Filled in by the per-session JOIN below so we don't pay
+            // an extra query per turn.
+            input_attachments: Vec::new(),
         })
     };
     let mut turns: Vec<TurnRecord> = match turn_limit_param {
@@ -932,6 +1169,42 @@ fn load_session(
     // SQL branch ran.
     if turn_limit_param.is_some() {
         turns.reverse();
+    }
+
+    // Hydrate input_attachments for all turns in this session with one
+    // query, then distribute by turn_id. Cheap even for long sessions
+    // because turn_attachments rows carry only metadata (no bytes).
+    {
+        let mut attach_stmt = connection
+            .prepare(
+                "SELECT id, turn_id, media_type, name, size_bytes
+                 FROM turn_attachments WHERE session_id = ?1
+                 ORDER BY created_at ASC",
+            )
+            .context("failed to prepare turn_attachments query")?;
+        let attach_iter = attach_stmt
+            .query_map(params![session_id], |row| {
+                let turn_id: String = row.get(1)?;
+                Ok((
+                    turn_id,
+                    AttachmentRef {
+                        id: row.get(0)?,
+                        media_type: row.get(2)?,
+                        name: row.get(3)?,
+                        size_bytes: row.get::<_, i64>(4)? as u64,
+                    },
+                ))
+            })
+            .context("failed to query turn_attachments")?;
+        let mut by_turn: HashMap<String, Vec<AttachmentRef>> = HashMap::new();
+        for entry in attach_iter.flatten() {
+            by_turn.entry(entry.0).or_default().push(entry.1);
+        }
+        for turn in &mut turns {
+            if let Some(atts) = by_turn.remove(&turn.turn_id) {
+                turn.input_attachments = atts;
+            }
+        }
     }
 
     let provider_state = connection

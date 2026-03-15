@@ -78,6 +78,10 @@ impl OrchestrationService {
             permission_mode,
             reasoning_effort,
             blocks: Vec::new(),
+            // Filled in by runtime-core::send_turn after the turn row
+            // is created and the per-image write_attachment() calls
+            // succeed.
+            input_attachments: Vec::new(),
         };
 
         session.summary.status = SessionStatus::Running;
