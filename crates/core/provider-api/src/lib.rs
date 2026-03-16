@@ -1030,10 +1030,23 @@ pub enum ClientMessage {
     SendTurn {
         session_id: String,
         input: String,
+        /// Pasted images attached to this turn. Each carries the raw
+        /// base64 bytes so the runtime can persist them to disk and
+        /// forward them to providers that support multimodal input.
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
         #[serde(default)]
         permission_mode: Option<PermissionMode>,
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
+    },
+    /// Fetch the full bytes of a persisted image attachment. The
+    /// frontend calls this lazily when the user clicks a chip on a
+    /// replayed turn; runtime-core reads the file from
+    /// `<data_dir>/attachments/<uuid>.<ext>` and responds with
+    /// `ServerMessage::Attachment`.
+    GetAttachment {
+        attachment_id: String,
     },
     InterruptTurn {
         session_id: String,
@@ -1141,6 +1154,9 @@ pub enum ServerMessage {
     Event { event: RuntimeEvent },
     Error { message: String },
     ArchivedSessionsList { sessions: Vec<SessionSummary> },
+    /// Response to `ClientMessage::GetAttachment`. Carries the full
+    /// bytes of a persisted image.
+    Attachment { data: AttachmentData },
 }
 
 #[async_trait]
@@ -1191,7 +1207,7 @@ pub trait ProviderAdapter: Send + Sync {
     async fn execute_turn(
         &self,
         session: &SessionDetail,
-        input: &str,
+        input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,

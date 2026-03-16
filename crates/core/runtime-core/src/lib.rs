@@ -8,11 +8,11 @@ use tokio::sync::{Mutex, broadcast};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
-    AppSnapshot, BootstrapPayload, ClientMessage, ContentBlock, FileChangeRecord,
+    AppSnapshot, BootstrapPayload, ClientMessage, ContentBlock, FileChangeRecord, ImageAttachment,
     PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
     ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
     SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus,
-    TurnEventSink, TurnRecord, TurnStatus, UserInputAnswer,
+    TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -582,12 +582,22 @@ impl RuntimeCore {
             ClientMessage::SendTurn {
                 session_id,
                 input,
+                images,
                 permission_mode,
                 reasoning_effort,
             } => {
                 let mode = permission_mode.unwrap_or_default();
-                match self.send_turn(session_id, input, mode, reasoning_effort).await {
+                match self
+                    .send_turn(session_id, input, images, mode, reasoning_effort)
+                    .await
+                {
                     Ok(message) => Some(ServerMessage::Ack { message }),
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
+            ClientMessage::GetAttachment { attachment_id } => {
+                match self.persistence.read_attachment(&attachment_id).await {
+                    Ok(data) => Some(ServerMessage::Attachment { data }),
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
@@ -893,8 +903,14 @@ impl RuntimeCore {
         self.persistence.upsert_session(session.clone()).await;
 
         let follow_up = format!("Proceed with the plan above.\n\nPlan:\n{plan_raw}");
-        self.send_turn(session_id, follow_up, PermissionMode::AcceptEdits, None)
-            .await
+        self.send_turn(
+            session_id,
+            follow_up,
+            Vec::new(),
+            PermissionMode::AcceptEdits,
+            None,
+        )
+        .await
     }
 
     async fn reject_plan(&self, session_id: String, plan_id: String) -> Result<String, String> {
@@ -976,11 +992,12 @@ impl RuntimeCore {
         &self,
         session_id: String,
         input: String,
+        images: Vec<ImageAttachment>,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<String, String> {
         let trimmed = input.trim().to_string();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && images.is_empty() {
             return Err("Turn input cannot be empty.".to_string());
         }
 
@@ -1012,12 +1029,57 @@ impl RuntimeCore {
             .clone();
 
         let title_before = session.summary.title.clone();
-        let turn = self.orchestration.start_turn(
+        let mut turn = self.orchestration.start_turn(
             &mut session,
             trimmed.clone(),
             Some(permission_mode),
             reasoning_effort,
         );
+
+        // Persist any pasted images to disk before the adapter runs.
+        // The bytes are written under <data_dir>/attachments/<uuid>.<ext>
+        // and a row goes into the turn_attachments table, so on replay
+        // the frontend renders a chip pointing at the persisted file.
+        // The raw `images` Vec is still passed to the adapter below
+        // (we don't re-read from disk for the live send) so multimodal
+        // providers see the bytes immediately.
+        let mut persisted_attachments = Vec::with_capacity(images.len());
+        for img in &images {
+            match self
+                .persistence
+                .write_attachment(
+                    &session.summary.session_id,
+                    &turn.turn_id,
+                    &img.media_type,
+                    img.name.as_deref(),
+                    &img.data_base64,
+                )
+                .await
+            {
+                Ok(att) => persisted_attachments.push(att),
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session.summary.session_id,
+                        turn_id = %turn.turn_id,
+                        error = %e,
+                        "failed to persist pasted image; turn will run without it on disk"
+                    );
+                }
+            }
+        }
+        // Stamp the persisted refs onto both the local turn copy and
+        // the session.turns entry orchestration just appended, so
+        // every downstream consumer (TurnStarted event, in-flight
+        // snapshot, final upsert) sees them.
+        turn.input_attachments = persisted_attachments.clone();
+        if let Some(stored) = session
+            .turns
+            .iter_mut()
+            .find(|t| t.turn_id == turn.turn_id)
+        {
+            stored.input_attachments = persisted_attachments;
+        }
+
         self.persistence.upsert_session(session.clone()).await;
         // Publish title change immediately so the sidebar updates before the turn finishes.
         if session.summary.title != title_before {
@@ -1064,7 +1126,10 @@ impl RuntimeCore {
         // Spawn the adapter call so it runs concurrently with our event drain loop.
         let adapter_clone = adapter.clone();
         let session_clone = session.clone();
-        let trimmed_clone = trimmed.clone();
+        let user_input = UserInput {
+            text: trimmed.clone(),
+            images,
+        };
         let adapter_sink = sink.clone();
         let active_sinks_for_cleanup = self.active_sinks.clone();
         let sid_for_cleanup = session.summary.session_id.clone();
@@ -1072,7 +1137,7 @@ impl RuntimeCore {
             let result = adapter_clone
                 .execute_turn(
                     &session_clone,
-                    &trimmed_clone,
+                    &user_input,
                     permission_mode,
                     reasoning_effort,
                     adapter_sink,
@@ -1635,7 +1700,7 @@ mod tests {
     use zenui_provider_api::{
         ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind,
         ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput,
-        ReasoningEffort, SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus,
+        ReasoningEffort, SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus, UserInput,
     };
 
     use super::RuntimeCore;
@@ -1658,19 +1723,20 @@ mod tests {
                 status: ProviderStatusLevel::Ready,
                 message: None,
                 models: vec![],
+                enabled: true,
             }
         }
 
         async fn execute_turn(
             &self,
             _session: &SessionDetail,
-            input: &str,
+            input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
             _events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             Ok(ProviderTurnOutput {
-                output: format!("fake response for {input}"),
+                output: format!("fake response for {}", input.text),
                 provider_state: None,
             })
         }
@@ -1699,13 +1765,14 @@ mod tests {
                 status: ProviderStatusLevel::Ready,
                 message: None,
                 models: vec![],
+                enabled: true,
             }
         }
 
         async fn execute_turn(
             &self,
             _session: &SessionDetail,
-            _input: &str,
+            _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
             events: TurnEventSink,
@@ -1793,13 +1860,14 @@ mod tests {
                 status: ProviderStatusLevel::Ready,
                 message: None,
                 models: vec![],
+                enabled: true,
             }
         }
 
         async fn execute_turn(
             &self,
             _session: &SessionDetail,
-            _input: &str,
+            _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
             events: TurnEventSink,
@@ -1887,6 +1955,7 @@ mod tests {
                 .handle_client_message(ClientMessage::SendTurn {
                     session_id: sid_clone,
                     input: "go".to_string(),
+                    images: Vec::new(),
                     permission_mode: None,
                     reasoning_effort: None,
                 })
@@ -1980,6 +2049,7 @@ mod tests {
             .handle_client_message(ClientMessage::SendTurn {
                 session_id: session_id.clone(),
                 input: "go".to_string(),
+                images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
             })
@@ -2062,6 +2132,7 @@ mod tests {
             .handle_client_message(ClientMessage::SendTurn {
                 session_id: session.summary.session_id.clone(),
                 input: "hello".to_string(),
+                images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
             })
@@ -2106,20 +2177,21 @@ mod tests {
                 status: ProviderStatusLevel::Ready,
                 message: None,
                 models: vec![],
+                enabled: true,
             }
         }
 
         async fn execute_turn(
             &self,
             _session: &SessionDetail,
-            input: &str,
+            input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
             _events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(ProviderTurnOutput {
-                output: format!("slow response for {input}"),
+                output: format!("slow response for {}", input.text),
                 provider_state: None,
             })
         }
@@ -2160,6 +2232,7 @@ mod tests {
             runtime.handle_client_message(ClientMessage::SendTurn {
                 session_id: session_id.clone(),
                 input: "hello".to_string(),
+                images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
             }),
@@ -2229,6 +2302,7 @@ mod tests {
             permission_mode: None,
             reasoning_effort: None,
             blocks: Vec::new(),
+            input_attachments: Vec::new(),
         });
         persistence.upsert_session(session).await;
 

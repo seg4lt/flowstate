@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputOption,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
     UserInputQuestion,
 };
 
@@ -1214,11 +1214,18 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     async fn execute_turn(
         &self,
         session: &SessionDetail,
-        input: &str,
+        input: &UserInput,
         permission_mode: PermissionMode,
         _reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
+        if !input.images.is_empty() {
+            tracing::warn!(
+                provider = ?ProviderKind::GitHubCopilotCli,
+                count = input.images.len(),
+                "github copilot CLI adapter dropping image attachments; not implemented"
+            );
+        }
         let cached = self.ensure_session_process(session).await?;
         // Held for the entire turn. Drops after run_turn completes,
         // stamping last_activity = now and decrementing in_flight so
@@ -1235,7 +1242,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         Self::run_turn(
             cached.process.clone(),
             native_session_id,
-            input.to_string(),
+            input.text.clone(),
             permission_mode,
             events,
         )

@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputAnswer,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputAnswer,
     UserInputOption, UserInputQuestion,
 };
 
@@ -106,6 +106,15 @@ impl Drop for ActivityGuard {
     }
 }
 
+/// Wire-shape image attachment passed through to the TS bridge. Mirrors
+/// `zenui_provider_api::ImageAttachment` minus the optional display
+/// `name` (the bridge doesn't need it).
+#[derive(Debug, Clone, Serialize)]
+struct BridgeImageAttachment {
+    media_type: String,
+    data_base64: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum BridgeRequest {
@@ -126,6 +135,12 @@ enum BridgeRequest {
         permission_mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// Multimodal image attachments. When non-empty the TS bridge
+        /// switches to the `query({ prompt: AsyncIterable, … })` form
+        /// and builds a user message whose `content` array carries
+        /// text + base64 image blocks.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<BridgeImageAttachment>,
     },
     #[serde(rename = "answer_permission")]
     AnswerPermission {
@@ -526,7 +541,7 @@ impl ClaudeSdkAdapter {
     async fn run_turn(
         &self,
         cached: CachedBridge,
-        prompt: String,
+        input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
@@ -538,10 +553,19 @@ impl ClaudeSdkAdapter {
         let mut process = cached.process.lock().await;
 
         let mode_str = permission_mode_to_str(permission_mode);
+        let bridge_images: Vec<BridgeImageAttachment> = input
+            .images
+            .iter()
+            .map(|img| BridgeImageAttachment {
+                media_type: img.media_type.clone(),
+                data_base64: img.data_base64.clone(),
+            })
+            .collect();
         let request = BridgeRequest::SendPrompt {
-            prompt,
+            prompt: input.text.clone(),
             permission_mode: mode_str.to_string(),
             reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
+            images: bridge_images,
         };
         write_request(&process.stdin, &request).await?;
 
@@ -876,7 +900,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
     async fn execute_turn(
         &self,
         session: &SessionDetail,
-        input: &str,
+        input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
@@ -885,7 +909,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         let result = self
             .run_turn(
                 cached,
-                input.to_string(),
+                input,
                 permission_mode,
                 reasoning_effort,
                 events,

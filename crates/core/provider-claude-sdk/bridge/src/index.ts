@@ -124,6 +124,7 @@ class ClaudeBridge {
     prompt: string,
     permissionMode: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions',
     reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high',
+    images: Array<{ media_type: string; data_base64: string }> = [],
   ): Promise<string> {
     if (this.inFlight) {
       throw new Error('Another turn is already in flight');
@@ -226,7 +227,42 @@ class ClaudeBridge {
     };
 
     let finalText = '';
-    const q = query({ prompt, options });
+    // When the user pasted one or more images we have to use the
+    // `query({ prompt: AsyncIterable<SDKUserMessage>, … })` form instead
+    // of the plain string path — Claude Agent SDK only accepts
+    // multimodal `content` arrays via that channel. The async iterator
+    // yields exactly one user message whose `content` is text + image
+    // blocks, then closes; the SDK pumps it like any other turn.
+    type SdkPromptInput = Parameters<typeof query>[0]['prompt'];
+    type SdkImageMediaType =
+      | 'image/jpeg'
+      | 'image/png'
+      | 'image/gif'
+      | 'image/webp';
+    const promptInput: SdkPromptInput = images.length === 0
+      ? prompt
+      : (async function* userMessages() {
+          yield {
+            type: 'user' as const,
+            message: {
+              role: 'user' as const,
+              content: [
+                { type: 'text' as const, text: prompt },
+                ...images.map((img) => ({
+                  type: 'image' as const,
+                  source: {
+                    type: 'base64' as const,
+                    media_type: img.media_type as SdkImageMediaType,
+                    data: img.data_base64,
+                  },
+                })),
+              ],
+            },
+            parent_tool_use_id: null,
+            session_id: '',
+          };
+        })();
+    const q = query({ prompt: promptInput, options });
     this.activeQuery = q;
     try {
       for await (const message of q) {
@@ -694,9 +730,12 @@ async function main(): Promise<void> {
           | 'medium'
           | 'high'
           | undefined;
+        const images = (msg.images as
+          | Array<{ media_type: string; data_base64: string }>
+          | undefined) ?? [];
         promptInFlight = (async () => {
           try {
-            const output = await bridge.sendPrompt(prompt, mode, effort);
+            const output = await bridge.sendPrompt(prompt, mode, effort, images);
             writeJson({
               type: 'response',
               output,

@@ -12,7 +12,7 @@ use tracing::warn;
 use zenui_provider_api::{
     PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
     ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
-    SessionDetail, TurnEventSink, UserInputAnswer, UserInputOption, UserInputQuestion,
+    SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -303,11 +303,18 @@ impl ProviderAdapter for CodexAdapter {
     async fn execute_turn(
         &self,
         session: &SessionDetail,
-        input: &str,
+        input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
+        if !input.images.is_empty() {
+            tracing::warn!(
+                provider = ?ProviderKind::Codex,
+                count = input.images.len(),
+                "codex adapter dropping image attachments; not implemented"
+            );
+        }
         // Codex's approvalPolicy/sandbox are bound at thread/start, so a mid-session
         // mode switch requires tearing down and recreating the thread. The runtime's
         // provider_state round-trips native_thread_id, so the recreated process
@@ -330,7 +337,7 @@ impl ProviderAdapter for CodexAdapter {
                 .as_str();
             let mut turn_params = json!({
                 "input": [{
-                    "text": input,
+                    "text": input.text.as_str(),
                     "text_elements": [],
                     "type": "text",
                 }],

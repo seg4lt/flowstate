@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use zenui_provider_api::{
     FileOperation, PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind,
     ProviderModel, ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputOption,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
     UserInputQuestion,
 };
 
@@ -807,11 +807,18 @@ impl ProviderAdapter for ClaudeCliAdapter {
     async fn execute_turn(
         &self,
         session: &SessionDetail,
-        input: &str,
+        input: &UserInput,
         permission_mode: PermissionMode,
         _reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
+        if !input.images.is_empty() {
+            tracing::warn!(
+                provider = ?ProviderKind::ClaudeCli,
+                count = input.images.len(),
+                "claude CLI adapter dropping image attachments; not implemented"
+            );
+        }
         let process = self.spawn_process(session, permission_mode).await?;
         let process = Arc::new(Mutex::new(process));
 
@@ -821,7 +828,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
             .await
             .insert(session_id.clone(), process.clone());
 
-        self.run_turn(session_id, process, input.to_string(), events)
+        self.run_turn(session_id, process, input.text.clone(), events)
             .await
     }
 

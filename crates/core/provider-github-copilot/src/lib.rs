@@ -17,7 +17,7 @@ use tracing::{debug, info};
 use zenui_provider_api::{
     PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInputOption,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
     UserInputQuestion,
 };
 
@@ -847,7 +847,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
     async fn execute_turn(
         &self,
         session: &SessionDetail,
-        input: &str,
+        input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         events: TurnEventSink,
@@ -856,6 +856,13 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             "Executing turn with GitHub Copilot (mode={:?}, effort={:?})",
             permission_mode, reasoning_effort
         );
+        if !input.images.is_empty() {
+            tracing::warn!(
+                provider = ?ProviderKind::GitHubCopilot,
+                count = input.images.len(),
+                "github copilot SDK adapter dropping image attachments; not implemented"
+            );
+        }
 
         let cached = self.ensure_session_process(session).await?;
         // Held for the entire turn. Drops after `process` is released,
@@ -871,7 +878,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             let output = self
                 .bridge_request_streaming(
                     &mut process,
-                    input.to_string(),
+                    input.text.clone(),
                     permission_mode,
                     reasoning_effort,
                     &events,
