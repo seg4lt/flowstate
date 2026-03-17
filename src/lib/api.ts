@@ -1,10 +1,24 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { ClientMessage, ServerMessage } from "./types";
+import type { AttachmentData, ClientMessage, ServerMessage } from "./types";
 
 export function sendMessage(
   message: ClientMessage,
 ): Promise<ServerMessage | null> {
   return invoke<ServerMessage | null>("handle_message", { message });
+}
+
+/** Lazy fetch of a persisted image attachment. Called when the user
+ * clicks a chip on a replayed turn — never on session load. */
+export async function getAttachment(
+  attachmentId: string,
+): Promise<AttachmentData> {
+  const resp = await sendMessage({
+    type: "get_attachment",
+    attachment_id: attachmentId,
+  });
+  if (resp?.type === "attachment") return resp.data;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to get_attachment");
 }
 
 export function connectStream(

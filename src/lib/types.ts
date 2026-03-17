@@ -120,6 +120,44 @@ export interface TurnRecord {
   permissionMode?: PermissionMode;
   reasoningEffort?: ReasoningEffort;
   blocks?: ContentBlock[];
+  /** References to images the user pasted on this turn. The full bytes
+   * live on disk and are fetched lazily via `get_attachment` when the
+   * user clicks a chip. */
+  inputAttachments?: AttachmentRef[];
+}
+
+/** Pre-send (in-flux) image — lives in ChatInput state until submit.
+ * Carries the raw base64 + an object URL for thumbnail rendering. */
+export interface AttachedImage {
+  /** Local UUID — React key + remove-by-id. */
+  id: string;
+  /** MIME type, e.g. "image/png". */
+  mediaType: string;
+  /** Standard base64 (no `data:` prefix). */
+  dataBase64: string;
+  /** Display name, e.g. "image.png". */
+  name: string;
+  /** Browser blob URL for rendering thumbnails / lightbox locally,
+   * before the bytes hit the server. */
+  previewUrl: string;
+}
+
+/** Persisted reference returned by the server on session load.
+ * Lightweight — no bytes. The bytes are fetched on-demand via
+ * `get_attachment` when the user clicks a chip. */
+export interface AttachmentRef {
+  /** UUID — also the filename (sans extension) on disk. */
+  id: string;
+  mediaType: string;
+  name?: string;
+  sizeBytes: number;
+}
+
+/** Full attachment payload returned by `get_attachment`. */
+export interface AttachmentData {
+  mediaType: string;
+  dataBase64: string;
+  name?: string;
 }
 
 export interface ProjectRecord {
@@ -198,7 +236,8 @@ export type ClientMessage =
   | { type: "load_snapshot" }
   | { type: "load_session"; session_id: string; limit?: number }
   | { type: "start_session"; provider: ProviderKind; title?: string; model?: string; project_id?: string }
-  | { type: "send_turn"; session_id: string; input: string; permission_mode?: PermissionMode; reasoning_effort?: ReasoningEffort }
+  | { type: "send_turn"; session_id: string; input: string; images?: { media_type: string; data_base64: string; name?: string }[]; permission_mode?: PermissionMode; reasoning_effort?: ReasoningEffort }
+  | { type: "get_attachment"; attachment_id: string }
   | { type: "interrupt_turn"; session_id: string }
   | { type: "update_permission_mode"; session_id: string; permission_mode: PermissionMode }
   | { type: "delete_session"; session_id: string }
@@ -228,7 +267,8 @@ export type ServerMessage =
   | { type: "ack"; message: string }
   | { type: "event"; event: RuntimeEvent }
   | { type: "error"; message: string }
-  | { type: "archived_sessions_list"; sessions: SessionSummary[] };
+  | { type: "archived_sessions_list"; sessions: SessionSummary[] }
+  | { type: "attachment"; data: AttachmentData };
 
 export type RuntimeEvent =
   | { type: "runtime_ready"; message: string }

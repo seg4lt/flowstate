@@ -1,5 +1,5 @@
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
-import { getGitBranch, getGitDiffSummary, sendMessage } from "./api";
+import { getAttachment, getGitBranch, getGitDiffSummary, sendMessage } from "./api";
 import type { GitFileSummary } from "./api";
 import type { SessionDetail } from "./types";
 
@@ -103,6 +103,23 @@ export function gitBranchQueryOptions(path: string | null) {
     // the branch may have moved (e.g. after a turn that ran `git
     // checkout`).
     staleTime: 60 * 60 * 1000,
+  });
+}
+
+/// Fetch the bytes of a persisted image attachment on demand. Cached
+/// indefinitely (the file is immutable for the lifetime of the row),
+/// dropped from memory five minutes after the last reference so a long
+/// session doesn't slowly accumulate every image the user ever pasted.
+export function attachmentQueryOptions(id: string | null) {
+  return queryOptions({
+    queryKey: ["attachment", id] as const,
+    queryFn: () => {
+      if (!id) throw new Error("attachmentQueryOptions called without an id");
+      return getAttachment(id);
+    },
+    enabled: !!id,
+    staleTime: Infinity,
+    gcTime: 5 * 60 * 1000,
   });
 }
 
