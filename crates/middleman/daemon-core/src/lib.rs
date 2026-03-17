@@ -10,10 +10,18 @@
 //!
 //! # Entry points
 //!
-//! - [`bootstrap_core`] — builds the tokio runtime, providers, SQLite,
-//!   `RuntimeCore`, and `DaemonLifecycle`. Reconciles stuck sessions.
-//!   Does NOT start any transport. Use this when you want the runtime
-//!   in-process and will wire your own transport.
+//! - [`bootstrap_core_async`] — **preferred for library embedders**.
+//!   Async; does not build a tokio runtime. Call from inside an
+//!   existing `#[tokio::main]`, `tokio::test`, or task. Returns an
+//!   [`InProcessCore`] that shares the caller's runtime. Use this when
+//!   you want `RuntimeCore` as an in-process service inside a host app.
+//! - [`bootstrap_core`] — sync wrapper over `bootstrap_core_async` that
+//!   builds and owns its own multi-threaded tokio runtime. Returns a
+//!   [`BootstrappedCore`]. Use from a plain sync `main()` that does not
+//!   already have a runtime (typically the daemon binary path).
+//!   ⚠️ Will panic with "Cannot start a runtime from within a runtime"
+//!   if called from inside an existing tokio runtime — reach for
+//!   `bootstrap_core_async` there instead.
 //! - [`run_blocking`] — the daemon-binary entry point. Calls
 //!   `bootstrap_core`, invokes `bind()` then `serve()` on each provided
 //!   transport, writes the ready file after every transport is live,
@@ -75,30 +83,100 @@ pub use zenui_transport_http as transport_http;
 /// Headless runtime handle returned by [`bootstrap_core`]. Owns the tokio
 /// runtime, the `RuntimeCore`, and the `DaemonLifecycle`. Callers use
 /// `run_blocking` to drive the full daemon lifecycle with transports, or
-/// work with these fields directly for in-process embedding.
+/// work with these fields directly for in-process embedding from a sync
+/// `main()`.
+///
+/// Library embedders that already have a tokio runtime should prefer
+/// [`bootstrap_core_async`] + [`InProcessCore`] instead, to avoid a
+/// second runtime in the process.
 pub struct BootstrappedCore {
     pub tokio_runtime: tokio::runtime::Runtime,
     pub runtime_core: Arc<RuntimeCore>,
     pub lifecycle: Arc<DaemonLifecycle>,
 }
 
-/// Transport-free bootstrap. Builds the tokio runtime, wires every
-/// provider adapter, opens SQLite, constructs `RuntimeCore` with a
-/// `DaemonLifecycle` as the `TurnLifecycleObserver`, and reconciles any
-/// sessions stuck at `Running` from a prior crash. Does **not** start
-/// any transport — the caller (usually `run_blocking`) is responsible
-/// for that.
+/// Runtime-agnostic handle returned by [`bootstrap_core_async`]. Holds
+/// just the `RuntimeCore` and `DaemonLifecycle` — no tokio runtime,
+/// because the caller owns one already. Every subsequent `RuntimeCore`
+/// call and every tokio task it spawns runs on the caller's runtime.
+///
+/// This is the preferred shape for library embedders (`tinybot`,
+/// `zenui-desktop`, test harnesses) that want `RuntimeCore` as just
+/// another in-process service rather than as a standalone daemon.
+pub struct InProcessCore {
+    pub runtime_core: Arc<RuntimeCore>,
+    pub lifecycle: Arc<DaemonLifecycle>,
+}
+
+/// Sync, runtime-owning bootstrap.
+///
+/// # When to use this
+///
+/// Use from a plain sync `main()` that does **not** already have a
+/// tokio runtime — typically the daemon-binary entry point. This
+/// function builds its own multi-threaded tokio runtime, wires every
+/// provider adapter, opens SQLite, constructs `RuntimeCore`, and
+/// synchronously reconciles any sessions stuck at `Running` from a
+/// prior crash. It returns a [`BootstrappedCore`] that **owns** the
+/// runtime; drop it to shut everything down. [`run_blocking`] is the
+/// canonical consumer.
+///
+/// ⚠️ Do not call this from inside an existing tokio runtime (e.g.
+/// from a `#[tokio::main]` function or a `tokio::test`). The internal
+/// `block_on` will panic with "Cannot start a runtime from within a
+/// runtime". Use [`bootstrap_core_async`] instead for that case.
+///
+/// Does **not** start any transport — the caller (usually
+/// `run_blocking`) is responsible for that.
 pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
-    init_tracing();
-
-    let working_directory = config.project_root.clone();
-    let database_path = working_directory.join(".zenui").join(&config.database_name);
-
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("zenui-runtime")
         .build()
         .context("failed to build tokio runtime")?;
+
+    let InProcessCore {
+        runtime_core,
+        lifecycle,
+    } = tokio_runtime.block_on(bootstrap_core_async(config))?;
+
+    Ok(BootstrappedCore {
+        tokio_runtime,
+        runtime_core,
+        lifecycle,
+    })
+}
+
+/// Async, runtime-agnostic bootstrap.
+///
+/// # When to use this
+///
+/// Use from an async context that **already has** a tokio runtime —
+/// i.e. host applications embedding the SDK as a library. Typical
+/// callers are inside `#[tokio::main]`, a `tokio::test`, or a task
+/// spawned on an existing runtime. This function does **not** build a
+/// runtime of its own: it awaits startup reconciliation on the
+/// caller's runtime and returns an [`InProcessCore`] whose
+/// `RuntimeCore` runs every subsequent task on that same runtime.
+///
+/// Prefer this over [`bootstrap_core`] whenever you can. Only reach
+/// for `bootstrap_core` when you genuinely need the SDK to own a
+/// dedicated runtime (e.g. a standalone daemon binary driven from a
+/// sync `main`).
+///
+/// # What it does
+///
+/// Wires every enabled provider adapter, opens SQLite, constructs
+/// `RuntimeCore` with `DaemonLifecycle` as the `TurnLifecycleObserver`,
+/// reclaims any sessions stuck at `Running` from a prior crash, and
+/// seeds the provider-enablement map from persistence. Does **not**
+/// start any transport — embedders call `RuntimeCore` methods
+/// directly.
+pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore> {
+    init_tracing();
+
+    let working_directory = config.project_root.clone();
+    let database_path = working_directory.join(".zenui").join(&config.database_name);
 
     let lifecycle = DaemonLifecycle::new(config.idle_timeout);
 
@@ -132,13 +210,10 @@ pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
     // seed the provider enablement map from persistence, before we
     // serve any clients. Both are single-shot async reads over the
     // already-open SQLite handle — cheap and idempotent.
-    tokio_runtime.block_on(async {
-        runtime_core.reconcile_startup().await;
-        runtime_core.seed_provider_enablement().await;
-    });
+    runtime_core.reconcile_startup().await;
+    runtime_core.seed_provider_enablement().await;
 
-    Ok(BootstrappedCore {
-        tokio_runtime,
+    Ok(InProcessCore {
         runtime_core,
         lifecycle,
     })
@@ -357,4 +432,44 @@ pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -
 
     let _ = ready.delete();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // Regression test for the runtime-in-runtime embedding bug.
+    //
+    // Before this refactor, `bootstrap_core` built its own tokio runtime
+    // and called `block_on` on it, which made it unusable from inside an
+    // existing runtime (e.g. a host app with `#[tokio::main]`). Any such
+    // call panicked with "Cannot start a runtime from within a runtime".
+    //
+    // `bootstrap_core_async` is the embedding-friendly variant: it does
+    // not construct a runtime and awaits startup reconciliation on the
+    // caller's runtime. This test locks in that guarantee — if some
+    // future change reintroduces a `block_on` or `Runtime::new` on the
+    // hot path, this test will panic and fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bootstrap_core_async_embeds_in_existing_runtime() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut config = DaemonConfig::zero_transport(tmp.path().to_path_buf());
+        // No provider features are enabled in this crate's test build,
+        // so adapter construction is a no-op regardless; clearing the
+        // list silences the "requested provider disabled at compile
+        // time" warnings that would otherwise fire for every ALL entry.
+        config.enabled_providers.clear();
+        config.idle_timeout = Duration::from_secs(5);
+
+        let core = bootstrap_core_async(&config)
+            .await
+            .expect("bootstrap_core_async must succeed inside an existing runtime");
+
+        // Touch both fields to prove the returned handle is usable.
+        // `subscribe` creates a broadcast receiver; `request_shutdown`
+        // is a cheap state mutation on the lifecycle counter.
+        let _events = core.runtime_core.subscribe();
+        core.lifecycle.request_shutdown();
+    }
 }
