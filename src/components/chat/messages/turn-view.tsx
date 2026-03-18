@@ -1,6 +1,6 @@
 import * as React from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
-import type { ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
+import type { AttachmentRef, ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
 import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
@@ -220,13 +220,18 @@ export interface MessageItem {
   blocks: ContentBlock[];
   toolCalls: ToolCall[] | null;
   streaming: boolean;
+  /** References to images the user pasted on this turn. None on the
+   * optimistic-echo row — they only appear once `turn_started` fires
+   * and the daemon has persisted the bytes to disk. */
+  inputAttachments?: AttachmentRef[];
 }
 
 interface TurnViewProps {
   item: MessageItem;
+  onOpenAttachment?: (attachment: AttachmentRef) => void;
 }
 
-function TurnViewInner({ item }: TurnViewProps) {
+function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
   const callsById = React.useMemo(() => {
     const map = new Map<string, ToolCall>();
     for (const tc of item.toolCalls ?? []) map.set(tc.callId, tc);
@@ -252,7 +257,13 @@ function TurnViewInner({ item }: TurnViewProps) {
 
   return (
     <div className="space-y-3">
-      {item.input !== null && <UserMessage input={item.input} />}
+      {item.input !== null && (
+        <UserMessage
+          input={item.input}
+          attachments={item.inputAttachments}
+          onOpenAttachment={onOpenAttachment}
+        />
+      )}
 
       {!hasAnyContent && item.streaming && (
         <div className="text-sm text-muted-foreground">
@@ -302,6 +313,7 @@ function TurnViewInner({ item }: TurnViewProps) {
 }
 
 export const TurnView = React.memo(TurnViewInner, (prev, next) => {
+  if (prev.onOpenAttachment !== next.onOpenAttachment) return false;
   const a = prev.item;
   const b = next.item;
   return (
@@ -313,6 +325,7 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
     // arrays when blocks or tool calls change, so this catches every
     // streaming update.
     a.blocks === b.blocks &&
-    a.toolCalls === b.toolCalls
+    a.toolCalls === b.toolCalls &&
+    a.inputAttachments === b.inputAttachments
   );
 });

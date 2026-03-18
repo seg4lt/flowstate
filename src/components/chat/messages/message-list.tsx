@@ -1,13 +1,14 @@
 import * as React from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ArrowDown, Loader2 } from "lucide-react";
-import type { ContentBlock, TurnRecord } from "@/lib/types";
+import type { AttachmentRef, ContentBlock, TurnRecord } from "@/lib/types";
 import { TurnView, type MessageItem } from "./turn-view";
 
 interface MessageListProps {
   turns: TurnRecord[];
   loading: boolean;
   pendingInput: string | null;
+  onOpenAttachment?: (attachment: AttachmentRef) => void;
   /** Identity of the currently-visible session. Used as the
    *  scroll-reset trigger so switching threads always lands the
    *  user at the bottom-most (latest) message, even though
@@ -36,6 +37,7 @@ function turnToItem(turn: TurnRecord): MessageItem {
     blocks: turn.blocks ?? EMPTY_BLOCKS,
     toolCalls: turn.toolCalls ?? null,
     streaming: turn.status === "running",
+    inputAttachments: turn.inputAttachments,
   };
 }
 
@@ -64,6 +66,7 @@ export function MessageList({
   hiddenOlderCount = 0,
   loadingOlder = false,
   onLoadOlder,
+  onOpenAttachment,
 }: MessageListProps) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
@@ -149,7 +152,7 @@ export function MessageList({
         computeItemKey={(_, item) => item.turnId}
         itemContent={(_, item) => (
           <div className="px-6 py-2">
-            <TurnView item={item} />
+            <TurnView item={item} onOpenAttachment={onOpenAttachment} />
           </div>
         )}
         followOutput={(isAtBottom) => (isAtBottom ? "auto" : false)}

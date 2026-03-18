@@ -6,6 +6,8 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 import { useApp } from "@/stores/app-store";
 import type {
+  AttachedImage,
+  AttachmentRef,
   ContentBlock,
   PermissionDecision,
   PermissionMode,
@@ -36,6 +38,7 @@ import { HeaderActions } from "./header-actions";
 import { WorkingIndicator } from "./working-indicator";
 import { StuckBanner } from "./stuck-banner";
 import { DiffPanel, type DiffStyle } from "./diff-panel";
+import { ImageLightbox } from "./image-lightbox";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 
 // Trip the watchdog after this many seconds of silence while a tool
@@ -379,6 +382,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
   const [diffOpen, setDiffOpen] = React.useState(false);
   const [diffFullscreen, setDiffFullscreen] = React.useState(false);
+  /** When set, a lightbox is open on top of everything for a persisted
+   * attachment. The bytes are fetched lazily via attachmentQueryOptions
+   * the first time it opens. */
+  const [persistedLightboxRef, setPersistedLightboxRef] =
+    React.useState<AttachmentRef | null>(null);
+  const handleOpenPersistedAttachment = React.useCallback(
+    (attachment: AttachmentRef) => setPersistedLightboxRef(attachment),
+    [],
+  );
   const [diffWidth, setDiffWidth] = React.useState<number>(() => {
     try {
       const saved = window.localStorage.getItem(DIFF_WIDTH_KEY);
@@ -678,7 +690,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [queryClient, navigate, refreshDiffs]);
 
-  async function handleSend(input: string) {
+  async function handleSend(input: string, images: AttachedImage[] = []) {
     // --- Slash command interception ---
     const resolved = resolveCommand(input);
     if (resolved) {
@@ -721,6 +733,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         type: "send_turn",
         session_id: sessionId,
         input,
+        images: images.map((img) => ({
+          media_type: img.mediaType,
+          data_base64: img.dataBase64,
+          name: img.name,
+        })),
         permission_mode: permissionMode,
         reasoning_effort: effort,
       });
@@ -962,6 +979,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             hiddenOlderCount={hiddenOlderCount}
             loadingOlder={loadingOlder}
             onLoadOlder={handleLoadOlder}
+            onOpenAttachment={handleOpenPersistedAttachment}
           />
 
           {isRunning && session && runningTurn && (
@@ -1071,6 +1089,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           </>
         )}
       </div>
+      {persistedLightboxRef && (
+        <ImageLightbox
+          source={{ kind: "persisted", ref: persistedLightboxRef }}
+          onClose={() => setPersistedLightboxRef(null)}
+        />
+      )}
     </div>
   );
 }

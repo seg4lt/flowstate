@@ -1,11 +1,14 @@
 import * as React from "react";
 import { Clock, Send, Square, X } from "lucide-react";
-import type { SessionStatus } from "@/lib/types";
+import type { AttachedImage, SessionStatus } from "@/lib/types";
 import { getCompletions } from "@/lib/slash-commands";
+import { toast } from "@/hooks/use-toast";
 import { SlashCommandPopup } from "./slash-command-popup";
+import { InFluxAttachmentChip } from "./attachment-chip";
+import { ImageLightbox, type LightboxSource } from "./image-lightbox";
 
 interface ChatInputProps {
-  onSend: (input: string) => void;
+  onSend: (input: string, images: AttachedImage[]) => void;
   onInterrupt: () => void;
   sessionStatus: SessionStatus | undefined;
   disabled: boolean;
@@ -22,6 +25,50 @@ interface ChatInputProps {
 interface QueuedMessage {
   id: string;
   text: string;
+  images: AttachedImage[];
+}
+
+/** Per-image cap, mirrors `ATTACHMENT_MAX_BYTES` on the Rust side. */
+const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+/** Allowed clipboard image MIME types — matches the Rust validator. */
+const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+
+function suggestedFilename(mediaType: string): string {
+  switch (mediaType) {
+    case "image/png":
+      return "image.png";
+    case "image/jpeg":
+      return "image.jpg";
+    case "image/gif":
+      return "image.gif";
+    case "image/webp":
+      return "image.webp";
+    default:
+      return "image";
+  }
+}
+
+/** Read a Blob as a base64 string (no `data:` prefix). */
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("FileReader failed"));
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string") {
+        reject(new Error("expected base64 data URL"));
+        return;
+      }
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
 }
 
 function newQueueId(): string {
@@ -45,6 +92,10 @@ export function ChatInput({
   const [value, setValue] = React.useState("");
   const [queued, setQueued] = React.useState<QueuedMessage[]>([]);
   const [popupIndex, setPopupIndex] = React.useState(0);
+  const [attachedImages, setAttachedImages] = React.useState<AttachedImage[]>([]);
+  const [lightboxSource, setLightboxSource] = React.useState<LightboxSource | null>(
+    null,
+  );
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
 
   const isRunning = sessionStatus === "running";
@@ -85,45 +136,128 @@ export function ChatInput({
     if (!wasRunning || !nowReady) return;
     if (queued.length === 0) return;
     const [first, ...rest] = queued;
-    onSend(first.text);
+    // Drain the head of the queue. Carry its images along with the
+    // text — the pasted attachments rode in the queued chip and need
+    // to fire when the queued text fires. Object URLs are revoked
+    // here, after the send goes out, so the chip thumbnail stays
+    // visible until the moment the message actually leaves.
+    onSend(first.text, first.images);
+    for (const img of first.images) {
+      URL.revokeObjectURL(img.previewUrl);
+    }
     setQueued(rest);
   }, [sessionStatus, queued, onSend]);
 
-  function enqueue(text: string) {
-    setQueued((q) => [...q, { id: newQueueId(), text }]);
+  function enqueue(text: string, images: AttachedImage[]) {
+    setQueued((q) => [...q, { id: newQueueId(), text, images }]);
   }
 
   function removeQueued(id: string) {
-    setQueued((q) => q.filter((item) => item.id !== id));
+    setQueued((q) => {
+      const target = q.find((item) => item.id === id);
+      if (target) {
+        for (const img of target.images) {
+          URL.revokeObjectURL(img.previewUrl);
+        }
+      }
+      return q.filter((item) => item.id !== id);
+    });
+  }
+
+  function removeAttachedImage(id: string) {
+    setAttachedImages((prev) => {
+      const target = prev.find((img) => img.id === id);
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+      return prev.filter((img) => img.id !== id);
+    });
+  }
+
+  /** Paste handler — picks up clipboard images and turns them into
+   * `AttachedImage` chips. Falls through to the default text paste
+   * when the clipboard contains no image entries. */
+  async function handlePaste(e: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = e.clipboardData ? Array.from(e.clipboardData.items) : [];
+    const imageItems = items.filter((it) => it.type.startsWith("image/"));
+    if (imageItems.length === 0) return; // default text paste
+    e.preventDefault();
+    for (const item of imageItems) {
+      const blob = item.getAsFile();
+      if (!blob) continue;
+      if (!ALLOWED_IMAGE_MEDIA_TYPES.has(blob.type)) {
+        toast({
+          description: `Unsupported image type: ${blob.type}`,
+          duration: 3000,
+        });
+        continue;
+      }
+      if (blob.size > IMAGE_MAX_BYTES) {
+        toast({
+          description: `Image exceeds 5 MB, skipping.`,
+          duration: 3000,
+        });
+        continue;
+      }
+      try {
+        const dataBase64 = await blobToBase64(blob);
+        const previewUrl = URL.createObjectURL(blob);
+        const file = blob as File;
+        setAttachedImages((prev) => [
+          ...prev,
+          {
+            id: newQueueId(),
+            mediaType: blob.type,
+            dataBase64,
+            name: file.name && file.name.length > 0 ? file.name : suggestedFilename(blob.type),
+            previewUrl,
+          },
+        ]);
+      } catch (err) {
+        toast({
+          description: `Could not read pasted image: ${(err as Error).message}`,
+          duration: 4000,
+        });
+      }
+    }
   }
 
   function handleSubmit() {
     if (providerDisabled) return;
     const trimmed = value.trim();
-    if (!trimmed) return;
+    if (!trimmed && attachedImages.length === 0) return;
+    // Snapshot images then clear state — we hand the snapshot off to
+    // either the queue or onSend, so the chip row clears immediately.
+    const imagesToSend = attachedImages;
+    setAttachedImages([]);
     // While a turn is running OR earlier messages are still queued,
     // append this one to the queue. Clearing the textarea immediately
     // mirrors what the user just did ("send"), and the queued chip
-    // above the input shows what's pending. The earlier UX kept the
-    // text in the textarea which felt like the message hadn't been
-    // accepted at all.
+    // above the input shows what's pending.
     if (isRunning || queued.length > 0) {
-      enqueue(trimmed);
+      enqueue(trimmed, imagesToSend);
       setValue("");
       resetHeight();
       return;
     }
-    onSend(trimmed);
+    onSend(trimmed, imagesToSend);
+    // Object URLs revoked AFTER onSend so the renderer can still
+    // paint the (now removed) chip's thumbnail this frame, then they
+    // get freed.
+    for (const img of imagesToSend) {
+      URL.revokeObjectURL(img.previewUrl);
+    }
     setValue("");
     resetHeight();
   }
 
   function handlePopupSelect(name: string) {
-    // Fill the command and immediately submit.
+    // Fill the command and immediately submit. Slash commands never
+    // carry image attachments — they're all text-driven shortcuts.
     const cmd = `/${name}`;
     setValue("");
     resetHeight();
-    onSend(cmd);
+    onSend(cmd, []);
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -181,7 +315,9 @@ export function ChatInput({
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }
 
-  const hasContent = value.trim().length > 0;
+  const hasText = value.trim().length > 0;
+  const hasAttachments = attachedImages.length > 0;
+  const hasContent = hasText || hasAttachments;
   // Stop button shows whenever the turn is running and the user isn't
   // mid-compose. Queued chips are intentionally NOT a precondition --
   // interrupting only stops the current turn and leaves the queue
@@ -227,6 +363,20 @@ export function ChatInput({
       )}
       <div className="border-t border-border px-3 pb-2 pt-3">
         <div className="mx-auto max-w-3xl">
+          {attachedImages.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-1">
+              {attachedImages.map((img) => (
+                <InFluxAttachmentChip
+                  key={img.id}
+                  image={img}
+                  onRemove={() => removeAttachedImage(img.id)}
+                  onOpen={() =>
+                    setLightboxSource({ kind: "inflight", image: img })
+                  }
+                />
+              ))}
+            </div>
+          )}
           <div className="relative flex items-end gap-2">
             {/* Autocomplete popup — positioned above the textarea */}
             {showPopup && matches.length > 0 && (
@@ -243,6 +393,7 @@ export function ChatInput({
               onChange={(e) => setValue(e.target.value)}
               onKeyDown={handleKeyDown}
               onInput={handleInput}
+              onPaste={handlePaste}
               placeholder={
                 providerDisabled
                   ? "Provider disabled — re-enable it in Settings to send"
@@ -283,6 +434,17 @@ export function ChatInput({
           {toolbar && <div className="mt-1.5">{toolbar}</div>}
         </div>
       </div>
+      {lightboxSource && (
+        <ImageLightbox
+          source={lightboxSource}
+          onClose={() => setLightboxSource(null)}
+          onRemove={
+            lightboxSource.kind === "inflight"
+              ? () => removeAttachedImage(lightboxSource.image.id)
+              : undefined
+          }
+        />
+      )}
     </div>
   );
 }
