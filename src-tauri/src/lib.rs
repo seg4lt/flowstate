@@ -9,7 +9,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 use tracing_subscriber::EnvFilter;
 use zenui_daemon_core::{
-    DaemonConfig, DaemonLifecycle, Transport, bootstrap_core, graceful_shutdown,
+    DaemonConfig, DaemonLifecycle, Transport, bootstrap_core_async, graceful_shutdown,
     transport_tauri,
 };
 use zenui_runtime_core::ConnectionObserver;
@@ -800,36 +800,42 @@ pub fn run() {
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
-            std::thread::spawn(move || {
+            // Run the daemon on Tauri's existing tokio runtime so the
+            // process has exactly one thread pool. The previous shape
+            // (std::thread::spawn + bootstrap_core's own runtime) was
+            // a workaround for "cannot start a runtime from within a
+            // runtime"; bootstrap_core_async removes that need by
+            // letting us share the host runtime.
+            tauri::async_runtime::spawn(async move {
                 let mut config = DaemonConfig::with_project_root(flowzen_root);
                 config.idle_timeout = Duration::MAX;
 
-                let core = bootstrap_core(&config).expect("daemon bootstrap failed");
+                let core = bootstrap_core_async(&config)
+                    .await
+                    .expect("daemon bootstrap failed");
 
-                core.tokio_runtime.block_on(async {
-                    let bound = transport.bind().expect("transport bind failed");
-                    let observer: Arc<dyn ConnectionObserver> = core.lifecycle.clone();
-                    let handle = bound
-                        .serve(core.runtime_core.clone(), observer)
-                        .expect("transport serve failed");
+                let bound = transport.bind().expect("transport bind failed");
+                let observer: Arc<dyn ConnectionObserver> = core.lifecycle.clone();
+                let handle = bound
+                    .serve(core.runtime_core.clone(), observer)
+                    .expect("transport serve failed");
 
-                    // Signal main thread AFTER serve() has managed TauriDaemonState.
-                    // This guarantees the connect command can access it.
-                    ready_tx
-                        .send(core.lifecycle.clone())
-                        .expect("failed to signal ready");
+                // Signal main thread AFTER serve() has managed TauriDaemonState.
+                // This guarantees the connect command can access it.
+                ready_tx
+                    .send(core.lifecycle.clone())
+                    .expect("failed to signal ready");
 
-                    core.lifecycle.wait_for_shutdown().await;
+                core.lifecycle.wait_for_shutdown().await;
 
-                    let _ = graceful_shutdown(
-                        core.runtime_core.clone(),
-                        core.lifecycle.clone(),
-                        config.shutdown_grace,
-                    )
-                    .await;
+                let _ = graceful_shutdown(
+                    core.runtime_core.clone(),
+                    core.lifecycle.clone(),
+                    config.shutdown_grace,
+                )
+                .await;
 
-                    handle.shutdown().await;
-                });
+                handle.shutdown().await;
             });
 
             // Block until serve() is done and TauriDaemonState is managed.
