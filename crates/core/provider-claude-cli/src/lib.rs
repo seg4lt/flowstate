@@ -137,22 +137,17 @@ impl ClaudeCliAdapter {
         }
     }
 
-    /// Locate the `claude` binary. Tries common Mac install paths first, then
-    /// falls back to plain "claude" (which relies on the inherited PATH).
+    /// Locate the `claude` binary. Delegates to the cross-platform
+    /// resolver in `zenui-provider-api` which walks PATH (with PATHEXT
+    /// on Windows) and falls back to a curated list of Linux/macOS/
+    /// Windows install locations. Returns the bare name `"claude"` as
+    /// a last resort so `Command::new` still gets a chance to do its
+    /// own PATH lookup — the spawn will produce a meaningful "not
+    /// found" error if even that fails.
     fn find_claude_binary() -> String {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let candidates = [
-            format!("{home}/.local/bin/claude"),
-            "/opt/homebrew/bin/claude".to_string(),
-            "/usr/local/bin/claude".to_string(),
-            "/usr/bin/claude".to_string(),
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return path.clone();
-            }
-        }
-        "claude".to_string()
+        zenui_provider_api::find_cli_binary("claude")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "claude".to_string())
     }
 
     fn permission_mode_flag(mode: PermissionMode) -> &'static str {

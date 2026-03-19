@@ -17,6 +17,9 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
+import { existsSync } from 'fs';
+import { delimiter as pathDelimiter, join as joinPath } from 'path';
+import { homedir } from 'os';
 
 type ZenUiMessage = {
   type: string;
@@ -55,6 +58,99 @@ interface StructuredAnswer {
   questionId: string;
   optionIds: string[];
   answer: string;
+}
+
+/**
+ * Optional override: try to resolve the user's locally-installed
+ * `claude` CLI on PATH and hand it to the Claude Agent SDK via
+ * `pathToClaudeCodeExecutable`. The whole thing is opportunistic —
+ * if no local `claude` is found we leave the option unset and the
+ * SDK transparently falls back to the binary it bundles inside
+ * `@anthropic-ai/claude-agent-sdk` (extracted via cli.js / embed.js
+ * at runtime), so users who have never installed Claude Code locally
+ * still get a working bridge with zero setup.
+ *
+ * Why prefer the local install when present:
+ *   - Picks up the user's existing Claude Code login automatically
+ *     (no separate `ANTHROPIC_API_KEY` plumbing required)
+ *   - Honors their MCP server configuration, settings, and any
+ *     globally-configured tools
+ *   - Tracks newer Claude Code releases without re-bundling the SDK
+ *
+ * Resolution is a pure-Node PATH walk (using `process.env.PATH` and
+ * `path.delimiter`, with `PATHEXT` on Windows) plus a curated list
+ * of well-known install locations across Linux, macOS, and Windows.
+ * No shell, no `which` / `where` subprocess, no extra npm deps.
+ *
+ * Computed once at module load and cached — the binary location
+ * doesn't change between turns within a single bridge process.
+ */
+function resolveLocalClaudeBinary(): string | null {
+  const isWindows = process.platform === 'win32';
+  const exeExtensions = isWindows
+    ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+        .split(';')
+        .filter((e) => e.length > 0)
+    : [''];
+  // Always include the bare name on every platform, in case the user
+  // installed a shim script without an extension on Windows.
+  if (!exeExtensions.includes('')) {
+    exeExtensions.unshift('');
+  }
+
+  const pathEntries = (process.env.PATH ?? '')
+    .split(pathDelimiter)
+    .filter((entry) => entry.length > 0);
+
+  for (const dir of pathEntries) {
+    for (const ext of exeExtensions) {
+      const candidate = joinPath(dir, `claude${ext}`);
+      try {
+        if (existsSync(candidate)) return candidate;
+      } catch {
+        // Permission errors on individual entries shouldn't abort the walk.
+      }
+    }
+  }
+
+  // Fallback: well-known install locations across the three OSes.
+  // Tried only when PATH lookup misses (e.g. host process didn't
+  // forward PATH, or `claude` is installed somewhere unusual).
+  const home = homedir();
+  const fallbackPaths: string[] = isWindows
+    ? [
+        joinPath(home, 'AppData', 'Local', 'Programs', 'claude', 'claude.exe'),
+        joinPath(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
+        'C:\\Program Files\\Claude\\claude.exe',
+      ]
+    : [
+        joinPath(home, '.local', 'bin', 'claude'),
+        '/opt/homebrew/bin/claude',
+        '/usr/local/bin/claude',
+        '/home/linuxbrew/.linuxbrew/bin/claude',
+        '/usr/bin/claude',
+      ];
+
+  for (const candidate of fallbackPaths) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // skip
+    }
+  }
+
+  return null;
+}
+
+const RESOLVED_LOCAL_CLAUDE_PATH: string | null = resolveLocalClaudeBinary();
+if (RESOLVED_LOCAL_CLAUDE_PATH) {
+  console.error(
+    `[bridge] Using local claude CLI at: ${RESOLVED_LOCAL_CLAUDE_PATH}`,
+  );
+} else {
+  console.error(
+    "[bridge] No local claude CLI found; falling back to the SDK's bundled binary",
+  );
 }
 
 const pendingPermissions = new Map<string, PendingPermission>();
@@ -223,6 +319,13 @@ class ClaudeBridge {
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingBudget !== null && thinkingBudget > 0
         ? { maxThinkingTokens: thinkingBudget }
+        : {}),
+      // Optional: prefer the user's local Claude Code install over
+      // the SDK's bundled binary when one is on PATH. Spread is
+      // empty (no key set) when no local install was found, so the
+      // SDK transparently uses its own embedded executable.
+      ...(RESOLVED_LOCAL_CLAUDE_PATH
+        ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
         : {}),
     };
 
@@ -639,6 +742,12 @@ class ClaudeBridge {
       options: {
         cwd: this.cwd,
         abortController,
+        // Same opportunistic local-claude override as the main turn
+        // query: use the user's install when present, leave the
+        // option unset otherwise.
+        ...(RESOLVED_LOCAL_CLAUDE_PATH
+          ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
+          : {}),
       },
     });
     try {

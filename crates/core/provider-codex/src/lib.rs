@@ -81,10 +81,23 @@ struct TurnCompletion {
 impl CodexAdapter {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
-            binary_path: "codex".to_string(),
+            binary_path: Self::find_codex_binary(),
             working_directory,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Locate the `codex` binary using the cross-platform resolver in
+    /// `zenui-provider-api`. Walks PATH (with PATHEXT on Windows)
+    /// then falls back to OS-specific install locations
+    /// (`~/.local/bin/codex`, `/opt/homebrew/bin/codex`, ...). Returns
+    /// the bare name as a last resort so `Command::new("codex")`
+    /// still attempts a runtime PATH lookup; the resulting ENOENT
+    /// will surface to the caller through `spawn_process`.
+    fn find_codex_binary() -> String {
+        zenui_provider_api::find_cli_binary("codex")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "codex".to_string())
     }
 
     async fn ensure_session_process(

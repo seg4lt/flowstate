@@ -1,3 +1,7 @@
+mod binary_resolver;
+
+pub use binary_resolver::find_cli_binary;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

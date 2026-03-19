@@ -13,6 +13,65 @@ import {
 } from '@github/copilot-sdk';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
+import { existsSync } from 'fs';
+import { delimiter as pathDelimiter, join as joinPath } from 'path';
+import { homedir } from 'os';
+
+/**
+ * Cross-platform PATH resolution for the `copilot` CLI binary.
+ * Pure Node, no shell, no extra deps — works on Linux, macOS, Windows.
+ *
+ * Returns an absolute path to the resolved binary, or null if no
+ * matching file exists on PATH or in any of the known fallback
+ * install locations.
+ */
+function resolveCopilotBinary(): string | null {
+  const isWindows = process.platform === 'win32';
+  const exeExtensions = isWindows
+    ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.toLowerCase())
+    : [''];
+
+  const pathEntries = (process.env.PATH ?? '').split(pathDelimiter).filter(Boolean);
+  for (const dir of pathEntries) {
+    for (const ext of exeExtensions) {
+      const candidate = joinPath(dir, `copilot${ext}`);
+      try {
+        if (existsSync(candidate)) return candidate;
+      } catch {
+        // ENOENT/EACCES on individual entries shouldn't abort the walk.
+      }
+    }
+  }
+
+  // Fallback: well-known install locations across the three OSes.
+  // Tried only when PATH lookup fails (e.g. host process didn't
+  // forward PATH, or the binary lives in a directory the user hasn't
+  // added to PATH).
+  const home = homedir();
+  const fallbackPaths: string[] = isWindows
+    ? [
+        joinPath(home, 'AppData', 'Local', 'Programs', 'copilot', 'copilot.exe'),
+        joinPath(home, 'AppData', 'Roaming', 'npm', 'copilot.cmd'),
+        'C:\\Program Files\\GitHub CLI\\copilot.exe',
+      ]
+    : [
+        joinPath(home, '.local', 'bin', 'copilot'),
+        '/opt/homebrew/bin/copilot',
+        '/usr/local/bin/copilot',
+        '/home/linuxbrew/.linuxbrew/bin/copilot',
+        '/usr/bin/copilot',
+      ];
+
+  for (const candidate of fallbackPaths) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // skip
+    }
+  }
+
+  return null;
+}
 
 // ZenUI protocol types
 interface ZenUiMessage {
@@ -99,26 +158,36 @@ class CopilotBridge {
   async start(): Promise<void> {
     console.error('[bridge] Starting GitHub Copilot SDK Bridge...');
 
-    // Find system copilot CLI
-    const copilotPaths = [
-      '/opt/homebrew/bin/copilot',
-      '/usr/local/bin/copilot',
-      '/home/linuxbrew/.linuxbrew/bin/copilot',
-      'copilot',
-    ];
+    // Resolve the absolute path to the `copilot` CLI binary.
+    //
+    // The upstream @github/copilot-sdk validates `cliPath` with
+    // `fs.existsSync(cliPath)`, which is a CWD-relative file check —
+    // a bare name like "copilot" never resolves through PATH. So we
+    // MUST hand the SDK an absolute path.
+    //
+    // We do the PATH walk in pure Node so this works identically on
+    // Linux, macOS, and Windows with no shell, no `which`/`where`
+    // subprocess, and no extra npm dep:
+    //   - `process.env.PATH` split by `path.delimiter` (':' on POSIX,
+    //     ';' on Windows)
+    //   - for each PATH entry, try `<entry>/<name><ext>` for every
+    //     ext in PATHEXT on Windows (.EXE/.CMD/...) or just '' on POSIX
+    //   - first hit that `existsSync` is the resolved binary
+    //
+    // If that fails (PATH not inherited, copilot installed somewhere
+    // unusual), fall back to a short list of well-known install
+    // locations across the three OSes.
+    const copilotPath = resolveCopilotBinary();
 
-    let copilotPath = 'copilot';
-    for (const path of copilotPaths) {
-      try {
-        const { execSync } = await import('child_process');
-        execSync(`${path} --version`, { stdio: 'ignore' });
-        copilotPath = path;
-        console.error(`[bridge] Found copilot at: ${path}`);
-        break;
-      } catch {
-        // Continue
-      }
+    if (!copilotPath) {
+      throw new Error(
+        'Copilot CLI not found. Install `@github/copilot` (e.g. via the official ' +
+          'GitHub Copilot CLI installer) and ensure the `copilot` binary is on PATH ' +
+          'when launching this process.',
+      );
     }
+
+    console.error(`[bridge] Resolved copilot CLI at: ${copilotPath}`);
 
     // Create client with system CLI
     this.client = new CopilotClient({

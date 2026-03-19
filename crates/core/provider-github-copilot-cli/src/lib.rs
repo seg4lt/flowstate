@@ -412,19 +412,17 @@ impl GitHubCopilotCliAdapter {
         });
     }
 
+    /// Locate the `copilot` binary. Delegates to the cross-platform
+    /// resolver in `zenui-provider-api`, which walks PATH (with
+    /// PATHEXT on Windows) and falls back to a curated list of
+    /// install locations across Linux, macOS, and Windows — including
+    /// `~/.local/bin/copilot`, which the previous hardcoded list was
+    /// missing. Returns the bare name as a last resort so
+    /// `Command::new` still attempts its own PATH lookup.
     fn find_copilot_binary() -> String {
-        let candidates = [
-            "/opt/homebrew/bin/copilot",
-            "/usr/local/bin/copilot",
-            "/home/linuxbrew/.linuxbrew/bin/copilot",
-            "/usr/bin/copilot",
-        ];
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return path.to_string();
-            }
-        }
-        "copilot".to_string()
+        zenui_provider_api::find_cli_binary("copilot")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "copilot".to_string())
     }
 
     /// Spawn the copilot binary in headless stdio (JSON-RPC) mode.
