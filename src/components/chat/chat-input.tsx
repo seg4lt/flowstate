@@ -333,7 +333,7 @@ export function ChatInput({
     <div className="shrink-0">
       {queued.length > 0 && (
         <div className="px-3 pb-1 pt-2">
-          <div className="mx-auto max-w-3xl space-y-1">
+          <div className="space-y-1">
             {queued.map((item, idx) => (
               <div
                 key={item.id}
@@ -362,7 +362,7 @@ export function ChatInput({
         </div>
       )}
       <div className="border-t border-border px-3 pb-2 pt-3">
-        <div className="mx-auto max-w-3xl">
+        <div>
           {attachedImages.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-1">
               {attachedImages.map((img) => (
