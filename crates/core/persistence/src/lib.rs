@@ -608,6 +608,7 @@ impl PersistenceService {
         let mut statement = match connection.prepare(
             "SELECT project_id, name, path, created_at, updated_at, sort_order
              FROM projects
+             WHERE deleted_at IS NULL
              ORDER BY sort_order ASC, created_at ASC",
         ) {
             Ok(s) => s,
@@ -658,8 +659,54 @@ impl PersistenceService {
             return None;
         }
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let project_id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
+
+        // Resurrection path. If we have a path AND there's an existing
+        // tombstoned project with the exact same path, un-tombstone it
+        // instead of inserting a new row. Reusing the same project_id
+        // means every session that was previously attached to this
+        // project automatically reappears under it — no UPDATE on the
+        // sessions table is needed because their project_id never
+        // changed when the project was deleted in the first place.
+        if let Some(p) = path.as_deref() {
+            let existing: Option<(String, i32, String)> = connection
+                .query_row(
+                    "SELECT project_id, sort_order, created_at FROM projects
+                     WHERE path = ?1 AND deleted_at IS NOT NULL
+                     ORDER BY deleted_at DESC LIMIT 1",
+                    params![p],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i32>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if let Some((existing_id, sort_order, created_at)) = existing {
+                let restored = connection.execute(
+                    "UPDATE projects
+                     SET deleted_at = NULL, name = ?1, updated_at = ?2
+                     WHERE project_id = ?3",
+                    params![trimmed, now, existing_id],
+                );
+                if restored.is_ok() {
+                    return Some(ProjectRecord {
+                        project_id: existing_id,
+                        name: trimmed,
+                        path,
+                        created_at,
+                        updated_at: now,
+                        sort_order,
+                    });
+                }
+            }
+        }
+
+        let project_id = Uuid::new_v4().to_string();
         // Place new projects at the end.
         let next_order: i32 = connection
             .query_row(
@@ -718,37 +765,38 @@ impl PersistenceService {
         if affected == 0 { None } else { Some(now) }
     }
 
-    /// Deletes a project and null-outs the `project_id` of any session pointing
-    /// at it. Returns the list of session IDs that were re-assigned to "unassigned".
+    /// Tombstones a project — sets `deleted_at` to now instead of
+    /// removing the row. Sessions that pointed at it keep their
+    /// `project_id`, which is critical for the resurrection flow:
+    /// re-creating a project with the same path un-tombstones the
+    /// existing row (same uuid), so every session that was attached
+    /// to it before reattaches automatically without any UPDATE on
+    /// the sessions table.
+    ///
+    /// `list_projects` filters tombstoned rows out so the UI sidebar
+    /// stops showing the project; the frontend additionally hides
+    /// any session whose `project_id` doesn't match a live project,
+    /// so the user doesn't see a flood of orphans dumped into the
+    /// unassigned bucket.
+    ///
+    /// Returns `Some(empty)` on success (the empty-vec wire shape is
+    /// preserved for backwards compatibility with old clients that
+    /// expected `reassigned_session_ids`) or `None` if no live row
+    /// matched the id.
     pub async fn delete_project(&self, project_id: &str) -> Option<Vec<String>> {
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let transaction = connection.transaction().ok()?;
-        let reassigned: Vec<String> = {
-            let mut stmt = transaction
-                .prepare("SELECT session_id FROM sessions WHERE project_id = ?1")
-                .ok()?;
-            let rows = stmt
-                .query_map(params![project_id], |row| row.get::<_, String>(0))
-                .ok()?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        transaction
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let now = Utc::now().to_rfc3339();
+        let updated = connection
             .execute(
-                "UPDATE sessions SET project_id = NULL WHERE project_id = ?1",
-                params![project_id],
+                "UPDATE projects SET deleted_at = ?1
+                 WHERE project_id = ?2 AND deleted_at IS NULL",
+                params![now, project_id],
             )
             .ok()?;
-        let deleted = transaction
-            .execute(
-                "DELETE FROM projects WHERE project_id = ?1",
-                params![project_id],
-            )
-            .ok()?;
-        if deleted == 0 {
+        if updated == 0 {
             return None;
         }
-        transaction.commit().ok()?;
-        Some(reassigned)
+        Some(Vec::new())
     }
 
     pub async fn assign_session_to_project(
@@ -863,6 +911,7 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN blocks_json TEXT", []);
         let _ = connection.execute("ALTER TABLE archived_turns ADD COLUMN blocks_json TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN path TEXT", []);
+        let _ = connection.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT", []);
 
         // Archived session/turn tables — same schema, plus archived_at timestamp.
         let _ = connection.execute_batch(
