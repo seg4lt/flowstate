@@ -21,11 +21,22 @@ import { ChatView } from "@/components/chat/chat-view";
 import { CodeView } from "@/components/code/code-view";
 import { SettingsView } from "@/components/settings/settings-view";
 import { Toaster } from "@/components/ui/toaster";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 const SIDEBAR_WIDTH_KEY = "flowzen:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 500;
 const SIDEBAR_DEFAULT_WIDTH = 256;
+
+const ZOOM_KEY = "flowzen:webview-zoom";
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 3.0;
+const ZOOM_STEP = 0.1;
+const ZOOM_DEFAULT = 1.0;
+
+function clampZoom(v: number) {
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, Math.round(v * 100) / 100));
+}
 
 function DragHandle({
   width,
@@ -120,8 +131,58 @@ function useTerminalShortcut() {
   }, [dispatch]);
 }
 
+// Cmd/Ctrl +=, +-, +0 control the webview zoom. Same no-text-input-guard
+// rationale as useTerminalShortcut: these are chrome-level shortcuts.
+function useZoomShortcuts() {
+  const zoomRef = React.useRef<number>(ZOOM_DEFAULT);
+
+  React.useEffect(() => {
+    const saved = Number.parseFloat(
+      window.localStorage.getItem(ZOOM_KEY) ?? "",
+    );
+    const initial = Number.isFinite(saved) ? clampZoom(saved) : ZOOM_DEFAULT;
+    zoomRef.current = initial;
+    getCurrentWebviewWindow()
+      .setZoom(initial)
+      .catch(() => {});
+  }, []);
+
+  React.useEffect(() => {
+    function apply(next: number) {
+      const clamped = clampZoom(next);
+      zoomRef.current = clamped;
+      window.localStorage.setItem(ZOOM_KEY, String(clamped));
+      getCurrentWebviewWindow()
+        .setZoom(clamped)
+        .catch(() => {});
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.altKey) return;
+      if (e.key === "0" && !e.shiftKey) {
+        e.preventDefault();
+        apply(ZOOM_DEFAULT);
+        return;
+      }
+      if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        apply(zoomRef.current + ZOOM_STEP);
+        return;
+      }
+      if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        apply(zoomRef.current - ZOOM_STEP);
+        return;
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+}
+
 function AppShell() {
   useTerminalShortcut();
+  useZoomShortcuts();
   const [width, setWidth] = React.useState<number>(() => {
     const saved = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
     if (!saved) return SIDEBAR_DEFAULT_WIDTH;
