@@ -19,7 +19,7 @@ passed in by `&mut`. One instance is shared across the runtime.
 | `create_session(provider, title, model, project_id)` | Mint a new `SessionDetail` with a fresh UUID and `Ready` status. |
 | `start_turn(session, input, permission_mode, reasoning_effort)` | Append a `Running` turn to `session.turns`, flip `session.summary.status` to `Running`, return the new `TurnRecord`. |
 | `finish_turn(session, turn_id, output, status)` | Mark the turn terminal. Flips the session back to `Ready` (success) or `Interrupted`, populates `last_turn_preview`. |
-| `interrupt_session(session, message)` | Mark the most recent running turn as `Interrupted` with `message`, flip the session status. Used by both the interactive `InterruptTurn` command and startup reconciliation. |
+| `interrupt_session(session, message)` | Mark the most recent running turn as `Interrupted` with `message`, flip the session status. Used by post-crash startup reconciliation — the interactive stop flow goes through `finish_turn(Interrupted)` inside `runtime-core::send_turn` instead so it can preserve streamed blocks. |
 
 ## Dependencies
 

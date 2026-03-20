@@ -100,6 +100,12 @@ pub struct RuntimeCore {
     /// the broadcast queue would otherwise be invisible until the very end.
     /// Cleared in both the success and failure exit paths.
     in_flight_turns: Arc<RwLock<HashMap<String, TurnRecord>>>,
+    /// Sessions whose current turn has been stopped by the user. Set by
+    /// `interrupt_turn` and consumed by `send_turn`'s exit path, which then
+    /// finalises the turn with `TurnStatus::Interrupted` instead of the
+    /// raw adapter outcome. Drives the Interrupted / Failed distinction
+    /// without string-matching provider error messages.
+    interrupted_sessions: Arc<Mutex<HashSet<String>>>,
     /// Runtime enabled/disabled flag per provider. Seeded from the
     /// `provider_enablement` persistence table on boot and mutated via
     /// `ClientMessage::SetProviderEnabled`. Missing entries default to
@@ -175,6 +181,7 @@ impl RuntimeCore {
             in_flight_model_fetches: Arc::new(Mutex::new(HashSet::new())),
             in_flight_health_checks: Arc::new(Mutex::new(HashSet::new())),
             in_flight_turns: Arc::new(RwLock::new(HashMap::new())),
+            interrupted_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_enablement: Arc::new(RwLock::new(HashMap::new())),
             turn_observer,
         }
@@ -1006,6 +1013,11 @@ impl RuntimeCore {
             .get_session(&session_id)
             .await
             .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        // Drop any stale interrupt flag for this session before the new
+        // turn begins. A prior turn that errored out via `?` before the
+        // drain loop could leave a set flag behind; without this clear,
+        // the next turn's exit path would wrongly finalise as Interrupted.
+        self.interrupted_sessions.lock().await.remove(&session_id);
         // Runtime enablement gate. Reject before we touch orchestration
         // so a disabled provider can't start a turn mid-stream. Previous
         // turns on this session stay visible (read-only) — that's the
@@ -1432,81 +1444,105 @@ impl RuntimeCore {
             map.remove(&sid);
         }
 
-        match adapter_result {
-            Ok(output) => {
+        // Consume the interrupt flag for this session. If set, the user
+        // clicked stop while the adapter was streaming — finalise the turn
+        // as Interrupted regardless of whether the adapter surfaced the
+        // interrupt as an Ok with a stub string (claude-sdk) or an Err
+        // from a closed stdout (claude-cli / codex).
+        let was_interrupted = self.interrupted_sessions.lock().await.remove(&sid);
+
+        let (status, canonical, result) = match (was_interrupted, adapter_result) {
+            (true, Ok(output)) => {
                 if output.provider_state.is_some() {
                     session.provider_state = output.provider_state.clone();
                 }
-
-                // Use the adapter's canonical output if non-empty, else fall back to accumulated.
+                // Prefer the streamed accumulated text — it's what the user
+                // actually saw on screen. Fall back to the adapter's stub
+                // ("[interrupted]") only when nothing was streamed.
+                let canonical = if !accumulated.trim().is_empty() {
+                    accumulated.clone()
+                } else if !output.output.trim().is_empty() {
+                    output.output
+                } else {
+                    "[interrupted]".to_string()
+                };
+                (
+                    TurnStatus::Interrupted,
+                    canonical,
+                    Ok("Turn interrupted.".to_string()),
+                )
+            }
+            (true, Err(_)) => {
+                let canonical = if accumulated.trim().is_empty() {
+                    "[interrupted]".to_string()
+                } else {
+                    accumulated.clone()
+                };
+                (
+                    TurnStatus::Interrupted,
+                    canonical,
+                    Ok("Turn interrupted.".to_string()),
+                )
+            }
+            (false, Ok(output)) => {
+                if output.provider_state.is_some() {
+                    session.provider_state = output.provider_state.clone();
+                }
                 let canonical = if !output.output.trim().is_empty() {
                     output.output
                 } else {
-                    accumulated
+                    accumulated.clone()
                 };
-
-                let completed_turn = self
-                    .orchestration
-                    .finish_turn(
-                        &mut session,
-                        &turn.turn_id,
-                        canonical,
-                        TurnStatus::Completed,
-                    )
-                    .ok_or_else(|| format!("Unknown turn `{}`.", turn.turn_id))?;
-
-                // Attach reasoning, tool_calls, and structured records to the persisted turn.
-                let merged_turn = if let Some(t) = session
-                    .turns
-                    .iter_mut()
-                    .find(|t| t.turn_id == completed_turn.turn_id)
-                {
-                    if !reasoning.is_empty() {
-                        t.reasoning = Some(reasoning);
-                    }
-                    t.tool_calls = tool_calls;
-                    t.file_changes = file_changes;
-                    t.subagents = subagents;
-                    t.plan = plan;
-                    t.blocks = blocks;
-                    t.clone()
-                } else {
-                    completed_turn
-                };
-
-                self.persistence.upsert_session(session.clone()).await;
-                self.publish(RuntimeEvent::TurnCompleted {
-                    session_id: session.summary.session_id.clone(),
-                    session: session.summary.clone(),
-                    turn: merged_turn,
-                });
-
-                Ok("Turn completed.".to_string())
+                (
+                    TurnStatus::Completed,
+                    canonical,
+                    Ok("Turn completed.".to_string()),
+                )
             }
-            Err(error) => {
-                let failed_turn = self
-                    .orchestration
-                    .finish_turn(
-                        &mut session,
-                        &turn.turn_id,
-                        error.clone(),
-                        TurnStatus::Failed,
-                    )
-                    .ok_or_else(|| format!("Unknown turn `{}`.", turn.turn_id))?;
+            (false, Err(error)) => (TurnStatus::Failed, error.clone(), Err(error)),
+        };
 
-                self.persistence.upsert_session(session.clone()).await;
-                self.publish(RuntimeEvent::Error {
-                    message: failed_turn.output.clone(),
-                });
-                self.publish(RuntimeEvent::TurnCompleted {
-                    session_id: session.summary.session_id.clone(),
-                    session: session.summary.clone(),
-                    turn: failed_turn,
-                });
+        let finished = self
+            .orchestration
+            .finish_turn(&mut session, &turn.turn_id, canonical, status)
+            .ok_or_else(|| format!("Unknown turn `{}`.", turn.turn_id))?;
 
-                Err(error)
+        // Merge the streamed locals into the running turn on every exit
+        // path. Without this, Err and Interrupted turns broadcast with
+        // empty `blocks`, and the frontend's `applyEventToTurns` replaces
+        // the cached turn on `turn_completed` — wiping out the content the
+        // user was already watching stream in.
+        let merged_turn = if let Some(t) = session
+            .turns
+            .iter_mut()
+            .find(|t| t.turn_id == finished.turn_id)
+        {
+            if !reasoning.is_empty() {
+                t.reasoning = Some(reasoning);
             }
+            t.tool_calls = tool_calls;
+            t.file_changes = file_changes;
+            t.subagents = subagents;
+            t.plan = plan;
+            t.blocks = blocks;
+            t.clone()
+        } else {
+            finished
+        };
+
+        self.persistence.upsert_session(session.clone()).await;
+        if status == TurnStatus::Failed {
+            self.publish(RuntimeEvent::Error {
+                message: merged_turn.output.clone(),
+            });
         }
+        self.publish(RuntimeEvent::TurnCompleted {
+            session_id: session.summary.session_id.clone(),
+            session: session.summary.clone(),
+            turn: merged_turn,
+        });
+
+        result
     }
 
     async fn update_permission_mode(
@@ -1537,9 +1573,14 @@ impl RuntimeCore {
     }
 
     async fn interrupt_turn(&self, session_id: String) -> Result<String, String> {
-        let mut session = self
-            .persistence
-            .get_session(&session_id)
+        // Prefer the in-flight snapshot over stale persistence so we never
+        // hand the adapter a view of the session that's missing the turn
+        // it's supposed to abort. Flag the session as interrupted so
+        // `send_turn`'s exit path finalises with `TurnStatus::Interrupted`
+        // and the streamed blocks are preserved — `interrupt_turn` itself
+        // does not persist or publish, to avoid racing `send_turn`.
+        let session = self
+            .live_session_detail(&session_id)
             .await
             .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
         let adapter = self
@@ -1553,14 +1594,11 @@ impl RuntimeCore {
             })?
             .clone();
 
-        let message = adapter.interrupt_turn(&session).await?;
-        self.orchestration.interrupt_session(&mut session, &message);
-        self.persistence.upsert_session(session.clone()).await;
-        self.publish(RuntimeEvent::SessionInterrupted {
-            session: session.summary.clone(),
-            message: message.clone(),
-        });
-        Ok(message)
+        self.interrupted_sessions
+            .lock()
+            .await
+            .insert(session_id.clone());
+        adapter.interrupt_turn(&session).await
     }
 
     async fn delete_session(&self, session_id: String) -> Result<String, String> {
@@ -1700,7 +1738,8 @@ mod tests {
     use zenui_provider_api::{
         ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind,
         ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput,
-        ReasoningEffort, SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus, UserInput,
+        ReasoningEffort, RuntimeEvent, SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus,
+        UserInput,
     };
 
     use super::RuntimeCore;
@@ -2253,6 +2292,388 @@ mod tests {
         assert_eq!(detail.turns.len(), 1);
         assert_eq!(detail.turns[0].status, TurnStatus::Completed);
         assert_eq!(detail.turns[0].output, "slow response for hello");
+    }
+
+    /// Adapter that streams a text delta + tool call, waits for the test
+    /// to trigger a mid-turn interrupt, then returns `outcome` (Ok or Err)
+    /// once released. Lets us exercise both exit paths of `send_turn` with
+    /// the interrupt flag already set.
+    struct InterruptingAdapter {
+        mid_turn_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        outcome: InterruptOutcome,
+    }
+
+    #[derive(Clone, Copy)]
+    enum InterruptOutcome {
+        OkStub,
+        Err,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for InterruptingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+                enabled: true,
+            }
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            _input: &UserInput,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "partial answer".to_string(),
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallStarted {
+                    call_id: "tool-1".to_string(),
+                    name: "search".to_string(),
+                    args: serde_json::json!({"q": "z"}),
+                    parent_call_id: None,
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallCompleted {
+                    call_id: "tool-1".to_string(),
+                    output: "ok".to_string(),
+                    error: None,
+                })
+                .await;
+
+            // Give the runtime drain loop time to process the events and
+            // write them into in_flight_turns before we gate the test.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            if let Some(tx) = self.mid_turn_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = self.resume_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+
+            match self.outcome {
+                InterruptOutcome::OkStub => Ok(ProviderTurnOutput {
+                    output: "[interrupted]".to_string(),
+                    provider_state: None,
+                }),
+                InterruptOutcome::Err => {
+                    Err("adapter stdout closed during interrupt".to_string())
+                }
+            }
+        }
+    }
+
+    /// Adapter that streams one delta then returns `Err`. Used to verify
+    /// that a genuine provider failure still merges the streamed blocks
+    /// into the failed turn (no content wiped on crash), and still
+    /// publishes a `RuntimeEvent::Error`.
+    struct FailingAdapter;
+
+    #[async_trait]
+    impl ProviderAdapter for FailingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+                enabled: true,
+            }
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            _input: &UserInput,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "half a thought".to_string(),
+                })
+                .await;
+            // Flush the delta through the drain loop before we explode
+            // so the test can observe the merged blocks.
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Err("boom".to_string())
+        }
+    }
+
+    async fn run_interrupt_scenario(outcome: InterruptOutcome) -> zenui_provider_api::TurnRecord {
+        let (mid_tx, mid_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(InterruptingAdapter {
+            mid_turn_tx: tokio::sync::Mutex::new(Some(mid_tx)),
+            resume_rx: tokio::sync::Mutex::new(Some(resume_rx)),
+            outcome,
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        let mut events = runtime.subscribe();
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("Interrupt".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        let runtime_clone = runtime.clone();
+        let sid_clone = session_id.clone();
+        let turn_task = tokio::spawn(async move {
+            runtime_clone
+                .handle_client_message(ClientMessage::SendTurn {
+                    session_id: sid_clone,
+                    input: "go".to_string(),
+                    images: Vec::new(),
+                    permission_mode: None,
+                    reasoning_effort: None,
+                })
+                .await
+        });
+
+        mid_rx.await.expect("adapter should signal mid-turn");
+
+        // Simulate the user clicking stop: interrupt_turn flips the flag
+        // and tells the adapter to abort.
+        runtime
+            .handle_client_message(ClientMessage::InterruptTurn {
+                session_id: session_id.clone(),
+            })
+            .await;
+
+        // Release the adapter so it returns (Ok or Err per `outcome`).
+        let _ = resume_tx.send(());
+        turn_task.await.expect("turn task should complete");
+
+        // Drain broadcast events looking for the TurnCompleted payload.
+        // Assert no `RuntimeEvent::Error` fires on the interrupt path —
+        // an interrupted turn is a user action, not a failure.
+        let mut turn_completed_turn = None;
+        while let Ok(evt) = events.try_recv() {
+            match evt {
+                RuntimeEvent::TurnCompleted { turn, .. } => {
+                    turn_completed_turn = Some(turn);
+                }
+                RuntimeEvent::Error { message } => {
+                    panic!("interrupt path must not publish Error, got: {message}");
+                }
+                _ => {}
+            }
+        }
+        turn_completed_turn.expect("TurnCompleted must be published on interrupt")
+    }
+
+    /// User stops the turn; adapter surfaces it as `Err(...)` (the
+    /// claude-cli / codex path). The final turn must keep every streamed
+    /// block, land in `Interrupted` status, and NOT publish `Error`.
+    #[tokio::test]
+    async fn interrupt_preserves_blocks_on_err_path() {
+        let turn = run_interrupt_scenario(InterruptOutcome::Err).await;
+        assert_eq!(turn.status, TurnStatus::Interrupted);
+        assert_eq!(turn.blocks.len(), 2, "blocks: {:?}", turn.blocks);
+        match &turn.blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "partial answer"),
+            other => panic!("expected Text block 0, got {other:?}"),
+        }
+        match &turn.blocks[1] {
+            ContentBlock::ToolCall { call_id } => assert_eq!(call_id, "tool-1"),
+            other => panic!("expected ToolCall block 1, got {other:?}"),
+        }
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].status, ToolCallStatus::Completed);
+        assert_eq!(turn.output, "partial answer");
+    }
+
+    /// Same scenario, but the adapter surfaces the interrupt as
+    /// `Ok("[interrupted]")` (the claude-sdk path). The streamed text
+    /// must still be preserved as `output` and `blocks`.
+    #[tokio::test]
+    async fn interrupt_preserves_blocks_on_ok_path() {
+        let turn = run_interrupt_scenario(InterruptOutcome::OkStub).await;
+        assert_eq!(turn.status, TurnStatus::Interrupted);
+        assert_eq!(turn.blocks.len(), 2, "blocks: {:?}", turn.blocks);
+        assert_eq!(
+            turn.output, "partial answer",
+            "accumulated text must win over the adapter's [interrupted] stub"
+        );
+    }
+
+    /// A genuine adapter failure (no interrupt) still merges the streamed
+    /// blocks into the failed turn and still publishes `Error`, so the
+    /// UI can surface "Turn failed" without losing partial content.
+    #[tokio::test]
+    async fn failed_turn_still_merges_blocks() {
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![Arc::new(FailingAdapter)],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+        let mut events = runtime.subscribe();
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("Fail".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        runtime
+            .handle_client_message(ClientMessage::SendTurn {
+                session_id: session_id.clone(),
+                input: "go".to_string(),
+                images: Vec::new(),
+                permission_mode: None,
+                reasoning_effort: None,
+            })
+            .await;
+
+        let detail = runtime
+            .persistence
+            .get_session(&session_id)
+            .await
+            .expect("session detail should exist");
+        let turn = detail.turns.last().expect("turn should exist");
+        assert_eq!(turn.status, TurnStatus::Failed);
+        assert_eq!(turn.output, "boom", "failed turn carries the error string");
+        assert_eq!(turn.blocks.len(), 1, "streamed block must survive");
+        match &turn.blocks[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "half a thought"),
+            other => panic!("expected Text block, got {other:?}"),
+        }
+
+        let mut saw_error = false;
+        let mut saw_completed = false;
+        while let Ok(evt) = events.try_recv() {
+            match evt {
+                RuntimeEvent::Error { .. } => saw_error = true,
+                RuntimeEvent::TurnCompleted { .. } => saw_completed = true,
+                _ => {}
+            }
+        }
+        assert!(saw_error, "failed path must publish Error");
+        assert!(saw_completed, "failed path must publish TurnCompleted");
+    }
+
+    /// `InterruptTurn` on a session with no streaming turn just flips
+    /// the flag. The next `send_turn` should clear the stale flag on
+    /// entry and finalise normally, not as Interrupted.
+    #[tokio::test]
+    async fn stale_interrupt_flag_is_cleared_on_next_turn() {
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![Arc::new(FakeAdapter)],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                title: Some("Stale".to_string()),
+                model: None,
+                project_id: None,
+            })
+            .await;
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        // Plant a stale flag as if a prior turn's interrupt never got
+        // consumed. The next `send_turn` must drop it on entry.
+        runtime
+            .interrupted_sessions
+            .lock()
+            .await
+            .insert(session_id.clone());
+
+        runtime
+            .handle_client_message(ClientMessage::SendTurn {
+                session_id: session_id.clone(),
+                input: "hello".to_string(),
+                images: Vec::new(),
+                permission_mode: None,
+                reasoning_effort: None,
+            })
+            .await;
+
+        let detail = runtime
+            .persistence
+            .get_session(&session_id)
+            .await
+            .expect("session detail should exist");
+        let turn = detail.turns.last().expect("turn should exist");
+        assert_eq!(
+            turn.status,
+            TurnStatus::Completed,
+            "stale flag must not flip a normal turn to Interrupted"
+        );
     }
 
     /// reconcile_startup should flip any session whose persisted status is
