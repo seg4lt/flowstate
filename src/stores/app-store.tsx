@@ -148,15 +148,18 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
     }
 
     case "project_deleted": {
+      // Drop the project from the list — sessions retain their
+      // (now-dangling) projectId on purpose. The sidebar filters them
+      // out by checking projectId against state.projects, and if the
+      // user later re-creates a project with the same path the
+      // backend un-tombstones the original row (same project_id) and
+      // they reappear under it. The reassigned_session_ids field on
+      // the wire is always empty now and is kept only for backwards
+      // compatibility with old daemon builds.
       const projects = state.projects.filter(
         (p) => p.projectId !== event.project_id,
       );
-      const sessions = new Map(state.sessions);
-      for (const sid of event.reassigned_session_ids) {
-        const s = sessions.get(sid);
-        if (s) sessions.set(sid, { ...s, projectId: undefined });
-      }
-      return { ...state, projects, sessions };
+      return { ...state, projects };
     }
 
     case "session_project_assigned": {

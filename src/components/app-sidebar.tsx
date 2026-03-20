@@ -49,9 +49,18 @@ export function AppSidebar() {
   const { state, send } = useApp();
   const navigate = useNavigate();
 
-  // Group sessions by project
+  // Group sessions by project. Sessions whose projectId points at a
+  // project that no longer exists (deleted/tombstoned) are filtered
+  // out entirely instead of being dumped into the unassigned bucket
+  // — they're "hibernating" until the user re-adds the same folder
+  // as a project, at which point the persistence layer un-tombstones
+  // the original project_id and they reappear under it.
+  const knownProjectIds = new Set(state.projects.map((p) => p.projectId));
   const sessionsByProject = new Map<string | null, SessionSummary[]>();
   for (const session of state.sessions.values()) {
+    if (session.projectId && !knownProjectIds.has(session.projectId)) {
+      continue;
+    }
     const key = session.projectId ?? null;
     const list = sessionsByProject.get(key) ?? [];
     list.push(session);
@@ -155,10 +164,10 @@ export function AppSidebar() {
               <Collapsible defaultOpen className="group/collapsible">
                 <SidebarMenuItem className="group/project">
                   <CollapsibleTrigger asChild>
-                    <SidebarMenuButton tooltip="Threads">
+                    <SidebarMenuButton tooltip="General">
                       <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
                       <MessageSquare />
-                      <span className="flex-1 truncate">Threads</span>
+                      <span className="flex-1 truncate">General</span>
                     </SidebarMenuButton>
                   </CollapsibleTrigger>
                   <div className="absolute right-1 top-1">
