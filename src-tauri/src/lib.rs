@@ -34,6 +34,265 @@ fn get_git_branch(path: String) -> Option<String> {
     if branch.is_empty() { None } else { Some(branch) }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitBranchList {
+    current: Option<String>,
+    local: Vec<String>,
+    remote: Vec<String>,
+}
+
+/// List every local and remote-tracking ref in `path`, ordered by
+/// most recent committer date. One `for-each-ref` call gives us the
+/// `*` marker for the current branch, the short name, and the full
+/// refname in a single pass — NUL-delimited so whitespace in refs
+/// can't corrupt parsing. Skips `origin/HEAD` symbolic refs.
+#[tauri::command]
+fn list_git_branches(path: String) -> Result<GitBranchList, String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &path,
+            "for-each-ref",
+            "--format=%(HEAD)%00%(refname:short)%00%(refname)",
+            "--sort=-committerdate",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("git for-each-ref failed (status {:?})", output.status.code())
+        } else {
+            stderr
+        });
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| format!("git output not utf-8: {e}"))?;
+
+    let mut current: Option<String> = None;
+    let mut local: Vec<String> = Vec::new();
+    let mut remote: Vec<String> = Vec::new();
+    for line in stdout.split('\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\0');
+        let head_marker = parts.next().unwrap_or("");
+        let short = parts.next().unwrap_or("");
+        let full = parts.next().unwrap_or("");
+        if short.is_empty() || full.is_empty() {
+            continue;
+        }
+        // Skip symbolic refs like `origin/HEAD` — they alias a real
+        // branch and showing both is noise.
+        if short.ends_with("/HEAD") {
+            continue;
+        }
+        if head_marker.trim() == "*" {
+            current = Some(short.to_string());
+        }
+        if full.starts_with("refs/heads/") {
+            local.push(short.to_string());
+        } else if full.starts_with("refs/remotes/") {
+            remote.push(short.to_string());
+        }
+    }
+
+    Ok(GitBranchList {
+        current,
+        local,
+        remote,
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorktree {
+    path: String,
+    head: Option<String>,
+    branch: Option<String>,
+}
+
+/// List every worktree attached to the repo containing `path`,
+/// parsed from `git worktree list --porcelain`. The porcelain format
+/// is newline-delimited key/value pairs grouped into blank-line
+/// separated records — one record per worktree. Each record has a
+/// mandatory `worktree <path>` header, and may carry `HEAD <sha>`,
+/// `branch refs/heads/<name>`, `detached`, or `bare`. We ignore
+/// `bare` records (they have no working tree to show) and strip the
+/// `refs/heads/` prefix so the UI can render the short branch name
+/// directly.
+#[tauri::command]
+fn list_git_worktrees(path: String) -> Result<Vec<GitWorktree>, String> {
+    let output = Command::new("git")
+        .args(["-C", &path, "worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!(
+                "git worktree list failed (status {:?})",
+                output.status.code()
+            )
+        } else {
+            stderr
+        });
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|e| format!("git output not utf-8: {e}"))?;
+
+    let mut worktrees: Vec<GitWorktree> = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_head: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    let mut current_bare = false;
+
+    let flush = |worktrees: &mut Vec<GitWorktree>,
+                 path: &mut Option<String>,
+                 head: &mut Option<String>,
+                 branch: &mut Option<String>,
+                 bare: &mut bool| {
+        if let Some(p) = path.take() {
+            if !*bare {
+                worktrees.push(GitWorktree {
+                    path: p,
+                    head: head.take(),
+                    branch: branch.take(),
+                });
+            } else {
+                head.take();
+                branch.take();
+            }
+        }
+        *bare = false;
+    };
+
+    for line in stdout.lines() {
+        if line.is_empty() {
+            flush(
+                &mut worktrees,
+                &mut current_path,
+                &mut current_head,
+                &mut current_branch,
+                &mut current_bare,
+            );
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            // A new record started without a blank separator — flush
+            // whatever we accumulated to stay tolerant of git versions
+            // that elide the trailing newline.
+            flush(
+                &mut worktrees,
+                &mut current_path,
+                &mut current_head,
+                &mut current_branch,
+                &mut current_bare,
+            );
+            current_path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            current_head = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            current_branch = Some(
+                rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string(),
+            );
+        } else if line == "bare" {
+            current_bare = true;
+        }
+        // "detached" and other single-word markers are ignored; a
+        // detached worktree just ends up with branch = None.
+    }
+    // Flush the final record (git's porcelain output may or may not
+    // end with a trailing blank line).
+    flush(
+        &mut worktrees,
+        &mut current_path,
+        &mut current_head,
+        &mut current_branch,
+        &mut current_bare,
+    );
+
+    Ok(worktrees)
+}
+
+/// Create a brand-new local branch based on the current HEAD and
+/// switch to it. Separate from `git_checkout` because the call shape
+/// is different (plain `checkout -b <name>`, no tracking ref) and
+/// because the UI surfaces it as a distinct action — typing a branch
+/// name that doesn't match any existing ref in the branch picker.
+#[tauri::command]
+fn git_create_branch(path: String, branch: String) -> Result<(), String> {
+    if branch.trim().is_empty() {
+        return Err("empty branch name".into());
+    }
+    let output = Command::new("git")
+        .args(["-C", &path, "checkout", "-b", &branch])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "git checkout -b exited with status {:?}",
+                output.status.code()
+            )
+        });
+    }
+    Ok(())
+}
+
+/// Switch the working tree in `path` to `branch`. When `create_track`
+/// is `Some(remote_ref)`, we run `checkout -b <branch> --track
+/// <remote_ref>` to create a new local branch tracking a remote; when
+/// it's `None`, a plain `checkout <branch>`. On failure, git's stderr
+/// is returned verbatim so the UI can show the user exactly why (dirty
+/// tree, merge conflict, nonexistent branch, etc.) rather than a
+/// generic "checkout failed" message.
+#[tauri::command]
+fn git_checkout(
+    path: String,
+    branch: String,
+    create_track: Option<String>,
+) -> Result<(), String> {
+    if branch.trim().is_empty() {
+        return Err("empty branch name".into());
+    }
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &path, "checkout"]);
+    match &create_track {
+        Some(remote_ref) => {
+            cmd.args(["-b", &branch, "--track", remote_ref]);
+        }
+        None => {
+            cmd.arg(&branch);
+        }
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("git checkout exited with status {:?}", output.status.code())
+        });
+    }
+    Ok(())
+}
+
 /// Lightweight per-file entry returned by `get_git_diff_summary`.
 /// Just path + line stats — no file contents. Designed so the diff
 /// panel can show the full file list immediately without paying the
@@ -848,6 +1107,10 @@ pub fn run() {
             transport_tauri::commands::connect,
             transport_tauri::commands::handle_message,
             get_git_branch,
+            list_git_branches,
+            list_git_worktrees,
+            git_checkout,
+            git_create_branch,
             get_git_diff_summary,
             get_git_diff_file,
             list_project_files,

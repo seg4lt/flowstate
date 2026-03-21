@@ -33,6 +33,38 @@ export function getGitBranch(path: string): Promise<string | null> {
   return invoke<string | null>("get_git_branch", { path });
 }
 
+export interface GitBranchList {
+  current: string | null;
+  local: string[];
+  remote: string[];
+}
+
+export function listGitBranches(path: string): Promise<GitBranchList> {
+  return invoke<GitBranchList>("list_git_branches", { path });
+}
+
+export function gitCheckout(
+  path: string,
+  branch: string,
+  createTrack: string | null,
+): Promise<void> {
+  return invoke<void>("git_checkout", { path, branch, createTrack });
+}
+
+export function gitCreateBranch(path: string, branch: string): Promise<void> {
+  return invoke<void>("git_create_branch", { path, branch });
+}
+
+export interface GitWorktree {
+  path: string;
+  head: string | null;
+  branch: string | null;
+}
+
+export function listGitWorktrees(path: string): Promise<GitWorktree[]> {
+  return invoke<GitWorktree[]>("list_git_worktrees", { path });
+}
+
 export type GitFileStatus =
   | "modified"
   | "added"

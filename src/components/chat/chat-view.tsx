@@ -1,7 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { GitBranch } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 import { useApp } from "@/stores/app-store";
@@ -35,6 +34,7 @@ import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
+import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
 import { StuckBanner } from "./stuck-banner";
 import { DiffPanel, type DiffStyle } from "./diff-panel";
@@ -909,11 +909,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             </span>
           )}
           <div className="flex items-center gap-2">
-            {gitBranch && (
-              <span className="inline-flex items-center gap-1 truncate text-[11px] text-muted-foreground">
-                <GitBranch className="h-3 w-3 shrink-0" />
-                {gitBranch}
-              </span>
+            {gitBranch && projectPath && (
+              <BranchSwitcher
+                projectPath={projectPath}
+                currentBranch={gitBranch}
+                onCheckedOut={refreshDiffs}
+              />
             )}
             {providerDisabled && (
               <span className="inline-flex shrink-0 items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">

@@ -1,6 +1,14 @@
 import { queryOptions, type QueryClient } from "@tanstack/react-query";
-import { getAttachment, getGitBranch, getGitDiffSummary, sendMessage } from "./api";
-import type { GitFileSummary } from "./api";
+import {
+  getAttachment,
+  getGitBranch,
+  getGitDiffSummary,
+  listGitBranches,
+  listGitWorktrees,
+  listProjectFiles,
+  sendMessage,
+} from "./api";
+import type { GitBranchList, GitFileSummary, GitWorktree } from "./api";
 import type { SessionDetail } from "./types";
 
 // Pagination page size for session loads. Requesting the most
@@ -106,6 +114,44 @@ export function gitBranchQueryOptions(path: string | null) {
   });
 }
 
+// All refs under the project — local heads + remote tracking branches,
+// sorted by recent committer date, returned in one `for-each-ref`
+// call. Only fetched when the branch-switcher popover opens (the
+// consumer overrides `enabled`), so we don't pay the git subprocess
+// cost on sessions where the user never clicks. Short staleTime +
+// refetchOnMount because the agent can run `git branch` / `git
+// checkout` at any moment and we want the next popover open to
+// reflect that without stale reads.
+export function gitBranchListQueryOptions(path: string | null) {
+  return queryOptions({
+    queryKey: ["git", "branch-list", path] as const,
+    queryFn: async (): Promise<GitBranchList> => {
+      if (!path) return { current: null, local: [], remote: [] };
+      return listGitBranches(path);
+    },
+    enabled: !!path,
+    staleTime: 5 * 1000,
+    refetchOnMount: true,
+  });
+}
+
+// Every worktree attached to the repo containing `path`, parsed from
+// `git worktree list --porcelain`. Same short-TTL + refetchOnMount
+// reasoning as the branch list — an agent running `git worktree add`
+// between popover opens should show up on the next open.
+export function gitWorktreeListQueryOptions(path: string | null) {
+  return queryOptions({
+    queryKey: ["git", "worktree-list", path] as const,
+    queryFn: async (): Promise<GitWorktree[]> => {
+      if (!path) return [];
+      return listGitWorktrees(path);
+    },
+    enabled: !!path,
+    staleTime: 5 * 1000,
+    refetchOnMount: true,
+  });
+}
+
 /// Fetch the bytes of a persisted image attachment on demand. Cached
 /// indefinitely (the file is immutable for the lifetime of the row),
 /// dropped from memory five minutes after the last reference so a long
@@ -120,6 +166,55 @@ export function attachmentQueryOptions(id: string | null) {
     enabled: !!id,
     staleTime: Infinity,
     gcTime: 5 * 60 * 1000,
+  });
+}
+
+// Throttle for the hover-driven file-list prefetch on the chat
+// header's Search button. prefetchQuery treats anything fresher
+// than this staleTime override as a no-op, so wiggling the mouse
+// over the button only fires one walk per ~1.5 seconds per
+// project — not one per mouse-enter event.
+const PROJECT_FILES_PREFETCH_THROTTLE_MS = 1_500;
+
+// Project file list for the /code editor view's picker + tree.
+// Cache lives forever once populated and is refreshed on explicit
+// user signal only (Search-button hover/focus → prefetchProjectFiles
+// below, or first cold mount of CodeView). NO automatic refetches:
+// no staleTime countdown, no refetchOnMount, no refetchInterval, no
+// refetchOnWindowFocus / Reconnect, no FS-watcher invalidation. The
+// user is in a long-running agent flow and explicitly does not want
+// the app walking thousands of files for data they might never look
+// at. A future change here must preserve that — see the plan at
+// `~/.claude/plans/lovely-singing-abelson.md` for the rationale.
+export function projectFilesQueryOptions(path: string | null) {
+  return queryOptions({
+    queryKey: ["code", "project-files", path] as const,
+    queryFn: async (): Promise<string[]> => {
+      if (!path) return [];
+      return listProjectFiles(path);
+    },
+    enabled: !!path,
+    staleTime: Infinity,
+    // Global default in main.tsx is already false, but be explicit
+    // so a future global change doesn't quietly start refetching.
+    refetchOnMount: false,
+    gcTime: 30 * 60 * 1000,
+  });
+}
+
+// Fire-and-forget hover prefetch for the project file list. Wired
+// to onMouseEnter / onFocus on the chat header's Search button so
+// the walk starts before the click lands. The staleTime override
+// gives natural throttling: rapid mouse movement over the button
+// does not queue up redundant walks.
+export function prefetchProjectFiles(
+  client: QueryClient,
+  path: string | null,
+) {
+  if (!path) return;
+  void client.prefetchQuery({
+    ...projectFilesQueryOptions(path),
+    staleTime: PROJECT_FILES_PREFETCH_THROTTLE_MS,
   });
 }
 
