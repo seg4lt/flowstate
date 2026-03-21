@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
 import { prefetchSession } from "@/lib/queries";
+import { cn } from "@/lib/utils";
 
 function formatTimeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -34,6 +35,19 @@ interface ThreadItemProps {
    *  spinner next to the title so the user can see at a glance which
    *  threads are working without having to open them. */
   running: boolean;
+  /** True when the agent has paused mid-turn and is actively waiting
+   *  on the user — a permission prompt, an AskUserQuestion, or an
+   *  ExitPlanMode plan approval. Distinct from `running`: a thread
+   *  can be running without awaiting input (model is generating)
+   *  and can briefly be awaiting input without being running (in
+   *  the gap between a turn ending and a new one starting, though
+   *  that's rare). Drives the "Need Response" badge. */
+  awaitingInput: boolean;
+  /** True when the most recent turn finished while the user was on
+   *  a different screen / thread. The store clears this the moment
+   *  the user activates the thread, so the badge naturally
+   *  disappears on click. Always false on the active thread. */
+  pendingDone: boolean;
   onClick: () => void;
 }
 
@@ -43,6 +57,8 @@ export function ThreadItem({
   updatedAt,
   isActive,
   running,
+  awaitingInput,
+  pendingDone,
   onClick,
 }: ThreadItemProps) {
   const { send } = useApp();
@@ -102,7 +118,16 @@ export function ThreadItem({
         />
       ) : (
         <SidebarMenuSubButton
-          className="h-7 w-full min-w-0 rounded-r-none pr-12"
+          className={cn(
+            "h-7 w-full min-w-0 rounded-r-none",
+            // pr-12 leaves room for the absolute hover-buttons (~46px)
+            // and the short "12m" timestamp. The "Need Response" chip
+            // is much wider (~90px), so when it's visible we bump the
+            // padding to pr-24 to keep it from overlapping the title.
+            // Active threads never show "Need Response" so they stay
+            // on the compact pr-12.
+            awaitingInput && !isActive ? "pr-24" : "pr-12",
+          )}
           isActive={isActive}
           onClick={onClick}
           onDoubleClick={(e) => {
@@ -119,10 +144,32 @@ export function ThreadItem({
         </SidebarMenuSubButton>
       )}
 
-      {/* Timestamp — fades out on hover */}
+      {/* Right-side status chip — fades out on hover so the action
+       *  buttons can take its place. Priority:
+       *    1. agent is actively waiting on the user         → "Need Response" (blue)
+       *    2. recently finished while user was elsewhere    → "Done"          (green)
+       *    3. otherwise                                     → relative time
+       *  Active threads always show the time — the user can already
+       *  see what's happening in the message timeline so the badge
+       *  would be redundant noise. Note that "Need Response" is NOT
+       *  the same as "running" — it only fires when the agent has
+       *  actually paused on a permission prompt / AskUserQuestion /
+       *  ExitPlanMode, not while the model is generating. */}
       {!editing && (
-        <span className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground transition-opacity group-hover/thread:opacity-0">
-          {formatTimeAgo(updatedAt)}
+        <span
+          className={
+            awaitingInput && !isActive
+              ? "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-medium text-blue-600 transition-opacity group-hover/thread:opacity-0 dark:text-blue-400"
+              : pendingDone && !isActive
+                ? "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-medium text-green-600 transition-opacity group-hover/thread:opacity-0 dark:text-green-400"
+                : "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground transition-opacity group-hover/thread:opacity-0"
+          }
+        >
+          {awaitingInput && !isActive
+            ? "Need Response"
+            : pendingDone && !isActive
+              ? "Done"
+              : formatTimeAgo(updatedAt)}
         </span>
       )}
 

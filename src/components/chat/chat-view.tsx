@@ -323,19 +323,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       setLoadingOlder(false);
     }
   }, [loadingOlder, queryClient, sessionId]);
-  // FIFO queue of outstanding permission requests. Parallel tool
-  // calls from the Claude Agent SDK fire multiple canUseTool
-  // callbacks in the same turn, and each one hits the runtime as a
-  // separate PermissionRequested event. Storing one at a time would
-  // overwrite older prompts and leave their canUseTool Promises
-  // blocking forever (the original "stuck pending" bug). The user
-  // sees the head of the queue; clicking Allow/Deny pops it and the
-  // next prompt slides in.
-  const [pendingPermissions, setPendingPermissions] = React.useState<
-    PermissionRequest[]
-  >([]);
-  const [pendingQuestion, setPendingQuestion] =
-    React.useState<QuestionRequest | null>(null);
+  // FIFO queue of outstanding permission requests + the in-flight
+  // clarifying question, BOTH read from the global store. Lifting
+  // them out of chat-view fixes the cross-thread drop bug: events
+  // that arrive while the user is on a different session used to be
+  // silently discarded by the eventSessionId !== sessionIdRef early
+  // return below, leaving the affected thread permanently stuck on
+  // a never-rendered prompt. The store now captures every event
+  // keyed by session_id, and chat-view becomes a pure consumer.
+  const pendingPermissions = React.useMemo<PermissionRequest[]>(
+    () => state.pendingPermissionsBySession.get(sessionId) ?? [],
+    [state.pendingPermissionsBySession, sessionId],
+  );
+  const pendingQuestion: QuestionRequest | null = React.useMemo(() => {
+    const q = state.pendingQuestionBySession.get(sessionId);
+    return q ?? null;
+  }, [state.pendingQuestionBySession, sessionId]);
   const [effort, setEffort] = React.useState<ReasoningEffort>("high");
   const permissionStorageKey = `flowzen:permissionMode:${sessionId}`;
   const [permissionMode, setPermissionMode] =
@@ -547,11 +550,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // don't belong to any specific session long-term, but they must
   // not leak from the session the user is leaving. (Per-session
   // *turns* don't need to reset because they live in the query
-  // cache, keyed by sessionId.)
+  // cache, keyed by sessionId; pending permissions / questions
+  // don't need to reset because they live in the global store
+  // keyed by sessionId — switching threads just reads a different
+  // entry.)
   React.useEffect(() => {
     setPendingInput(null);
-    setPendingPermissions([]);
-    setPendingQuestion(null);
     setLastEventAt(Date.now());
     setStuckSince(null);
   }, [sessionId]);
@@ -632,49 +636,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       switch (event.type) {
         case "turn_started":
           // Clear the optimistic pending row now that the real turn
-          // has been appended to the cache. Drop any queued permission
-          // prompts left over from a previous (probably interrupted)
-          // turn — the backend's sink for those is gone, and letting
-          // the user click on a stale prompt produces the old
-          // "resolve_permission found no pending sender" warning.
+          // has been appended to the cache. The store handles
+          // pendingPermissions/pendingQuestion clearing globally
+          // (turn_completed / session_interrupted reducer paths).
           setPendingInput(null);
-          setPendingPermissions([]);
           break;
 
         case "turn_completed":
           setPendingInput(null);
-          setPendingPermissions([]);
           // Turn-wise refresh: every completed turn re-runs `git diff
           // HEAD` so the panel reflects exactly what this turn left
           // on disk.
           refreshDiffs();
           break;
 
-        case "user_question_asked":
-          setPendingQuestion({
-            requestId: event.request_id,
-            questions: event.questions,
-          });
-          break;
-
-        case "permission_requested":
-          // Append to the FIFO queue. Dedupe on request_id because
-          // the daemon-side lag-recovery path can replay events.
-          setPendingPermissions((prev) => {
-            if (prev.some((p) => p.requestId === event.request_id)) {
-              return prev;
-            }
-            return [
-              ...prev,
-              {
-                requestId: event.request_id,
-                toolName: event.tool_name,
-                input: event.input,
-                suggested: event.suggested,
-              },
-            ];
-          });
-          break;
+        // permission_requested / user_question_asked are handled in
+        // the global store reducer (app-store.tsx). chat-view reads
+        // pendingPermissions / pendingQuestion from the store, so a
+        // prompt that arrives while the user is on a different
+        // thread now lives in the store until they switch over.
 
         case "session_deleted":
         case "session_archived":
@@ -761,7 +741,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // queued prompt becomes visible immediately.
     const head = pendingPermissions[0];
     if (!head) return;
-    setPendingPermissions((prev) => prev.slice(1));
+    dispatch({
+      type: "consume_pending_permission",
+      sessionId,
+      requestId: head.requestId,
+    });
     await sendMessage({
       type: "answer_permission",
       session_id: sessionId,
@@ -781,7 +765,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   async function handleQuestionSubmit(answers: UserInputAnswer[]) {
     if (!pendingQuestion) return;
     const requestId = pendingQuestion.requestId;
-    setPendingQuestion(null);
+    dispatch({ type: "consume_pending_question", sessionId, requestId });
     await sendMessage({
       type: "answer_question",
       session_id: sessionId,
@@ -793,7 +777,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   async function handleQuestionCancel() {
     if (!pendingQuestion) return;
     const requestId = pendingQuestion.requestId;
-    setPendingQuestion(null);
+    dispatch({ type: "consume_pending_question", sessionId, requestId });
     await sendMessage({
       type: "cancel_question",
       session_id: sessionId,

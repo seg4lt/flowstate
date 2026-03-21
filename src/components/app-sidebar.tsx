@@ -185,6 +185,12 @@ export function AppSidebar() {
                             state.activeSessionId === session.sessionId
                           }
                           running={session.status === "running"}
+                          awaitingInput={state.awaitingInputSessionIds.has(
+                            session.sessionId,
+                          )}
+                          pendingDone={state.doneSessionIds.has(
+                            session.sessionId,
+                          )}
                           onClick={() =>
                             handleThreadClick(session.sessionId)
                           }
@@ -247,6 +253,12 @@ export function AppSidebar() {
                                 state.activeSessionId === session.sessionId
                               }
                               running={session.status === "running"}
+                              awaitingInput={state.awaitingInputSessionIds.has(
+                                session.sessionId,
+                              )}
+                              pendingDone={state.doneSessionIds.has(
+                                session.sessionId,
+                              )}
                               onClick={() =>
                                 handleThreadClick(session.sessionId)
                               }
