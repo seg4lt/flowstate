@@ -313,10 +313,11 @@ function BranchesPanel({
           <>
             {!showCreate && <CommandEmpty>No branch matches.</CommandEmpty>}
             {showCreate && (
-              <CommandGroup>
+              <CommandGroup forceMount>
                 <CommandItem
                   forceMount
                   value={`__create_branch__${trimmedSearch}`}
+                  keywords={[trimmedSearch]}
                   disabled={isBusy}
                   onSelect={() => onCreateBranch(trimmedSearch)}
                   className="items-start gap-2 py-2"
