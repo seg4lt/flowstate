@@ -377,6 +377,29 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setDiffRefreshTick((t) => t + 1);
   }, []);
 
+  // Throttle for user-gesture-driven diff prefetches (Diff button
+  // hover and Diff button click). The throttle is intentionally
+  // shared between hover and click: if the user hovers and then
+  // clicks within ~1.5s, the click should reuse the hover's
+  // in-flight or just-completed refetch rather than bumping the tick
+  // a second time and discarding the prefetch's work.
+  //
+  // System-event refreshes (session_loaded, turn_completed, branch
+  // checkout) bypass this throttle entirely — they call
+  // `refreshDiffs` directly and always force a fresh tick. Only the
+  // user-pointer / focus path is throttled.
+  //
+  // Staleness window is at most 1.5s; if files change on disk inside
+  // that window the user can close + reopen the panel to force a
+  // new tick.
+  const lastDiffPrefetchAt = React.useRef<number>(0);
+  const maybePrefetchDiffs = React.useCallback(() => {
+    const now = Date.now();
+    if (now - lastDiffPrefetchAt.current < 1500) return;
+    lastDiffPrefetchAt.current = now;
+    setDiffRefreshTick((t) => t + 1);
+  }, []);
+
   // Diff panel state. Closed by default — open it from the chat
   // header's "Show diff" button when you want to see what the
   // session changed. `diffWidth` and `diffStyle` are user
@@ -934,10 +957,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 // Force a fresh git diff whenever the panel opens so
                 // changes the user made outside the agent (manual
                 // edits, external tools) show up without a reload.
-                if (!v) refreshDiffs();
+                // Routed through `maybePrefetchDiffs` so a click that
+                // lands within ~1.5s of a hover prefetch reuses the
+                // hover's in-flight refetch instead of bumping the
+                // tick twice and discarding the pre-warm.
+                if (!v) maybePrefetchDiffs();
                 return !v;
               });
             }}
+            // Only prefetch when the panel is closed. If the panel is
+            // already open the user is almost certainly hovering on
+            // their way to clicking *close* — pre-warming a refresh
+            // would refetch the very data we're about to discard,
+            // and worse, the in-flight refetch lands while the panel
+            // is still visible and visibly resets it (scroll jumps,
+            // tokenization restarts). No prefetch on hover-while-open.
+            onHoverDiff={diffOpen ? undefined : maybePrefetchDiffs}
           />
         </div>
       </header>

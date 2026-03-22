@@ -5,6 +5,14 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Switch } from "@/components/ui/switch";
 import { useApp } from "@/stores/app-store";
 import { toast } from "@/hooks/use-toast";
+import { getAppDataDir } from "@/lib/api";
+import {
+  POOL_SIZE_MIN,
+  getDefaultPoolSize,
+  getMaxPoolSize,
+  readPoolSizeSetting,
+  writePoolSizeSetting,
+} from "@/lib/pierre-diffs-worker";
 import type { ProviderKind, ProviderStatus } from "@/lib/types";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
@@ -118,6 +126,143 @@ function ProviderRow({
   );
 }
 
+// Single row in the Performance group. The current value lives in
+// flowzen's own SQLite (`user_config` table) — fetched once on
+// mount via `readPoolSizeSetting`, written back on every commit
+// via `writePoolSizeSetting`. Both calls are async because they
+// cross the Tauri IPC bridge, but local SQLite reads are
+// sub-millisecond so the row feels instant in practice. The pool
+// itself isn't rebuilt — main.tsx reads the value once at app boot
+// and the @pierre/diffs pool is a singleton — so the hint text
+// tells the user to restart for the change to take effect.
+function PoolSizeRow() {
+  const maxPoolSize = React.useMemo(() => getMaxPoolSize(), []);
+  const cores = React.useMemo(
+    () =>
+      (typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 4,
+    [],
+  );
+  // `null` = still loading the persisted value from sqlite; once
+  // it resolves we swap to a number and never go back.
+  const [value, setValue] = React.useState<number | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readPoolSizeSetting()
+      .then((resolved) => {
+        if (cancelled) return;
+        setValue(resolved);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setValue(getDefaultPoolSize());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const commit = React.useCallback(
+    (next: number) => {
+      const clamped = Math.max(
+        POOL_SIZE_MIN,
+        Math.min(maxPoolSize, Math.round(next)),
+      );
+      setValue(clamped);
+      void writePoolSizeSetting(clamped);
+    },
+    [maxPoolSize],
+  );
+
+  return (
+    <div className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Highlighter workers</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Background workers for syntax highlighting in the diff panel and
+          code view. More workers tokenize files in parallel — faster on big
+          diffs, more idle memory.
+        </div>
+        <div className="mt-1 text-[11px] text-muted-foreground">
+          Detected {cores} {cores === 1 ? "core" : "cores"} · range{" "}
+          {POOL_SIZE_MIN}–{maxPoolSize} · default {getDefaultPoolSize()} ·
+          restart Flowzen to apply.
+        </div>
+      </div>
+      <input
+        type="number"
+        min={POOL_SIZE_MIN}
+        max={maxPoolSize}
+        step={1}
+        value={value ?? ""}
+        disabled={value === null}
+        onChange={(e) => {
+          const parsed = Number.parseInt(e.target.value, 10);
+          if (Number.isFinite(parsed)) commit(parsed);
+        }}
+        className="h-8 w-16 rounded-md border border-input bg-background px-2 text-sm disabled:opacity-50"
+        aria-label="Highlighter worker pool size"
+      />
+    </div>
+  );
+}
+
+// Read-only display of the cross-platform app data directory
+// (where the daemon database, threads dir, and user_config sqlite
+// all live). Resolved by the rust side via Tauri's path resolver
+// so we get the right OS-specific location:
+//   - macOS:   ~/Library/Application Support/<bundle.id>/
+//   - Linux:   ~/.local/share/<bundle.id>/
+//   - Windows: %APPDATA%/<bundle.id>/
+// Click the input to select all, then Cmd/Ctrl+C to copy.
+function AppDataDirRow() {
+  const [path, setPath] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    getAppDataDir()
+      .then((resolved) => {
+        if (cancelled) return;
+        setPath(resolved);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <div className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">App data folder</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Where Flowzen keeps its databases, sessions, and config on disk.
+          Click the field to select, then Cmd/Ctrl+C to copy.
+        </div>
+        <div className="mt-2">
+          {error ? (
+            <div className="text-[11px] text-destructive">{error}</div>
+          ) : (
+            <input
+              type="text"
+              readOnly
+              value={path ?? "Loading…"}
+              onFocus={(e) => e.currentTarget.select()}
+              onClick={(e) => e.currentTarget.select()}
+              className="w-full rounded-md border border-input bg-muted/30 px-2 py-1 font-mono text-[11px] text-foreground"
+              aria-label="App data folder path"
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function SettingsView() {
   const { state, send } = useApp();
   const [refreshingKind, setRefreshingKind] = React.useState<ProviderKind | null>(
@@ -202,6 +347,18 @@ export function SettingsView() {
                 onToggleEnabled={(enabled) => handleToggleEnabled(kind, enabled)}
               />
             ))}
+          </SettingsGroup>
+          <SettingsGroup
+            title="Performance"
+            description="Tune how Flowzen uses your machine's resources."
+          >
+            <PoolSizeRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Storage"
+            description="Where Flowzen keeps its data on disk."
+          >
+            <AppDataDirRow />
           </SettingsGroup>
         </div>
       </div>

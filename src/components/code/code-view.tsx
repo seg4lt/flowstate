@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
 import { File as PierreFile } from "@pierre/diffs/react";
 import { Virtualizer } from "@pierre/diffs/react";
 import {
@@ -17,12 +18,12 @@ import { Button } from "@/components/ui/button";
 import { useApp } from "@/stores/app-store";
 import {
   defaultContentSearchOptions,
-  listProjectFiles,
   readProjectFile,
   searchFileContents,
   type ContentBlock,
   type ContentSearchOptions,
 } from "@/lib/api";
+import { projectFilesQueryOptions } from "@/lib/queries";
 import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
 import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
@@ -67,6 +68,11 @@ const TREE_MAX_WIDTH = 520;
 // single icon button, narrow enough to cede most of the
 // horizontal space back to the right pane.
 const TREE_COLLAPSED_WIDTH = 28;
+
+// Stable empty-array sentinel for the filesQuery fallback. Pulled
+// out of render so a re-render doesn't allocate a new [] every time
+// and break downstream `useMemo([files])` reference equality.
+const EMPTY_FILES: readonly string[] = Object.freeze([]);
 
 interface ContentSearchUiOptions {
   advancedOpen: boolean;
@@ -137,9 +143,23 @@ export function CodeView({ sessionId }: { sessionId: string }) {
   }, []);
 
   // ─── file list / picker state ────────────────────────────────
-  const [files, setFiles] = React.useState<string[]>([]);
-  const [filesLoading, setFilesLoading] = React.useState(false);
-  const [filesError, setFilesError] = React.useState<string | null>(null);
+  // Hover-driven cache: refreshed only when the user hovers/focuses
+  // the chat header's Search button (prefetchProjectFiles) or on the
+  // very first cold mount here. NO automatic refetch — see
+  // projectFilesQueryOptions in lib/queries.ts for the rationale.
+  // Preserving that property is a hard constraint; do not introduce
+  // refetchOnMount, refetchInterval, or any other auto-refresh.
+  const filesQuery = useQuery(projectFilesQueryOptions(projectPath));
+  // structuralSharing keeps the same array reference when a refresh
+  // returns identical data, so the FileTree useMemo dependency stays
+  // stable on no-op refreshes. EMPTY_FILES is a frozen module-level
+  // sentinel for the same reason.
+  const files = (filesQuery.data ?? EMPTY_FILES) as string[];
+  // Only show the "indexing…" badge on a true cold fetch (no cached
+  // data yet). A populated cache means the picker is already usable
+  // and we should not flash a loading state on remount.
+  const filesLoading = filesQuery.isPending && !!projectPath;
+  const filesError = filesQuery.error ? String(filesQuery.error) : null;
 
   // ─── search state ────────────────────────────────────────────
   const [searchMode, setSearchMode] = React.useState<SearchMode>("files");
@@ -161,7 +181,11 @@ export function CodeView({ sessionId }: { sessionId: string }) {
 
   const inputRef = React.useRef<HTMLInputElement>(null);
 
-  // Reset everything and load file list when project changes.
+  // Reset selection / search / viewer state when the project
+  // changes. The file list itself is owned by `filesQuery` above;
+  // useQuery swaps in the new project's cached entry (or kicks off
+  // a cold fetch if none) on its own, so there's no fetch logic
+  // here — only stale per-project UI state to clear.
   React.useEffect(() => {
     setSelectedPath(null);
     setFileContents(null);
@@ -170,34 +194,6 @@ export function CodeView({ sessionId }: { sessionId: string }) {
     setHighlightedIndex(0);
     setContentBlocks([]);
     setContentSearchError(null);
-
-    if (!projectPath) {
-      setFiles([]);
-      setFilesError(null);
-      return;
-    }
-
-    let cancelled = false;
-    setFilesLoading(true);
-    setFilesError(null);
-    listProjectFiles(projectPath)
-      .then((entries) => {
-        if (cancelled) return;
-        setFiles(entries);
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setFilesError(String(err));
-        setFiles([]);
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setFilesLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
   }, [projectPath]);
 
   // ─── filename filter (client-side, instant) ─────────────────

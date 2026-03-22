@@ -244,11 +244,7 @@ const FileSection = React.memo(function FileSection({
     // Use the window viewport as root — the diff panel's internal
     // scroll area shifts each section's window coordinates, so a
     // viewport-rooted observer still fires at the right time
-    // without us having to plumb a scrollRoot ref through. No
-    // rootMargin pre-warm: with the worker pool enabled, the
-    // very brief "Loading diff…" flash on scroll is a tiny price
-    // for doing zero up-front tokenization on files the user
-    // hasn't actually scrolled to.
+    // without us having to plumb a scrollRoot ref through.
     const observer = new IntersectionObserver((entries) => {
       if (entries.some((e) => e.isIntersecting)) {
         setHasBeenVisible(true);
@@ -362,11 +358,27 @@ const DiffBody = React.memo(function DiffBody({
       </div>
     );
   }
+  // cacheKey is what makes the @pierre/diffs LRU actually do its
+  // job — without it, `getFileResultCache` returns undefined and
+  // every mount re-tokenizes from scratch. Keying on
+  // `path::refreshKey::side` means same-content within a refresh
+  // tick shares the cache, so reopening the panel on an unchanged
+  // diff hits the cache instead of re-tokenizing. Bumping
+  // refreshKey (turn_completed, manual refresh, branch checkout)
+  // produces a new key — old entries age out via the LRU.
   return (
     <MultiFileDiff
       key={`${path}::${style}`}
-      oldFile={{ name: path, contents: state.contents.before }}
-      newFile={{ name: path, contents: state.contents.after }}
+      oldFile={{
+        name: path,
+        contents: state.contents.before,
+        cacheKey: `${path}::${state.refreshKey}::before`,
+      }}
+      newFile={{
+        name: path,
+        contents: state.contents.after,
+        cacheKey: `${path}::${state.refreshKey}::after`,
+      }}
       options={{
         diffStyle: style,
         theme: { dark: "pierre-dark", light: "pierre-light" },

@@ -110,6 +110,31 @@ export function listProjectFiles(path: string): Promise<string[]> {
   return invoke<string[]>("list_project_files", { path });
 }
 
+// Flowzen-app-owned key/value store. Backed by SQLite at
+// <app_data_dir>/user_config.sqlite — separate from the agent
+// SDK's daemon database. SDK and app each own their own SQLite;
+// app-level UI tunables (pool size, future toggles) live here, not
+// in the daemon's schema.
+//
+// `getUserConfig` returns null when the key has never been set;
+// callers should treat that as "use the default."
+export function getUserConfig(key: string): Promise<string | null> {
+  return invoke<string | null>("get_user_config", { key });
+}
+
+export function setUserConfig(key: string, value: string): Promise<void> {
+  return invoke<void>("set_user_config", { key, value });
+}
+
+// Resolved cross-platform app data dir for Flowzen — the same
+// directory the daemon database, threads dir, and user_config
+// sqlite live under. Surfaced to the Settings UI as a read-only
+// path so users can copy it and open in Finder / Explorer / a
+// terminal.
+export function getAppDataDir(): Promise<string> {
+  return invoke<string>("get_app_data_dir");
+}
+
 // Read a single project file as a UTF-8 string. Rejects on:
 //   * file outside the project root (canonicalisation escape)
 //   * file above CODE_VIEW_MAX_FILE_BYTES (4 MiB)

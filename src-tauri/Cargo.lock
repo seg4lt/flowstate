@@ -1096,12 +1096,14 @@ dependencies = [
 name = "flowzen"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs 5.0.1",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
  "portable-pty",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

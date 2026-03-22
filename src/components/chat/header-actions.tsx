@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronDown, Diff, FolderOpen, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -9,6 +10,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { openInEditor } from "@/lib/api";
+import { prefetchProjectFiles } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 
@@ -18,6 +20,11 @@ interface HeaderActionsProps {
   diffs: AggregatedFileDiff[];
   diffOpen: boolean;
   onToggleDiff: () => void;
+  // Fired on Diff button hover/focus so ChatView can pre-warm the
+  // git diff summary before the click lands. Optional because the
+  // throttling lives upstream — this component doesn't care whether
+  // the callback is idempotent or not.
+  onHoverDiff?: () => void;
 }
 
 // Known editors we offer in the Open dropdown. Each `command` is
@@ -61,8 +68,20 @@ export function HeaderActions({
   diffs,
   diffOpen,
   onToggleDiff,
+  onHoverDiff,
 }: HeaderActionsProps) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  // Hover-driven prefetch for the /code view's file list. Wired to
+  // both onMouseEnter and onFocus on the Search button so mouse and
+  // keyboard users get the same head-start: by the time the click
+  // fires, the rust-side walk is already in flight (or done) and
+  // CodeView mounts straight onto cached data. Throttling lives
+  // inside prefetchProjectFiles itself, so this can be called as
+  // many times per second as the browser fires events.
+  const handleSearchPrefetch = React.useCallback(() => {
+    prefetchProjectFiles(queryClient, projectPath);
+  }, [queryClient, projectPath]);
   const { additions, deletions } = React.useMemo(() => {
     let a = 0;
     let d = 0;
@@ -157,6 +176,8 @@ export function HeaderActions({
           variant={diffOpen ? "secondary" : "outline"}
           size="xs"
           onClick={onToggleDiff}
+          onMouseEnter={onHoverDiff}
+          onFocus={onHoverDiff}
           aria-pressed={diffOpen}
           title={
             diffOpen ? "Hide diff panel" : "Show diff panel for this session"
@@ -177,6 +198,8 @@ export function HeaderActions({
         onClick={() =>
           navigate({ to: "/code/$sessionId", params: { sessionId } })
         }
+        onMouseEnter={handleSearchPrefetch}
+        onFocus={handleSearchPrefetch}
         title="Search project files"
       >
         <Search className="h-3 w-3" />
