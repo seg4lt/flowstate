@@ -16,26 +16,19 @@ impl OrchestrationService {
     pub fn create_session(
         &self,
         provider: ProviderKind,
-        title: Option<String>,
         model: Option<String>,
         project_id: Option<String>,
     ) -> SessionDetail {
         let created_at = Utc::now().to_rfc3339();
         let session_id = Uuid::new_v4().to_string();
-        let title = title
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("{} Session", provider.label()));
 
         SessionDetail {
             summary: SessionSummary {
                 session_id,
                 provider,
-                title,
                 status: SessionStatus::Ready,
                 created_at: created_at.clone(),
                 updated_at: created_at,
-                last_turn_preview: None,
                 turn_count: 0,
                 model,
                 project_id,
@@ -53,15 +46,6 @@ impl OrchestrationService {
         permission_mode: Option<zenui_provider_api::PermissionMode>,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> TurnRecord {
-        // Auto-title from the first user prompt (max 6 words).
-        if session.summary.turn_count == 0 {
-            let words: Vec<&str> = input.split_whitespace().take(6).collect();
-            let auto_title = words.join(" ");
-            if !auto_title.is_empty() {
-                session.summary.title = auto_title;
-            }
-        }
-
         let now = Utc::now().to_rfc3339();
         let turn = TurnRecord {
             turn_id: Uuid::new_v4().to_string(),
@@ -104,7 +88,7 @@ impl OrchestrationService {
             .iter_mut()
             .find(|turn| turn.turn_id == turn_id)?;
 
-        turn.output = output.clone();
+        turn.output = output;
         turn.status = status;
         turn.updated_at = now.clone();
 
@@ -113,7 +97,6 @@ impl OrchestrationService {
             _ => SessionStatus::Ready,
         };
         session.summary.updated_at = now;
-        session.summary.last_turn_preview = Some(output.chars().take(140).collect());
 
         Some(turn.clone())
     }
@@ -122,7 +105,6 @@ impl OrchestrationService {
         let now = Utc::now().to_rfc3339();
         session.summary.status = SessionStatus::Interrupted;
         session.summary.updated_at = now.clone();
-        session.summary.last_turn_preview = Some(message.chars().take(140).collect());
 
         if let Some(turn) = session
             .turns

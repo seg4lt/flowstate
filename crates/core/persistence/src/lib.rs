@@ -98,15 +98,13 @@ impl PersistenceService {
         if transaction
             .execute(
                 "INSERT INTO sessions (
-                    session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model, project_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    session_id, provider, status, created_at, updated_at, turn_count, provider_state_json, model, project_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(session_id) DO UPDATE SET
                     provider = excluded.provider,
-                    title = excluded.title,
                     status = excluded.status,
                     created_at = excluded.created_at,
                     updated_at = excluded.updated_at,
-                    last_turn_preview = excluded.last_turn_preview,
                     turn_count = excluded.turn_count,
                     provider_state_json = excluded.provider_state_json,
                     model = excluded.model,
@@ -114,11 +112,9 @@ impl PersistenceService {
                 params![
                     session.summary.session_id,
                     provider_kind_to_str(session.summary.provider),
-                    session.summary.title,
                     session_status_to_str(session.summary.status),
                     session.summary.created_at,
                     session.summary.updated_at,
-                    session.summary.last_turn_preview,
                     session.summary.turn_count as i64,
                     session
                         .provider_state
@@ -248,8 +244,8 @@ impl PersistenceService {
     pub async fn list_session_summaries(&self) -> Vec<SessionSummary> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = match connection.prepare(
-            "SELECT session_id, provider, title, status, created_at, updated_at,
-                    last_turn_preview, turn_count, model, project_id
+            "SELECT session_id, provider, status, created_at, updated_at,
+                    turn_count, model, project_id
              FROM sessions ORDER BY created_at DESC",
         ) {
             Ok(statement) => statement,
@@ -260,14 +256,12 @@ impl PersistenceService {
             Ok(SessionSummary {
                 session_id: row.get(0)?,
                 provider: provider_kind_from_str(&row.get::<_, String>(1)?),
-                title: row.get(2)?,
-                status: session_status_from_str(&row.get::<_, String>(3)?),
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                last_turn_preview: row.get(6)?,
-                turn_count: row.get::<_, i64>(7)? as usize,
-                model: row.get(8)?,
-                project_id: row.get(9)?,
+                status: session_status_from_str(&row.get::<_, String>(2)?),
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                turn_count: row.get::<_, i64>(5)? as usize,
+                model: row.get(6)?,
+                project_id: row.get(7)?,
             })
         }) {
             Ok(rows) => rows,
@@ -606,10 +600,10 @@ impl PersistenceService {
     pub async fn list_projects(&self) -> Vec<ProjectRecord> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = match connection.prepare(
-            "SELECT project_id, name, path, created_at, updated_at, sort_order
+            "SELECT project_id, path, created_at, updated_at
              FROM projects
              WHERE deleted_at IS NULL
-             ORDER BY sort_order ASC, created_at ASC",
+             ORDER BY created_at ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -617,11 +611,9 @@ impl PersistenceService {
         let rows = statement.query_map([], |row| {
             Ok(ProjectRecord {
                 project_id: row.get(0)?,
-                name: row.get(1)?,
-                path: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
-                sort_order: row.get(5)?,
+                path: row.get(1)?,
+                created_at: row.get(2)?,
+                updated_at: row.get(3)?,
             })
         });
         match rows {
@@ -634,17 +626,15 @@ impl PersistenceService {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         connection
             .query_row(
-                "SELECT project_id, name, path, created_at, updated_at, sort_order
+                "SELECT project_id, path, created_at, updated_at
                  FROM projects WHERE project_id = ?1",
                 params![project_id],
                 |row| {
                     Ok(ProjectRecord {
                         project_id: row.get(0)?,
-                        name: row.get(1)?,
-                        path: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                        sort_order: row.get(5)?,
+                        path: row.get(1)?,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
                     })
                 },
             )
@@ -653,11 +643,7 @@ impl PersistenceService {
             .flatten()
     }
 
-    pub async fn create_project(&self, name: String, path: Option<String>) -> Option<ProjectRecord> {
-        let trimmed = name.trim().to_string();
-        if trimmed.is_empty() {
-            return None;
-        }
+    pub async fn create_project(&self, path: Option<String>) -> Option<ProjectRecord> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let now = Utc::now().to_rfc3339();
 
@@ -669,100 +655,55 @@ impl PersistenceService {
         // sessions table is needed because their project_id never
         // changed when the project was deleted in the first place.
         if let Some(p) = path.as_deref() {
-            let existing: Option<(String, i32, String)> = connection
+            let existing: Option<(String, String)> = connection
                 .query_row(
-                    "SELECT project_id, sort_order, created_at FROM projects
+                    "SELECT project_id, created_at FROM projects
                      WHERE path = ?1 AND deleted_at IS NOT NULL
                      ORDER BY deleted_at DESC LIMIT 1",
                     params![p],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, i32>(1)?,
-                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(1)?,
                         ))
                     },
                 )
                 .optional()
                 .ok()
                 .flatten();
-            if let Some((existing_id, sort_order, created_at)) = existing {
+            if let Some((existing_id, created_at)) = existing {
                 let restored = connection.execute(
                     "UPDATE projects
-                     SET deleted_at = NULL, name = ?1, updated_at = ?2
-                     WHERE project_id = ?3",
-                    params![trimmed, now, existing_id],
+                     SET deleted_at = NULL, updated_at = ?1
+                     WHERE project_id = ?2",
+                    params![now, existing_id],
                 );
                 if restored.is_ok() {
                     return Some(ProjectRecord {
                         project_id: existing_id,
-                        name: trimmed,
                         path,
                         created_at,
                         updated_at: now,
-                        sort_order,
                     });
                 }
             }
         }
 
         let project_id = Uuid::new_v4().to_string();
-        // Place new projects at the end.
-        let next_order: i32 = connection
-            .query_row(
-                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM projects",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
         let result = connection.execute(
-            "INSERT INTO projects (project_id, name, path, created_at, updated_at, sort_order)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![project_id, trimmed, path, now, now, next_order],
+            "INSERT INTO projects (project_id, path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id, path, now, now],
         );
         if result.is_err() {
             return None;
         }
         Some(ProjectRecord {
             project_id,
-            name: trimmed,
             path,
             created_at: now.clone(),
             updated_at: now,
-            sort_order: next_order,
         })
-    }
-
-    pub async fn rename_session(&self, session_id: &str, title: String) -> Option<String> {
-        let trimmed = title.trim().to_string();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let now = Utc::now().to_rfc3339();
-        let affected = connection
-            .execute(
-                "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE session_id = ?3",
-                params![trimmed, now, session_id],
-            )
-            .unwrap_or(0);
-        if affected == 0 { None } else { Some(now) }
-    }
-
-    pub async fn rename_project(&self, project_id: &str, name: String) -> Option<String> {
-        let trimmed = name.trim().to_string();
-        if trimmed.is_empty() {
-            return None;
-        }
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
-        let now = Utc::now().to_rfc3339();
-        let affected = connection
-            .execute(
-                "UPDATE projects SET name = ?1, updated_at = ?2 WHERE project_id = ?3",
-                params![trimmed, now, project_id],
-            )
-            .unwrap_or(0);
-        if affected == 0 { None } else { Some(now) }
     }
 
     /// Tombstones a project — sets `deleted_at` to now instead of
@@ -821,14 +762,16 @@ impl PersistenceService {
                 "
             PRAGMA journal_mode = WAL;
 
+            -- Display-only fields (`title`, `last_turn_preview`)
+            -- deliberately do NOT exist here: they're app concerns,
+            -- persisted by consuming apps in their own stores. See
+            -- `CLAUDE.md` in this directory for the boundary rule.
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
-                title TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                last_turn_preview TEXT,
                 turn_count INTEGER NOT NULL,
                 provider_state_json TEXT
             );
@@ -852,12 +795,12 @@ impl PersistenceService {
                 models_json TEXT NOT NULL
             );
 
+            -- Display-only fields (`name`, `sort_order`) deliberately
+            -- do NOT exist here — see `CLAUDE.md` in this directory.
             CREATE TABLE IF NOT EXISTS projects (
                 project_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                sort_order INTEGER NOT NULL
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS provider_health_cache (
@@ -919,11 +862,9 @@ impl PersistenceService {
             CREATE TABLE IF NOT EXISTS archived_sessions (
                 session_id TEXT PRIMARY KEY,
                 provider TEXT NOT NULL,
-                title TEXT NOT NULL,
                 status TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                last_turn_preview TEXT,
                 turn_count INTEGER NOT NULL,
                 provider_state_json TEXT,
                 model TEXT,
@@ -968,10 +909,10 @@ impl PersistenceService {
         let moved = tx
             .execute(
                 "INSERT INTO archived_sessions
-                    (session_id, provider, title, status, created_at, updated_at,
-                     last_turn_preview, turn_count, provider_state_json, model, project_id, archived_at)
-                 SELECT session_id, provider, title, status, created_at, updated_at,
-                        last_turn_preview, turn_count, provider_state_json, model, project_id, ?1
+                    (session_id, provider, status, created_at, updated_at,
+                     turn_count, provider_state_json, model, project_id, archived_at)
+                 SELECT session_id, provider, status, created_at, updated_at,
+                        turn_count, provider_state_json, model, project_id, ?1
                  FROM sessions WHERE session_id = ?2",
                 params![now, session_id],
             )
@@ -1009,10 +950,10 @@ impl PersistenceService {
             let moved = tx
                 .execute(
                     "INSERT INTO sessions
-                        (session_id, provider, title, status, created_at, updated_at,
-                         last_turn_preview, turn_count, provider_state_json, model, project_id)
-                     SELECT session_id, provider, title, status, created_at, updated_at,
-                            last_turn_preview, turn_count, provider_state_json, model, project_id
+                        (session_id, provider, status, created_at, updated_at,
+                         turn_count, provider_state_json, model, project_id)
+                     SELECT session_id, provider, status, created_at, updated_at,
+                            turn_count, provider_state_json, model, project_id
                      FROM archived_sessions WHERE session_id = ?1",
                     params![session_id],
                 )
@@ -1048,8 +989,8 @@ impl PersistenceService {
     pub async fn list_archived_session_summaries(&self) -> Vec<SessionSummary> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut stmt = match connection.prepare(
-            "SELECT session_id, provider, title, status, created_at, updated_at,
-                    last_turn_preview, turn_count, model, project_id
+            "SELECT session_id, provider, status, created_at, updated_at,
+                    turn_count, model, project_id
              FROM archived_sessions ORDER BY created_at DESC",
         ) {
             Ok(stmt) => stmt,
@@ -1060,14 +1001,12 @@ impl PersistenceService {
             Ok(SessionSummary {
                 session_id: row.get(0)?,
                 provider: provider_kind_from_str(&row.get::<_, String>(1)?),
-                title: row.get(2)?,
-                status: session_status_from_str(&row.get::<_, String>(3)?),
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                last_turn_preview: row.get(6)?,
-                turn_count: row.get::<_, i64>(7)? as usize,
-                model: row.get(8)?,
-                project_id: row.get(9)?,
+                status: session_status_from_str(&row.get::<_, String>(2)?),
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                turn_count: row.get::<_, i64>(5)? as usize,
+                model: row.get(6)?,
+                project_id: row.get(7)?,
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -1094,21 +1033,19 @@ fn load_session(
 ) -> Result<Option<SessionDetail>> {
     let summary = connection
         .query_row(
-            "SELECT session_id, provider, title, status, created_at, updated_at, last_turn_preview, turn_count, provider_state_json, model, project_id
+            "SELECT session_id, provider, status, created_at, updated_at, turn_count, provider_state_json, model, project_id
              FROM sessions WHERE session_id = ?1",
             params![session_id],
             |row| {
                 Ok(SessionSummary {
                     session_id: row.get(0)?,
                     provider: provider_kind_from_str(&row.get::<_, String>(1)?),
-                    title: row.get(2)?,
-                    status: session_status_from_str(&row.get::<_, String>(3)?),
-                    created_at: row.get(4)?,
-                    updated_at: row.get(5)?,
-                    last_turn_preview: row.get(6)?,
-                    turn_count: row.get::<_, i64>(7)? as usize,
-                    model: row.get(9)?,
-                    project_id: row.get(10)?,
+                    status: session_status_from_str(&row.get::<_, String>(2)?),
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    turn_count: row.get::<_, i64>(5)? as usize,
+                    model: row.get(7)?,
+                    project_id: row.get(8)?,
                 })
             },
         )

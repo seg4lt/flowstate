@@ -574,12 +574,11 @@ impl RuntimeCore {
             }
             ClientMessage::StartSession {
                 provider,
-                title,
                 model,
                 project_id,
             } => {
                 tracing::info!(?provider, ?model, ?project_id, "Starting session");
-                match self.start_session(provider, title, model, project_id).await {
+                match self.start_session(provider, model, project_id).await {
                     Ok(session) => Some(ServerMessage::SessionCreated {
                         session: session.summary,
                     }),
@@ -697,36 +696,19 @@ impl RuntimeCore {
                     ),
                 })
             }
-            ClientMessage::CreateProject { name, path } => {
-                match self.persistence.create_project(name, path).await {
+            ClientMessage::CreateProject { path } => {
+                match self.persistence.create_project(path).await {
                     Some(project) => {
+                        let project_id = project.project_id.clone();
                         self.publish(RuntimeEvent::ProjectCreated {
                             project: project.clone(),
                         });
                         Some(ServerMessage::Ack {
-                            message: format!("Project `{}` created.", project.name),
+                            message: format!("Project `{project_id}` created."),
                         })
                     }
                     None => Some(ServerMessage::Error {
-                        message: "Project name cannot be empty.".to_string(),
-                    }),
-                }
-            }
-            ClientMessage::RenameProject { project_id, name } => {
-                match self.persistence.rename_project(&project_id, name.clone()).await {
-                    Some(updated_at) => {
-                        let trimmed = name.trim().to_string();
-                        self.publish(RuntimeEvent::ProjectRenamed {
-                            project_id,
-                            name: trimmed,
-                            updated_at,
-                        });
-                        Some(ServerMessage::Ack {
-                            message: "Project renamed.".to_string(),
-                        })
-                    }
-                    None => Some(ServerMessage::Error {
-                        message: "Rename failed — project not found or name empty.".to_string(),
+                        message: "Project creation failed.".to_string(),
                     }),
                 }
             }
@@ -766,23 +748,6 @@ impl RuntimeCore {
                     Some(ServerMessage::Error {
                         message: "Session not found.".to_string(),
                     })
-                }
-            }
-            ClientMessage::RenameSession { session_id, title } => {
-                match self.persistence.rename_session(&session_id, title.clone()).await {
-                    Some(_updated_at) => {
-                        let trimmed = title.trim().to_string();
-                        self.publish(RuntimeEvent::SessionRenamed {
-                            session_id,
-                            title: trimmed,
-                        });
-                        Some(ServerMessage::Ack {
-                            message: "Session renamed.".to_string(),
-                        })
-                    }
-                    None => Some(ServerMessage::Error {
-                        message: "Rename failed — session not found or title empty.".to_string(),
-                    }),
                 }
             }
             ClientMessage::UpdateSessionModel { session_id, model } => {
@@ -954,7 +919,6 @@ impl RuntimeCore {
     async fn start_session(
         &self,
         provider: ProviderKind,
-        title: Option<String>,
         model: Option<String>,
         project_id: Option<String>,
     ) -> Result<SessionDetail, String> {
@@ -973,7 +937,7 @@ impl RuntimeCore {
 
         let mut session = self
             .orchestration
-            .create_session(provider, title, model, project_id);
+            .create_session(provider, model, project_id);
         tracing::info!("Session created in orchestration, calling adapter.start_session");
         self.resolve_session_cwd(&mut session).await;
 
@@ -1040,7 +1004,6 @@ impl RuntimeCore {
             })?
             .clone();
 
-        let title_before = session.summary.title.clone();
         let mut turn = self.orchestration.start_turn(
             &mut session,
             trimmed.clone(),
@@ -1093,13 +1056,6 @@ impl RuntimeCore {
         }
 
         self.persistence.upsert_session(session.clone()).await;
-        // Publish title change immediately so the sidebar updates before the turn finishes.
-        if session.summary.title != title_before {
-            self.publish(RuntimeEvent::SessionRenamed {
-                session_id: session.summary.session_id.clone(),
-                title: session.summary.title.clone(),
-            });
-        }
         self.publish(RuntimeEvent::TurnStarted {
             session_id: session.summary.session_id.clone(),
             turn: turn.clone(),
@@ -1970,7 +1926,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Live".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2069,7 +2024,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Interleave".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2153,7 +2107,6 @@ mod tests {
         let response = runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Test Session".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2165,7 +2118,7 @@ mod tests {
 
         let snapshot = runtime.snapshot().await;
         let session = snapshot.sessions.first().expect("session should exist");
-        assert_eq!(session.summary.title, "Test Session");
+        assert_eq!(session.summary.provider, ProviderKind::Codex);
 
         let response = runtime
             .handle_client_message(ClientMessage::SendTurn {
@@ -2251,7 +2204,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("No-subscriber Test".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2451,7 +2403,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Interrupt".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2564,7 +2515,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Fail".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2631,7 +2581,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Stale".to_string()),
                 model: None,
                 project_id: None,
             })
@@ -2695,7 +2644,6 @@ mod tests {
         runtime
             .handle_client_message(ClientMessage::StartSession {
                 provider: ProviderKind::Codex,
-                title: Some("Stuck".to_string()),
                 model: None,
                 project_id: None,
             })

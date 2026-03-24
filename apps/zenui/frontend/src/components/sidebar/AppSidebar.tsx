@@ -41,7 +41,11 @@ export function AppSidebar({ sendClientMessage }: AppSidebarProps) {
       setCreatingProject(false);
       return;
     }
-    sendClientMessage({ type: "create_project", name: trimmed });
+    // The SDK's `create_project` takes no name — display labels are
+    // purely app-side now. Queue the draft name so the reducer can
+    // pop it into projectDisplay when `project_created` arrives.
+    actions.queueProjectName(trimmed);
+    sendClientMessage({ type: "create_project" });
     setDraftName("");
     setCreatingProject(false);
   };

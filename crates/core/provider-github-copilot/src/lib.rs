@@ -954,7 +954,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         let Some(cached) = cached else {
             return Ok(format!(
                 "GitHub Copilot interrupt requested for session '{}' (no active bridge).",
-                session.summary.title
+                session.summary.session_id
             ));
         };
         let stdin = {
@@ -964,7 +964,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         write_request(&stdin, &BridgeRequest::Interrupt).await?;
         Ok(format!(
             "GitHub Copilot turn interrupted for session '{}'.",
-            session.summary.title
+            session.summary.session_id
         ))
     }
 }

@@ -408,16 +408,20 @@ pub struct TurnRecord {
     pub input_attachments: Vec<AttachmentRef>,
 }
 
+// Display-only fields (`name`, `sort_order` here; `title`,
+// `last_turn_preview` on `SessionSummary`) deliberately do NOT
+// exist: they're app concerns, persisted by consuming apps in
+// their own stores. See
+// `rs-agent-sdk/crates/core/persistence/CLAUDE.md` for the
+// boundary rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRecord {
     pub project_id: String,
-    pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    pub sort_order: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,11 +429,9 @@ pub struct ProjectRecord {
 pub struct SessionSummary {
     pub session_id: String,
     pub provider: ProviderKind,
-    pub title: String,
     pub status: SessionStatus,
     pub created_at: String,
     pub updated_at: String,
-    pub last_turn_preview: Option<String>,
     pub turn_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -978,11 +980,6 @@ pub enum RuntimeEvent {
     ProjectCreated {
         project: ProjectRecord,
     },
-    ProjectRenamed {
-        project_id: String,
-        name: String,
-        updated_at: String,
-    },
     ProjectDeleted {
         project_id: String,
         reassigned_session_ids: Vec<String>,
@@ -990,10 +987,6 @@ pub enum RuntimeEvent {
     SessionProjectAssigned {
         session_id: String,
         project_id: Option<String>,
-    },
-    SessionRenamed {
-        session_id: String,
-        title: String,
     },
     SessionModelUpdated {
         session_id: String,
@@ -1025,7 +1018,6 @@ pub enum ClientMessage {
     },
     StartSession {
         provider: ProviderKind,
-        title: Option<String>,
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
@@ -1113,13 +1105,8 @@ pub enum ClientMessage {
         enabled: bool,
     },
     CreateProject {
-        name: String,
         #[serde(default)]
         path: Option<String>,
-    },
-    RenameProject {
-        project_id: String,
-        name: String,
     },
     DeleteProject {
         project_id: String,
@@ -1128,10 +1115,6 @@ pub enum ClientMessage {
         session_id: String,
         #[serde(default)]
         project_id: Option<String>,
-    },
-    RenameSession {
-        session_id: String,
-        title: String,
     },
     UpdateSessionModel {
         session_id: String,

@@ -112,7 +112,7 @@ export function useWebSocket() {
               actions.mergeSessionDetail(payload.session);
               break;
             case "session_created":
-              actions.setLastAction(`Session created: ${payload.session.title}`);
+              actions.setLastAction(`Session created: ${payload.session.sessionId}`);
               // Let the subsequent session_started event add it to the list.
               actions.selectSession(payload.session.sessionId);
               break;

@@ -14,7 +14,7 @@ write flows through `PersistenceService`, which wraps a single
 | `get_session(id)` | Read one session. |
 | `list_sessions()` | Read every session, newest first. |
 | `delete_session(id)` | Returns `bool` indicating whether a row was actually removed. |
-| `create_project(name)` / `rename_project(id, name)` / `delete_project(id)` / `list_projects()` | Project CRUD. Returns `(project_id, reassigned_session_ids)` on delete. |
+| `create_project(path)` / `delete_project(id)` / `list_projects()` | Project CRUD. `path` is optional; display labels (name, sort order) live in the consuming app's own store — see `CLAUDE.md` in this directory. Delete returns `(project_id, reassigned_session_ids)`. |
 | `assign_session_to_project(session_id, project_id)` | Move a session between projects or out of all projects. |
 | `get_cached_models(provider)` / `set_cached_models(provider, models)` | 24-hour provider model list cache, consulted by `RuntimeCore::bootstrap`. |
 

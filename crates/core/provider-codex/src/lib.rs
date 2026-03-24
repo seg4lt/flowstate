@@ -432,7 +432,7 @@ impl ProviderAdapter for CodexAdapter {
         let Some(process) = process else {
             return Ok(format!(
                 "Codex interrupt requested for session `{}`.",
-                session.summary.title
+                session.summary.session_id
             ));
         };
 
@@ -446,7 +446,7 @@ impl ProviderAdapter for CodexAdapter {
         let Some(turn_id) = running_turn_id else {
             return Ok(format!(
                 "Codex interrupt requested for session `{}`.",
-                session.summary.title
+                session.summary.session_id
             ));
         };
 
@@ -464,7 +464,7 @@ impl ProviderAdapter for CodexAdapter {
 
         Ok(format!(
             "Codex interrupt requested for session `{}`.",
-            session.summary.title
+            session.summary.session_id
         ))
     }
 }

@@ -41,18 +41,19 @@ export function ProjectGroupNode({ group, providers, sendClientMessage }: Props)
   const expanded = useAppStore(
     (s) => s.expandedProjectIds[key] ?? true,
   );
+  const storedName = useAppStore((s) =>
+    project ? s.projectDisplay[project.projectId]?.name : null,
+  );
+  const projectName = storedName ?? "Untitled project";
   const [renaming, setRenaming] = useState(false);
-  const [draftName, setDraftName] = useState(project?.name ?? "");
-  const label = project?.name ?? "Unassigned";
+  const [draftName, setDraftName] = useState(projectName);
+  const label = project ? projectName : "Unassigned";
 
   const submitRename = () => {
     const trimmed = draftName.trim();
-    if (project && trimmed && trimmed !== project.name) {
-      sendClientMessage({
-        type: "rename_project",
-        project_id: project.projectId,
-        name: trimmed,
-      });
+    if (project && trimmed && trimmed !== projectName) {
+      // Rename is purely an app-side concern — no SDK round-trip.
+      actions.setProjectDisplay(project.projectId, { name: trimmed });
     }
     setRenaming(false);
   };
@@ -66,7 +67,6 @@ export function ProjectGroupNode({ group, providers, sendClientMessage }: Props)
     sendClientMessage({
       type: "start_session",
       provider: providerKind,
-      title: null,
       model: model ?? null,
       project_id: project?.projectId ?? null,
     });
@@ -104,7 +104,7 @@ export function ProjectGroupNode({ group, providers, sendClientMessage }: Props)
                   submitRename();
                 } else if (e.key === "Escape") {
                   setRenaming(false);
-                  setDraftName(project?.name ?? "");
+                  setDraftName(projectName);
                 }
               }}
               onBlur={submitRename}
@@ -166,7 +166,7 @@ export function ProjectGroupNode({ group, providers, sendClientMessage }: Props)
               <ContextMenuItem
                 onClick={() => {
                   setRenaming(true);
-                  setDraftName(project.name);
+                  setDraftName(projectName);
                 }}
               >
                 <Pencil className="mr-2 h-3.5 w-3.5" /> Rename

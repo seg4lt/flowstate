@@ -1,7 +1,7 @@
 import { Button } from "../ui/button";
 import { Badge } from "../ui/badge";
 import { PROVIDER_COLORS, PROVIDER_LABELS, type SessionDetail } from "../../types";
-import type { SendClientMessage } from "../../state/appStore";
+import { useAppStore, type SendClientMessage } from "../../state/appStore";
 
 interface Props {
   session: SessionDetail;
@@ -10,6 +10,9 @@ interface Props {
 
 export function ChatHeader({ session, sendClientMessage }: Props) {
   const { summary } = session;
+  const title = useAppStore(
+    (s) => s.sessionDisplay[summary.sessionId]?.title,
+  );
   const isRunning = summary.status === "running";
   return (
     <div className="h-14 border-b border-border flex items-center justify-between px-6 shrink-0">
@@ -17,7 +20,7 @@ export function ChatHeader({ session, sendClientMessage }: Props) {
         <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${PROVIDER_COLORS[summary.provider]}`} />
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <h1 className="font-semibold truncate">{summary.title}</h1>
+            <h1 className="font-semibold truncate">{title || "New session"}</h1>
             {summary.model && (
               <Badge variant="outline" className="text-[10px] h-4 px-1.5">
                 {summary.model}

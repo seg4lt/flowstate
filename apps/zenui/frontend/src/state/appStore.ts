@@ -42,6 +42,15 @@ export interface QuestionSelection {
   freeformText: string;
 }
 
+export interface SessionDisplay {
+  title: string | null;
+  lastTurnPreview: string | null;
+}
+
+export interface ProjectDisplay {
+  name: string | null;
+}
+
 export interface AppState {
   bootstrap: BootstrapPayload | null;
   snapshot: AppSnapshot;
@@ -55,6 +64,18 @@ export interface AppState {
   lastAction: string;
   expandedProjectIds: Record<string, boolean>;
   composer: ComposerDraft;
+  /** App-level display metadata. The SDK snapshot only has ids +
+   *  runtime state; anything the user sees as a label (session title,
+   *  project name, last-turn preview) lives here. Reference apps keep
+   *  this in memory; production apps persist it to their own store.
+   *  See `rs-agent-sdk/crates/core/persistence/CLAUDE.md`. */
+  sessionDisplay: Record<string, SessionDisplay>;
+  projectDisplay: Record<string, ProjectDisplay>;
+  /** FIFO queue of project names awaiting a matching `project_created`
+   *  event. The SDK's `create_project` takes no name, so the create
+   *  flow queues the user-entered name here before sending and pops
+   *  it when the event arrives. */
+  pendingProjectNames: string[];
 }
 
 const INITIAL_STATE: AppState = {
@@ -75,6 +96,9 @@ const INITIAL_STATE: AppState = {
     permissionMode: "accept_edits",
     reasoningEffort: "medium",
   },
+  sessionDisplay: {},
+  projectDisplay: {},
+  pendingProjectNames: [],
 };
 
 type Listener = () => void;
@@ -266,36 +290,79 @@ export const actions = {
   },
   optimisticSendTurn(sessionId: string, input: string, pendingId: string) {
     const now = new Date().toISOString();
+    setState((prev) => {
+      // Derive a title locally on the first turn if we don't already
+      // have one — mirrors what the SDK's orchestration layer used to
+      // do, moved to app-side now that the SDK doesn't own titles.
+      const existingDisplay = prev.sessionDisplay[sessionId];
+      const turnCount = prev.snapshot.sessions.find(
+        (s) => s.summary.sessionId === sessionId,
+      )?.summary.turnCount ?? 0;
+      const shouldAutoTitle =
+        turnCount === 0 && !existingDisplay?.title;
+      const autoTitle = shouldAutoTitle
+        ? input.split(/\s+/).filter(Boolean).slice(0, 6).join(" ") || null
+        : null;
+      const nextDisplay: SessionDisplay = {
+        title: autoTitle ?? existingDisplay?.title ?? null,
+        lastTurnPreview: input.slice(0, 80),
+      };
+
+      return {
+        ...prev,
+        sessionDisplay: {
+          ...prev.sessionDisplay,
+          [sessionId]: nextDisplay,
+        },
+        snapshot: {
+          ...prev.snapshot,
+          sessions: prev.snapshot.sessions.map((session) =>
+            session.summary.sessionId !== sessionId
+              ? session
+              : {
+                  summary: {
+                    ...session.summary,
+                    status: "running",
+                    turnCount: session.summary.turnCount + 1,
+                    updatedAt: now,
+                  },
+                  turns: [
+                    ...session.turns,
+                    {
+                      turnId: pendingId,
+                      input,
+                      output: "",
+                      status: "running",
+                      createdAt: now,
+                      updatedAt: now,
+                      pendingId,
+                    },
+                  ],
+                },
+          ),
+        },
+      };
+    });
+  },
+  /** Push a project name onto the pending-create queue. Called right
+   *  before sending a `create_project` message; popped on the matching
+   *  `project_created` event and written into `projectDisplay`. */
+  queueProjectName(name: string) {
     setState((prev) => ({
       ...prev,
-      snapshot: {
-        ...prev.snapshot,
-        sessions: prev.snapshot.sessions.map((session) =>
-          session.summary.sessionId !== sessionId
-            ? session
-            : {
-                summary: {
-                  ...session.summary,
-                  status: "running",
-                  turnCount: session.summary.turnCount + 1,
-                  lastTurnPreview: input.slice(0, 80),
-                  updatedAt: now,
-                },
-                turns: [
-                  ...session.turns,
-                  {
-                    turnId: pendingId,
-                    input,
-                    output: "",
-                    status: "running",
-                    createdAt: now,
-                    updatedAt: now,
-                    pendingId,
-                  },
-                ],
-              },
-        ),
-      },
+      pendingProjectNames: [...prev.pendingProjectNames, name],
+    }));
+  },
+  setProjectDisplay(projectId: string, display: ProjectDisplay) {
+    setState((prev) => ({
+      ...prev,
+      projectDisplay: { ...prev.projectDisplay, [projectId]: display },
+    }));
+  },
+  setSessionDisplay(sessionId: string, display: SessionDisplay) {
+    setState((prev) => ({
+      ...prev,
+      sessionDisplay: { ...prev.sessionDisplay, [sessionId]: display },
     }));
   },
   applyEvent(event: RuntimeEvent) {
@@ -620,6 +687,14 @@ function applyRuntimeEvent(prev: AppState, event: RuntimeEvent): AppState {
       };
     }
     case "project_created": {
+      // Pop the pending name queued by whichever component triggered
+      // the create flow and stamp it into projectDisplay. If nothing
+      // is pending we still register an empty display row so selectors
+      // don't return undefined.
+      const [nextName, ...remainingPending] = prev.pendingProjectNames;
+      const displayName: ProjectDisplay = {
+        name: nextName ?? null,
+      };
       return {
         ...prev,
         snapshot: {
@@ -630,19 +705,11 @@ function applyRuntimeEvent(prev: AppState, event: RuntimeEvent): AppState {
           ...prev.expandedProjectIds,
           [event.project.projectId]: true,
         },
-      };
-    }
-    case "project_renamed": {
-      return {
-        ...prev,
-        snapshot: {
-          ...prev.snapshot,
-          projects: prev.snapshot.projects.map((p) =>
-            p.projectId !== event.project_id
-              ? p
-              : { ...p, name: event.name, updatedAt: event.updated_at },
-          ),
+        projectDisplay: {
+          ...prev.projectDisplay,
+          [event.project.projectId]: displayName,
         },
+        pendingProjectNames: remainingPending,
       };
     }
     case "project_deleted": {

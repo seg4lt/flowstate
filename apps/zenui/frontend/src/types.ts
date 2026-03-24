@@ -123,14 +123,16 @@ export interface TurnRecord {
   pendingId?: string;
 }
 
+// Display-only fields (`title`, `lastTurnPreview` on SessionSummary;
+// `name`, `sortOrder` on ProjectRecord) deliberately do NOT exist
+// here: they're app-level concerns, tracked in the app's own store.
+// See `rs-agent-sdk/crates/core/persistence/CLAUDE.md` for the boundary.
 export interface SessionSummary {
   sessionId: string;
   provider: ProviderKind;
-  title: string;
   status: SessionStatus;
   createdAt: string;
   updatedAt: string;
-  lastTurnPreview: string | null;
   turnCount: number;
   model?: string;
   projectId?: string | null;
@@ -143,10 +145,9 @@ export interface SessionDetail {
 
 export interface ProjectRecord {
   projectId: string;
-  name: string;
+  path?: string;
   createdAt: string;
   updatedAt: string;
-  sortOrder: number;
 }
 
 export interface AppSnapshot {
@@ -264,7 +265,6 @@ export type RuntimeEvent =
     }
   | { type: "provider_health_updated"; status: ProviderStatus }
   | { type: "project_created"; project: ProjectRecord }
-  | { type: "project_renamed"; project_id: string; name: string; updated_at: string }
   | {
       type: "project_deleted";
       project_id: string;
@@ -293,7 +293,6 @@ export type ClientMessage =
   | {
       type: "start_session";
       provider: ProviderKind;
-      title: string | null;
       model?: string | null;
       project_id?: string | null;
     }
@@ -326,8 +325,7 @@ export type ClientMessage =
   | { type: "accept_plan"; session_id: string; plan_id: string }
   | { type: "reject_plan"; session_id: string; plan_id: string }
   | { type: "refresh_models"; provider: ProviderKind }
-  | { type: "create_project"; name: string }
-  | { type: "rename_project"; project_id: string; name: string }
+  | { type: "create_project"; path?: string }
   | { type: "delete_project"; project_id: string }
   | {
       type: "assign_session_to_project";

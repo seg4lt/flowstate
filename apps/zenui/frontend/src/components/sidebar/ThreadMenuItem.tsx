@@ -10,8 +10,13 @@ interface Props {
 
 export function ThreadMenuItem({ session, sendClientMessage }: Props) {
   const activeSessionId = useAppStore((s) => s.activeSessionId);
+  const display = useAppStore(
+    (s) => s.sessionDisplay[session.summary.sessionId],
+  );
   const isActive = session.summary.sessionId === activeSessionId;
   const isRunning = session.summary.status === "running";
+  const title = display?.title || "New session";
+  const preview = display?.lastTurnPreview;
 
   return (
     <SidebarMenuItem>
@@ -35,7 +40,7 @@ export function ThreadMenuItem({ session, sendClientMessage }: Props) {
           className={`w-2 h-2 rounded-full shrink-0 ${PROVIDER_COLORS[session.summary.provider]}`}
         />
         <div className="flex-1 min-w-0">
-          <div className="text-sm truncate">{session.summary.title}</div>
+          <div className="text-sm truncate">{title}</div>
           <div className="text-xs text-muted-foreground truncate">
             {isRunning ? (
               <span className="flex items-center gap-1">
@@ -43,7 +48,7 @@ export function ThreadMenuItem({ session, sendClientMessage }: Props) {
                 Running...
               </span>
             ) : (
-              session.summary.lastTurnPreview || "No messages yet"
+              preview || "No messages yet"
             )}
           </div>
         </div>
