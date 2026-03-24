@@ -160,23 +160,24 @@ export interface AttachmentData {
   name?: string;
 }
 
+// Display-only fields (`name`, `sortOrder`, `title`, `lastTurnPreview`)
+// deliberately live on the app-side `user_config.sqlite` store via
+// `SessionDisplay` / `ProjectDisplay` in `src/lib/api.ts`, not on these
+// SDK types. See `rs-agent-sdk/crates/core/persistence/CLAUDE.md` for
+// the boundary rule.
 export interface ProjectRecord {
   projectId: string;
-  name: string;
   path?: string;
   createdAt: string;
   updatedAt: string;
-  sortOrder: number;
 }
 
 export interface SessionSummary {
   sessionId: string;
   provider: ProviderKind;
-  title: string;
   status: SessionStatus;
   createdAt: string;
   updatedAt: string;
-  lastTurnPreview: string | null;
   turnCount: number;
   model?: string;
   projectId?: string;
@@ -235,7 +236,7 @@ export type ClientMessage =
   | { type: "ping" }
   | { type: "load_snapshot" }
   | { type: "load_session"; session_id: string; limit?: number }
-  | { type: "start_session"; provider: ProviderKind; title?: string; model?: string; project_id?: string }
+  | { type: "start_session"; provider: ProviderKind; model?: string; project_id?: string }
   | { type: "send_turn"; session_id: string; input: string; images?: { media_type: string; data_base64: string; name?: string }[]; permission_mode?: PermissionMode; reasoning_effort?: ReasoningEffort }
   | { type: "get_attachment"; attachment_id: string }
   | { type: "interrupt_turn"; session_id: string }
@@ -248,11 +249,9 @@ export type ClientMessage =
   | { type: "reject_plan"; session_id: string; plan_id: string }
   | { type: "refresh_models"; provider: ProviderKind }
   | { type: "set_provider_enabled"; provider: ProviderKind; enabled: boolean }
-  | { type: "create_project"; name: string; path?: string }
-  | { type: "rename_project"; project_id: string; name: string }
+  | { type: "create_project"; path?: string }
   | { type: "delete_project"; project_id: string }
   | { type: "assign_session_to_project"; session_id: string; project_id?: string }
-  | { type: "rename_session"; session_id: string; title: string }
   | { type: "update_session_model"; session_id: string; model: string }
   | { type: "archive_session"; session_id: string }
   | { type: "unarchive_session"; session_id: string }
@@ -293,11 +292,9 @@ export type RuntimeEvent =
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }
   | { type: "provider_health_updated"; status: ProviderStatus }
-  | { type: "session_renamed"; session_id: string; title: string }
   | { type: "session_model_updated"; session_id: string; model: string }
   | { type: "session_archived"; session_id: string }
   | { type: "session_unarchived"; session: SessionSummary }
   | { type: "project_created"; project: ProjectRecord }
-  | { type: "project_renamed"; project_id: string; name: string; updated_at: string }
   | { type: "project_deleted"; project_id: string; reassigned_session_ids: string[] }
   | { type: "session_project_assigned"; session_id: string; project_id?: string };

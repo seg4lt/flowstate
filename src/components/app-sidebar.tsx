@@ -45,8 +45,18 @@ import { ThreadItem } from "@/components/sidebar/thread-item";
 import type { SessionSummary } from "@/lib/types";
 
 export function AppSidebar() {
-  const { state, send } = useApp();
+  const { state, send, createProject } = useApp();
   const navigate = useNavigate();
+
+  // Look up display metadata (titles, names) from the app-side store.
+  // The SDK only knows ids + runtime state; anything the user sees as
+  // a label comes from `state.sessionDisplay` / `state.projectDisplay`.
+  const sessionTitle = (sessionId: string): string => {
+    return state.sessionDisplay.get(sessionId)?.title ?? "";
+  };
+  const projectName = (projectId: string): string => {
+    return state.projectDisplay.get(projectId)?.name ?? "Untitled project";
+  };
 
   // Group sessions by project. Sessions whose projectId points at a
   // project that no longer exists (deleted/tombstoned) are filtered
@@ -75,7 +85,7 @@ export function AppSidebar() {
   // Group archived sessions by project
   const projectNameMap = new Map<string, string>();
   for (const p of state.projects) {
-    projectNameMap.set(p.projectId, p.name);
+    projectNameMap.set(p.projectId, projectName(p.projectId));
   }
 
   const archivedByProject = new Map<string | null, SessionSummary[]>();
@@ -129,7 +139,7 @@ export function AppSidebar() {
     const path = typeof selected === "string" ? selected : selected[0];
     if (!path) return;
     const name = path.split("/").pop() ?? path;
-    await send({ type: "create_project", name, path });
+    await createProject(path, name);
   }
 
   async function handleRemoveProject(projectId: string) {
@@ -178,7 +188,7 @@ export function AppSidebar() {
                         <ThreadItem
                           key={session.sessionId}
                           sessionId={session.sessionId}
-                          title={session.title}
+                          title={sessionTitle(session.sessionId)}
                           updatedAt={session.updatedAt}
                           isActive={
                             state.activeSessionId === session.sessionId
@@ -218,11 +228,11 @@ export function AppSidebar() {
                   >
                     <SidebarMenuItem className="group/project">
                       <CollapsibleTrigger asChild>
-                        <SidebarMenuButton tooltip={project.name}>
+                        <SidebarMenuButton tooltip={projectName(project.projectId)}>
                           <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
                           <FolderIcon />
                           <span className="flex-1 truncate">
-                            {project.name}
+                            {projectName(project.projectId)}
                           </span>
                         </SidebarMenuButton>
                       </CollapsibleTrigger>
@@ -246,7 +256,7 @@ export function AppSidebar() {
                             <ThreadItem
                               key={session.sessionId}
                               sessionId={session.sessionId}
-                              title={session.title}
+                              title={sessionTitle(session.sessionId)}
                               updatedAt={session.updatedAt}
                               isActive={
                                 state.activeSessionId === session.sessionId
@@ -322,7 +332,8 @@ export function AppSidebar() {
                                   >
                                     <SidebarMenuSubButton className="h-7 w-full min-w-0 rounded-r-none pr-12">
                                       <span className="flex-1 truncate text-xs">
-                                        {session.title || "New thread"}
+                                        {sessionTitle(session.sessionId) ||
+                                          "New thread"}
                                       </span>
                                     </SidebarMenuSubButton>
                                     <div

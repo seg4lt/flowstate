@@ -19,7 +19,9 @@ mod pty;
 use pty::{PtyId, PtyManager};
 
 mod user_config;
-use user_config::UserConfigStore;
+use user_config::{ProjectDisplay, SessionDisplay, UserConfigStore};
+
+use std::collections::HashMap;
 
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
@@ -1098,6 +1100,78 @@ fn set_user_config(
     store.set(&key, &value)
 }
 
+// Per-session and per-project display metadata: titles, names,
+// previews, ordering. Lives in the same `user_config.sqlite`
+// file as the kv table above, in dedicated tables. The agent
+// SDK no longer persists any of this — its persistence layer
+// only stores fields the runtime needs to execute or resume
+// agents. See `rs-agent-sdk/crates/core/persistence/CLAUDE.md`
+// for the boundary.
+
+#[tauri::command]
+fn set_session_display(
+    store: State<'_, UserConfigStore>,
+    session_id: String,
+    display: SessionDisplay,
+) -> Result<(), String> {
+    store.set_session_display(&session_id, &display)
+}
+
+#[tauri::command]
+fn get_session_display(
+    store: State<'_, UserConfigStore>,
+    session_id: String,
+) -> Result<Option<SessionDisplay>, String> {
+    store.get_session_display(&session_id)
+}
+
+#[tauri::command]
+fn list_session_display(
+    store: State<'_, UserConfigStore>,
+) -> Result<HashMap<String, SessionDisplay>, String> {
+    store.list_session_display()
+}
+
+#[tauri::command]
+fn delete_session_display(
+    store: State<'_, UserConfigStore>,
+    session_id: String,
+) -> Result<(), String> {
+    store.delete_session_display(&session_id)
+}
+
+#[tauri::command]
+fn set_project_display(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+    display: ProjectDisplay,
+) -> Result<(), String> {
+    store.set_project_display(&project_id, &display)
+}
+
+#[tauri::command]
+fn get_project_display(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<Option<ProjectDisplay>, String> {
+    store.get_project_display(&project_id)
+}
+
+#[tauri::command]
+fn list_project_display(
+    store: State<'_, UserConfigStore>,
+) -> Result<HashMap<String, ProjectDisplay>, String> {
+    store.list_project_display()
+}
+
+#[tauri::command]
+fn delete_project_display(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<(), String> {
+    store.delete_project_display(&project_id)
+}
+
 /// Resolved cross-platform app data dir for Flowzen — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
@@ -1215,6 +1289,14 @@ pub fn run() {
             pty_kill,
             get_user_config,
             set_user_config,
+            set_session_display,
+            get_session_display,
+            list_session_display,
+            delete_session_display,
+            set_project_display,
+            get_project_display,
+            list_project_display,
+            delete_project_display,
             get_app_data_dir,
         ])
         .on_window_event(|window, event| {

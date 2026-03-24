@@ -1,5 +1,16 @@
 import * as React from "react";
-import { connectStream, sendMessage } from "@/lib/api";
+import {
+  connectStream,
+  deleteProjectDisplay,
+  deleteSessionDisplay,
+  listProjectDisplay,
+  listSessionDisplay,
+  sendMessage,
+  setProjectDisplay,
+  setSessionDisplay,
+  type ProjectDisplay,
+  type SessionDisplay,
+} from "@/lib/api";
 import type {
   ClientMessage,
   PermissionDecision,
@@ -30,6 +41,13 @@ interface AppState {
   sessions: Map<string, SessionSummary>;
   archivedSessions: SessionSummary[];
   projects: ProjectRecord[];
+  /** App-side display metadata: titles, names, previews, ordering.
+   *  Hydrated on boot from `user_config.sqlite`. The SDK snapshot
+   *  above only has ids + runtime state; anything a user sees as a
+   *  label lives here. See
+   *  `rs-agent-sdk/crates/core/persistence/CLAUDE.md`. */
+  sessionDisplay: Map<string, SessionDisplay>;
+  projectDisplay: Map<string, ProjectDisplay>;
   activeSessionId: string | null;
   /** Sessions whose most recent turn finished while the user was
    *  looking at a different screen / thread. Renders a "Done" badge
@@ -67,7 +85,26 @@ type AppAction =
   | { type: "consume_pending_permission"; sessionId: string; requestId: string }
   /** Clear the per-session pending question. Used when the user
    *  answers OR cancels a question. */
-  | { type: "consume_pending_question"; sessionId: string; requestId: string };
+  | { type: "consume_pending_question"; sessionId: string; requestId: string }
+  /** Bulk-hydrate the display maps from the app-side store on boot. */
+  | {
+      type: "hydrate_display";
+      sessionDisplay: Map<string, SessionDisplay>;
+      projectDisplay: Map<string, ProjectDisplay>;
+    }
+  /** Local write — updates the store after a Tauri set_*_display call
+   *  succeeds. `null` value means clear the row locally (used alongside
+   *  delete_*_display on session/project deletion). */
+  | {
+      type: "set_session_display";
+      sessionId: string;
+      display: SessionDisplay | null;
+    }
+  | {
+      type: "set_project_display";
+      projectId: string;
+      display: ProjectDisplay | null;
+    };
 
 /** Recompute whether a session still has any pending input after a
  *  consume action. If both the permissions queue and the question
@@ -142,6 +179,31 @@ function appReducer(state: AppState, action: AppAction): AppState {
         pendingQuestionBySession,
         awaitingInputSessionIds,
       };
+    }
+    case "hydrate_display": {
+      return {
+        ...state,
+        sessionDisplay: action.sessionDisplay,
+        projectDisplay: action.projectDisplay,
+      };
+    }
+    case "set_session_display": {
+      const sessionDisplay = new Map(state.sessionDisplay);
+      if (action.display === null) {
+        sessionDisplay.delete(action.sessionId);
+      } else {
+        sessionDisplay.set(action.sessionId, action.display);
+      }
+      return { ...state, sessionDisplay };
+    }
+    case "set_project_display": {
+      const projectDisplay = new Map(state.projectDisplay);
+      if (action.display === null) {
+        projectDisplay.delete(action.projectId);
+      } else {
+        projectDisplay.set(action.projectId, action.display);
+      }
+      return { ...state, projectDisplay };
     }
     default:
       return state;
@@ -404,18 +466,13 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
     }
 
     case "project_created": {
+      // Dedupe by id — the runtime publishes this event AND includes
+      // it (indirectly) in the Ack response, so we may receive it
+      // twice in rapid succession.
+      if (state.projects.some((p) => p.projectId === event.project.projectId)) {
+        return state;
+      }
       return { ...state, projects: [...state.projects, event.project] };
-    }
-
-    case "project_renamed": {
-      return {
-        ...state,
-        projects: state.projects.map((p) =>
-          p.projectId === event.project_id
-            ? { ...p, name: event.name, updatedAt: event.updated_at }
-            : p,
-        ),
-      };
     }
 
     case "project_deleted": {
@@ -460,13 +517,6 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
             )
           : [...state.providers, event.status],
       };
-    }
-
-    case "session_renamed": {
-      const sessions = new Map(state.sessions);
-      const s = sessions.get(event.session_id);
-      if (s) sessions.set(event.session_id, { ...s, title: event.title });
-      return { ...state, sessions };
     }
 
     case "session_model_updated": {
@@ -539,6 +589,8 @@ const initialState: AppState = {
   sessions: new Map(),
   archivedSessions: [],
   projects: [],
+  sessionDisplay: new Map(),
+  projectDisplay: new Map(),
   activeSessionId: null,
   doneSessionIds: new Set(),
   awaitingInputSessionIds: new Set(),
@@ -551,6 +603,20 @@ interface AppContextValue {
   state: AppState;
   dispatch: React.Dispatch<AppAction>;
   send: (message: ClientMessage) => Promise<ServerMessage | null>;
+  /** Rename a session locally — app-side store only, no SDK call. */
+  renameSession: (sessionId: string, title: string) => Promise<void>;
+  /** Rename a project locally — app-side store only, no SDK call. */
+  renameProject: (projectId: string, name: string) => Promise<void>;
+  /** Create a project via the SDK (path only) and immediately write
+   *  the display name into the app-side store. Resolves once both
+   *  the SDK row and the app-side display row exist; returns the
+   *  new project_id. */
+  createProject: (path: string, name: string) => Promise<string>;
+  /** Update a session's preview locally (e.g. on first turn). */
+  updateSessionPreview: (sessionId: string, preview: string) => Promise<void>;
+  /** Clear display rows when a session/project is deleted by the SDK. */
+  deleteSessionDisplayLocal: (sessionId: string) => Promise<void>;
+  deleteProjectDisplayLocal: (projectId: string) => Promise<void>;
 }
 
 const AppContext = React.createContext<AppContextValue | null>(null);
@@ -559,14 +625,56 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = React.useReducer(appReducer, initialState);
   const dispatchRef = React.useRef(dispatch);
   dispatchRef.current = dispatch;
+  // Mirror state into a ref so the callbacks below can read the latest
+  // display maps without stale closures or useCallback dependency churn.
+  const stateRef = React.useRef(state);
+  stateRef.current = state;
 
   React.useEffect(() => {
     let active = true;
     connectStream((message) => {
-      if (active) {
-        dispatchRef.current({ type: "server_message", message });
+      if (!active) return;
+      dispatchRef.current({ type: "server_message", message });
+      // Side-effect cleanup: when the SDK reports a session or
+      // project as permanently deleted, drop its app-side display
+      // row too. We don't clean on archive — archived rows may be
+      // unarchived later and the display should be preserved.
+      if (message.type === "event") {
+        if (message.event.type === "session_deleted") {
+          void deleteSessionDisplay(message.event.session_id);
+          dispatchRef.current({
+            type: "set_session_display",
+            sessionId: message.event.session_id,
+            display: null,
+          });
+        } else if (message.event.type === "project_deleted") {
+          void deleteProjectDisplay(message.event.project_id);
+          dispatchRef.current({
+            type: "set_project_display",
+            projectId: message.event.project_id,
+            display: null,
+          });
+        }
       }
     });
+
+    // Hydrate the display maps in parallel with the stream. These live
+    // in `user_config.sqlite` (app-owned), not in the SDK's daemon
+    // database. The daemon only knows session/project ids + runtime
+    // state; anything a user sees as a label is merged in here.
+    Promise.all([listSessionDisplay(), listProjectDisplay()])
+      .then(([sessionRecord, projectRecord]) => {
+        if (!active) return;
+        dispatchRef.current({
+          type: "hydrate_display",
+          sessionDisplay: new Map(Object.entries(sessionRecord)),
+          projectDisplay: new Map(Object.entries(projectRecord)),
+        });
+      })
+      .catch((err) => {
+        console.error("failed to hydrate display metadata", err);
+      });
+
     return () => {
       active = false;
     };
@@ -585,7 +693,149 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return res;
   }, []);
 
-  const value = React.useMemo(() => ({ state, dispatch, send }), [state, send]);
+  const renameSession = React.useCallback(
+    async (sessionId: string, title: string) => {
+      const trimmed = title.trim();
+      const existing = stateRef.current.sessionDisplay.get(sessionId);
+      const display: SessionDisplay = {
+        title: trimmed.length > 0 ? trimmed : null,
+        lastTurnPreview: existing?.lastTurnPreview ?? null,
+      };
+      await setSessionDisplay(sessionId, display);
+      dispatchRef.current({
+        type: "set_session_display",
+        sessionId,
+        display,
+      });
+    },
+    [],
+  );
+
+  const renameProject = React.useCallback(
+    async (projectId: string, name: string) => {
+      const trimmed = name.trim();
+      const existing = stateRef.current.projectDisplay.get(projectId);
+      const display: ProjectDisplay = {
+        name: trimmed.length > 0 ? trimmed : null,
+        sortOrder: existing?.sortOrder ?? null,
+      };
+      await setProjectDisplay(projectId, display);
+      dispatchRef.current({
+        type: "set_project_display",
+        projectId,
+        display,
+      });
+    },
+    [],
+  );
+
+  const createProject = React.useCallback(
+    async (path: string, name: string): Promise<string> => {
+      // Snapshot what's currently in the store so we can detect the
+      // new project_id when it lands. The SDK's response is an Ack; the
+      // authoritative `ProjectCreated` event is delivered via the
+      // Tauri channel and processed by the reducer. We wait briefly
+      // for the event to show up, then write the display name.
+      const beforeIds = new Set(
+        stateRef.current.projects.map((p) => p.projectId),
+      );
+      await sendMessage({ type: "create_project", path });
+
+      let projectId: string | null = null;
+      for (let i = 0; i < 40; i++) {
+        const match = stateRef.current.projects.find(
+          (p) => !beforeIds.has(p.projectId) && p.path === path,
+        );
+        if (match) {
+          projectId = match.projectId;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      if (!projectId) {
+        throw new Error("create_project: project_created event never arrived");
+      }
+
+      const trimmed = name.trim();
+      const display: ProjectDisplay = {
+        name: trimmed.length > 0 ? trimmed : null,
+        sortOrder: null,
+      };
+      await setProjectDisplay(projectId, display);
+      dispatchRef.current({
+        type: "set_project_display",
+        projectId,
+        display,
+      });
+      return projectId;
+    },
+    [],
+  );
+
+  const updateSessionPreview = React.useCallback(
+    async (sessionId: string, preview: string) => {
+      const existing = stateRef.current.sessionDisplay.get(sessionId);
+      const display: SessionDisplay = {
+        title: existing?.title ?? null,
+        lastTurnPreview: preview.slice(0, 140),
+      };
+      await setSessionDisplay(sessionId, display);
+      dispatchRef.current({
+        type: "set_session_display",
+        sessionId,
+        display,
+      });
+    },
+    [],
+  );
+
+  const deleteSessionDisplayLocal = React.useCallback(
+    async (sessionId: string) => {
+      await deleteSessionDisplay(sessionId);
+      dispatchRef.current({
+        type: "set_session_display",
+        sessionId,
+        display: null,
+      });
+    },
+    [],
+  );
+
+  const deleteProjectDisplayLocal = React.useCallback(
+    async (projectId: string) => {
+      await deleteProjectDisplay(projectId);
+      dispatchRef.current({
+        type: "set_project_display",
+        projectId,
+        display: null,
+      });
+    },
+    [],
+  );
+
+  const value = React.useMemo(
+    () => ({
+      state,
+      dispatch,
+      send,
+      renameSession,
+      renameProject,
+      createProject,
+      updateSessionPreview,
+      deleteSessionDisplayLocal,
+      deleteProjectDisplayLocal,
+    }),
+    [
+      state,
+      send,
+      renameSession,
+      renameProject,
+      createProject,
+      updateSessionPreview,
+      deleteSessionDisplayLocal,
+      deleteProjectDisplayLocal,
+    ],
+  );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }

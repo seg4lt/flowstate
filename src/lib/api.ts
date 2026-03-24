@@ -126,6 +126,65 @@ export function setUserConfig(key: string, value: string): Promise<void> {
   return invoke<void>("set_user_config", { key, value });
 }
 
+// Per-session and per-project display metadata: titles, names,
+// previews, ordering. Persisted in the same `user_config.sqlite`
+// file as the kv store above, in dedicated tables. The agent SDK
+// no longer stores any of this — it only persists fields the
+// runtime needs to execute or resume agents. See
+// `rs-agent-sdk/crates/core/persistence/CLAUDE.md` for the boundary.
+
+export interface SessionDisplay {
+  title: string | null;
+  lastTurnPreview: string | null;
+}
+
+export interface ProjectDisplay {
+  name: string | null;
+  sortOrder: number | null;
+}
+
+export function setSessionDisplay(
+  sessionId: string,
+  display: SessionDisplay,
+): Promise<void> {
+  return invoke<void>("set_session_display", { sessionId, display });
+}
+
+export function getSessionDisplay(
+  sessionId: string,
+): Promise<SessionDisplay | null> {
+  return invoke<SessionDisplay | null>("get_session_display", { sessionId });
+}
+
+export function listSessionDisplay(): Promise<Record<string, SessionDisplay>> {
+  return invoke<Record<string, SessionDisplay>>("list_session_display");
+}
+
+export function deleteSessionDisplay(sessionId: string): Promise<void> {
+  return invoke<void>("delete_session_display", { sessionId });
+}
+
+export function setProjectDisplay(
+  projectId: string,
+  display: ProjectDisplay,
+): Promise<void> {
+  return invoke<void>("set_project_display", { projectId, display });
+}
+
+export function getProjectDisplay(
+  projectId: string,
+): Promise<ProjectDisplay | null> {
+  return invoke<ProjectDisplay | null>("get_project_display", { projectId });
+}
+
+export function listProjectDisplay(): Promise<Record<string, ProjectDisplay>> {
+  return invoke<Record<string, ProjectDisplay>>("list_project_display");
+}
+
+export function deleteProjectDisplay(projectId: string): Promise<void> {
+  return invoke<void>("delete_project_display", { projectId });
+}
+
 // Resolved cross-platform app data dir for Flowzen — the same
 // directory the daemon database, threads dir, and user_config
 // sqlite live under. Surfaced to the Settings UI as a read-only

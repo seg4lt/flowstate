@@ -285,7 +285,7 @@ function DiffDragHandle({
 //     full render cost on every click, which is why threads felt
 //     slow to load even on warm cache.
 export function ChatView({ sessionId }: { sessionId: string }) {
-  const { state, dispatch, send } = useApp();
+  const { state, dispatch, send, renameSession } = useApp();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const sessionQuery = useQuery(sessionQueryOptions(sessionId));
@@ -851,7 +851,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => clearTimeout(id);
   }, [isRunning, hasPendingToolCall, lastEventAt]);
 
-  const title = session?.title || "New thread";
+  const title = state.sessionDisplay.get(sessionId)?.title || "New thread";
 
   const [editingTitle, setEditingTitle] = React.useState(false);
   const [titleDraft, setTitleDraft] = React.useState(title);
@@ -872,11 +872,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     const trimmed = titleDraft.trim();
     setEditingTitle(false);
     if (trimmed && trimmed !== title) {
-      sendMessage({
-        type: "rename_session",
-        session_id: sessionId,
-        title: trimmed,
-      });
+      void renameSession(sessionId, trimmed);
     }
   }
 

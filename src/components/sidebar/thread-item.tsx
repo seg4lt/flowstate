@@ -61,7 +61,7 @@ export function ThreadItem({
   pendingDone,
   onClick,
 }: ThreadItemProps) {
-  const { send } = useApp();
+  const { send, renameSession } = useApp();
   const queryClient = useQueryClient();
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(title);
@@ -92,7 +92,7 @@ export function ThreadItem({
     const trimmed = draft.trim();
     setEditing(false);
     if (trimmed && trimmed !== title) {
-      send({ type: "rename_session", session_id: sessionId, title: trimmed });
+      void renameSession(sessionId, trimmed);
     }
   }
 
