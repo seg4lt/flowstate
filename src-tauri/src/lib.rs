@@ -19,9 +19,19 @@ mod pty;
 use pty::{PtyId, PtyManager};
 
 mod user_config;
-use user_config::{ProjectDisplay, SessionDisplay, UserConfigStore};
+use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
 use std::collections::HashMap;
+
+/// Cheap "does this filesystem entry exist?" probe. Used by the
+/// chat view to flip a worktree thread into read-only mode when
+/// the user has removed its folder out from under flowzen — the
+/// banner explains why the composer is disabled and the existing
+/// archived-readonly infra is reused to enforce it.
+#[tauri::command]
+fn path_exists(path: String) -> bool {
+    Path::new(&path).exists()
+}
 
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
@@ -248,6 +258,112 @@ fn git_create_branch(path: String, branch: String) -> Result<(), String> {
         } else {
             format!(
                 "git checkout -b exited with status {:?}",
+                output.status.code()
+            )
+        });
+    }
+    Ok(())
+}
+
+/// Create a new git worktree for `project_path` at `worktree_path`.
+/// Runs `git -C <project_path> worktree add -b <branch> <worktree_path>
+/// <base_ref>`. The `base_ref` is typically the current HEAD or branch
+/// name the user wants to fork from. Returns the freshly-listed
+/// `GitWorktree` entry for the new path so the frontend can hydrate
+/// caches without a second round-trip. Stderr is forwarded verbatim
+/// on failure so errors like "pathspec is already checked out" or
+/// "a branch named X already exists" surface to the user.
+#[tauri::command]
+fn create_git_worktree(
+    project_path: String,
+    worktree_path: String,
+    branch: String,
+    base_ref: String,
+) -> Result<GitWorktree, String> {
+    if branch.trim().is_empty() {
+        return Err("empty branch name".into());
+    }
+    if worktree_path.trim().is_empty() {
+        return Err("empty worktree path".into());
+    }
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &project_path,
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &worktree_path,
+            &base_ref,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "git worktree add exited with status {:?}",
+                output.status.code()
+            )
+        });
+    }
+
+    // Re-read the list so the caller gets the new entry with the
+    // canonical fields the porcelain parser produces (in particular
+    // the HEAD sha, which we don't otherwise have on the create
+    // side). Linear scan — the list is short.
+    let all = list_git_worktrees(project_path)?;
+    all.into_iter()
+        .find(|w| w.path == worktree_path)
+        .ok_or_else(|| {
+            format!(
+                "worktree add succeeded but {worktree_path} not found in subsequent list"
+            )
+        })
+}
+
+/// Remove the worktree rooted at `worktree_path`. When `force` is
+/// false, git refuses if the worktree has uncommitted changes or
+/// locked state — the frontend surfaces stderr inline and can offer
+/// a retry with `force = true`, which runs `git worktree remove -f`.
+/// Does NOT soft-delete the SDK project linked to this worktree; the
+/// caller is responsible for cleaning up any flowzen-side metadata
+/// so history stays visible until the user explicitly deletes the
+/// threads.
+#[tauri::command]
+fn remove_git_worktree(
+    project_path: String,
+    worktree_path: String,
+    force: bool,
+) -> Result<(), String> {
+    if worktree_path.trim().is_empty() {
+        return Err("empty worktree path".into());
+    }
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &project_path, "worktree", "remove"]);
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg(&worktree_path);
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "git worktree remove exited with status {:?}",
                 output.status.code()
             )
         });
@@ -1172,6 +1288,46 @@ fn delete_project_display(
     store.delete_project_display(&project_id)
 }
 
+// Parent/child worktree links — a flowzen-app concept, not an SDK
+// concept. Each worktree has its own SDK project (so the SDK's
+// existing cwd resolution picks up the worktree folder), and this
+// table just records "project X is a worktree of project Y, on
+// branch Z". The sidebar uses these links to group worktree threads
+// under the parent project visually.
+
+#[tauri::command]
+fn set_project_worktree(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+    parent_project_id: String,
+    branch: Option<String>,
+) -> Result<(), String> {
+    store.set_project_worktree(&project_id, &parent_project_id, branch.as_deref())
+}
+
+#[tauri::command]
+fn get_project_worktree(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<Option<ProjectWorktree>, String> {
+    store.get_project_worktree(&project_id)
+}
+
+#[tauri::command]
+fn list_project_worktree(
+    store: State<'_, UserConfigStore>,
+) -> Result<HashMap<String, ProjectWorktree>, String> {
+    store.list_project_worktree()
+}
+
+#[tauri::command]
+fn delete_project_worktree(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<(), String> {
+    store.delete_project_worktree(&project_id)
+}
+
 /// Resolved cross-platform app data dir for Flowzen — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
@@ -1275,6 +1431,9 @@ pub fn run() {
             list_git_worktrees,
             git_checkout,
             git_create_branch,
+            create_git_worktree,
+            remove_git_worktree,
+            path_exists,
             get_git_diff_summary,
             get_git_diff_file,
             list_project_files,
@@ -1297,6 +1456,10 @@ pub fn run() {
             get_project_display,
             list_project_display,
             delete_project_display,
+            set_project_worktree,
+            get_project_worktree,
+            list_project_worktree,
+            delete_project_worktree,
             get_app_data_dir,
         ])
         .on_window_event(|window, event| {

@@ -17,6 +17,10 @@ interface ChatInputProps {
    *  re-enables it. Distinct from `disabled` which is about transient
    *  loading states. */
   providerDisabled?: boolean;
+  /** When true, the session is archived and strictly read-only — no
+   *  new messages, no unarchive path. Archived threads exist only
+   *  for history viewing. */
+  archived?: boolean;
   toolbar?: React.ReactNode;
   /** Command metadata for the autocomplete popup. */
   commands?: { name: string; description: string }[];
@@ -87,6 +91,7 @@ export function ChatInput({
   sessionStatus,
   disabled,
   providerDisabled = false,
+  archived = false,
   toolbar,
 }: ChatInputProps) {
   const [value, setValue] = React.useState("");
@@ -223,7 +228,7 @@ export function ChatInput({
   }
 
   function handleSubmit() {
-    if (providerDisabled) return;
+    if (providerDisabled || archived) return;
     const trimmed = value.trim();
     if (!trimmed && attachedImages.length === 0) return;
     // Snapshot images then clear state — we hand the snapshot off to
@@ -322,8 +327,9 @@ export function ChatInput({
   // mid-compose. Queued chips are intentionally NOT a precondition --
   // interrupting only stops the current turn and leaves the queue
   // intact, so the user can always reach the stop affordance.
-  const showStop = isRunning && !hasContent && !providerDisabled;
-  const sendDisabled = !hasContent || disabled || providerDisabled;
+  const showStop = isRunning && !hasContent && !providerDisabled && !archived;
+  const sendDisabled =
+    !hasContent || disabled || providerDisabled || archived;
 
   return (
     // Queued chips live OUTSIDE the bordered composer so they float above
@@ -395,13 +401,15 @@ export function ChatInput({
               onInput={handleInput}
               onPaste={handlePaste}
               placeholder={
-                providerDisabled
-                  ? "Provider disabled — re-enable it in Settings to send"
-                  : queued.length > 0
-                    ? "Compose another message…"
-                    : "Send a message..."
+                archived
+                  ? "Archived thread — read-only"
+                  : providerDisabled
+                    ? "Provider disabled — re-enable it in Settings to send"
+                    : queued.length > 0
+                      ? "Compose another message…"
+                      : "Send a message..."
               }
-              disabled={disabled || providerDisabled}
+              disabled={disabled || providerDisabled || archived}
               rows={1}
               className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
             />

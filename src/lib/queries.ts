@@ -6,6 +6,7 @@ import {
   listGitBranches,
   listGitWorktrees,
   listProjectFiles,
+  pathExists,
   sendMessage,
 } from "./api";
 import type { GitBranchList, GitFileSummary, GitWorktree } from "./api";
@@ -148,6 +149,24 @@ export function gitWorktreeListQueryOptions(path: string | null) {
     },
     enabled: !!path,
     staleTime: 5 * 1000,
+    refetchOnMount: true,
+  });
+}
+
+// Cheap existence probe for a worktree's folder. When a worktree
+// thread's underlying directory has been removed (either from the
+// terminal or from the branch-switcher's delete button) we flip the
+// chat view into read-only mode. 10s staleTime keeps it responsive
+// without thrashing the filesystem.
+export function pathExistsQueryOptions(path: string | null) {
+  return queryOptions({
+    queryKey: ["fs", "path-exists", path] as const,
+    queryFn: async (): Promise<boolean> => {
+      if (!path) return true;
+      return pathExists(path);
+    },
+    enabled: !!path,
+    staleTime: 10 * 1000,
     refetchOnMount: true,
   });
 }

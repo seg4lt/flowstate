@@ -17,6 +17,11 @@
 //                         last-turn preview) keyed by session_id
 //   * `project_display` — per-project display labels (name,
 //                         sort order) keyed by project_id
+//   * `project_worktree` — parent/child link marking an SDK
+//                         project as a git worktree of another
+//                         SDK project. Flowzen groups them under
+//                         the parent in the sidebar; the SDK never
+//                         sees this relationship.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,6 +42,22 @@ pub struct SessionDisplay {
 pub struct ProjectDisplay {
     pub name: Option<String>,
     pub sort_order: Option<i64>,
+}
+
+/// Parent/child link between two SDK projects where the child is a
+/// git worktree of the parent. Stored in flowzen's user_config —
+/// the agent SDK treats both as ordinary independent projects and
+/// has no notion of worktree ancestry. The flowzen sidebar reads
+/// this table to group worktree threads under the parent project
+/// visually, and the branch-switcher reads it to find-or-create the
+/// worktree project when a user clicks or creates a worktree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWorktree {
+    pub project_id: String,
+    pub parent_project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// Owned by Tauri state. The connection is wrapped in a Mutex
@@ -85,7 +106,17 @@ impl UserConfigStore {
                     name TEXT,
                     sort_order INTEGER,
                     updated_at TEXT NOT NULL
-                );",
+                );
+
+                CREATE TABLE IF NOT EXISTS project_worktree (
+                    project_id TEXT PRIMARY KEY,
+                    parent_project_id TEXT NOT NULL,
+                    branch TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_project_worktree_parent
+                    ON project_worktree(parent_project_id);",
             )
             .map_err(|e| format!("create user_config schema: {e}"))?;
         Ok(Self {
@@ -304,6 +335,102 @@ impl UserConfigStore {
                 params![project_id],
             )
             .map_err(|e| format!("delete project_display: {e}"))?;
+        Ok(())
+    }
+
+    pub fn set_project_worktree(
+        &self,
+        project_id: &str,
+        parent_project_id: &str,
+        branch: Option<&str>,
+    ) -> Result<(), String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO project_worktree
+                    (project_id, parent_project_id, branch, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(project_id) DO UPDATE SET
+                    parent_project_id = excluded.parent_project_id,
+                    branch = excluded.branch,
+                    updated_at = excluded.updated_at",
+                params![project_id, parent_project_id, branch, now],
+            )
+            .map_err(|e| format!("set project_worktree: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_project_worktree(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectWorktree>, String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        connection
+            .query_row(
+                "SELECT project_id, parent_project_id, branch
+                 FROM project_worktree WHERE project_id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(ProjectWorktree {
+                        project_id: row.get(0)?,
+                        parent_project_id: row.get(1)?,
+                        branch: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("get project_worktree: {e}"))
+    }
+
+    pub fn list_project_worktree(
+        &self,
+    ) -> Result<HashMap<String, ProjectWorktree>, String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut stmt = connection
+            .prepare("SELECT project_id, parent_project_id, branch FROM project_worktree")
+            .map_err(|e| format!("prepare list project_worktree: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let project_id: String = row.get(0)?;
+                Ok((
+                    project_id.clone(),
+                    ProjectWorktree {
+                        project_id,
+                        parent_project_id: row.get(1)?,
+                        branch: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|e| format!("query list project_worktree: {e}"))?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, rec) = row.map_err(|e| format!("row project_worktree: {e}"))?;
+            out.insert(id, rec);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_project_worktree(&self, project_id: &str) -> Result<(), String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        connection
+            .execute(
+                "DELETE FROM project_worktree WHERE project_id = ?1",
+                params![project_id],
+            )
+            .map_err(|e| format!("delete project_worktree: {e}"))?;
         Ok(())
     }
 }

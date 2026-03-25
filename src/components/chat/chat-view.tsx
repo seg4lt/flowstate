@@ -21,6 +21,7 @@ import {
   gitBranchQueryOptions,
   gitDiffSummaryQueryOptions,
   loadFullSession,
+  pathExistsQueryOptions,
   sessionQueryKey,
   sessionQueryOptions,
   type SessionPage,
@@ -449,7 +450,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
   }, []);
 
-  const session = state.sessions.get(sessionId);
+  // Look up the active session first, then fall back to the archived
+  // list so the chat view can render read-only history for an archived
+  // thread without the caller having to know which table it lives in.
+  const session =
+    state.sessions.get(sessionId) ??
+    state.archivedSessions.find((s) => s.sessionId === sessionId);
+  const isArchived = React.useMemo(
+    () => state.archivedSessions.some((s) => s.sessionId === sessionId),
+    [state.archivedSessions, sessionId],
+  );
   // Runtime enablement lookup for the session's provider. When the
   // user disables a provider from Settings, existing sessions stay
   // visible (history preserved) but the chat header shows a badge
@@ -466,6 +476,23 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
   }, [session?.projectId, state.projects]);
+  // Worktree threads live under their own SDK project whose path is
+  // the worktree folder. The "parent" is the main repo's SDK project
+  // — what the user perceives as the one project in the sidebar. If
+  // this session isn't a worktree, parent == current.
+  const parentProjectId = React.useMemo(() => {
+    if (!session?.projectId) return null;
+    return (
+      state.projectWorktrees.get(session.projectId)?.parentProjectId ??
+      session.projectId
+    );
+  }, [session?.projectId, state.projectWorktrees]);
+  const parentProjectPath = React.useMemo(() => {
+    if (!parentProjectId) return null;
+    return (
+      state.projects.find((p) => p.projectId === parentProjectId)?.path ?? null
+    );
+  }, [parentProjectId, state.projects]);
   // Branch + diff summary are fetched via project-scoped queries,
   // so switching between threads in the same project reuses the
   // cached values rather than re-shelling out to git on every
@@ -477,6 +504,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const gitDiffQuery = useQuery(
     gitDiffSummaryQueryOptions(projectPath, diffRefreshTick),
   );
+  // Worktree threads live under their own SDK project whose path IS
+  // the worktree folder. If that folder has been removed on disk —
+  // either from the branch-switcher's delete button or out-of-band
+  // in a terminal — the agent can't run there anymore, so we flip
+  // the thread into the same read-only mode archived threads use.
+  const isWorktreeThread = React.useMemo(() => {
+    if (!session?.projectId) return false;
+    return state.projectWorktrees.has(session.projectId);
+  }, [session?.projectId, state.projectWorktrees]);
+  const worktreeFolderQuery = useQuery({
+    ...pathExistsQueryOptions(projectPath),
+    enabled: isWorktreeThread && !!projectPath,
+  });
+  const worktreeFolderMissing =
+    isWorktreeThread && worktreeFolderQuery.data === false;
   const diffs = React.useMemo<AggregatedFileDiff[]>(
     () => gitDiffQuery.data ?? [],
     [gitDiffQuery.data],
@@ -694,6 +736,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, [queryClient, navigate, refreshDiffs]);
 
   async function handleSend(input: string, images: AttachedImage[] = []) {
+    if (isArchived) {
+      // Defense in depth — the composer is disabled when archived,
+      // but slash-command and keyboard shortcut paths could still
+      // call this; reject at the source.
+      toast({
+        description: "This thread is archived and can't accept new messages",
+        duration: 3000,
+      });
+      return;
+    }
+    if (worktreeFolderMissing) {
+      toast({
+        description:
+          "This worktree's folder no longer exists — recreate it to continue",
+        duration: 3000,
+      });
+      return;
+    }
     // --- Slash command interception ---
     const resolved = resolveCommand(input);
     if (resolved) {
@@ -928,10 +988,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             </span>
           )}
           <div className="flex items-center gap-2">
-            {gitBranch && projectPath && (
+            {gitBranch && projectPath && session && parentProjectId && parentProjectPath && (
               <BranchSwitcher
                 projectPath={projectPath}
                 currentBranch={gitBranch}
+                parentProjectId={parentProjectId}
+                parentProjectPath={parentProjectPath}
+                provider={session.provider}
+                model={session.model ?? null}
                 onCheckedOut={refreshDiffs}
               />
             )}
@@ -1052,6 +1116,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               />
             )}
 
+          {isArchived && (
+            <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
+              This thread is archived — read-only history. Archived
+              conversations can't receive new messages.
+            </div>
+          )}
+          {!isArchived && worktreeFolderMissing && (
+            <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
+              This worktree's folder no longer exists — read-only
+              history. Recreate the worktree to keep working on it.
+            </div>
+          )}
           <ChatInput
             // Remount the composer on every thread switch so its
             // internal state (textarea draft, pendingSend queue
@@ -1067,6 +1143,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             sessionStatus={session?.status}
             disabled={loading}
             providerDisabled={providerDisabled}
+            archived={isArchived || worktreeFolderMissing}
             toolbar={toolbar}
             commands={COMMAND_META}
           />

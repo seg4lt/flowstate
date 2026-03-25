@@ -2,13 +2,17 @@ import * as React from "react";
 import {
   connectStream,
   deleteProjectDisplay,
+  deleteProjectWorktree,
   deleteSessionDisplay,
   listProjectDisplay,
+  listProjectWorktree,
   listSessionDisplay,
   sendMessage,
   setProjectDisplay,
+  setProjectWorktree,
   setSessionDisplay,
   type ProjectDisplay,
+  type ProjectWorktree,
   type SessionDisplay,
 } from "@/lib/api";
 import type {
@@ -48,6 +52,13 @@ interface AppState {
    *  `rs-agent-sdk/crates/core/persistence/CLAUDE.md`. */
   sessionDisplay: Map<string, SessionDisplay>;
   projectDisplay: Map<string, ProjectDisplay>;
+  /** Parent/child worktree links, keyed by the worktree's SDK
+   *  project_id. A row here marks the project as a git worktree of
+   *  its `parentProjectId`. Lives in flowzen's user_config, not the
+   *  SDK — each worktree has its own SDK project so cwd resolution
+   *  works natively; this table is purely for sidebar grouping and
+   *  the tooltip/branch-icon indicator. */
+  projectWorktrees: Map<string, ProjectWorktree>;
   activeSessionId: string | null;
   /** Sessions whose most recent turn finished while the user was
    *  looking at a different screen / thread. Renders a "Done" badge
@@ -91,6 +102,7 @@ type AppAction =
       type: "hydrate_display";
       sessionDisplay: Map<string, SessionDisplay>;
       projectDisplay: Map<string, ProjectDisplay>;
+      projectWorktrees: Map<string, ProjectWorktree>;
     }
   /** Local write — updates the store after a Tauri set_*_display call
    *  succeeds. `null` value means clear the row locally (used alongside
@@ -104,6 +116,11 @@ type AppAction =
       type: "set_project_display";
       projectId: string;
       display: ProjectDisplay | null;
+    }
+  | {
+      type: "set_project_worktree";
+      projectId: string;
+      record: ProjectWorktree | null;
     };
 
 /** Recompute whether a session still has any pending input after a
@@ -185,6 +202,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
         ...state,
         sessionDisplay: action.sessionDisplay,
         projectDisplay: action.projectDisplay,
+        projectWorktrees: action.projectWorktrees,
       };
     }
     case "set_session_display": {
@@ -204,6 +222,15 @@ function appReducer(state: AppState, action: AppAction): AppState {
         projectDisplay.set(action.projectId, action.display);
       }
       return { ...state, projectDisplay };
+    }
+    case "set_project_worktree": {
+      const projectWorktrees = new Map(state.projectWorktrees);
+      if (action.record === null) {
+        projectWorktrees.delete(action.projectId);
+      } else {
+        projectWorktrees.set(action.projectId, action.record);
+      }
+      return { ...state, projectWorktrees };
     }
     default:
       return state;
@@ -589,6 +616,7 @@ const initialState: AppState = {
   sessions: new Map(),
   archivedSessions: [],
   projects: [],
+  projectWorktrees: new Map(),
   sessionDisplay: new Map(),
   projectDisplay: new Map(),
   activeSessionId: null,
@@ -617,6 +645,20 @@ interface AppContextValue {
   /** Clear display rows when a session/project is deleted by the SDK. */
   deleteSessionDisplayLocal: (sessionId: string) => Promise<void>;
   deleteProjectDisplayLocal: (projectId: string) => Promise<void>;
+  /** Mark an SDK project as a git worktree of another SDK project.
+   *  Used by the branch-switcher when a user opens or creates a
+   *  worktree — the worktree gets its own SDK project (so the agent
+   *  runs with cwd = worktree path) and this link tells the sidebar
+   *  to group it under the parent project visually. */
+  linkProjectWorktree: (
+    projectId: string,
+    parentProjectId: string,
+    branch: string | null,
+  ) => Promise<void>;
+  /** Remove the parent/child link — used when a worktree is deleted.
+   *  The SDK project itself may stay (so archived/old threads still
+   *  show) unless also removed separately. */
+  unlinkProjectWorktree: (projectId: string) => Promise<void>;
 }
 
 const AppContext = React.createContext<AppContextValue | null>(null);
@@ -662,13 +704,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // in `user_config.sqlite` (app-owned), not in the SDK's daemon
     // database. The daemon only knows session/project ids + runtime
     // state; anything a user sees as a label is merged in here.
-    Promise.all([listSessionDisplay(), listProjectDisplay()])
-      .then(([sessionRecord, projectRecord]) => {
+    Promise.all([
+      listSessionDisplay(),
+      listProjectDisplay(),
+      listProjectWorktree(),
+    ])
+      .then(([sessionRecord, projectRecord, worktreeRecord]) => {
         if (!active) return;
         dispatchRef.current({
           type: "hydrate_display",
           sessionDisplay: new Map(Object.entries(sessionRecord)),
           projectDisplay: new Map(Object.entries(projectRecord)),
+          projectWorktrees: new Map(Object.entries(worktreeRecord)),
         });
       })
       .catch((err) => {
@@ -813,6 +860,34 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
+  const linkProjectWorktree = React.useCallback(
+    async (
+      projectId: string,
+      parentProjectId: string,
+      branch: string | null,
+    ) => {
+      await setProjectWorktree(projectId, parentProjectId, branch);
+      dispatchRef.current({
+        type: "set_project_worktree",
+        projectId,
+        record: { projectId, parentProjectId, branch },
+      });
+    },
+    [],
+  );
+
+  const unlinkProjectWorktree = React.useCallback(
+    async (projectId: string) => {
+      await deleteProjectWorktree(projectId);
+      dispatchRef.current({
+        type: "set_project_worktree",
+        projectId,
+        record: null,
+      });
+    },
+    [],
+  );
+
   const value = React.useMemo(
     () => ({
       state,
@@ -824,6 +899,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       updateSessionPreview,
       deleteSessionDisplayLocal,
       deleteProjectDisplayLocal,
+      linkProjectWorktree,
+      unlinkProjectWorktree,
     }),
     [
       state,
@@ -834,6 +911,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       updateSessionPreview,
       deleteSessionDisplayLocal,
       deleteProjectDisplayLocal,
+      linkProjectWorktree,
+      unlinkProjectWorktree,
     ],
   );
 

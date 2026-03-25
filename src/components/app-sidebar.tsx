@@ -64,13 +64,27 @@ export function AppSidebar() {
   // — they're "hibernating" until the user re-adds the same folder
   // as a project, at which point the persistence layer un-tombstones
   // the original project_id and they reappear under it.
+  //
+  // Worktree projects are a special case: each git worktree gets its
+  // own SDK project so the agent runs with cwd = worktree folder,
+  // but visually the user sees ONE project in the sidebar. We pull
+  // the parent projectId out of `projectWorktrees` and use that as
+  // the grouping key so worktree threads land under the main repo's
+  // section, not as separate top-level entries.
   const knownProjectIds = new Set(state.projects.map((p) => p.projectId));
+  const worktreeProjectIds = new Set(state.projectWorktrees.keys());
+  const effectiveProjectId = (rawProjectId: string | null): string | null => {
+    if (!rawProjectId) return null;
+    return (
+      state.projectWorktrees.get(rawProjectId)?.parentProjectId ?? rawProjectId
+    );
+  };
   const sessionsByProject = new Map<string | null, SessionSummary[]>();
   for (const session of state.sessions.values()) {
     if (session.projectId && !knownProjectIds.has(session.projectId)) {
       continue;
     }
-    const key = session.projectId ?? null;
+    const key = effectiveProjectId(session.projectId ?? null);
     const list = sessionsByProject.get(key) ?? [];
     list.push(session);
     sessionsByProject.set(key, list);
@@ -90,11 +104,13 @@ export function AppSidebar() {
 
   const archivedByProject = new Map<string | null, SessionSummary[]>();
   for (const session of state.archivedSessions) {
-    // If projectId exists and is still a known project, group under it; otherwise "General"
-    const key =
-      session.projectId && projectNameMap.has(session.projectId)
-        ? session.projectId
-        : null;
+    // If projectId exists and is still a known project, group under
+    // the EFFECTIVE parent (rolling up worktree projects to their
+    // main repo); otherwise fall through to "General". This mirrors
+    // the active-session grouping above so archived worktree threads
+    // show under the same visual project they always did.
+    const rolledUp = effectiveProjectId(session.projectId ?? null);
+    const key = rolledUp && projectNameMap.has(rolledUp) ? rolledUp : null;
     const list = archivedByProject.get(key) ?? [];
     list.push(session);
     archivedByProject.set(key, list);
@@ -150,6 +166,23 @@ export function AppSidebar() {
     navigate({ to: "/chat/$sessionId", params: { sessionId } });
   }
 
+  // Pull worktree metadata for a given session's SDK project. If the
+  // session is tied to a project_worktree row we surface the branch
+  // label + the worktree folder path so ThreadItem can render the
+  // branch icon + tooltip. For main-project threads both are null.
+  function worktreeInfo(session: SessionSummary): {
+    branch: string | null;
+    path: string | null;
+  } {
+    if (!session.projectId) return { branch: null, path: null };
+    const link = state.projectWorktrees.get(session.projectId);
+    if (!link) return { branch: null, path: null };
+    const wtProject = state.projects.find(
+      (p) => p.projectId === session.projectId,
+    );
+    return { branch: link.branch ?? null, path: wtProject?.path ?? null };
+  }
+
   const unassigned = sessionsByProject.get(null) ?? [];
 
   return (
@@ -184,27 +217,32 @@ export function AppSidebar() {
                   </div>
                   <CollapsibleContent>
                     <SidebarMenuSub>
-                      {unassigned.map((session) => (
-                        <ThreadItem
-                          key={session.sessionId}
-                          sessionId={session.sessionId}
-                          title={sessionTitle(session.sessionId)}
-                          updatedAt={session.updatedAt}
-                          isActive={
-                            state.activeSessionId === session.sessionId
-                          }
-                          running={session.status === "running"}
-                          awaitingInput={state.awaitingInputSessionIds.has(
-                            session.sessionId,
-                          )}
-                          pendingDone={state.doneSessionIds.has(
-                            session.sessionId,
-                          )}
-                          onClick={() =>
-                            handleThreadClick(session.sessionId)
-                          }
-                        />
-                      ))}
+                      {unassigned.map((session) => {
+                        const wt = worktreeInfo(session);
+                        return (
+                          <ThreadItem
+                            key={session.sessionId}
+                            sessionId={session.sessionId}
+                            title={sessionTitle(session.sessionId)}
+                            updatedAt={session.updatedAt}
+                            isActive={
+                              state.activeSessionId === session.sessionId
+                            }
+                            worktreeBranch={wt.branch}
+                            worktreePath={wt.path}
+                            running={session.status === "running"}
+                            awaitingInput={state.awaitingInputSessionIds.has(
+                              session.sessionId,
+                            )}
+                            pendingDone={state.doneSessionIds.has(
+                              session.sessionId,
+                            )}
+                            onClick={() =>
+                              handleThreadClick(session.sessionId)
+                            }
+                          />
+                        );
+                      })}
                       {unassigned.length === 0 && (
                         <SidebarMenuSubItem>
                           <span className="px-2 py-1 text-xs text-muted-foreground">
@@ -217,7 +255,9 @@ export function AppSidebar() {
                 </SidebarMenuItem>
               </Collapsible>
 
-              {state.projects.map((project) => {
+              {state.projects
+                .filter((project) => !worktreeProjectIds.has(project.projectId))
+                .map((project) => {
                 const threads =
                   sessionsByProject.get(project.projectId) ?? [];
                 return (
@@ -252,27 +292,32 @@ export function AppSidebar() {
                       </div>
                       <CollapsibleContent>
                         <SidebarMenuSub>
-                          {threads.map((session) => (
-                            <ThreadItem
-                              key={session.sessionId}
-                              sessionId={session.sessionId}
-                              title={sessionTitle(session.sessionId)}
-                              updatedAt={session.updatedAt}
-                              isActive={
-                                state.activeSessionId === session.sessionId
-                              }
-                              running={session.status === "running"}
-                              awaitingInput={state.awaitingInputSessionIds.has(
-                                session.sessionId,
-                              )}
-                              pendingDone={state.doneSessionIds.has(
-                                session.sessionId,
-                              )}
-                              onClick={() =>
-                                handleThreadClick(session.sessionId)
-                              }
-                            />
-                          ))}
+                          {threads.map((session) => {
+                            const wt = worktreeInfo(session);
+                            return (
+                              <ThreadItem
+                                key={session.sessionId}
+                                sessionId={session.sessionId}
+                                title={sessionTitle(session.sessionId)}
+                                updatedAt={session.updatedAt}
+                                isActive={
+                                  state.activeSessionId === session.sessionId
+                                }
+                                worktreeBranch={wt.branch}
+                                worktreePath={wt.path}
+                                running={session.status === "running"}
+                                awaitingInput={state.awaitingInputSessionIds.has(
+                                  session.sessionId,
+                                )}
+                                pendingDone={state.doneSessionIds.has(
+                                  session.sessionId,
+                                )}
+                                onClick={() =>
+                                  handleThreadClick(session.sessionId)
+                                }
+                              />
+                            );
+                          })}
                           {threads.length === 0 && (
                             <SidebarMenuSubItem>
                               <span className="px-2 py-1 text-xs text-muted-foreground">
@@ -330,7 +375,12 @@ export function AppSidebar() {
                                     key={session.sessionId}
                                     className="group/thread -mr-6"
                                   >
-                                    <SidebarMenuSubButton className="h-7 w-full min-w-0 rounded-r-none pr-12">
+                                    <SidebarMenuSubButton
+                                      className="h-7 w-full min-w-0 cursor-pointer rounded-r-none pr-12"
+                                      onClick={() =>
+                                        handleThreadClick(session.sessionId)
+                                      }
+                                    >
                                       <span className="flex-1 truncate text-xs">
                                         {sessionTitle(session.sessionId) ||
                                           "New thread"}

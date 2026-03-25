@@ -13,6 +13,10 @@ import {
   readPoolSizeSetting,
   writePoolSizeSetting,
 } from "@/lib/pierre-diffs-worker";
+import {
+  readWorktreeBasePath,
+  writeWorktreeBasePath,
+} from "@/lib/worktree-settings";
 import type { ProviderKind, ProviderStatus } from "@/lib/types";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
@@ -207,6 +211,89 @@ function PoolSizeRow() {
   );
 }
 
+// Configurable base directory under which new git worktrees are
+// created. Persisted to `user_config.sqlite` via the kv table. When
+// empty, the branch-switcher's create-worktree flow falls back to
+// `<parent-dir-of-project>/worktrees/...` — a sibling folder next
+// to the repo. When set, that prefix is used instead so users can
+// keep all their worktrees under a dedicated workspace dir like
+// `~/Code/worktrees`.
+function WorktreeBasePathRow() {
+  // `null` before the sqlite read resolves, `""` after if the user
+  // hasn't set anything (renders as placeholder), otherwise the raw
+  // path string.
+  const [value, setValue] = React.useState<string | null>(null);
+  const [saved, setSaved] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readWorktreeBasePath()
+      .then((resolved) => {
+        if (cancelled) return;
+        setValue(resolved ?? "");
+        setSaved(resolved ?? "");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setValue("");
+        setSaved("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const commit = React.useCallback(async () => {
+    if (value === null) return;
+    const trimmed = value.trim();
+    if (trimmed === saved) return;
+    await writeWorktreeBasePath(trimmed);
+    setSaved(trimmed);
+    toast({
+      description:
+        trimmed.length > 0
+          ? `Worktree base set to ${trimmed}`
+          : "Worktree base reset to default",
+      duration: 2000,
+    });
+  }, [saved, value]);
+
+  return (
+    <div className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Worktree base directory</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Parent folder for new git worktrees created from the branch
+          switcher. Leave blank to use a sibling of each project (the
+          default). Each worktree lands under{" "}
+          <span className="font-mono">
+            &lt;base&gt;/&lt;project&gt;-worktrees/&lt;project&gt;-&lt;name&gt;
+          </span>
+          .
+        </div>
+        <div className="mt-2">
+          <input
+            type="text"
+            value={value ?? ""}
+            disabled={value === null}
+            onChange={(e) => setValue(e.target.value)}
+            onBlur={() => void commit()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void commit();
+              }
+            }}
+            placeholder="/Users/me/Code/worktrees"
+            className="w-full rounded-md border border-input bg-background px-2 py-1 font-mono text-[11px] text-foreground disabled:opacity-50"
+            aria-label="Worktree base directory"
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Read-only display of the cross-platform app data directory
 // (where the daemon database, threads dir, and user_config sqlite
 // all live). Resolved by the rust side via Tauri's path resolver
@@ -353,6 +440,12 @@ export function SettingsView() {
             description="Tune how Flowzen uses your machine's resources."
           >
             <PoolSizeRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Git worktrees"
+            description="Controls for where new git worktrees land on disk."
+          >
+            <WorktreeBasePathRow />
           </SettingsGroup>
           <SettingsGroup
             title="Storage"

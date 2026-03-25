@@ -1,6 +1,12 @@
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Archive, EllipsisVertical, Loader2, Trash2 } from "lucide-react";
+import {
+  Archive,
+  EllipsisVertical,
+  GitBranch,
+  Loader2,
+  Trash2,
+} from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -11,6 +17,11 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
 } from "@/components/ui/sidebar";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useApp } from "@/stores/app-store";
 import { prefetchSession } from "@/lib/queries";
 import { cn } from "@/lib/utils";
@@ -31,6 +42,11 @@ interface ThreadItemProps {
   title: string;
   updatedAt: string;
   isActive: boolean;
+  /** Set on threads tied to a git worktree project. Drives the small
+   *  branch-icon indicator before the title + its hover tooltip. Null
+   *  for main-project threads. */
+  worktreeBranch?: string | null;
+  worktreePath?: string | null;
   /** True while the session has an in-flight turn. Renders a small
    *  spinner next to the title so the user can see at a glance which
    *  threads are working without having to open them. */
@@ -56,6 +72,8 @@ export function ThreadItem({
   title,
   updatedAt,
   isActive,
+  worktreeBranch = null,
+  worktreePath = null,
   running,
   awaitingInput,
   pendingDone,
@@ -137,6 +155,29 @@ export function ThreadItem({
         >
           {running && (
             <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />
+          )}
+          {worktreePath && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="inline-flex shrink-0 items-center text-muted-foreground"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <GitBranch className="h-3 w-3" />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="right" className="max-w-xs">
+                <div className="space-y-0.5">
+                  <div className="font-medium">
+                    Worktree
+                    {worktreeBranch ? `: ${worktreeBranch}` : ""}
+                  </div>
+                  <div className="font-mono text-[10px] opacity-80">
+                    {worktreePath}
+                  </div>
+                </div>
+              </TooltipContent>
+            </Tooltip>
           )}
           <span className="flex-1 truncate text-xs">
             {title || "New thread"}

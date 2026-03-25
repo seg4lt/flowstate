@@ -65,6 +65,49 @@ export function listGitWorktrees(path: string): Promise<GitWorktree[]> {
   return invoke<GitWorktree[]>("list_git_worktrees", { path });
 }
 
+// Create a new linked worktree at `worktreePath` rooted in
+// `projectPath`, on a newly-created branch `branch` based off
+// `baseRef`. Git runs `worktree add -b <branch> <worktreePath>
+// <baseRef>`. On success returns the freshly-parsed GitWorktree
+// entry so the caller can avoid an extra list round-trip.
+export function createGitWorktree(
+  projectPath: string,
+  worktreePath: string,
+  branch: string,
+  baseRef: string,
+): Promise<GitWorktree> {
+  return invoke<GitWorktree>("create_git_worktree", {
+    projectPath,
+    worktreePath,
+    branch,
+    baseRef,
+  });
+}
+
+// Remove the worktree at `worktreePath` (rooted in `projectPath`).
+// `force=false` runs plain `git worktree remove`, which fails loud
+// on dirty working trees — the frontend surfaces stderr and can
+// retry with `force=true`, which adds `--force`.
+export function removeGitWorktree(
+  projectPath: string,
+  worktreePath: string,
+  force: boolean,
+): Promise<void> {
+  return invoke<void>("remove_git_worktree", {
+    projectPath,
+    worktreePath,
+    force,
+  });
+}
+
+// Cheap existence probe used by the chat view to detect when a
+// worktree folder has been removed out from under flowzen — the
+// composer flips to read-only via the same infra as archived
+// threads.
+export function pathExists(path: string): Promise<boolean> {
+  return invoke<boolean>("path_exists", { path });
+}
+
 export type GitFileStatus =
   | "modified"
   | "added"
@@ -183,6 +226,44 @@ export function listProjectDisplay(): Promise<Record<string, ProjectDisplay>> {
 
 export function deleteProjectDisplay(projectId: string): Promise<void> {
   return invoke<void>("delete_project_display", { projectId });
+}
+
+// Parent/child worktree links. Each worktree has its own SDK
+// project so the agent SDK's existing cwd resolution "just works",
+// and this table records "this SDK project is a git worktree of
+// that SDK project, on branch Z". The flowzen sidebar reads these
+// to group worktree threads under the parent project visually —
+// the SDK has no concept of worktrees.
+export interface ProjectWorktree {
+  projectId: string;
+  parentProjectId: string;
+  branch: string | null;
+}
+
+export function setProjectWorktree(
+  projectId: string,
+  parentProjectId: string,
+  branch: string | null,
+): Promise<void> {
+  return invoke<void>("set_project_worktree", {
+    projectId,
+    parentProjectId,
+    branch,
+  });
+}
+
+export function getProjectWorktree(
+  projectId: string,
+): Promise<ProjectWorktree | null> {
+  return invoke<ProjectWorktree | null>("get_project_worktree", { projectId });
+}
+
+export function listProjectWorktree(): Promise<Record<string, ProjectWorktree>> {
+  return invoke<Record<string, ProjectWorktree>>("list_project_worktree");
+}
+
+export function deleteProjectWorktree(projectId: string): Promise<void> {
+  return invoke<void>("delete_project_worktree", { projectId });
 }
 
 // Resolved cross-platform app data dir for Flowzen — the same
