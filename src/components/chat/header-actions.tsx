@@ -171,27 +171,29 @@ export function HeaderActions({
 
   return (
     <div className="flex items-center gap-1">
-      {hasChanges && (
-        <Button
-          variant={diffOpen ? "secondary" : "outline"}
-          size="xs"
-          onClick={onToggleDiff}
-          onMouseEnter={onHoverDiff}
-          onFocus={onHoverDiff}
-          aria-pressed={diffOpen}
-          title={
-            diffOpen ? "Hide diff panel" : "Show diff panel for this session"
-          }
-        >
-          <Diff className="h-3 w-3" />
-          <span className="tabular-nums text-green-600 dark:text-green-400">
-            +{additions}
-          </span>
-          <span className="tabular-nums text-red-600 dark:text-red-400">
-            −{deletions}
-          </span>
-        </Button>
-      )}
+      <Button
+        variant={diffOpen ? "secondary" : "outline"}
+        size="xs"
+        onClick={onToggleDiff}
+        onMouseEnter={onHoverDiff}
+        onFocus={onHoverDiff}
+        aria-pressed={diffOpen}
+        title={
+          diffOpen ? "Hide diff panel" : "Show diff panel for this session"
+        }
+      >
+        <Diff className="h-3 w-3" />
+        {hasChanges && (
+          <>
+            <span className="tabular-nums text-green-600 dark:text-green-400">
+              +{additions}
+            </span>
+            <span className="tabular-nums text-red-600 dark:text-red-400">
+              −{deletions}
+            </span>
+          </>
+        )}
+      </Button>
       <Button
         variant="outline"
         size="xs"
