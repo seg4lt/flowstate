@@ -787,6 +787,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
 
     // --- Normal message flow ---
+
+    // First-turn auto-title. Mirrors what the SDK's orchestration layer
+    // used to do before display metadata moved app-side; see the zenui
+    // reference in rs-agent-sdk/apps/zenui/frontend/src/state/appStore.ts.
+    const existingDisplay = state.sessionDisplay.get(sessionId);
+    if (
+      session &&
+      session.turnCount === 0 &&
+      !existingDisplay?.title
+    ) {
+      const autoTitle = input
+        .split(/\s+/)
+        .filter(Boolean)
+        .slice(0, 6)
+        .join(" ");
+      if (autoTitle.length > 0) {
+        void renameSession(sessionId, autoTitle);
+      }
+    }
+
     // Optimistic: show the user's message immediately, then await the
     // round-trip. turn_started will clear this and replace it with the
     // real turn from the daemon.
