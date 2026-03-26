@@ -74,6 +74,15 @@ const TREE_COLLAPSED_WIDTH = 28;
 // and break downstream `useMemo([files])` reference equality.
 const EMPTY_FILES: readonly string[] = Object.freeze([]);
 
+// Atomic "file that finished loading" record. Bundling path+contents
+// keeps PierreFile from ever seeing a mismatched pair during the
+// render between a click and the fetch effect.
+interface LoadedFile {
+  path: string;
+  contents: string;
+  cacheKey: string;
+}
+
 interface ContentSearchUiOptions {
   advancedOpen: boolean;
   include: string;
@@ -174,8 +183,16 @@ export function CodeView({ sessionId }: { sessionId: string }) {
     React.useState<ContentSearchUiOptions>(defaultContentSearchUiOptions);
 
   // ─── viewer state ────────────────────────────────────────────
+  // `loadedFile` bundles the fetched path + contents + cacheKey in a
+  // single state atom so they update atomically. Splitting them across
+  // two useState slots lets React commit one intermediate render after
+  // a click (where `selectedPath` is the new file but `contents` still
+  // holds the previous file) — PierreFile then mounts with the new
+  // name but stale contents, which is the "opens the wrong file" bug.
+  // The cacheKey drives @pierre/diffs' worker-pool LRU; see the sibling
+  // explanation in `diff-panel.tsx` around line 361.
   const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
-  const [fileContents, setFileContents] = React.useState<string | null>(null);
+  const [loadedFile, setLoadedFile] = React.useState<LoadedFile | null>(null);
   const [fileError, setFileError] = React.useState<string | null>(null);
   const [fileLoading, setFileLoading] = React.useState(false);
 
@@ -188,7 +205,7 @@ export function CodeView({ sessionId }: { sessionId: string }) {
   // here — only stale per-project UI state to clear.
   React.useEffect(() => {
     setSelectedPath(null);
-    setFileContents(null);
+    setLoadedFile(null);
     setFileError(null);
     setQuery("");
     setHighlightedIndex(0);
@@ -308,19 +325,24 @@ export function CodeView({ sessionId }: { sessionId: string }) {
   // ─── lazy file-content fetch on selection ───────────────────
   React.useEffect(() => {
     if (!projectPath || !selectedPath) {
-      setFileContents(null);
+      setLoadedFile(null);
       setFileError(null);
       return;
     }
 
     let cancelled = false;
+    const fetchPath = selectedPath;
     setFileLoading(true);
     setFileError(null);
-    setFileContents(null);
-    readProjectFile(projectPath, selectedPath)
+    setLoadedFile(null);
+    readProjectFile(projectPath, fetchPath)
       .then((contents) => {
         if (cancelled) return;
-        setFileContents(contents);
+        setLoadedFile({
+          path: fetchPath,
+          contents,
+          cacheKey: `${fetchPath}::${contents.length}::${Date.now()}`,
+        });
       })
       .catch((err) => {
         if (cancelled) return;
@@ -621,7 +643,7 @@ export function CodeView({ sessionId }: { sessionId: string }) {
             ) : (
               <CodeViewBody
                 path={selectedPath}
-                contents={fileContents}
+                loadedFile={loadedFile}
                 loading={fileLoading}
                 error={fileError}
                 filesError={filesError}
@@ -865,7 +887,7 @@ const FilePickerResults = React.memo(function FilePickerResults({
 
 interface CodeViewBodyProps {
   path: string | null;
-  contents: string | null;
+  loadedFile: LoadedFile | null;
   loading: boolean;
   error: string | null;
   filesError: string | null;
@@ -874,7 +896,7 @@ interface CodeViewBodyProps {
 
 const CodeViewBody = React.memo(function CodeViewBody({
   path,
-  contents,
+  loadedFile,
   loading,
   error,
   filesError,
@@ -903,7 +925,13 @@ const CodeViewBody = React.memo(function CodeViewBody({
       </div>
     );
   }
-  if (loading || contents === null) {
+  // The `loadedFile.path !== path` guard catches the one-frame window
+  // after a click where `selectedPath` has already flipped to the new
+  // file but the fetch effect hasn't yet cleared `loadedFile`. Showing
+  // the loading placeholder instead of mounting PierreFile with a
+  // mismatched (name, contents) pair is what keeps the wrong file's
+  // text from flashing into the viewer on every click.
+  if (loading || !loadedFile || loadedFile.path !== path) {
     if (error) {
       return (
         <div className="flex h-full items-center justify-center px-4 text-center text-xs text-destructive">
@@ -920,8 +948,12 @@ const CodeViewBody = React.memo(function CodeViewBody({
   return (
     <Virtualizer className="h-full overflow-auto">
       <PierreFile
-        key={path}
-        file={{ name: path, contents }}
+        key={loadedFile.path}
+        file={{
+          name: loadedFile.path,
+          contents: loadedFile.contents,
+          cacheKey: loadedFile.cacheKey,
+        }}
         options={{
           theme: { dark: "pierre-dark", light: "pierre-light" },
           themeType: "system",
