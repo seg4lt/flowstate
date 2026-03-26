@@ -18,6 +18,8 @@ use transport_tauri::TauriTransport;
 mod pty;
 use pty::{PtyId, PtyManager};
 
+mod shell_env;
+
 mod user_config;
 use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
@@ -1343,6 +1345,15 @@ fn get_app_data_dir(app: tauri::AppHandle) -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
+
+    // Enrich the process env with the user's login shell's PATH
+    // (and friends) before anything else boots. Must happen before
+    // any thread spawns — tauri, tokio workers, pty readers — so
+    // every downstream `Command::spawn` (integrated terminal,
+    // open_in_editor, git subcommands) inherits a PATH that
+    // contains Homebrew, mise, nvm, cargo, bun, etc. See the module
+    // doc on `shell_env` for the rationale.
+    shell_env::hydrate_from_login_shell();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
