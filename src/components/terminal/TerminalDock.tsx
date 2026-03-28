@@ -85,10 +85,15 @@ export function TerminalDock() {
   // Auto-open a first tab when the dock is shown for a project
   // that has none yet. Gated on `resolved` so we don't create a
   // throwaway $HOME shell during the brief window between mount
-  // and the daemon snapshot arriving.
+  // and the daemon snapshot arriving. Project routes additionally
+  // wait until `cwd` is a real path: we freeze `tab.cwd` at creation
+  // time and pass it straight into TerminalTab's effect, so a tab
+  // born with an empty cwd would later see its prop change and
+  // rebuild the xterm/PTY from scratch.
   React.useEffect(() => {
     if (!state.dockOpen) return;
     if (!resolved) return;
+    if (projectKey !== NO_PROJECT_KEY && !cwd) return;
     const current = state.projects.get(projectKey);
     if (!current || current.tabs.length === 0) {
       dispatch({
@@ -230,7 +235,7 @@ export function TerminalDock() {
           >
             <TerminalTab
               tabId={tab.id}
-              cwd={tab.cwd || cwd || ""}
+              cwd={tab.cwd}
               isVisible={state.dockOpen && isActive}
               onTitleChange={(title) =>
                 dispatch({

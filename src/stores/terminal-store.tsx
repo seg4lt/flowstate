@@ -105,6 +105,15 @@ function terminalReducer(
         ),
       };
     case "open_tab": {
+      // Refuse to create a project-scoped tab without a resolved
+      // path. An empty cwd flows into TerminalTab as a prop, and
+      // because the tab's stored cwd is frozen at creation, a later
+      // resolution would make the prop change and re-spawn the pty.
+      // NO_PROJECT_KEY intentionally stores "" — the Rust side
+      // treats that as $HOME (see pty.rs open()).
+      if (action.projectKey !== NO_PROJECT_KEY && !action.cwd) {
+        return state;
+      }
       const projects = new Map(state.projects);
       const current = projects.get(action.projectKey) ?? {
         tabs: [],

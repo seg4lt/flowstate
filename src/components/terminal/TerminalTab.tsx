@@ -217,7 +217,10 @@ export function TerminalTab({
   // Attach/dispose the WebGL renderer when visibility flips. Hidden
   // tabs drop the GPU context to free texture atlas memory; the
   // xterm buffer and pty reader keep running so commands in the
-  // background are not paused.
+  // background are not paused. Recreating on show (rather than
+  // keeping a persistent canvas through the display:none cycle)
+  // avoids a one-frame "big text" flash where the stale canvas
+  // paints at its last size before fit runs.
   React.useEffect(() => {
     const term = termRef.current;
     if (!term) return;
