@@ -45,7 +45,7 @@ function DragHandle({
   width: number;
   onResize: (w: number) => void;
 }) {
-  const { state } = useSidebar();
+  const { state, isMobile } = useSidebar();
   const handleRef = React.useRef<HTMLDivElement>(null);
   const draggingRef = React.useRef(false);
   const latestWidthRef = React.useRef(width);
@@ -87,7 +87,14 @@ function DragHandle({
     };
   }, [onResize]);
 
-  if (state === "collapsed") return null;
+  // Hide on mobile: the sidebar renders as a full-width Sheet overlay
+  // whose width is hardcoded (`SIDEBAR_WIDTH_MOBILE`) and isn't driven
+  // by `--sidebar-width`, so there's nothing to drag. Leaving the
+  // handle rendered puts a fixed `z-30` 1px resize bar in the middle
+  // of the narrow viewport that catches taps and, if the user drags
+  // it, persists a bogus width to localStorage that bites them the
+  // next time they return to a wider window.
+  if (isMobile || state === "collapsed") return null;
 
   return (
     <div

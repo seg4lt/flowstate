@@ -1,3 +1,4 @@
+import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -38,6 +39,7 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarRail,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
@@ -47,6 +49,15 @@ import type { SessionSummary } from "@/lib/types";
 export function AppSidebar() {
   const { state, send, createProject } = useApp();
   const navigate = useNavigate();
+  // On a narrow window the sidebar renders as a full-screen Sheet
+  // overlay that covers the chat view. Without `closeIfMobile()` the
+  // sheet stays open after the user picks a thread and they have to
+  // hunt for the backdrop to dismiss it — "open close is broken" as
+  // far as the user is concerned. Desktop ignores it.
+  const { isMobile, setOpenMobile } = useSidebar();
+  const closeIfMobile = React.useCallback(() => {
+    if (isMobile) setOpenMobile(false);
+  }, [isMobile, setOpenMobile]);
 
   // Look up display metadata (titles, names) from the app-side store.
   // The SDK only knows ids + runtime state; anything the user sees as
@@ -164,6 +175,7 @@ export function AppSidebar() {
 
   function handleThreadClick(sessionId: string) {
     navigate({ to: "/chat/$sessionId", params: { sessionId } });
+    closeIfMobile();
   }
 
   // Pull worktree metadata for a given session's SDK project. If the
@@ -447,7 +459,10 @@ export function AppSidebar() {
           <SidebarMenuItem>
             <SidebarMenuButton
               tooltip="Settings"
-              onClick={() => navigate({ to: "/settings" })}
+              onClick={() => {
+                navigate({ to: "/settings" });
+                closeIfMobile();
+              }}
             >
               <Settings />
               <span>Settings</span>
