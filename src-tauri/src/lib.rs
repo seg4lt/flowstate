@@ -38,8 +38,21 @@ fn path_exists(path: String) -> bool {
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
 /// surface the active branch under the thread title.
+///
+/// The subprocess wait is dispatched through
+/// `tauri::async_runtime::spawn_blocking` so a slow repo can never hold
+/// up the IPC handler — the rule is "git never blocks UI", and making
+/// that explicit in the source protects it against future runtime
+/// changes.
 #[tauri::command]
-fn get_git_branch(path: String) -> Option<String> {
+async fn get_git_branch(path: String) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || get_git_branch_sync(path))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn get_git_branch_sync(path: String) -> Option<String> {
     let output = Command::new("git")
         .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -64,8 +77,18 @@ struct GitBranchList {
 /// `*` marker for the current branch, the short name, and the full
 /// refname in a single pass — NUL-delimited so whitespace in refs
 /// can't corrupt parsing. Skips `origin/HEAD` symbolic refs.
+///
+/// Async wrapper pushes the subprocess wait onto `spawn_blocking`, so
+/// the branch-switcher popover opening never blocks other IPC while
+/// `for-each-ref` runs on a slow repo.
 #[tauri::command]
-fn list_git_branches(path: String) -> Result<GitBranchList, String> {
+async fn list_git_branches(path: String) -> Result<GitBranchList, String> {
+    tauri::async_runtime::spawn_blocking(move || list_git_branches_sync(path))
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+}
+
+fn list_git_branches_sync(path: String) -> Result<GitBranchList, String> {
     let output = Command::new("git")
         .args([
             "-C",
@@ -142,8 +165,18 @@ struct GitWorktree {
 /// `bare` records (they have no working tree to show) and strip the
 /// `refs/heads/` prefix so the UI can render the short branch name
 /// directly.
+///
+/// Async wrapper dispatches the subprocess wait through
+/// `spawn_blocking`. Internal callers (e.g. `create_git_worktree`)
+/// use `list_git_worktrees_sync` directly.
 #[tauri::command]
-fn list_git_worktrees(path: String) -> Result<Vec<GitWorktree>, String> {
+async fn list_git_worktrees(path: String) -> Result<Vec<GitWorktree>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_git_worktrees_sync(path))
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
+}
+
+fn list_git_worktrees_sync(path: String) -> Result<Vec<GitWorktree>, String> {
     let output = Command::new("git")
         .args(["-C", &path, "worktree", "list", "--porcelain"])
         .output()
@@ -319,8 +352,10 @@ fn create_git_worktree(
     // Re-read the list so the caller gets the new entry with the
     // canonical fields the porcelain parser produces (in particular
     // the HEAD sha, which we don't otherwise have on the create
-    // side). Linear scan — the list is short.
-    let all = list_git_worktrees(project_path)?;
+    // side). Linear scan — the list is short. Call the sync helper
+    // directly so we don't need to make this command async just to
+    // chain an `.await`.
+    let all = list_git_worktrees_sync(project_path)?;
     all.into_iter()
         .find(|w| w.path == worktree_path)
         .ok_or_else(|| {
@@ -484,109 +519,140 @@ fn git_show_head(repo: &str, file: &str) -> String {
 /// `git ls-files --others` for untracked files (we count their
 /// lines on the rust side since git doesn't compute stats for files
 /// that aren't tracked yet).
+///
+/// Async wrapper: pushes all subprocess waits through
+/// `spawn_blocking`, and inside the blocking task runs the two
+/// independent git reads (tracked numstat + untracked ls-files)
+/// concurrently via `std::thread::scope`. Both are read-only
+/// queries that don't touch `.git/index.lock`, so they truly
+/// overlap rather than serialise inside git.
 #[tauri::command]
-fn get_git_diff_summary(path: String) -> Vec<GitFileSummary> {
-    let mut entries: Vec<GitFileSummary> = Vec::new();
+async fn get_git_diff_summary(path: String) -> Vec<GitFileSummary> {
+    tauri::async_runtime::spawn_blocking(move || get_git_diff_summary_sync(path))
+        .await
+        .unwrap_or_default()
+}
+
+fn get_git_diff_summary_sync(path: String) -> Vec<GitFileSummary> {
     let project_path = Path::new(&path);
     if !project_path.is_dir() {
+        return Vec::new();
+    }
+
+    let mut entries: Vec<GitFileSummary> = Vec::new();
+    std::thread::scope(|s| {
+        let tracked_h = s.spawn(|| run_git_diff_numstat(&path));
+        let untracked_h = s.spawn(|| run_git_ls_files_others(project_path, &path));
+        entries.extend(tracked_h.join().unwrap_or_default());
+        entries.extend(untracked_h.join().unwrap_or_default());
+    });
+    entries
+}
+
+/// Tracked changes via `git diff HEAD --numstat -z`.
+/// Format with `-z`:
+///   For non-renames:  "<adds>\t<dels>\t<path>\0"
+///   For renames:      "<adds>\t<dels>\t\0<old>\0<new>\0"
+/// Binary files report `-` for both counts; we treat as 0/0.
+fn run_git_diff_numstat(path: &str) -> Vec<GitFileSummary> {
+    let mut entries: Vec<GitFileSummary> = Vec::new();
+    let Ok(output) = Command::new("git")
+        .args(["-C", path, "diff", "HEAD", "--numstat", "-z"])
+        .output()
+    else {
+        return entries;
+    };
+    if !output.status.success() {
         return entries;
     }
-
-    // Tracked changes via `git diff HEAD --numstat -z`.
-    // Format with `-z`:
-    //   For non-renames:  "<adds>\t<dels>\t<path>\0"
-    //   For renames:      "<adds>\t<dels>\t\0<old>\0<new>\0"
-    // Binary files report `-` for both counts; we treat as 0/0.
-    if let Ok(output) = Command::new("git")
-        .args(["-C", &path, "diff", "HEAD", "--numstat", "-z"])
-        .output()
-    {
-        if output.status.success() {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            // Walk the stream chunk-by-chunk so we can pick up the
-            // extra rename path that follows the leading record.
-            let mut iter = raw.split('\0').peekable();
-            while let Some(chunk) = iter.next() {
-                if chunk.is_empty() {
-                    continue;
-                }
-                let parts: Vec<&str> = chunk.splitn(3, '\t').collect();
-                if parts.len() < 2 {
-                    continue;
-                }
-                let adds = parts[0].parse::<u32>().unwrap_or(0);
-                let dels = parts[1].parse::<u32>().unwrap_or(0);
-                let path_field = parts.get(2).copied().unwrap_or("");
-                let (file_path, status) = if path_field.is_empty() {
-                    // Rename: next chunk is the old path, the one
-                    // after that is the new path. We display the
-                    // new path and tag the row "renamed".
-                    let _old = iter.next().unwrap_or("");
-                    let new_path = iter.next().unwrap_or("");
-                    (new_path.to_string(), "renamed")
-                } else {
-                    let status = if adds == 0 && dels > 0 {
-                        "deleted"
-                    } else if dels == 0 && adds > 0 {
-                        "added"
-                    } else {
-                        "modified"
-                    };
-                    (path_field.to_string(), status)
-                };
-                if file_path.is_empty() {
-                    continue;
-                }
-                entries.push(GitFileSummary {
-                    path: file_path,
-                    status: status.to_string(),
-                    additions: adds,
-                    deletions: dels,
-                });
-            }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    // Walk the stream chunk-by-chunk so we can pick up the
+    // extra rename path that follows the leading record.
+    let mut iter = raw.split('\0').peekable();
+    while let Some(chunk) = iter.next() {
+        if chunk.is_empty() {
+            continue;
         }
+        let parts: Vec<&str> = chunk.splitn(3, '\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let adds = parts[0].parse::<u32>().unwrap_or(0);
+        let dels = parts[1].parse::<u32>().unwrap_or(0);
+        let path_field = parts.get(2).copied().unwrap_or("");
+        let (file_path, status) = if path_field.is_empty() {
+            // Rename: next chunk is the old path, the one
+            // after that is the new path. We display the
+            // new path and tag the row "renamed".
+            let _old = iter.next().unwrap_or("");
+            let new_path = iter.next().unwrap_or("");
+            (new_path.to_string(), "renamed")
+        } else {
+            let status = if adds == 0 && dels > 0 {
+                "deleted"
+            } else if dels == 0 && adds > 0 {
+                "added"
+            } else {
+                "modified"
+            };
+            (path_field.to_string(), status)
+        };
+        if file_path.is_empty() {
+            continue;
+        }
+        entries.push(GitFileSummary {
+            path: file_path,
+            status: status.to_string(),
+            additions: adds,
+            deletions: dels,
+        });
     }
+    entries
+}
 
-    // Untracked (new) files honoring .gitignore. `git diff HEAD`
-    // doesn't see these so we list them separately and count the
-    // lines ourselves.
-    if let Ok(output) = Command::new("git")
+/// Untracked (new) files honoring .gitignore. `git diff HEAD`
+/// doesn't see these so we list them separately and count the
+/// lines ourselves.
+fn run_git_ls_files_others(project_path: &Path, path: &str) -> Vec<GitFileSummary> {
+    let mut entries: Vec<GitFileSummary> = Vec::new();
+    let Ok(output) = Command::new("git")
         .args([
             "-C",
-            &path,
+            path,
             "ls-files",
             "--others",
             "--exclude-standard",
             "-z",
         ])
         .output()
-    {
-        if output.status.success() {
-            let raw = String::from_utf8_lossy(&output.stdout);
-            for file_path in raw.split('\0').filter(|s| !s.is_empty()) {
-                let abs = project_path.join(file_path);
-                let additions = match std::fs::read_to_string(&abs) {
-                    Ok(c) => {
-                        if c.is_empty() {
-                            0
-                        } else if c.ends_with('\n') {
-                            c.matches('\n').count() as u32
-                        } else {
-                            c.matches('\n').count() as u32 + 1
-                        }
-                    }
-                    Err(_) => 0,
-                };
-                entries.push(GitFileSummary {
-                    path: file_path.to_string(),
-                    status: "added".to_string(),
-                    additions,
-                    deletions: 0,
-                });
-            }
-        }
+    else {
+        return entries;
+    };
+    if !output.status.success() {
+        return entries;
     }
-
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for file_path in raw.split('\0').filter(|s| !s.is_empty()) {
+        let abs = project_path.join(file_path);
+        let additions = match std::fs::read_to_string(&abs) {
+            Ok(c) => {
+                if c.is_empty() {
+                    0
+                } else if c.ends_with('\n') {
+                    c.matches('\n').count() as u32
+                } else {
+                    c.matches('\n').count() as u32 + 1
+                }
+            }
+            Err(_) => 0,
+        };
+        entries.push(GitFileSummary {
+            path: file_path.to_string(),
+            status: "added".to_string(),
+            additions,
+            deletions: 0,
+        });
+    }
     entries
 }
 
@@ -595,8 +661,20 @@ fn get_git_diff_summary(path: String) -> Vec<GitFileSummary> {
 /// has already given us the path; this fills in before+after only
 /// when needed, so we never ship the contents of files the user
 /// doesn't actually look at.
+///
+/// Async wrapper: `git show HEAD:<file>` can take hundreds of ms on
+/// a slow repo, so the subprocess wait lives on `spawn_blocking`.
 #[tauri::command]
-fn get_git_diff_file(path: String, file: String) -> GitFileContents {
+async fn get_git_diff_file(path: String, file: String) -> GitFileContents {
+    tauri::async_runtime::spawn_blocking(move || get_git_diff_file_sync(path, file))
+        .await
+        .unwrap_or_else(|_| GitFileContents {
+            before: String::new(),
+            after: String::new(),
+        })
+}
+
+fn get_git_diff_file_sync(path: String, file: String) -> GitFileContents {
     let project_path = Path::new(&path);
     let abs = project_path.join(&file);
     let after = if abs.exists() {

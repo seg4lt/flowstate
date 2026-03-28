@@ -374,7 +374,28 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // the diff summary while still caching identical `(path, tick)`
   // pairs across session switches in the same project.
   const [diffRefreshTick, setDiffRefreshTick] = React.useState(0);
-  const refreshDiffs = React.useCallback(() => {
+  // Latches true the first time the user opens the diff panel for
+  // this chat view. Used by the stream-event handlers below to
+  // suppress the `refreshDiffs()` storm during streaming turns when
+  // the user isn't even looking at the diff panel — on a slow repo
+  // every one of those refreshes is a multi-second `git diff HEAD`
+  // that wastes work and contends with other git reads. A ref (not
+  // state) so the latch doesn't re-render or churn query keys.
+  const diffPanelEverOpenedRef = React.useRef(false);
+  // 400ms grace window to collapse back-to-back `refreshDiffs()`
+  // triggers into a single tick bump. `session_loaded` and the first
+  // `turn_completed` can fire within a few hundred ms of each other
+  // on initial load, and rapid multi-turn runs can also storm this
+  // path; either way we don't need more than ~2.5 refetches/sec.
+  // User gestures (branch checkout, panel open via maybePrefetchDiffs)
+  // pass `{ force: true }` to bypass — they're one-shot events and
+  // must always reach the query cache even if a streaming refresh
+  // just landed inside the debounce window.
+  const lastRefreshAtRef = React.useRef(0);
+  const refreshDiffs = React.useCallback((opts?: { force?: boolean }) => {
+    const now = Date.now();
+    if (!opts?.force && now - lastRefreshAtRef.current < 400) return;
+    lastRefreshAtRef.current = now;
     setDiffRefreshTick((t) => t + 1);
   }, []);
 
@@ -658,7 +679,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           setPendingInput(null);
           setLastEventAt(Date.now());
           setStuckSince(null);
-          refreshDiffs();
+          // Only refresh the diff if the user has actually opened
+          // the panel at some point in this view's lifetime. Before
+          // then the badge sits on whatever the initial mount fetch
+          // produced and we skip the git call entirely — critical
+          // on slow repos.
+          if (diffPanelEverOpenedRef.current) refreshDiffs();
         }
         return;
       }
@@ -711,8 +737,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           setPendingInput(null);
           // Turn-wise refresh: every completed turn re-runs `git diff
           // HEAD` so the panel reflects exactly what this turn left
-          // on disk.
-          refreshDiffs();
+          // on disk — but only if the user has opened the diff panel
+          // at least once in this view's lifetime. A 20-turn session
+          // on a slow repo with the panel closed used to waste 20
+          // full diff runs; now it wastes zero, and the next panel
+          // open forces a fresh read via `maybePrefetchDiffs`.
+          if (diffPanelEverOpenedRef.current) refreshDiffs();
           break;
 
         // permission_requested / user_question_asked are handled in
@@ -1016,7 +1046,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 parentProjectPath={parentProjectPath}
                 provider={session.provider}
                 model={session.model ?? null}
-                onCheckedOut={refreshDiffs}
+                onCheckedOut={() => refreshDiffs({ force: true })}
               />
             )}
             {providerDisabled && (
@@ -1041,7 +1071,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 // lands within ~1.5s of a hover prefetch reuses the
                 // hover's in-flight refetch instead of bumping the
                 // tick twice and discarding the pre-warm.
-                if (!v) maybePrefetchDiffs();
+                if (!v) {
+                  // First-open latch: from now on, stream-event
+                  // refreshes (session_loaded / turn_completed) are
+                  // allowed to re-read the diff. Before the first
+                  // open we leave the badge showing whatever the
+                  // initial mount fetch produced and skip all
+                  // streaming re-reads — huge win on slow repos
+                  // when the user never opens the panel.
+                  diffPanelEverOpenedRef.current = true;
+                  maybePrefetchDiffs();
+                }
                 return !v;
               });
             }}
