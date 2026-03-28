@@ -24,12 +24,36 @@ function useActiveProject(): ActiveProject {
   const matches = useMatches();
 
   let sessionId: string | null = null;
+  let projectId: string | null = null;
   for (const m of matches) {
     const params = m.params as Record<string, string> | undefined;
     if (params?.sessionId) {
       sessionId = params.sessionId;
       break;
     }
+    if (params?.projectId) {
+      projectId = params.projectId;
+      break;
+    }
+  }
+
+  // /project/$projectId — route is keyed directly by the project.
+  // Resolve the cwd from state.projects so the dock reuses the
+  // project's existing tab pool instead of falling back to
+  // NO_PROJECT_KEY and spawning a throwaway $HOME shell.
+  if (projectId) {
+    if (!state.ready) {
+      return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: false };
+    }
+    const project = state.projects.find((p) => p.projectId === projectId);
+    if (!project) {
+      return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+    }
+    return {
+      projectKey: project.projectId,
+      cwd: project.path ?? null,
+      resolved: true,
+    };
   }
 
   // No session in the URL → we know this is NO_PROJECT_KEY. That

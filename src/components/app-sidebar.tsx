@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useNavigate } from "@tanstack/react-router";
+import { useLocation, useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
@@ -49,6 +49,7 @@ import type { SessionSummary } from "@/lib/types";
 export function AppSidebar() {
   const { state, send, createProject } = useApp();
   const navigate = useNavigate();
+  const location = useLocation();
   // On a narrow window the sidebar renders as a full-screen Sheet
   // overlay that covers the chat view. Without `closeIfMobile()` the
   // sheet stays open after the user picks a thread and they have to
@@ -178,6 +179,11 @@ export function AppSidebar() {
     closeIfMobile();
   }
 
+  function handleProjectClick(projectId: string) {
+    navigate({ to: "/project/$projectId", params: { projectId } });
+    closeIfMobile();
+  }
+
   // Pull worktree metadata for a given session's SDK project. If the
   // session is tied to a project_worktree row we surface the branch
   // label + the worktree folder path so ThreadItem can render the
@@ -272,6 +278,8 @@ export function AppSidebar() {
                 .map((project) => {
                 const threads =
                   sessionsByProject.get(project.projectId) ?? [];
+                const isActive =
+                  location.pathname === `/project/${project.projectId}`;
                 return (
                   <Collapsible
                     key={project.projectId}
@@ -279,14 +287,33 @@ export function AppSidebar() {
                     className="group/collapsible"
                   >
                     <SidebarMenuItem className="group/project">
+                      <SidebarMenuButton
+                        tooltip={projectName(project.projectId)}
+                        isActive={isActive}
+                        onClick={() => handleProjectClick(project.projectId)}
+                        className="pl-7"
+                      >
+                        <FolderIcon />
+                        <span className="flex-1 truncate">
+                          {projectName(project.projectId)}
+                        </span>
+                      </SidebarMenuButton>
+                      {/* The chevron is its own CollapsibleTrigger now so
+                          the rest of the row is free to navigate. Anchored
+                          to `top-1` (not `top-1/2`) because SidebarMenuItem
+                          is the li that also contains CollapsibleContent —
+                          "50%" of that expanded box is halfway down the
+                          thread list, not halfway down the header row.
+                          Same trick the right-side action cluster uses. */}
                       <CollapsibleTrigger asChild>
-                        <SidebarMenuButton tooltip={projectName(project.projectId)}>
-                          <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
-                          <FolderIcon />
-                          <span className="flex-1 truncate">
-                            {projectName(project.projectId)}
-                          </span>
-                        </SidebarMenuButton>
+                        <button
+                          type="button"
+                          aria-label={`Toggle ${projectName(project.projectId)} threads`}
+                          onClick={(e) => e.stopPropagation()}
+                          className="absolute left-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground outline-none hover:text-foreground"
+                        >
+                          <ChevronRight className="h-4 w-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                        </button>
                       </CollapsibleTrigger>
                       <div className="absolute right-1 top-1 flex items-center gap-0.5">
                         <button

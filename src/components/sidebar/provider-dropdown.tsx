@@ -1,3 +1,4 @@
+import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { Loader2, SquarePen } from "lucide-react";
 import {
@@ -56,9 +57,13 @@ function statusBadge(provider: ProviderStatus | undefined) {
 
 interface ProviderDropdownProps {
   projectId?: string;
+  /** Override the default pencil-icon trigger. Used by the project-home
+   *  page to render the action as a sized button instead of the tiny
+   *  hover-only icon the sidebar shows. */
+  trigger?: React.ReactElement;
 }
 
-export function ProviderDropdown({ projectId }: ProviderDropdownProps) {
+export function ProviderDropdown({ projectId, trigger }: ProviderDropdownProps) {
   const { state, send } = useApp();
   const navigate = useNavigate();
 
@@ -83,13 +88,15 @@ export function ProviderDropdown({ projectId }: ProviderDropdownProps) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <SquarePen className="h-3.5 w-3.5" />
-        </button>
+        {trigger ?? (
+          <button
+            type="button"
+            className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <SquarePen className="h-3.5 w-3.5" />
+          </button>
+        )}
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-64">
         {stillLoading && (

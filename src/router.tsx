@@ -19,6 +19,7 @@ import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
 import { TerminalDock } from "@/components/terminal/TerminalDock";
 import { ChatView } from "@/components/chat/chat-view";
 import { CodeView } from "@/components/code/code-view";
+import { ProjectHomeView } from "@/components/project/project-home-view";
 import { SettingsView } from "@/components/settings/settings-view";
 import { Toaster } from "@/components/ui/toaster";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -284,6 +285,15 @@ const codeRoute = createRoute({
   },
 });
 
+const projectRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/project/$projectId",
+  component: function ProjectPage() {
+    const { projectId } = useParams({ from: "/project/$projectId" });
+    return <ProjectHomeView projectId={projectId} />;
+  },
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
@@ -294,6 +304,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
   codeRoute,
+  projectRoute,
   settingsRoute,
 ]);
 

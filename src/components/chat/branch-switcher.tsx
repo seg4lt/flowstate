@@ -56,6 +56,14 @@ interface BranchSwitcherProps {
   provider: ProviderKind;
   model: string | null;
   onCheckedOut: () => void;
+  /** Which tab opens first. Defaults to "branches" to match the
+   *  chat-header usage. The project-home page passes "worktrees"
+   *  for its Worktrees action button. */
+  initialTab?: Tab;
+  /** Override the default popover trigger. Used by the project-home
+   *  page to render the button as a sized action card instead of the
+   *  tiny inline branch label the chat header shows. */
+  trigger?: React.ReactElement;
 }
 
 type Tab = "branches" | "worktrees";
@@ -68,9 +76,11 @@ export function BranchSwitcher({
   provider,
   model,
   onCheckedOut,
+  initialTab = "branches",
+  trigger,
 }: BranchSwitcherProps) {
   const [open, setOpen] = React.useState(false);
-  const [tab, setTab] = React.useState<Tab>("branches");
+  const [tab, setTab] = React.useState<Tab>(initialTab);
   const [checkoutError, setCheckoutError] = React.useState<string | null>(null);
   const [pendingBranch, setPendingBranch] = React.useState<string | null>(null);
 
@@ -166,9 +176,9 @@ export function BranchSwitcher({
       setCheckoutError(null);
       setWorktreeError(null);
       setFailedRemoval(null);
-      setTab("branches");
+      setTab(initialTab);
     }
-  }, [open]);
+  }, [open, initialTab]);
 
   // Find-or-create flow for opening a worktree as a flowzen thread.
   // Each worktree has its own SDK project (so the agent SDK's existing
@@ -335,13 +345,15 @@ export function BranchSwitcher({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="inline-flex min-w-0 cursor-pointer items-center gap-1 truncate text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground"
-        >
-          <GitBranch className="h-3 w-3 shrink-0" />
-          <span className="truncate">{currentBranch}</span>
-        </button>
+        {trigger ?? (
+          <button
+            type="button"
+            className="inline-flex min-w-0 cursor-pointer items-center gap-1 truncate text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground"
+          >
+            <GitBranch className="h-3 w-3 shrink-0" />
+            <span className="truncate">{currentBranch}</span>
+          </button>
+        )}
       </PopoverTrigger>
       <PopoverContent
         align="start"
