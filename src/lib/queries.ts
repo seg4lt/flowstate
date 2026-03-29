@@ -2,14 +2,13 @@ import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import {
   getAttachment,
   getGitBranch,
-  getGitDiffSummary,
   listGitBranches,
   listGitWorktrees,
   listProjectFiles,
   pathExists,
   sendMessage,
 } from "./api";
-import type { GitBranchList, GitFileSummary, GitWorktree } from "./api";
+import type { GitBranchList, GitWorktree } from "./api";
 import type { SessionDetail } from "./types";
 
 // Pagination page size for session loads. Requesting the most
@@ -237,22 +236,3 @@ export function prefetchProjectFiles(
   });
 }
 
-export function gitDiffSummaryQueryOptions(
-  path: string | null,
-  refreshTick: number,
-) {
-  return queryOptions({
-    queryKey: ["git", "diff-summary", path, refreshTick] as const,
-    queryFn: async (): Promise<GitFileSummary[]> => {
-      if (!path) return [];
-      return getGitDiffSummary(path);
-    },
-    enabled: !!path,
-    // `refreshTick` is bumped whenever the chat view knows the diff
-    // should be re-read (session load, turn_completed, panel open).
-    // Bumping the tick produces a fresh queryKey, which is what
-    // drives the refetch — so we can keep staleTime Infinity and
-    // never refetch the same (path, tick) pair twice.
-    staleTime: Infinity,
-  });
-}

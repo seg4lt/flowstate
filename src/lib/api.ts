@@ -145,6 +145,67 @@ export function getGitDiffFile(
   return invoke<GitFileContents>("get_git_diff_file", { path, file });
 }
 
+// ── Streaming diff summary ────────────────────────────────────────
+//
+// `getGitDiffSummary` above is a one-shot call that doesn't return
+// until git has fully computed the diff — on a monorepo with many
+// changes that can take tens of seconds, during which the UI has
+// nothing to render. `watchGitDiffSummary` streams the same shape in
+// two phases over a Tauri Channel:
+//
+//   Phase 1 (`files`): fast `git status` pass, returns the file list
+//     near-instantly with untracked line counts already populated
+//     and tracked entries placeholdered at 0 / 0.
+//   Phase 2 (`numstat`): one event per tracked file as git produces
+//     its numstat record, so counts hydrate progressively.
+//   `done`: terminal event; `ok: false` carries the error message
+//     for timeouts / cancellations / subprocess failures.
+//
+// The returned handle includes a `stop()` that the caller MUST
+// invoke on cleanup — it kills the git subprocess and frees the
+// slot in the Rust-side task map.
+
+export type DiffSummaryEvent =
+  | { kind: "files"; files: GitFileSummary[] }
+  | {
+      kind: "numstat";
+      path: string;
+      additions: number;
+      deletions: number;
+    }
+  | { kind: "done"; ok: boolean; error: string | null };
+
+let nextDiffToken = 1;
+function allocDiffToken(): number {
+  const t = nextDiffToken;
+  nextDiffToken += 1;
+  return t;
+}
+
+export interface DiffSummarySubscription {
+  token: number;
+  stop: () => void;
+}
+
+export function watchGitDiffSummary(
+  path: string,
+  onEvent: (event: DiffSummaryEvent) => void,
+): DiffSummarySubscription {
+  const token = allocDiffToken();
+  const channel = new Channel<DiffSummaryEvent>();
+  channel.onmessage = onEvent;
+  // Fire and forget — the command returns as soon as the Rust side
+  // has spawned its blocking worker. Everything after that flows
+  // through the channel.
+  void invoke("watch_git_diff_summary", { path, token, onEvent: channel });
+  return {
+    token,
+    stop: () => {
+      void invoke("stop_git_diff_summary", { token });
+    },
+  };
+}
+
 // Every file in `path` that isn't ignored by .gitignore / .ignore,
 // returned as forward-slash relative paths. Used by the /code
 // editor view's Cmd+P-style picker. Capped at 20k entries on the

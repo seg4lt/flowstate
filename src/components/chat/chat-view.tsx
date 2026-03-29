@@ -19,13 +19,13 @@ import type {
 import { connectStream, sendMessage } from "@/lib/api";
 import {
   gitBranchQueryOptions,
-  gitDiffSummaryQueryOptions,
   loadFullSession,
   pathExistsQueryOptions,
   sessionQueryKey,
   sessionQueryOptions,
   type SessionPage,
 } from "@/lib/queries";
+import { useStreamedGitDiffSummary } from "@/lib/git-diff-stream";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
 import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
@@ -370,27 +370,29 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // on session load, on every `turn_completed` event, and whenever
   // the user opens the panel — so each turn shows its cumulative
   // effect without us instrumenting individual tool calls.
-  // `diffRefreshTick` bumps the queryKey so tanstack query refetches
-  // the diff summary while still caching identical `(path, tick)`
-  // pairs across session switches in the same project.
+  // `diffRefreshTick` bumps to restart the streamed subscription
+  // without blowing away the previously-committed file list, so the
+  // Diff button badge stays steady across refreshes.
   const [diffRefreshTick, setDiffRefreshTick] = React.useState(0);
-  // Latches true the first time the user opens the diff panel for
-  // this chat view. Used by the stream-event handlers below to
-  // suppress the `refreshDiffs()` storm during streaming turns when
-  // the user isn't even looking at the diff panel — on a slow repo
-  // every one of those refreshes is a multi-second `git diff HEAD`
-  // that wastes work and contends with other git reads. A ref (not
-  // state) so the latch doesn't re-render or churn query keys.
+  // Latches true the first time the user opens or hovers the diff
+  // panel button for this chat view. Gates the streamed
+  // subscription itself (`enabled`) AND the stream-event refresh
+  // path — before the first interaction we don't run a single git
+  // subprocess for this view. The state flavor drives the hook's
+  // `enabled` prop; the ref flavor is read synchronously from
+  // stream-event handlers whose effect we don't want to re-run on
+  // every flip.
+  const [diffSubscriptionActive, setDiffSubscriptionActive] =
+    React.useState(false);
   const diffPanelEverOpenedRef = React.useRef(false);
   // 400ms grace window to collapse back-to-back `refreshDiffs()`
   // triggers into a single tick bump. `session_loaded` and the first
   // `turn_completed` can fire within a few hundred ms of each other
   // on initial load, and rapid multi-turn runs can also storm this
   // path; either way we don't need more than ~2.5 refetches/sec.
-  // User gestures (branch checkout, panel open via maybePrefetchDiffs)
-  // pass `{ force: true }` to bypass — they're one-shot events and
-  // must always reach the query cache even if a streaming refresh
-  // just landed inside the debounce window.
+  // Branch checkout passes `{ force: true }` to bypass — it's a
+  // one-shot gesture that must always reach the subscription even
+  // if a streaming refresh just landed inside the debounce window.
   const lastRefreshAtRef = React.useRef(0);
   const refreshDiffs = React.useCallback((opts?: { force?: boolean }) => {
     const now = Date.now();
@@ -399,27 +401,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setDiffRefreshTick((t) => t + 1);
   }, []);
 
-  // Throttle for user-gesture-driven diff prefetches (Diff button
-  // hover and Diff button click). The throttle is intentionally
-  // shared between hover and click: if the user hovers and then
-  // clicks within ~1.5s, the click should reuse the hover's
-  // in-flight or just-completed refetch rather than bumping the tick
-  // a second time and discarding the prefetch's work.
-  //
-  // System-event refreshes (session_loaded, turn_completed, branch
-  // checkout) bypass this throttle entirely — they call
-  // `refreshDiffs` directly and always force a fresh tick. Only the
-  // user-pointer / focus path is throttled.
-  //
-  // Staleness window is at most 1.5s; if files change on disk inside
-  // that window the user can close + reopen the panel to force a
-  // new tick.
-  const lastDiffPrefetchAt = React.useRef<number>(0);
-  const maybePrefetchDiffs = React.useCallback(() => {
-    const now = Date.now();
-    if (now - lastDiffPrefetchAt.current < 1500) return;
-    lastDiffPrefetchAt.current = now;
-    setDiffRefreshTick((t) => t + 1);
+  // Arm the diff subscription. Called on Diff-button hover/focus
+  // AND on first panel open. Unlike the old hover prefetch this
+  // does NOT bump the refresh tick on every call — flipping
+  // `diffSubscriptionActive` from false → true starts the
+  // subscription exactly once, and subsequent calls are React
+  // no-ops (setState bails when the value didn't change). The
+  // streamed hook keeps previous diffs visible across any future
+  // refresh-tick bumps, so the Diff button badge never flickers
+  // empty on hover the way it did with the tanstack-query version.
+  const activateDiffSubscription = React.useCallback(() => {
+    diffPanelEverOpenedRef.current = true;
+    setDiffSubscriptionActive(true);
   }, []);
 
   // Diff panel state. Closed by default — open it from the chat
@@ -522,8 +515,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // where there's nothing to diff against.
   const gitBranchQuery = useQuery(gitBranchQueryOptions(projectPath));
   const gitBranch = gitBranchQuery.data ?? null;
-  const gitDiffQuery = useQuery(
-    gitDiffSummaryQueryOptions(projectPath, diffRefreshTick),
+  // Streamed replacement for the old useQuery(gitDiffSummaryQueryOptions)
+  // call. The hook handles phase-1/phase-2 streaming, cancellation on
+  // unmount, and keep-previous-data across refresh-tick bumps so the
+  // Diff button badge doesn't flash empty when we restart the
+  // subscription (turn_completed, session_loaded, branch checkout).
+  const diffStream = useStreamedGitDiffSummary(
+    projectPath,
+    diffRefreshTick,
+    diffSubscriptionActive,
   );
   // Worktree threads live under their own SDK project whose path IS
   // the worktree folder. If that folder has been removed on disk —
@@ -541,8 +541,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const worktreeFolderMissing =
     isWorktreeThread && worktreeFolderQuery.data === false;
   const diffs = React.useMemo<AggregatedFileDiff[]>(
-    () => gitDiffQuery.data ?? [],
-    [gitDiffQuery.data],
+    () => diffStream.diffs,
+    [diffStream.diffs],
   );
 
   // Keyboard shortcut for mode cycling (Shift+Tab)
@@ -735,13 +735,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
         case "turn_completed":
           setPendingInput(null);
-          // Turn-wise refresh: every completed turn re-runs `git diff
-          // HEAD` so the panel reflects exactly what this turn left
-          // on disk — but only if the user has opened the diff panel
-          // at least once in this view's lifetime. A 20-turn session
-          // on a slow repo with the panel closed used to waste 20
-          // full diff runs; now it wastes zero, and the next panel
-          // open forces a fresh read via `maybePrefetchDiffs`.
+          // Turn-wise refresh: every completed turn restarts the
+          // streamed diff subscription so the panel reflects what
+          // this turn left on disk — but only if the user has
+          // activated the subscription at least once (opened or
+          // hovered the Diff button). A 20-turn session on a slow
+          // repo with the panel untouched used to waste 20 full
+          // diff runs; now it wastes zero, and the first button
+          // interaction arms the subscription.
           if (diffPanelEverOpenedRef.current) refreshDiffs();
           break;
 
@@ -1064,35 +1065,28 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             diffOpen={diffOpen}
             onToggleDiff={() => {
               setDiffOpen((v) => {
-                // Force a fresh git diff whenever the panel opens so
-                // changes the user made outside the agent (manual
-                // edits, external tools) show up without a reload.
-                // Routed through `maybePrefetchDiffs` so a click that
-                // lands within ~1.5s of a hover prefetch reuses the
-                // hover's in-flight refetch instead of bumping the
-                // tick twice and discarding the pre-warm.
                 if (!v) {
-                  // First-open latch: from now on, stream-event
-                  // refreshes (session_loaded / turn_completed) are
-                  // allowed to re-read the diff. Before the first
-                  // open we leave the badge showing whatever the
-                  // initial mount fetch produced and skip all
-                  // streaming re-reads — huge win on slow repos
-                  // when the user never opens the panel.
-                  diffPanelEverOpenedRef.current = true;
-                  maybePrefetchDiffs();
+                  // First interaction with the diff button of any
+                  // kind activates the subscription. `refreshDiffs`
+                  // then bumps the tick so the newly-opened panel
+                  // picks up any on-disk changes made outside the
+                  // agent — but unlike the old path this does NOT
+                  // blank out the badge, because the streamed hook
+                  // keeps the previous diffs committed until the
+                  // new subscription's Phase 1 lands.
+                  activateDiffSubscription();
+                  refreshDiffs({ force: true });
                 }
                 return !v;
               });
             }}
-            // Only prefetch when the panel is closed. If the panel is
-            // already open the user is almost certainly hovering on
-            // their way to clicking *close* — pre-warming a refresh
-            // would refetch the very data we're about to discard,
-            // and worse, the in-flight refetch lands while the panel
-            // is still visible and visibly resets it (scroll jumps,
-            // tokenization restarts). No prefetch on hover-while-open.
-            onHoverDiff={diffOpen ? undefined : maybePrefetchDiffs}
+            // Hover arms the subscription (exactly once, via the
+            // React setState bail-out). No tick bump, no refetch —
+            // the subscription fires as soon as it's activated and
+            // subsequent hovers are no-ops. This is the fix for the
+            // old button-badge flicker: hovers never restart the
+            // query, so the `+N/−M` count stays visible.
+            onHoverDiff={diffOpen ? undefined : activateDiffSubscription}
           />
         </div>
       </header>
@@ -1229,6 +1223,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 projectPath={projectPath}
                 diffs={diffs}
                 refreshKey={diffRefreshTick}
+                streamStatus={diffStream.status}
                 style={diffStyle}
                 onStyleChange={setDiffStyle}
                 onClose={() => {

@@ -3,6 +3,7 @@ import { MultiFileDiff } from "@pierre/diffs/react";
 import { ChevronDown, ChevronRight, Maximize2, Minimize2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { getGitDiffFile, type GitFileContents } from "@/lib/api";
+import type { DiffStreamStatus } from "@/lib/git-diff-stream";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 
 export type DiffStyle = "split" | "unified";
@@ -21,6 +22,11 @@ interface DiffPanelProps {
   // tagged with an older refreshKey are considered stale and
   // refetched when the section is visible.
   refreshKey: number;
+  // Streaming lifecycle from `useStreamedGitDiffSummary`. While
+  // `"streaming"`, per-file numstat may still be landing — rows
+  // whose additions/deletions are both 0 render a muted placeholder
+  // instead of `+0/−0` so users don't think the file is unchanged.
+  streamStatus: DiffStreamStatus;
   style: DiffStyle;
   onStyleChange: (s: DiffStyle) => void;
   onClose: () => void;
@@ -49,6 +55,7 @@ export function DiffPanel({
   projectPath,
   diffs,
   refreshKey,
+  streamStatus,
   style,
   onStyleChange,
   onClose,
@@ -114,6 +121,7 @@ export function DiffPanel({
   );
 
   const fileCount = diffs.length;
+  const isStreaming = streamStatus === "streaming";
 
   return (
     <div className="flex h-full flex-col">
@@ -121,6 +129,14 @@ export function DiffPanel({
         <span className="truncate text-[11px] font-medium">
           {fileCount} {fileCount === 1 ? "file" : "files"} changed
         </span>
+        {isStreaming && (
+          <span
+            className="truncate text-[10px] text-muted-foreground"
+            title="Streaming line counts from git…"
+          >
+            · scanning…
+          </span>
+        )}
 
         <div className="ml-auto flex items-center gap-1">
           <div
@@ -194,6 +210,7 @@ export function DiffPanel({
               state={cacheRef.current.get(d.path)}
               ensureLoaded={ensureLoaded}
               style={style}
+              countsPending={isStreaming && d.additions === 0 && d.deletions === 0}
             />
           ))
         )}
@@ -207,6 +224,11 @@ interface FileSectionProps {
   state: CacheEntry | undefined;
   ensureLoaded: (path: string) => void;
   style: DiffStyle;
+  // True while the streamed subscription is still populating
+  // numstat for this file — render a placeholder `+…/−…` badge
+  // instead of the literal `+0/−0` so users can tell the counts
+  // are in-flight, not that the file is actually unchanged.
+  countsPending: boolean;
 }
 
 // Each file section watches its own visibility via IntersectionObserver.
@@ -222,6 +244,7 @@ const FileSection = React.memo(function FileSection({
   state,
   ensureLoaded,
   style,
+  countsPending,
 }: FileSectionProps) {
   const sectionRef = React.useRef<HTMLElement>(null);
   const [hasBeenVisible, setHasBeenVisible] = React.useState(false);
@@ -286,13 +309,19 @@ const FileSection = React.memo(function FileSection({
         )}
         <span className="truncate font-mono text-[11px]">{diff.path}</span>
         <span className="ml-auto shrink-0 tabular-nums text-[10px]">
-          <span className="text-green-600 dark:text-green-400">
-            +{diff.additions}
-          </span>
-          {" "}
-          <span className="text-red-600 dark:text-red-400">
-            −{diff.deletions}
-          </span>
+          {countsPending ? (
+            <span className="text-muted-foreground">+… −…</span>
+          ) : (
+            <>
+              <span className="text-green-600 dark:text-green-400">
+                +{diff.additions}
+              </span>
+              {" "}
+              <span className="text-red-600 dark:text-red-400">
+                −{diff.deletions}
+              </span>
+            </>
+          )}
         </span>
       </button>
       {!collapsed && (

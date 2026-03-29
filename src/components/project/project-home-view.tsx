@@ -29,10 +29,10 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   gitBranchQueryOptions,
-  gitDiffSummaryQueryOptions,
   gitWorktreeListQueryOptions,
   prefetchProjectFiles,
 } from "@/lib/queries";
+import { useStreamedGitDiffSummary } from "@/lib/git-diff-stream";
 import {
   openInEditor,
   removeGitWorktree,
@@ -658,12 +658,10 @@ function WorktreeDiffBody({
   onClose: () => void;
 }) {
   const [refreshTick, setRefreshTick] = React.useState(0);
-  const diffQuery = useQuery(
-    gitDiffSummaryQueryOptions(worktreePath, refreshTick),
-  );
+  const diffStream = useStreamedGitDiffSummary(worktreePath, refreshTick, true);
   const diffs: AggregatedFileDiff[] = React.useMemo(
-    () => diffQuery.data ?? [],
-    [diffQuery.data],
+    () => diffStream.diffs,
+    [diffStream.diffs],
   );
   const [style, setStyle] = React.useState<DiffStyle>("split");
 
@@ -684,6 +682,7 @@ function WorktreeDiffBody({
       projectPath={worktreePath}
       diffs={diffs}
       refreshKey={refreshTick}
+      streamStatus={diffStream.status}
       style={style}
       onStyleChange={setStyle}
       onClose={onClose}
