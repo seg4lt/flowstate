@@ -132,7 +132,9 @@ export function ChatInput({
   // overlapping send_turn calls. The explicit interrupt path leaves
   // the queue intact (status flips to "interrupted", not "ready"),
   // so the user can choose whether to drain by sending one more
-  // message themselves or to clear chips manually.
+  // message themselves (which is allowed by the enqueue gate on the
+  // submit path below, scoped to non-interrupted state) or to clear
+  // chips manually.
   const prevStatusRef = React.useRef(sessionStatus);
   React.useEffect(() => {
     const wasRunning = prevStatusRef.current === "running";
@@ -238,8 +240,17 @@ export function ChatInput({
     // While a turn is running OR earlier messages are still queued,
     // append this one to the queue. Clearing the textarea immediately
     // mirrors what the user just did ("send"), and the queued chip
-    // above the input shows what's pending.
-    if (isRunning || queued.length > 0) {
+    // above the input shows what's pending. The "queued.length > 0"
+    // clause is a race guard against the tiny window between onSend
+    // firing and turn_started flipping sessionStatus back to
+    // "running" — without it, a fast user could fire two concurrent
+    // send_turn calls which the runtime rejects. That guard is
+    // deliberately scoped to non-interrupted state: after a stop,
+    // there is no in-flight send_turn to race against, so we let the
+    // next message fire directly. The existing drain effect picks up
+    // whatever was already queued once the new turn completes, which
+    // is how the user's "send one more to drain" workflow above works.
+    if (isRunning || (queued.length > 0 && sessionStatus !== "interrupted")) {
       enqueue(trimmed, imagesToSend);
       setValue("");
       resetHeight();
