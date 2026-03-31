@@ -41,15 +41,16 @@ function groupBlocks(
       }
     | null = null;
 
-  // Sub-agent boxes: one per parentCallId, deduped via this Map. The
-  // first time a sub-agent's tool call appears in the stream, its box
-  // is created and pushed into result at that position; every later
-  // tool call from the SAME sub-agent — even if other content
-  // (main-agent tools, text, reasoning) intervenes — appends to the
-  // same in-place callIds array, so the user sees one persistent box
-  // per sub-agent that collects all of its activity in stream order.
-  // Parallel sub-agents land in separate boxes because each has a
-  // different parentCallId.
+  // Sub-agent boxes: one per parentCallId, deduped via this Map. A box
+  // can be seeded two ways: (1) by the dispatcher Task tool call itself
+  // when it appears in the stream (hoisted out of the main group so the
+  // user sees the spawn and its activity in one place), or (2) by the
+  // first child tool call if the dispatcher hasn't arrived yet. Later
+  // child tool calls from the SAME sub-agent append to the existing
+  // box's callIds array in place — the user sees one persistent box
+  // per sub-agent collecting all of its activity at the dispatcher's
+  // original stream position. Parallel sub-agents land in separate
+  // boxes because each has a different parentCallId.
   const subagentBoxes = new Map<
     string,
     {
@@ -60,8 +61,36 @@ function groupBlocks(
     }
   >();
 
+  // Callsids that spawned at least one sub-agent tool call. These
+  // dispatcher tool calls are hoisted out of the main-agent group and
+  // rendered as sub-agent boxes instead — everything the sub-agent
+  // produced (tool calls + final output text) lives in one place.
+  const dispatcherIds = new Set<string>();
+  for (const tc of callsById.values()) {
+    if (tc.parentCallId) dispatcherIds.add(tc.parentCallId);
+  }
+
   blocks.forEach((block, idx) => {
     if (block.kind === "tool_call") {
+      if (dispatcherIds.has(block.callId)) {
+        // Main-agent tool call that spawned a sub-agent. Seed the
+        // sub-agent box at THIS position and skip the main-group push.
+        // The box's parentCallId matches this dispatcher's callId,
+        // which is also the parentCallId every child tool call carries.
+        currentMainGroup = null;
+        if (!subagentBoxes.has(block.callId)) {
+          const box = {
+            kind: "tool_call_group" as const,
+            callIds: [],
+            parentCallId: block.callId,
+            key: `tg-sub-${block.callId}`,
+          };
+          subagentBoxes.set(block.callId, box);
+          result.push(box);
+        }
+        return;
+      }
+
       const parent = callsById.get(block.callId)?.parentCallId;
 
       if (parent === undefined) {
@@ -80,9 +109,9 @@ function groupBlocks(
         return;
       }
 
-      // Sub-agent — find or create the persistent box for this parent.
-      // A sub-agent block always breaks the current main-agent streak,
-      // so the next main tool call starts fresh.
+      // Sub-agent child — find or create the persistent box for this
+      // parent. A sub-agent block always breaks the current main-agent
+      // streak, so the next main tool call starts fresh.
       currentMainGroup = null;
       const existing = subagentBoxes.get(parent);
       if (existing) {
@@ -140,13 +169,6 @@ function ToolCallGroup({
     return out;
   }, [callIds, callsById]);
 
-  if (calls.length === 0) return null;
-
-  const overflow = calls.length - GROUP_DEFAULT_VISIBLE;
-  const hasOverflow = overflow > 0;
-  const visible =
-    expanded || !hasOverflow ? calls : calls.slice(0, GROUP_DEFAULT_VISIBLE);
-
   // Sub-agent groups get a visible header so the user can see which
   // dispatch issued them and which agent type is running. The agent
   // type lives in the spawning Task tool's args (`subagent_type`),
@@ -162,6 +184,18 @@ function ToolCallGroup({
         ?.subagent_type
     : undefined;
   const agentLabel = subagentType ?? parentCall?.name ?? "Subagent";
+
+  // A sub-agent box may legitimately have zero children early in the
+  // stream (dispatcher seen, first child not yet). Keep it visible if
+  // we at least have the dispatcher's output/error to show.
+  if (calls.length === 0 && !parentCall?.output && !parentCall?.error) {
+    return null;
+  }
+
+  const overflow = calls.length - GROUP_DEFAULT_VISIBLE;
+  const hasOverflow = overflow > 0;
+  const visible =
+    expanded || !hasOverflow ? calls : calls.slice(0, GROUP_DEFAULT_VISIBLE);
 
   const body = (
     <>
@@ -202,7 +236,23 @@ function ToolCallGroup({
           ↳ {agentLabel}{" "}
           <span className="text-muted-foreground/60">· {calls.length}</span>
         </summary>
-        <div className="mt-1.5">{body}</div>
+        <div className="mt-1.5">
+          {body}
+          {(parentCall?.output || parentCall?.error) && (
+            <div className="mt-2 border-t border-border/30 pt-2">
+              {parentCall?.output && (
+                <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 text-[11px] text-muted-foreground">
+                  {parentCall.output}
+                </pre>
+              )}
+              {parentCall?.error && (
+                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 text-[11px] text-destructive">
+                  {parentCall.error}
+                </pre>
+              )}
+            </div>
+          )}
+        </div>
       </details>
     );
   }
