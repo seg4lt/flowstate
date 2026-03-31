@@ -1118,7 +1118,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
           {isRunning && session && runningTurn && (
             <WorkingIndicator
-              lastActivityAt={lastEventAt}
+              turnStartedAt={new Date(runningTurn.createdAt).getTime()}
+              lastEventAt={lastEventAt}
               onInterrupt={handleInterrupt}
             />
           )}
