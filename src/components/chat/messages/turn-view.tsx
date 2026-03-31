@@ -164,15 +164,17 @@ function ToolCallGroup({
   const agentLabel = subagentType ?? parentCall?.name ?? "Subagent";
 
   const body = (
-    <div className="space-y-1">
-      {visible.map((tc) => (
-        <ToolCallCard key={tc.callId} toolCall={tc} />
-      ))}
+    <>
+      <div className="divide-y divide-border/30">
+        {visible.map((tc) => (
+          <ToolCallCard key={tc.callId} toolCall={tc} />
+        ))}
+      </div>
       {hasOverflow && (
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
-          className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          className="mt-1 inline-flex items-center gap-1 rounded-md px-2 py-0 text-[10px] leading-5 text-muted-foreground hover:bg-muted/50 hover:text-foreground"
         >
           {expanded ? (
             <>
@@ -187,22 +189,35 @@ function ToolCallGroup({
           )}
         </button>
       )}
-    </div>
+    </>
   );
 
   if (isSubagent) {
     return (
-      <div className="rounded-md border border-border/50 bg-muted/20 px-2 py-1.5">
-        <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-          <span>↳ {agentLabel}</span>
+      <details
+        open
+        className="rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs"
+      >
+        <summary className="cursor-pointer select-none text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground">
+          ↳ {agentLabel}{" "}
           <span className="text-muted-foreground/60">· {calls.length}</span>
-        </div>
-        {body}
-      </div>
+        </summary>
+        <div className="mt-1.5">{body}</div>
+      </details>
     );
   }
 
-  return <div className="pl-2">{body}</div>;
+  return (
+    <details
+      open
+      className="rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs"
+    >
+      <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+        Tools <span className="text-muted-foreground/60">· {calls.length}</span>
+      </summary>
+      <div className="mt-1.5">{body}</div>
+    </details>
+  );
 }
 
 // Normalized shape that covers both completed TurnRecords and the

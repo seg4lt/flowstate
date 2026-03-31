@@ -61,29 +61,29 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const preview = toolPreview(toolCall.name, toolCall.args);
 
   return (
-    <div className="rounded-md border border-border text-xs">
+    <div className="text-xs">
       <button
         type="button"
-        className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/50"
+        className="flex w-full items-center gap-1.5 px-1 py-1 text-left hover:bg-muted/40 focus-visible:bg-muted/40"
         onClick={() => setOpen(!open)}
       >
         <ChevronRight
-          className={`h-3 w-3 shrink-0 transition-transform ${open ? "rotate-90" : ""}`}
+          className={`h-3 w-3 shrink-0 text-muted-foreground/70 transition-transform ${open ? "rotate-90" : ""}`}
         />
-        <Wrench className="h-3 w-3 shrink-0" />
+        <Wrench className="h-3 w-3 shrink-0 text-muted-foreground/70" />
         <span className="min-w-0 flex-1 truncate">
           <span className="font-medium">{toolCall.name}</span>
           {preview && (
             <span className="ml-1.5 text-muted-foreground">{preview}</span>
           )}
         </span>
-        <span className={`ml-2 shrink-0 ${statusColor}`}>
+        <span className={`ml-2 shrink-0 text-[10px] ${statusColor}`}>
           {toolCall.status}
         </span>
       </button>
 
       {open && (
-        <div className="space-y-2 border-t border-border px-3 py-2">
+        <div className="space-y-2 px-1 pb-2 pt-1">
           <div>{renderToolArgs(toolCall.name, toolCall.args)}</div>
           {toolCall.output && (
             <div>
