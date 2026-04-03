@@ -13,11 +13,10 @@
     "windows": [
       {
         "title": "flowzen",
-        "width": 1440,
-        "height": 900,
-        "minWidth": 960,
-        "minHeight": 600,
-        "maximized": true,
+        "width": 1296,
+        "height": 810,
+        "minWidth": 400,
+        "minHeight": 400,
         "center": true,
         "backgroundColor": "#252525"
       }
