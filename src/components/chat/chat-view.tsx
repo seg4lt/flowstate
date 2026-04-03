@@ -553,13 +553,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       // Only respond to Shift+Tab
       if (event.key !== "Tab" || !event.shiftKey) return;
 
-      // Don't interfere if user is typing in an input/textarea/contenteditable
+      // Skip when focus is on an INPUT or contenteditable — e.g.
+      // title-rename, branch switcher search, diff style toggles —
+      // where Shift+Tab should keep its default focus-navigation
+      // behavior. The composer <textarea> is the only textarea in
+      // the app and is intentionally NOT skipped: users want the
+      // mode to cycle while typing without losing their cursor.
       const target = event.target as HTMLElement;
-      if (
-        target.tagName === "INPUT" ||
-        target.tagName === "TEXTAREA" ||
-        target.isContentEditable
-      ) {
+      if (target.tagName === "INPUT" || target.isContentEditable) {
         return;
       }
 
