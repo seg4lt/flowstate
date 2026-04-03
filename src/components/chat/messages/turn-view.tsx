@@ -227,6 +227,35 @@ function ToolCallGroup({
   );
 
   if (isSubagent) {
+    // The dispatcher Task's status reflects the sub-agent's own
+    // lifecycle: pending while the sub-agent is running, completed when
+    // it returns, failed if it errored. Surface it in the summary so
+    // the user can scan activity without opening the box.
+    const status = parentCall?.status;
+    const statusText =
+      status === "completed"
+        ? "completed"
+        : status === "failed"
+          ? "failed"
+          : status === "pending"
+            ? "pending"
+            : null;
+    const statusClass =
+      status === "completed"
+        ? "text-green-600 dark:text-green-400"
+        : status === "failed"
+          ? "text-destructive"
+          : "animate-pulse text-muted-foreground";
+
+    // Subtext under the agent label: prefer the Task's description arg
+    // (the natural-language one-liner like "Find tool call UI
+    // rendering"), fall back to the agent type so the subtext is
+    // always informative.
+    const description = (
+      parentCall?.args as { description?: string } | undefined
+    )?.description;
+    const subtext = description ?? agentLabel;
+
     return (
       <details
         open
@@ -235,6 +264,12 @@ function ToolCallGroup({
         <summary className="cursor-pointer select-none text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground">
           ↳ {agentLabel}{" "}
           <span className="text-muted-foreground/60">· {calls.length}</span>
+          {statusText && (
+            <span className={`ml-1 ${statusClass}`}>· {statusText}</span>
+          )}
+          <div className="mt-0.5 truncate text-[11px] font-normal normal-case tracking-normal text-muted-foreground/80">
+            Subagent - {subtext}
+          </div>
         </summary>
         <div className="mt-1.5">
           {body}
