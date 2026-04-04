@@ -147,16 +147,14 @@ export function ChatInput({
   // with status still "ready" until the new turn flips it back to
   // "running" -- without the transition guard we'd drain the entire
   // queue in one synchronous burst and the runtime would reject
-  // overlapping send_turn calls. The explicit interrupt path leaves
-  // the queue intact (status flips to "interrupted", not "ready"),
-  // so the user can choose whether to drain by sending one more
-  // message themselves (which is allowed by the enqueue gate on the
-  // submit path below, scoped to non-interrupted state) or to clear
-  // chips manually.
+  // overlapping send_turn calls. Both the normal completion
+  // (running -> ready) and an explicit interrupt (running -> interrupted)
+  // drain the head of the queue, because after a stop there is no
+  // in-flight send_turn to race against.
   const prevStatusRef = React.useRef(sessionStatus);
   React.useEffect(() => {
     const wasRunning = prevStatusRef.current === "running";
-    const nowReady = sessionStatus === "ready";
+    const nowReady = sessionStatus === "ready" || sessionStatus === "interrupted";
     prevStatusRef.current = sessionStatus;
     if (!wasRunning || !nowReady) return;
     if (queued.length === 0) return;
