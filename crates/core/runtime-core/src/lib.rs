@@ -419,6 +419,14 @@ impl RuntimeCore {
         // applies to `spawn_health_check`.
         let mut cached_providers: Vec<ProviderStatus> = Vec::new();
         for &kind in self.adapters.keys() {
+            // provider_model_cache is the authoritative source for the
+            // model list; the `models` vec embedded inside a health
+            // cache entry is only a stale snapshot from whenever the
+            // last health probe ran. Consult it up front so the same
+            // value can both merge into the bootstrap payload and
+            // drive the stale-model refresh below.
+            let cached_models = self.persistence.get_cached_models(kind).await;
+
             match self.persistence.get_cached_health(kind).await {
                 Some((checked_at, mut status)) => {
                     tracing::info!(
@@ -427,6 +435,9 @@ impl RuntimeCore {
                         "loaded cached provider health"
                     );
                     status.enabled = self.is_provider_enabled(kind);
+                    if let Some((_, ref models)) = cached_models {
+                        status.models = models.clone();
+                    }
                     cached_providers.push(status);
                     if is_cache_stale(&checked_at) {
                         self.spawn_health_check(kind);
@@ -435,6 +446,17 @@ impl RuntimeCore {
                 None => {
                     self.spawn_health_check(kind);
                 }
+            }
+
+            // Refresh models independently of health-cache freshness so
+            // a fresh health cache can't pin the frontend to old models
+            // past the 24h model TTL.
+            let needs_model_refresh = match &cached_models {
+                Some((fetched_at, _)) => is_cache_stale(fetched_at),
+                None => true,
+            };
+            if needs_model_refresh && self.is_provider_enabled(kind) {
+                self.spawn_model_refresh(kind);
             }
         }
 
@@ -1622,6 +1644,15 @@ fn spawn_model_refresh_detached(
                     "fetched provider models, persisting and broadcasting"
                 );
                 persistence.set_cached_models(kind, &models).await;
+                // Keep provider_health_cache.status_json in sync with
+                // the fresh model list. The bootstrap path now prefers
+                // provider_model_cache, but any other reader that
+                // touches only the health cache (or a future one) must
+                // not observe a stale list.
+                if let Some((_, mut status)) = persistence.get_cached_health(kind).await {
+                    status.models = models.clone();
+                    persistence.set_cached_health(kind, &status).await;
+                }
                 let _ = event_tx.send(RuntimeEvent::ProviderModelsUpdated {
                     provider: kind,
                     models,
@@ -2695,5 +2726,240 @@ mod tests {
         );
         let last_turn = detail.turns.last().expect("turn should exist");
         assert_eq!(last_turn.status, TurnStatus::Interrupted);
+    }
+
+    /// Build a `ProviderStatus` suitable for seeding the health cache in
+    /// the bootstrap tests. The embedded `models` field is what ships in
+    /// `status_json`; the tests assert whether it or `provider_model_cache`
+    /// wins during bootstrap.
+    fn fake_status_with_models(
+        models: Vec<zenui_provider_api::ProviderModel>,
+    ) -> ProviderStatus {
+        ProviderStatus {
+            kind: ProviderKind::Codex,
+            label: "Codex".to_string(),
+            installed: true,
+            authenticated: true,
+            version: Some("test".to_string()),
+            status: ProviderStatusLevel::Ready,
+            message: None,
+            models,
+            enabled: true,
+        }
+    }
+
+    fn model(value: &str, label: &str) -> zenui_provider_api::ProviderModel {
+        zenui_provider_api::ProviderModel {
+            value: value.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    /// Refreshed models must survive an app restart. Seeds an old model
+    /// list in the health cache and a fresh list in the dedicated model
+    /// cache, then spins up a new RuntimeCore reusing the same
+    /// persistence Arc (simulating a restart) and asserts the fresh list
+    /// wins the bootstrap merge.
+    #[tokio::test]
+    async fn bootstrap_prefers_provider_model_cache_over_health_cache_models() {
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
+
+        // The "last health check" stored [old-model] inside status_json.
+        persistence
+            .set_cached_health(
+                ProviderKind::Codex,
+                &fake_status_with_models(vec![model("old-model", "Old")]),
+            )
+            .await;
+
+        // The user then clicked "Refresh models" which wrote to
+        // provider_model_cache (with a fresh, non-stale timestamp).
+        persistence
+            .set_cached_models(
+                ProviderKind::Codex,
+                &[model("fresh-model", "Fresh")],
+            )
+            .await;
+
+        // Simulate an app restart: brand-new RuntimeCore against the
+        // same persistence. FakeAdapter::health() returns empty models,
+        // so any non-empty models vec in the payload must come from
+        // the cache merge.
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![Arc::new(FakeAdapter)],
+            Arc::new(OrchestrationService::new()),
+            persistence.clone(),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        let payload = runtime.bootstrap("ws://test".to_string()).await;
+        assert_eq!(payload.providers.len(), 1);
+        let models = &payload.providers[0].models;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].value, "fresh-model");
+    }
+
+    /// When provider_model_cache has no row (e.g. upgrading from an
+    /// older build that only populated the health cache), bootstrap
+    /// must fall back to the models embedded in the health cache
+    /// instead of clearing them.
+    #[tokio::test]
+    async fn bootstrap_falls_back_to_health_cache_models_when_model_cache_missing() {
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
+
+        persistence
+            .set_cached_health(
+                ProviderKind::Codex,
+                &fake_status_with_models(vec![model("legacy-model", "Legacy")]),
+            )
+            .await;
+
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![Arc::new(FakeAdapter)],
+            Arc::new(OrchestrationService::new()),
+            persistence.clone(),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        let payload = runtime.bootstrap("ws://test".to_string()).await;
+        assert_eq!(payload.providers.len(), 1);
+        let models = &payload.providers[0].models;
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].value, "legacy-model");
+    }
+
+    /// Adapter whose `fetch_models` returns a known non-empty list and
+    /// bumps an atomic counter. Used by the stale-model-cache test to
+    /// observe whether bootstrap fired an independent model refresh.
+    struct ModelFetchCountingAdapter {
+        fetch_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for ModelFetchCountingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            fake_status_with_models(vec![])
+        }
+
+        async fn fetch_models(&self) -> Result<Vec<zenui_provider_api::ProviderModel>, String> {
+            self.fetch_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![model("refreshed-model", "Refreshed")])
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            input: &UserInput,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            _events: TurnEventSink,
+        ) -> Result<zenui_provider_api::ProviderTurnOutput, String> {
+            Ok(zenui_provider_api::ProviderTurnOutput {
+                output: format!("fake response for {}", input.text),
+                provider_state: None,
+            })
+        }
+    }
+
+    /// A stale provider_model_cache must trigger an independent model
+    /// refresh even when the health cache is fresh. Otherwise a fresh
+    /// health cache could pin the frontend to old models past the 24h
+    /// model TTL. The refresh is async — we assert it fires by waiting
+    /// for the adapter's `fetch_models` counter to increment AND for a
+    /// `ProviderModelsUpdated` event to arrive on the runtime bus.
+    #[tokio::test]
+    async fn bootstrap_triggers_model_refresh_when_model_cache_is_stale() {
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
+
+        // Fresh health cache (checked_at = now via set_cached_health).
+        persistence
+            .set_cached_health(
+                ProviderKind::Codex,
+                &fake_status_with_models(vec![model("old-model", "Old")]),
+            )
+            .await;
+
+        // Stale model cache: fetched_at 25h in the past.
+        let stale = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        persistence
+            .set_cached_models_at(
+                ProviderKind::Codex,
+                &[model("old-model", "Old")],
+                &stale,
+            )
+            .await;
+
+        let adapter = Arc::new(ModelFetchCountingAdapter {
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter.clone()],
+            Arc::new(OrchestrationService::new()),
+            persistence.clone(),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        // Subscribe before bootstrapping so we don't miss the event.
+        let mut events = runtime.subscribe();
+        let payload = runtime.bootstrap("ws://test".to_string()).await;
+
+        // Bootstrap merges the stale (but still present) model cache
+        // into the payload, so the frontend still gets SOMETHING to
+        // render immediately — the refresh comes in after.
+        assert_eq!(payload.providers.len(), 1);
+        assert_eq!(payload.providers[0].models.len(), 1);
+        assert_eq!(payload.providers[0].models[0].value, "old-model");
+
+        // Poll for the background refresh: fetch counter must bump
+        // and ProviderModelsUpdated must fire with the fresh list.
+        let mut saw_updated = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            while let Ok(event) = events.try_recv() {
+                if let RuntimeEvent::ProviderModelsUpdated { provider, models } = event {
+                    if provider == ProviderKind::Codex
+                        && models.len() == 1
+                        && models[0].value == "refreshed-model"
+                    {
+                        saw_updated = true;
+                    }
+                }
+            }
+            if saw_updated {
+                break;
+            }
+        }
+        assert!(
+            saw_updated,
+            "expected ProviderModelsUpdated event with refreshed-model"
+        );
+        assert!(
+            adapter
+                .fetch_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1,
+            "expected fetch_models to be called at least once"
+        );
+
+        // And the model cache on disk should now have the fresh list
+        // with a current timestamp — the next restart won't trigger
+        // yet another refresh.
+        let (_, cached) = persistence
+            .get_cached_models(ProviderKind::Codex)
+            .await
+            .expect("refreshed model cache row");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].value, "refreshed-model");
     }
 }

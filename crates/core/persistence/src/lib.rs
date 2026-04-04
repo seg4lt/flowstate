@@ -496,11 +496,23 @@ impl PersistenceService {
 
     /// Persist the model list for a provider with `now` as the fetched_at timestamp.
     pub async fn set_cached_models(&self, kind: ProviderKind, models: &[ProviderModel]) {
+        self.set_cached_models_at(kind, models, &chrono::Utc::now().to_rfc3339())
+            .await;
+    }
+
+    /// Like `set_cached_models` but takes an explicit `fetched_at` timestamp.
+    /// Used by tests that need to forge a stale cache entry; production code
+    /// should stick to `set_cached_models`.
+    pub async fn set_cached_models_at(
+        &self,
+        kind: ProviderKind,
+        models: &[ProviderModel],
+        fetched_at: &str,
+    ) {
         let json = match serde_json::to_string(models) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let now = chrono::Utc::now().to_rfc3339();
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let _ = connection.execute(
             "INSERT INTO provider_model_cache (provider, fetched_at, models_json)
@@ -508,7 +520,7 @@ impl PersistenceService {
              ON CONFLICT(provider) DO UPDATE SET
                 fetched_at = excluded.fetched_at,
                 models_json = excluded.models_json",
-            params![provider_kind_to_str(kind), now, json],
+            params![provider_kind_to_str(kind), fetched_at, json],
         );
     }
 
