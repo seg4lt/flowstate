@@ -1,4 +1,5 @@
 import * as React from "react";
+import { CodeBlock as ShikiCodeBlock } from "./messages/code-block";
 import { MarkdownContent } from "./messages/markdown-content";
 
 // Per-tool args renderers. Looked up by tool name. The default falls
@@ -155,11 +156,16 @@ function ExitPlanModeRenderer({ args }: RendererProps) {
   );
 }
 
+// Wrapper that leans on the shared shiki-powered CodeBlock used by
+// MarkdownContent — gives Bash and friends real syntax highlighting
+// instead of a plain monospace blob. The shared component applies its
+// own mb-3 which collides with the tight tool-card layout, so we wrap
+// it in a zero-margin container and let the last:mb-0 rule take over.
 function CodeBlock({ language, code }: { language: string; code: string }) {
   return (
-    <pre className="max-h-64 overflow-auto rounded bg-muted p-2 text-[11px]">
-      <code className={`language-${language}`}>{code}</code>
-    </pre>
+    <div className="[&>*]:!mb-0 [&_pre]:!whitespace-pre-wrap [&_pre]:!break-words">
+      <ShikiCodeBlock code={code} language={language} />
+    </div>
   );
 }
 
