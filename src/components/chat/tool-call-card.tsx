@@ -34,7 +34,7 @@ function toolPreview(name: string, args: unknown): string | null {
     case "Write":
     case "Edit":
     case "NotebookEdit":
-      return basename(str("file_path")) ?? null;
+      return basename(str("file_path") ?? str("notebook_path")) ?? null;
     case "Glob":
     case "Grep":
       return str("pattern") ?? null;
@@ -43,6 +43,18 @@ function toolPreview(name: string, args: unknown): string | null {
       return str("description") ?? null;
     case "WebSearch":
       return str("query") ?? null;
+    case "Skill":
+      return str("skill") ?? null;
+    case "ScheduleWakeup":
+      return str("reason") ?? null;
+    case "ExitPlanMode": {
+      const plan = str("plan");
+      if (!plan) return null;
+      const firstLine = plan.split("\n").find((line) => line.trim().length > 0);
+      if (!firstLine) return null;
+      const cleaned = firstLine.replace(/^#+\s*/, "").trim();
+      return cleaned.length > 40 ? cleaned.slice(0, 40) + "…" : cleaned;
+    }
     default:
       return null;
   }

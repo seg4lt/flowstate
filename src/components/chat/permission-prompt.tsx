@@ -1,6 +1,6 @@
 import * as React from "react";
 import type { PermissionDecision, PermissionMode } from "@/lib/types";
-import { isPlanExitTool, renderToolArgs } from "./tool-renderers";
+import { isPlanExitTool, renderPlanBody, renderToolArgs } from "./tool-renderers";
 
 interface PermissionPromptProps {
   toolName: string;
@@ -141,9 +141,11 @@ function PlanExitPrompt({
   return (
     <div className="space-y-3">
       <div className="text-sm font-medium">Plan ready for review</div>
-      {/* The plan body — rendered as markdown via the ExitPlanMode renderer. */}
+      {/* The plan body — bare markdown so it sits flush inside the amber
+          banner. The framed variant lives in ExitPlanModeRenderer and is
+          used by the post-approval tool card. */}
       <div className="max-h-80 overflow-auto">
-        {renderToolArgs("ExitPlanMode", input)}
+        {renderPlanBody(input) ?? renderToolArgs("ExitPlanMode", input)}
       </div>
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">Approve and switch to:</span>
