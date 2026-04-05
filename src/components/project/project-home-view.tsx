@@ -245,7 +245,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   // resulting session_created lands in state.sessions before the
   // navigate fires.
   const startThreadOnWorktree = React.useCallback(
-    async (wt: GitWorktree) => {
+    async (wt: GitWorktree, provider: ProviderKind, model?: string) => {
       if (!projectPath) return;
       setOpeningWtPath(wt.path);
       try {
@@ -264,7 +264,8 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
         const res = await send({
           type: "start_session",
-          provider: defaultProvider,
+          provider,
+          model,
           project_id: wtProjectId,
         });
         if (res?.type === "session_created") {
@@ -297,7 +298,6 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       createProject,
       linkProjectWorktree,
       send,
-      defaultProvider,
       navigate,
     ],
   );
@@ -572,20 +572,26 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                           })}
                         </DropdownMenuContent>
                       </DropdownMenu>
-                      <button
-                        type="button"
-                        disabled={isOpening || isRemoving}
-                        onClick={() => void startThreadOnWorktree(wt)}
-                        title={`Start a new thread in ${label}`}
-                        className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium outline-none hover:bg-muted hover:text-foreground disabled:opacity-50 dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
-                      >
-                        {isOpening ? (
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                        ) : (
-                          <MessageSquarePlus className="h-3 w-3" />
-                        )}
-                        New thread
-                      </button>
+                      <ProviderDropdown
+                        onSelect={(provider, model) =>
+                          void startThreadOnWorktree(wt, provider, model)
+                        }
+                        trigger={
+                          <button
+                            type="button"
+                            disabled={isOpening || isRemoving}
+                            title={`Start a new thread in ${label}`}
+                            className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium outline-none hover:bg-muted hover:text-foreground disabled:opacity-50 dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
+                          >
+                            {isOpening ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <MessageSquarePlus className="h-3 w-3" />
+                            )}
+                            New thread
+                          </button>
+                        }
+                      />
                       <button
                         type="button"
                         aria-label={

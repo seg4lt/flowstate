@@ -61,9 +61,13 @@ interface ProviderDropdownProps {
    *  page to render the action as a sized button instead of the tiny
    *  hover-only icon the sidebar shows. */
   trigger?: React.ReactElement;
+  /** When provided, the dropdown calls this instead of creating a new
+   *  thread itself. Useful when the caller needs to run extra setup
+   *  (e.g. worktree provisioning) before starting the session. */
+  onSelect?: (provider: ProviderKind, model?: string) => void;
 }
 
-export function ProviderDropdown({ projectId, trigger }: ProviderDropdownProps) {
+export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropdownProps) {
   const { state, send } = useApp();
   const navigate = useNavigate();
 
@@ -71,6 +75,10 @@ export function ProviderDropdown({ projectId, trigger }: ProviderDropdownProps) 
   const stillLoading = !state.ready;
 
   async function createThread(provider: ProviderKind, model?: string) {
+    if (onSelect) {
+      onSelect(provider, model);
+      return;
+    }
     const res = await send({
       type: "start_session",
       provider,
