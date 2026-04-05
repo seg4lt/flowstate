@@ -1,4 +1,5 @@
 import * as React from "react";
+import { structuredPatch, formatPatch, OMIT_HEADERS } from "diff";
 import { CodeBlock as ShikiCodeBlock } from "./messages/code-block";
 import { MarkdownContent } from "./messages/markdown-content";
 
@@ -193,29 +194,62 @@ function BashRenderer({ args }: RendererProps) {
   );
 }
 
+/**
+ * Compute a compact unified diff string from old/new text snippets.
+ * Returns only hunk headers + content lines (no file headers),
+ * suitable for rendering with Shiki's "diff" language grammar.
+ */
+function buildUnifiedDiff(oldStr: string, newStr: string): string {
+  const a = oldStr.endsWith("\n") ? oldStr : oldStr + "\n";
+  const b = newStr.endsWith("\n") ? newStr : newStr + "\n";
+  const patch = structuredPatch("", "", a, b, undefined, undefined, {
+    context: 3,
+  });
+  return formatPatch(patch, OMIT_HEADERS).replace(/\n$/, "");
+}
+
+function DiffBlock({ oldStr, newStr }: { oldStr: string; newStr: string }) {
+  const diffText = React.useMemo(
+    () => buildUnifiedDiff(oldStr, newStr),
+    [oldStr, newStr],
+  );
+  return (
+    <div className="max-h-40 overflow-auto [&>*]:!mb-0">
+      <ShikiCodeBlock language="diff" code={diffText} />
+    </div>
+  );
+}
+
 function EditRenderer({ args }: RendererProps) {
   const a = asRecord(args);
   const path = asString(a.file_path) ?? asString(a.path);
   const oldStr = asString(a.old_string);
   const newStr = asString(a.new_string);
+  const hasBoth = oldStr !== undefined && newStr !== undefined;
   return (
     <div className="space-y-1.5">
       {path && <PathLine label="file" path={path} />}
-      {oldStr !== undefined && (
-        <div>
-          <p className="mb-1 text-[11px] text-muted-foreground">old</p>
-          <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px] text-destructive">
-            {oldStr}
-          </pre>
-        </div>
-      )}
-      {newStr !== undefined && (
-        <div>
-          <p className="mb-1 text-[11px] text-muted-foreground">new</p>
-          <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px] text-emerald-600 dark:text-emerald-400">
-            {newStr}
-          </pre>
-        </div>
+      {hasBoth ? (
+        <DiffBlock oldStr={oldStr} newStr={newStr} />
+      ) : (
+        <>
+          {oldStr !== undefined && (
+            <div>
+              <p className="mb-1 text-[11px] text-muted-foreground">old</p>
+              <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px] text-destructive">
+                {oldStr}
+              </pre>
+            </div>
+          )}
+          {newStr !== undefined && (
+            <div>
+              <p className="mb-1 text-[11px] text-muted-foreground">new</p>
+              <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px] text-emerald-600 dark:text-emerald-400">
+                {newStr}
+              </pre>
+            </div>
+          )}
+        </>
       )}
       {!path && oldStr === undefined && newStr === undefined && (
         <GenericArgsRenderer args={args} />
@@ -256,18 +290,27 @@ function MultiEditRenderer({ args }: RendererProps) {
         <div className="mt-2 space-y-2">
           {edits.map((edit, idx) => {
             const e = asRecord(edit);
+            const oldStr = asString(e.old_string);
+            const newStr = asString(e.new_string);
+            const hasBoth = oldStr !== undefined && newStr !== undefined;
             return (
               <div key={idx} className="space-y-1">
                 <p className="text-muted-foreground">edit {idx + 1}</p>
-                {asString(e.old_string) !== undefined && (
-                  <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-destructive">
-                    {asString(e.old_string)}
-                  </pre>
-                )}
-                {asString(e.new_string) !== undefined && (
-                  <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-emerald-600 dark:text-emerald-400">
-                    {asString(e.new_string)}
-                  </pre>
+                {hasBoth ? (
+                  <DiffBlock oldStr={oldStr} newStr={newStr} />
+                ) : (
+                  <>
+                    {oldStr !== undefined && (
+                      <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-destructive">
+                        {oldStr}
+                      </pre>
+                    )}
+                    {newStr !== undefined && (
+                      <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-emerald-600 dark:text-emerald-400">
+                        {newStr}
+                      </pre>
+                    )}
+                  </>
                 )}
               </div>
             );
