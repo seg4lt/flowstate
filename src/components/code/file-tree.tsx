@@ -32,17 +32,12 @@ export function FileTree({ files, selectedPath, onSelect }: FileTreeProps) {
   // cheap enough that we don't need persistent caching.
   const root = React.useMemo(() => buildTree(files), [files]);
 
-  // Track which directories are expanded. Default: top-level folders
-  // expanded so the user sees something on first open. Drilling
-  // deeper requires a click. Keyed by full directory path so state
+  // Track which directories are expanded. Start collapsed; the user
+  // expands folders manually. Keyed by full directory path so state
   // survives tree rebuilds (e.g. after a file refresh).
-  const [expanded, setExpanded] = React.useState<Set<string>>(() => {
-    const initial = new Set<string>();
-    for (const child of root.children ?? []) {
-      if (child.children) initial.add(child.path);
-    }
-    return initial;
-  });
+  const [expanded, setExpanded] = React.useState<Set<string>>(
+    () => new Set<string>(),
+  );
 
   const toggle = React.useCallback((path: string) => {
     setExpanded((prev) => {
