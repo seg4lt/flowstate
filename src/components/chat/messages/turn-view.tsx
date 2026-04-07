@@ -2,6 +2,7 @@ import * as React from "react";
 import { ChevronDown, ChevronUp } from "lucide-react";
 import type { AttachmentRef, ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
+import { ToolOutputContent } from "../tool-renderers";
 import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
 
@@ -276,9 +277,7 @@ function ToolCallGroup({
           {(parentCall?.output || parentCall?.error) && (
             <div className="mt-2 border-t border-border/30 pt-2">
               {parentCall?.output && (
-                <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 text-[11px] text-muted-foreground">
-                  {parentCall.output}
-                </pre>
+                <ToolOutputContent output={parentCall.output} />
               )}
               {parentCall?.error && (
                 <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 text-[11px] text-destructive">

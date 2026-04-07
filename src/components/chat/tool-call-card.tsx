@@ -1,7 +1,7 @@
 import * as React from "react";
 import { ChevronRight, Wrench } from "lucide-react";
 import type { ToolCall } from "@/lib/types";
-import { renderToolArgs } from "./tool-renderers";
+import { renderToolArgs, ToolOutputContent } from "./tool-renderers";
 
 interface ToolCallCardProps {
   toolCall: ToolCall;
@@ -100,9 +100,13 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
           {toolCall.output && (
             <div>
               <p className="mb-1 font-medium text-muted-foreground">Output</p>
-              <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]">
-                {toolCall.output}
-              </pre>
+              {toolCall.name === "Task" || toolCall.name === "Agent" ? (
+                <ToolOutputContent output={toolCall.output} />
+              ) : (
+                <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px]">
+                  {toolCall.output}
+                </pre>
+              )}
             </div>
           )}
           {toolCall.error && (

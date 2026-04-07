@@ -2,6 +2,7 @@ import * as React from "react";
 import { structuredPatch, formatPatch, OMIT_HEADERS } from "diff";
 import { CodeBlock as ShikiCodeBlock } from "./messages/code-block";
 import { MarkdownContent } from "./messages/markdown-content";
+import { extractToolOutputText } from "@/lib/parse-tool-output";
 
 // Per-tool args renderers. Looked up by tool name. The default falls
 // back to GenericArgsRenderer, which produces a labeled key/value view
@@ -487,6 +488,27 @@ function CollapsibleMarkdown({ label, body }: { label: string; body: string }) {
         <MarkdownContent content={body} />
       </div>
     </details>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sub-agent / Task output: parse the JSON content-block array and render
+// the extracted text as markdown inside a compact scrollable container.
+// Falls back to a plain <pre> when the output isn't the expected format.
+// ---------------------------------------------------------------------------
+export function ToolOutputContent({ output }: { output: string }) {
+  const { text, isMarkdown } = extractToolOutputText(output);
+  if (!isMarkdown) {
+    return (
+      <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 text-[11px] text-muted-foreground">
+        {text}
+      </pre>
+    );
+  }
+  return (
+    <div className="max-h-40 overflow-auto rounded bg-muted/60 p-2 text-xs text-muted-foreground [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_pre]:text-[10px]">
+      <MarkdownContent content={text} />
+    </div>
   );
 }
 
