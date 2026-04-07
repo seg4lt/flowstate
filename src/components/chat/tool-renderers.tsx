@@ -1,5 +1,6 @@
 import * as React from "react";
-import { structuredPatch, formatPatch, OMIT_HEADERS } from "diff";
+import { structuredPatch, formatPatch, FILE_HEADERS_ONLY } from "diff";
+import { PatchDiff } from "@pierre/diffs/react";
 import { CodeBlock as ShikiCodeBlock } from "./messages/code-block";
 import { MarkdownContent } from "./messages/markdown-content";
 import { extractToolOutputText } from "@/lib/parse-tool-output";
@@ -200,23 +201,45 @@ function BashRenderer({ args }: RendererProps) {
  * Returns only hunk headers + content lines (no file headers),
  * suitable for rendering with Shiki's "diff" language grammar.
  */
-function buildUnifiedDiff(oldStr: string, newStr: string): string {
+function buildUnifiedDiff(oldStr: string, newStr: string, filePath?: string): string {
   const a = oldStr.endsWith("\n") ? oldStr : oldStr + "\n";
   const b = newStr.endsWith("\n") ? newStr : newStr + "\n";
-  const patch = structuredPatch("", "", a, b, undefined, undefined, {
+  const name = filePath ?? "file";
+  const patch = structuredPatch(name, name, a, b, undefined, undefined, {
     context: 3,
   });
-  return formatPatch(patch, OMIT_HEADERS).replace(/\n$/, "");
+  return formatPatch(patch, FILE_HEADERS_ONLY).replace(/\n$/, "");
 }
 
-function DiffBlock({ oldStr, newStr }: { oldStr: string; newStr: string }) {
-  const diffText = React.useMemo(
-    () => buildUnifiedDiff(oldStr, newStr),
-    [oldStr, newStr],
+function DiffBlock({
+  oldStr,
+  newStr,
+  filePath,
+}: {
+  oldStr: string;
+  newStr: string;
+  filePath?: string;
+}) {
+  const patchText = React.useMemo(
+    () => buildUnifiedDiff(oldStr, newStr, filePath),
+    [oldStr, newStr, filePath],
   );
+  if (oldStr === newStr) return null;
   return (
-    <div className="max-h-40 overflow-auto [&>*]:!mb-0">
-      <ShikiCodeBlock language="diff" code={diffText} />
+    <div className="max-h-40 overflow-auto">
+      <PatchDiff
+        patch={patchText}
+        options={{
+          diffStyle: "unified",
+          theme: { dark: "pierre-dark", light: "pierre-light" },
+          themeType: "system",
+          diffIndicators: "classic",
+          overflow: "scroll",
+          disableFileHeader: true,
+          maxLineDiffLength: 2_000,
+          tokenizeMaxLineLength: 5_000,
+        }}
+      />
     </div>
   );
 }
@@ -231,7 +254,7 @@ function EditRenderer({ args }: RendererProps) {
     <div className="space-y-1.5">
       {path && <PathLine label="file" path={path} />}
       {hasBoth ? (
-        <DiffBlock oldStr={oldStr} newStr={newStr} />
+        <DiffBlock oldStr={oldStr} newStr={newStr} filePath={path} />
       ) : (
         <>
           {oldStr !== undefined && (
@@ -298,7 +321,7 @@ function MultiEditRenderer({ args }: RendererProps) {
               <div key={idx} className="space-y-1">
                 <p className="text-muted-foreground">edit {idx + 1}</p>
                 {hasBoth ? (
-                  <DiffBlock oldStr={oldStr} newStr={newStr} />
+                  <DiffBlock oldStr={oldStr} newStr={newStr} filePath={path} />
                 ) : (
                   <>
                     {oldStr !== undefined && (

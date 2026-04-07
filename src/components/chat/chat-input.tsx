@@ -103,23 +103,17 @@ export function ChatInput({
   );
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
 
-  // Land focus in the composer on every mount. ChatView keys this
-  // component by sessionId, so a thread switch remounts and re-fires
-  // this effect — the user can start typing immediately after
-  // clicking a different thread. Skipped when the composer is in a
-  // non-interactive state (archived history, provider down, disabled
-  // load phase) so we don't steal focus from modals or scroll a
-  // hidden element into view.
+  // Land focus in the composer on every mount *and* whenever the
+  // composer transitions from non-interactive → interactive. ChatView
+  // keys this component by sessionId, so a thread switch remounts and
+  // re-fires this effect. For newly created threads the session query
+  // is still loading on first mount (disabled=true); once the query
+  // resolves the deps change and focus is applied, so the user can
+  // start typing immediately.
   React.useEffect(() => {
     if (disabled || providerDisabled || archived) return;
     textareaRef.current?.focus();
-    // Empty deps: this is the per-mount autofocus hook. The values
-    // captured above are the authoritative "is this textarea
-    // interactive right now" read for the mount; later transitions
-    // (unarchive, provider re-enable) are rare enough that a user
-    // click is fine.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [disabled, providerDisabled, archived]);
 
   const isRunning = sessionStatus === "running";
 
