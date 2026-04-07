@@ -392,7 +392,6 @@ export function AppSidebar() {
                       {archivedGroups.map((group) => (
                         <Collapsible
                           key={group.key}
-                          defaultOpen
                           className="group/archived-project"
                         >
                           <SidebarMenuSubItem>
