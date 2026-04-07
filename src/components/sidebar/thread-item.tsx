@@ -200,9 +200,9 @@ export function ThreadItem({
         <span
           className={
             awaitingInput && !isActive
-              ? "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-medium text-blue-600 transition-opacity group-hover/thread:opacity-0 dark:text-blue-400"
+              ? "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-600 transition-opacity group-hover/thread:opacity-0 dark:bg-blue-900/40 dark:text-blue-400"
               : pendingDone && !isActive
-                ? "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-medium text-green-600 transition-opacity group-hover/thread:opacity-0 dark:text-green-400"
+                ? "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-600 transition-opacity group-hover/thread:opacity-0 dark:bg-green-900/40 dark:text-green-400"
                 : "pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground transition-opacity group-hover/thread:opacity-0"
           }
         >
