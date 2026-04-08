@@ -301,7 +301,7 @@ export const actions = {
       const shouldAutoTitle =
         turnCount === 0 && !existingDisplay?.title;
       const autoTitle = shouldAutoTitle
-        ? input.split(/\s+/).filter(Boolean).slice(0, 6).join(" ") || null
+        ? input.split(/\s+/).filter(Boolean).slice(0, 10).join(" ") || null
         : null;
       const nextDisplay: SessionDisplay = {
         title: autoTitle ?? existingDisplay?.title ?? null,
