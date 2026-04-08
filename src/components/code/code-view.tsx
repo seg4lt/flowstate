@@ -25,6 +25,7 @@ import {
 } from "@/lib/api";
 import { projectFilesQueryOptions } from "@/lib/queries";
 import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
+import { useTheme } from "@/hooks/use-theme";
 import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
 
@@ -902,6 +903,7 @@ const CodeViewBody = React.memo(function CodeViewBody({
   filesError,
   hasProject,
 }: CodeViewBodyProps) {
+  const { resolvedTheme } = useTheme();
   if (!hasProject) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-muted-foreground">
@@ -956,7 +958,7 @@ const CodeViewBody = React.memo(function CodeViewBody({
         }}
         options={{
           theme: { dark: "pierre-dark", light: "pierre-light" },
-          themeType: "system",
+          themeType: resolvedTheme,
           overflow: "scroll",
           tokenizeMaxLineLength: 5_000,
         }}

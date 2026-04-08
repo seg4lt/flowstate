@@ -680,12 +680,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           setPendingInput(null);
           setLastEventAt(Date.now());
           setStuckSince(null);
-          // Only refresh the diff if the user has actually opened
-          // the panel at some point in this view's lifetime. Before
-          // then the badge sits on whatever the initial mount fetch
-          // produced and we skip the git call entirely — critical
-          // on slow repos.
-          if (diffPanelEverOpenedRef.current) refreshDiffs();
+          // Activate and refresh the diff subscription so the badge
+          // reflects the current working-tree state after reconnection.
+          activateDiffSubscription();
+          refreshDiffs();
         }
         return;
       }
@@ -736,15 +734,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
         case "turn_completed":
           setPendingInput(null);
-          // Turn-wise refresh: every completed turn restarts the
-          // streamed diff subscription so the panel reflects what
-          // this turn left on disk — but only if the user has
-          // activated the subscription at least once (opened or
-          // hovered the Diff button). A 20-turn session on a slow
-          // repo with the panel untouched used to waste 20 full
-          // diff runs; now it wastes zero, and the first button
-          // interaction arms the subscription.
-          if (diffPanelEverOpenedRef.current) refreshDiffs();
+          // Every completed turn activates the diff subscription
+          // (idempotent after the first call) and restarts it so
+          // the badge reflects what this turn left on disk. The
+          // git work runs entirely on the Rust side via Tauri IPC
+          // — non-blocking for the UI.
+          activateDiffSubscription();
+          refreshDiffs();
           break;
 
         // permission_requested / user_question_asked are handled in
@@ -765,7 +761,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => {
       active = false;
     };
-  }, [queryClient, navigate, refreshDiffs]);
+  }, [queryClient, navigate, refreshDiffs, activateDiffSubscription]);
 
   async function handleSend(input: string, images: AttachedImage[] = []) {
     if (isArchived) {

@@ -1,9 +1,10 @@
 import * as React from "react";
-import { Loader2, RefreshCw } from "lucide-react";
+import { Loader2, Monitor, Moon, RefreshCw, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Switch } from "@/components/ui/switch";
 import { useApp } from "@/stores/app-store";
+import { useTheme, type ThemePreference } from "@/hooks/use-theme";
 import { toast } from "@/hooks/use-toast";
 import { getAppDataDir } from "@/lib/api";
 import {
@@ -42,6 +43,44 @@ const PROVIDER_ORDER: ProviderKind[] = [
   "github_copilot",
   "github_copilot_cli",
 ];
+
+const THEME_OPTIONS: {
+  value: ThemePreference;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  { value: "light", label: "Light", icon: Sun },
+  { value: "dark", label: "Dark", icon: Moon },
+  { value: "system", label: "System", icon: Monitor },
+];
+
+function ThemeRow() {
+  const { preference, setTheme } = useTheme();
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Theme</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Choose light, dark, or sync with your operating system.
+        </div>
+      </div>
+      <div className="flex gap-1">
+        {THEME_OPTIONS.map((opt) => (
+          <Button
+            key={opt.value}
+            variant={preference === opt.value ? "default" : "outline"}
+            size="sm"
+            onClick={() => setTheme(opt.value)}
+          >
+            <opt.icon className="h-4 w-4" />
+            {opt.label}
+          </Button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function SettingsGroup({
   title,
@@ -420,6 +459,12 @@ export function SettingsView() {
       </header>
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-6 py-8">
+          <SettingsGroup
+            title="Appearance"
+            description="Customize how Flowzen looks."
+          >
+            <ThemeRow />
+          </SettingsGroup>
           <SettingsGroup
             title="Providers"
             description="Toggle which providers are available, and refresh their cached model lists. Models are cached for 24 hours by default."

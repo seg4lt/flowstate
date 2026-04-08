@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { getGitDiffFile, type GitFileContents } from "@/lib/api";
 import type { DiffStreamStatus } from "@/lib/git-diff-stream";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
+import { useTheme } from "@/hooks/use-theme";
 
 export type DiffStyle = "split" | "unified";
 
@@ -358,6 +359,7 @@ const DiffBody = React.memo(function DiffBody({
   style,
   hasBeenVisible,
 }: DiffBodyProps) {
+  const { resolvedTheme } = useTheme();
   if (!hasBeenVisible) {
     return (
       <div
@@ -411,7 +413,7 @@ const DiffBody = React.memo(function DiffBody({
       options={{
         diffStyle: style,
         theme: { dark: "pierre-dark", light: "pierre-light" },
-        themeType: "system",
+        themeType: resolvedTheme,
         diffIndicators: "classic",
         overflow: "scroll",
         // Skip character-level intra-line diffing on very long

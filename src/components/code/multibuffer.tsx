@@ -4,6 +4,7 @@ import { MultiFileDiff } from "@pierre/diffs/react";
 import type { FileDiffMetadata } from "@pierre/diffs/react";
 import { Button } from "@/components/ui/button";
 import { readProjectFile, type ContentBlock } from "@/lib/api";
+import { useTheme } from "@/hooks/use-theme";
 
 // Zed-style multibuffer for content-search results, rendered via
 // `@pierre/diffs` MultiFileDiff. Trick: we build a synthetic "before"
@@ -139,6 +140,7 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
   projectPath,
   onOpenFile,
 }: FileMatchGroupProps) {
+  const { resolvedTheme } = useTheme();
   const sectionRef = React.useRef<HTMLElement>(null);
   const [hasBeenVisible, setHasBeenVisible] = React.useState(false);
   const [contents, setContents] = React.useState<string | null>(null);
@@ -328,7 +330,7 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
           // before file is meaningless to look at on its own.
           diffStyle: "unified",
           theme: { dark: "pierre-dark", light: "pierre-light" },
-          themeType: "system",
+          themeType: resolvedTheme,
           // Drop the +/- gutter prefix; the line tint already
           // signals a match and the prefix would look diff-y.
           diffIndicators: "none",
