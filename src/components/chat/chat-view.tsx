@@ -828,7 +828,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       const autoTitle = input
         .split(/\s+/)
         .filter(Boolean)
-        .slice(0, 6)
+        .slice(0, 10)
         .join(" ");
       if (autoTitle.length > 0) {
         void renameSession(sessionId, autoTitle);
