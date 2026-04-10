@@ -26,7 +26,6 @@ const PRELOAD_LANGS: BundledLanguage[] = [
   "java",
   "ruby",
   "php",
-  "diff",
 ];
 
 const THEME = "github-dark";

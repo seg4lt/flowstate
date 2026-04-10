@@ -3,6 +3,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { CodeBlock } from "./code-block";
+import { DiffCodeBlock } from "./diff-code-block";
 
 interface MarkdownContentProps {
   content: string;
@@ -126,6 +127,9 @@ const components: Components = {
         .map((c) => (c.type === "text" ? c.value : ""))
         .join("")
         .replace(/\n$/, "");
+      if (language === "diff") {
+        return <DiffCodeBlock code={code} />;
+      }
       return <CodeBlock code={code} language={language} />;
     }
     // Defensive fallback: unexpected pre structure, render plain.
