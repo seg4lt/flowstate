@@ -37,6 +37,7 @@ import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
+import { LiveTodoPanel } from "./live-todo-panel";
 import { StuckBanner } from "./stuck-banner";
 import { DiffPanel, type DiffStyle } from "./diff-panel";
 import { ImageLightbox } from "./image-lightbox";
@@ -1112,6 +1113,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             onLoadOlder={handleLoadOlder}
             onOpenAttachment={handleOpenPersistedAttachment}
           />
+
+          {isRunning && runningTurn && (
+            <LiveTodoPanel toolCalls={runningTurn.toolCalls} />
+          )}
 
           {isRunning && session && runningTurn && (
             <WorkingIndicator

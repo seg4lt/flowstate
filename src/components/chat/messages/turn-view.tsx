@@ -5,6 +5,7 @@ import { ToolCallCard } from "../tool-call-card";
 import { ToolOutputContent } from "../tool-renderers";
 import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
+import { TurnTodoPanel } from "./turn-todo-panel";
 
 const GROUP_DEFAULT_VISIBLE = 5;
 
@@ -92,7 +93,15 @@ function groupBlocks(
         return;
       }
 
-      const parent = callsById.get(block.callId)?.parentCallId;
+      const tc = callsById.get(block.callId);
+      if (tc && tc.name === "TodoWrite" && tc.parentCallId === undefined) {
+        // Pinned at the top of the turn via TurnTodoPanel; skip the
+        // inline render. Do NOT break currentMainGroup — keep
+        // surrounding main-agent tool calls in one clean streak.
+        return;
+      }
+
+      const parent = tc?.parentCallId;
 
       if (parent === undefined) {
         // Main agent — sequential grouping.
@@ -342,6 +351,19 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
     [item.blocks, callsById],
   );
 
+  // Latest main-agent TodoWrite for the pinned panel. Subagent
+  // TodoWrite calls (parentCallId set) stay inline inside their
+  // subagent box via the existing TodoWriteRenderer path.
+  const latestMainTodoWrite = React.useMemo(() => {
+    const calls = item.toolCalls;
+    if (!calls) return null;
+    for (let i = calls.length - 1; i >= 0; i--) {
+      const tc = calls[i];
+      if (tc.name === "TodoWrite" && tc.parentCallId === undefined) return tc;
+    }
+    return null;
+  }, [item.toolCalls]);
+
   // Index of the trailing text block in the grouped stream so the
   // blinking cursor only attaches to the very last text run while
   // the turn is still streaming.
@@ -362,6 +384,10 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
           attachments={item.inputAttachments}
           onOpenAttachment={onOpenAttachment}
         />
+      )}
+
+      {latestMainTodoWrite && !item.streaming && (
+        <TurnTodoPanel toolCall={latestMainTodoWrite} />
       )}
 
       {!hasAnyContent && item.streaming && (

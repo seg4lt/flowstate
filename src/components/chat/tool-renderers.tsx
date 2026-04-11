@@ -465,10 +465,7 @@ function AskUserQuestionRenderer({ args }: RendererProps) {
   );
 }
 
-function TodoWriteRenderer({ args }: RendererProps) {
-  const a = asRecord(args);
-  const todos = Array.isArray(a.todos) ? a.todos : null;
-  if (!todos) return <GenericArgsRenderer args={args} />;
+export function TodoList({ todos }: { todos: unknown[] }) {
   return (
     <ul className="space-y-1 text-xs">
       {todos.map((todo, idx) => {
@@ -488,6 +485,13 @@ function TodoWriteRenderer({ args }: RendererProps) {
       })}
     </ul>
   );
+}
+
+function TodoWriteRenderer({ args }: RendererProps) {
+  const a = asRecord(args);
+  const todos = Array.isArray(a.todos) ? a.todos : null;
+  if (!todos) return <GenericArgsRenderer args={args} />;
+  return <TodoList todos={todos} />;
 }
 
 function CollapsibleMarkdown({ label, body }: { label: string; body: string }) {
