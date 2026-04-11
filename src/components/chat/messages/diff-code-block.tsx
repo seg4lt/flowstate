@@ -3,6 +3,9 @@ import { PatchDiff } from "@pierre/diffs/react";
 
 interface DiffCodeBlockProps {
   code: string;
+  /** Underlying language for syntax highlighting (used as file extension in
+   *  synthetic diff headers so @pierre/diffs can infer the grammar). */
+  language?: string;
 }
 
 /**
@@ -10,7 +13,7 @@ interface DiffCodeBlockProps {
  * If it already has proper headers (--- / +++ / @@), return as-is.
  * Otherwise, wrap bare +/- lines with synthetic headers.
  */
-function ensureUnifiedPatch(raw: string): string {
+function ensureUnifiedPatch(raw: string, ext: string): string {
   if (/^---\s/m.test(raw) && /^\+\+\+\s/m.test(raw) && /^@@\s/m.test(raw)) {
     return raw;
   }
@@ -31,15 +34,18 @@ function ensureUnifiedPatch(raw: string): string {
   }
 
   return [
-    "--- a/file",
-    "+++ b/file",
+    `--- a/file.${ext}`,
+    `+++ b/file.${ext}`,
     `@@ -1,${oldCount} +1,${newCount} @@`,
     ...lines,
   ].join("\n");
 }
 
-function DiffCodeBlockInner({ code }: DiffCodeBlockProps) {
-  const patch = React.useMemo(() => ensureUnifiedPatch(code), [code]);
+function DiffCodeBlockInner({ code, language = "tsx" }: DiffCodeBlockProps) {
+  const patch = React.useMemo(
+    () => ensureUnifiedPatch(code, language),
+    [code, language],
+  );
 
   return (
     <div className="mb-3 overflow-x-auto rounded-md border border-border text-xs last:mb-0">
@@ -62,5 +68,5 @@ function DiffCodeBlockInner({ code }: DiffCodeBlockProps) {
 
 export const DiffCodeBlock = React.memo(
   DiffCodeBlockInner,
-  (prev, next) => prev.code === next.code,
+  (prev, next) => prev.code === next.code && prev.language === next.language,
 );

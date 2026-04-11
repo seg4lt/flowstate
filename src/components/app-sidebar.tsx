@@ -315,7 +315,7 @@ export function AppSidebar() {
                           <ChevronRight className="h-4 w-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
                         </button>
                       </CollapsibleTrigger>
-                      <div className="absolute right-1 top-1 flex items-center gap-0.5">
+                      <div className="absolute right-1 top-1 flex items-center gap-1">
                         <button
                           type="button"
                           title="Remove project"

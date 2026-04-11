@@ -127,8 +127,13 @@ const components: Components = {
         .map((c) => (c.type === "text" ? c.value : ""))
         .join("")
         .replace(/\n$/, "");
-      if (language === "diff") {
-        return <DiffCodeBlock code={code} />;
+      if (language === "diff" || language?.startsWith("diff-")) {
+        // Support ```diff-tsx, ```diff-python, etc. to specify the
+        // underlying language for syntax highlighting inside diffs.
+        const diffLang = language?.startsWith("diff-")
+          ? language.slice("diff-".length)
+          : undefined;
+        return <DiffCodeBlock code={code} language={diffLang} />;
       }
       return <CodeBlock code={code} language={language} />;
     }
