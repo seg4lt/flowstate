@@ -37,7 +37,11 @@ import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
-import { LiveTodoPanel } from "./live-todo-panel";
+import { AgentContextPanel } from "./agent-context-panel";
+import {
+  findLatestMainTodoWrite,
+  parseTodoProgress,
+} from "@/lib/todo-extract";
 import { StuckBanner } from "./stuck-banner";
 import { DiffPanel, type DiffStyle } from "./diff-panel";
 import { ImageLightbox } from "./image-lightbox";
@@ -57,6 +61,10 @@ const DIFF_STYLE_KEY = "flowzen:diff-style";
 const DIFF_MIN_WIDTH = 360;
 const DIFF_DEFAULT_WIDTH = 560;
 const DIFF_CHAT_MIN_WIDTH = 420;
+
+const CONTEXT_WIDTH_KEY = "flowzen:context-width";
+const CONTEXT_MIN_WIDTH = 320;
+const CONTEXT_DEFAULT_WIDTH = 440;
 
 interface PermissionRequest {
   requestId: string;
@@ -196,15 +204,23 @@ function applyEventToTurns(
 // against the split container's right edge so the panel grows from
 // the right as the mouse moves left. The handle lives inline between
 // the two flex children (not absolutely positioned) to avoid z-index
-// fights with the sidebar handle and other overlays.
-function DiffDragHandle({
+// fights with the sidebar handle and other overlays. Generic over
+// storageKey/minWidth so both the diff pane and the agent-context
+// pane can reuse the same primitive with their own persisted width.
+function PanelDragHandle({
   containerRef,
   width,
   onResize,
+  storageKey,
+  minWidth,
+  ariaLabel,
 }: {
   containerRef: React.RefObject<HTMLDivElement | null>;
   width: number;
   onResize: (w: number) => void;
+  storageKey: string;
+  minWidth: number;
+  ariaLabel: string;
 }) {
   const draggingRef = React.useRef(false);
   const latestWidthRef = React.useRef(width);
@@ -218,11 +234,11 @@ function DiffDragHandle({
       if (!draggingRef.current || !containerRef.current) return;
       const rect = containerRef.current.getBoundingClientRect();
       const maxWidth = Math.max(
-        DIFF_MIN_WIDTH,
+        minWidth,
         Math.floor(rect.width - DIFF_CHAT_MIN_WIDTH),
       );
       const next = Math.max(
-        DIFF_MIN_WIDTH,
+        minWidth,
         Math.min(maxWidth, Math.round(rect.right - e.clientX)),
       );
       latestWidthRef.current = next;
@@ -235,7 +251,7 @@ function DiffDragHandle({
       document.body.style.userSelect = "";
       try {
         window.localStorage.setItem(
-          DIFF_WIDTH_KEY,
+          storageKey,
           String(latestWidthRef.current),
         );
       } catch {
@@ -248,12 +264,12 @@ function DiffDragHandle({
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [containerRef, onResize]);
+  }, [containerRef, onResize, storageKey, minWidth]);
 
   return (
     <div
       role="separator"
-      aria-label="Resize diff panel"
+      aria-label={ariaLabel}
       aria-orientation="vertical"
       className="w-1 shrink-0 cursor-col-resize bg-border/50 hover:bg-border"
       onMouseDown={(e) => {
@@ -464,6 +480,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       /* storage may be unavailable */
     }
   }, []);
+
+  // Agent-context pane state — mirrors the diff pane state. The two
+  // panes are mutually exclusive (enforced in the toggle handlers
+  // below); they share the split-right slot inside splitContainerRef.
+  const [contextOpen, setContextOpen] = React.useState(false);
+  const [contextFullscreen, setContextFullscreen] = React.useState(false);
+  const [contextWidth, setContextWidth] = React.useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem(CONTEXT_WIDTH_KEY);
+      if (saved) {
+        const parsed = Number.parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= CONTEXT_MIN_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      /* storage may be unavailable */
+    }
+    return CONTEXT_DEFAULT_WIDTH;
+  });
 
   // Look up the active session first, then fall back to the archived
   // list so the chat view can render read-only history for an archived
@@ -929,6 +965,29 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return null;
   }, [isRunning, turns]);
 
+  // Progress badge for the Agent Context button in the header — ticks
+  // live off the latest main-agent TodoWrite anywhere in the session,
+  // prefers the running turn when one is in flight.
+  const todoProgress = React.useMemo(() => {
+    const found = findLatestMainTodoWrite(turns, runningTurn);
+    const parsed = parseTodoProgress(found);
+    if (!parsed) return null;
+    return { completed: parsed.completed, total: parsed.total };
+  }, [turns, runningTurn]);
+
+  const handleToggleContext = React.useCallback(() => {
+    setContextOpen((v) => {
+      const next = !v;
+      if (next) {
+        setDiffOpen(false);
+        setDiffFullscreen(false);
+      } else {
+        setContextFullscreen(false);
+      }
+      return next;
+    });
+  }, []);
+
   // Is there at least one tool call on the running turn still waiting
   // for its completion event? That's the precondition for the
   // stuck-watchdog: we don't care about ordinary model thinking
@@ -1061,6 +1120,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             projectPath={projectPath}
             diffs={diffs}
             diffOpen={diffOpen}
+            contextOpen={contextOpen}
+            todoProgress={todoProgress}
+            onToggleContext={handleToggleContext}
             onToggleDiff={() => {
               setDiffOpen((v) => {
                 if (!v) {
@@ -1074,6 +1136,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                   // new subscription's Phase 1 lands.
                   activateDiffSubscription();
                   refreshDiffs({ force: true });
+                  // Mutual exclusion with the agent-context pane:
+                  // opening diff closes context and drops its
+                  // fullscreen so the split-right slot is clean.
+                  setContextOpen(false);
+                  setContextFullscreen(false);
+                } else {
+                  setDiffFullscreen(false);
                 }
                 return !v;
               });
@@ -1100,7 +1169,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <div
           className={cn(
             "flex min-w-0 flex-col",
-            diffFullscreen ? "hidden" : "flex-1",
+            diffFullscreen || contextFullscreen ? "hidden" : "flex-1",
           )}
         >
           <MessageList
@@ -1113,10 +1182,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             onLoadOlder={handleLoadOlder}
             onOpenAttachment={handleOpenPersistedAttachment}
           />
-
-          {isRunning && runningTurn && (
-            <LiveTodoPanel toolCalls={runningTurn.toolCalls} />
-          )}
 
           {isRunning && session && runningTurn && (
             <WorkingIndicator
@@ -1209,10 +1274,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         {diffOpen && (
           <>
             {!diffFullscreen && (
-              <DiffDragHandle
+              <PanelDragHandle
                 containerRef={splitContainerRef}
                 width={diffWidth}
                 onResize={setDiffWidth}
+                storageKey={DIFF_WIDTH_KEY}
+                minWidth={DIFF_MIN_WIDTH}
+                ariaLabel="Resize diff panel"
               />
             )}
             <aside
@@ -1235,6 +1303,39 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 }}
                 isFullscreen={diffFullscreen}
                 onToggleFullscreen={() => setDiffFullscreen((v) => !v)}
+              />
+            </aside>
+          </>
+        )}
+
+        {contextOpen && (
+          <>
+            {!contextFullscreen && (
+              <PanelDragHandle
+                containerRef={splitContainerRef}
+                width={contextWidth}
+                onResize={setContextWidth}
+                storageKey={CONTEXT_WIDTH_KEY}
+                minWidth={CONTEXT_MIN_WIDTH}
+                ariaLabel="Resize agent context panel"
+              />
+            )}
+            <aside
+              className={cn(
+                "border-l border-border bg-background",
+                contextFullscreen ? "flex-1" : "shrink-0",
+              )}
+              style={contextFullscreen ? undefined : { width: contextWidth }}
+            >
+              <AgentContextPanel
+                turns={turns}
+                runningTurn={runningTurn}
+                onClose={() => {
+                  setContextOpen(false);
+                  setContextFullscreen(false);
+                }}
+                isFullscreen={contextFullscreen}
+                onToggleFullscreen={() => setContextFullscreen((v) => !v)}
               />
             </aside>
           </>

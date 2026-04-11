@@ -1,7 +1,14 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { Check, ChevronDown, Diff, FolderOpen, Search } from "lucide-react";
+import {
+  Check,
+  ChevronDown,
+  Compass,
+  Diff,
+  FolderOpen,
+  Search,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -25,6 +32,12 @@ interface HeaderActionsProps {
   // throttling lives upstream — this component doesn't care whether
   // the callback is idempotent or not.
   onHoverDiff?: () => void;
+  contextOpen: boolean;
+  onToggleContext: () => void;
+  // Live `N of M` badge shown on the context button whenever the
+  // session's latest main-agent TodoWrite has at least one item.
+  // Null hides the badge entirely.
+  todoProgress: { completed: number; total: number } | null;
 }
 
 // Known editors we offer in the Open dropdown. Each `command` is
@@ -69,6 +82,9 @@ export function HeaderActions({
   diffOpen,
   onToggleDiff,
   onHoverDiff,
+  contextOpen,
+  onToggleContext,
+  todoProgress,
 }: HeaderActionsProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -172,6 +188,24 @@ export function HeaderActions({
   return (
     <div className="flex items-center gap-1">
       <Button
+        variant={contextOpen ? "secondary" : "outline"}
+        size="xs"
+        onClick={onToggleContext}
+        aria-pressed={contextOpen}
+        title={
+          contextOpen
+            ? "Hide agent context"
+            : "Show agent context (plan + todos)"
+        }
+      >
+        <Compass className="h-3 w-3" />
+        {todoProgress && (
+          <span className="tabular-nums text-muted-foreground">
+            {todoProgress.completed} of {todoProgress.total}
+          </span>
+        )}
+      </Button>
+      <Button
         variant={diffOpen ? "secondary" : "outline"}
         size="xs"
         onClick={onToggleDiff}
@@ -205,7 +239,6 @@ export function HeaderActions({
         title="Search project files"
       >
         <Search className="h-3 w-3" />
-        Search
       </Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
@@ -224,7 +257,6 @@ export function HeaderActions({
             className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
           >
             <FolderOpen className="h-3 w-3" />
-            Open
             <ChevronDown className="h-3 w-3" />
           </button>
         </DropdownMenuTrigger>

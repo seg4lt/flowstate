@@ -968,7 +968,7 @@ const CodeViewBody = React.memo(function CodeViewBody({
 });
 
 // ──────────────────────────────────────────────────────────────
-// TreeDragHandle — mirrors DiffDragHandle in chat-view.tsx but
+// TreeDragHandle — mirrors PanelDragHandle in chat-view.tsx but
 // resizes from the LEFT edge instead of the right. Width grows as
 // you drag right; persisted to localStorage on mouse-up.
 // ──────────────────────────────────────────────────────────────
