@@ -66,21 +66,25 @@ export function listGitWorktrees(path: string): Promise<GitWorktree[]> {
 }
 
 // Create a new linked worktree at `worktreePath` rooted in
-// `projectPath`, on a newly-created branch `branch` based off
-// `baseRef`. Git runs `worktree add -b <branch> <worktreePath>
-// <baseRef>`. On success returns the freshly-parsed GitWorktree
-// entry so the caller can avoid an extra list round-trip.
+// `projectPath`. When `checkoutExisting` is false (default), git
+// runs `worktree add -b <branch> <worktreePath> <baseRef>` to
+// create a new branch. When `checkoutExisting` is true, git runs
+// `worktree add <worktreePath> <branch>` to check out an existing
+// branch. On success returns the freshly-parsed GitWorktree entry
+// so the caller can avoid an extra list round-trip.
 export function createGitWorktree(
   projectPath: string,
   worktreePath: string,
   branch: string,
   baseRef: string,
+  checkoutExisting?: boolean,
 ): Promise<GitWorktree> {
   return invoke<GitWorktree>("create_git_worktree", {
     projectPath,
     worktreePath,
     branch,
     baseRef,
+    checkoutExisting: checkoutExisting ?? false,
   });
 }
 

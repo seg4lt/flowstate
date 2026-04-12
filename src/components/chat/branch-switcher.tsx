@@ -5,7 +5,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { GitBranch, Loader2, Plus, Trash2 } from "lucide-react";
+import { FolderGit2, GitBranch, Loader2, Plus } from "lucide-react";
 
 import {
   Popover,
@@ -20,21 +20,15 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { cn } from "@/lib/utils";
 import {
-  createGitWorktree,
   gitCheckout,
   gitCreateBranch,
-  removeGitWorktree,
   type GitWorktree,
 } from "@/lib/api";
-import {
-  gitBranchListQueryOptions,
-  gitWorktreeListQueryOptions,
-} from "@/lib/queries";
+import { gitBranchListQueryOptions } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import { useApp } from "@/stores/app-store";
-import { readWorktreeBasePath } from "@/lib/worktree-settings";
+import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import type { ProviderKind } from "@/lib/types";
 
 interface BranchSwitcherProps {
@@ -56,17 +50,11 @@ interface BranchSwitcherProps {
   provider: ProviderKind;
   model: string | null;
   onCheckedOut: () => void;
-  /** Which tab opens first. Defaults to "branches" to match the
-   *  chat-header usage. The project-home page passes "worktrees"
-   *  for its Worktrees action button. */
-  initialTab?: Tab;
   /** Override the default popover trigger. Used by the project-home
    *  page to render the button as a sized action card instead of the
    *  tiny inline branch label the chat header shows. */
   trigger?: React.ReactElement;
 }
-
-type Tab = "branches" | "worktrees";
 
 export function BranchSwitcher({
   projectPath,
@@ -76,24 +64,21 @@ export function BranchSwitcher({
   provider,
   model,
   onCheckedOut,
-  initialTab = "branches",
   trigger,
 }: BranchSwitcherProps) {
   const [open, setOpen] = React.useState(false);
-  const [tab, setTab] = React.useState<Tab>(initialTab);
   const [checkoutError, setCheckoutError] = React.useState<string | null>(null);
   const [pendingBranch, setPendingBranch] = React.useState<string | null>(null);
 
-  // Worktree-side state. Separate from branch state so errors don't
-  // cross-contaminate and the force-delete retry can remember which
-  // worktree to retry against.
-  const [worktreeError, setWorktreeError] = React.useState<string | null>(
-    null,
-  );
-  const [pendingWorktreePath, setPendingWorktreePath] = React.useState<
-    string | null
-  >(null);
-  const [failedRemoval, setFailedRemoval] = React.useState<string | null>(null);
+  // Worktree dialog state — tracks whether the dialog is open and
+  // what initial values to seed it with. Opened either from the
+  // "Create Worktree" suggestion (new branch) or from the FolderGit2
+  // icon button on an existing branch row (checkout existing).
+  const [wtDialog, setWtDialog] = React.useState<{
+    open: boolean;
+    branchName: string;
+    checkoutExisting: boolean;
+  }>({ open: false, branchName: "", checkoutExisting: false });
 
   const queryClient = useQueryClient();
   const navigate = useNavigate();
@@ -101,11 +86,7 @@ export function BranchSwitcher({
 
   const branchListQuery = useQuery({
     ...gitBranchListQueryOptions(projectPath),
-    enabled: open && tab === "branches",
-  });
-  const worktreeListQuery = useQuery({
-    ...gitWorktreeListQueryOptions(projectPath),
-    enabled: open && tab === "worktrees",
+    enabled: open,
   });
 
   const invalidateAfterBranchChange = React.useCallback(() => {
@@ -174,11 +155,8 @@ export function BranchSwitcher({
   React.useEffect(() => {
     if (open) {
       setCheckoutError(null);
-      setWorktreeError(null);
-      setFailedRemoval(null);
-      setTab(initialTab);
     }
-  }, [open, initialTab]);
+  }, [open]);
 
   // Find-or-create flow for opening a worktree as a flowzen thread.
   // Each worktree has its own SDK project (so the agent SDK's existing
@@ -190,11 +168,6 @@ export function BranchSwitcher({
   // group worktree threads under the main repo's project header.
   const openWorktreeSession = React.useCallback(
     async (wt: GitWorktree) => {
-      // 1. Find the SDK project whose path matches this worktree (or
-      //    create it if we haven't linked it yet). The main repo is
-      //    already its own SDK project — clicking "main" in the
-      //    worktree list resolves to the parent project_id directly
-      //    and no new project is created.
       let wtProjectId =
         state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
 
@@ -204,12 +177,9 @@ export function BranchSwitcher({
         wtProjectId = await createProject(wt.path, displayName);
         await linkProjectWorktree(wtProjectId, parentProjectId, wt.branch);
       } else if (!isParent && !state.projectWorktrees.has(wtProjectId)) {
-        // SDK project existed but wasn't linked yet (e.g. orphan from
-        // a previous run). Link it now so the sidebar groups it.
         await linkProjectWorktree(wtProjectId, parentProjectId, wt.branch);
       }
 
-      // 2. Find an existing session for this SDK project, or start one.
       const existing = Array.from(state.sessions.values()).find(
         (s) => s.projectId === wtProjectId,
       );
@@ -259,133 +229,32 @@ export function BranchSwitcher({
     ],
   );
 
-  const createWorktreeMutation = useMutation({
-    mutationFn: async (typedName: string) => {
-      setPendingBranch(typedName);
-      // Read the user-overridable base path each time — cheap
-      // sqlite lookup, and keeping it off state means the setting
-      // takes effect immediately without a popover remount.
-      const configuredBase = await readWorktreeBasePath();
-      const wtPath = deriveWorktreePath(
-        parentProjectPath,
-        typedName,
-        configuredBase,
-      );
-      const wt = await createGitWorktree(
-        parentProjectPath,
-        wtPath,
-        typedName,
-        currentBranch,
-      );
-      return wt;
+  const openWorktreeDialog = React.useCallback(
+    (branchName: string, checkoutExisting: boolean) => {
+      setWtDialog({ open: true, branchName, checkoutExisting });
     },
-    onSuccess: async (wt, name) => {
-      setPendingBranch(null);
-      setCheckoutError(null);
-      queryClient.invalidateQueries({
-        queryKey: ["git", "worktree-list", projectPath],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["git", "worktree-list", parentProjectPath],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["git", "branch-list", projectPath],
-      });
-      toast({
-        title: `Created worktree ${name}`,
-        description: `Based off ${currentBranch}`,
-        duration: 2500,
-      });
-      await openWorktreeSession(wt);
-    },
-    onError: (err, name) => {
-      setPendingBranch(null);
-      const msg = err instanceof Error ? err.message : String(err);
-      setWorktreeError(msg);
-      toast({
-        title: `Failed to create worktree ${name}`,
-        description: msg,
-        duration: 6000,
-      });
-    },
-  });
-
-  const removeWorktreeMutation = useMutation({
-    mutationFn: async (args: { wtPath: string; force: boolean }) => {
-      setPendingWorktreePath(args.wtPath);
-      await removeGitWorktree(parentProjectPath, args.wtPath, args.force);
-      return args.wtPath;
-    },
-    onSuccess: (wtPath) => {
-      setPendingWorktreePath(null);
-      setWorktreeError(null);
-      setFailedRemoval(null);
-      queryClient.invalidateQueries({
-        queryKey: ["git", "worktree-list", projectPath],
-      });
-      queryClient.invalidateQueries({
-        queryKey: ["git", "worktree-list", parentProjectPath],
-      });
-      toast({
-        title: "Worktree removed",
-        description: wtPath,
-        duration: 2500,
-      });
-    },
-    onError: (err, vars) => {
-      setPendingWorktreePath(null);
-      const msg = err instanceof Error ? err.message : String(err);
-      setWorktreeError(msg);
-      // Stash the path so the inline "Force delete" button knows
-      // what to retry without reopening the row.
-      setFailedRemoval(vars.wtPath);
-    },
-  });
+    [],
+  );
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        {trigger ?? (
-          <button
-            type="button"
-            className="inline-flex min-w-0 cursor-pointer items-center gap-1 truncate text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground"
-          >
-            <GitBranch className="h-3 w-3 shrink-0" />
-            <span className="truncate">{currentBranch}</span>
-          </button>
-        )}
-      </PopoverTrigger>
-      <PopoverContent
-        align="start"
-        sideOffset={6}
-        className="w-80 gap-0 p-0"
-      >
-        <div
-          role="tablist"
-          aria-label="Branch switcher tabs"
-          className="flex items-center gap-1 border-b border-border p-1"
-          onKeyDown={(e) => {
-            if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-              e.preventDefault();
-              setTab((t) => (t === "branches" ? "worktrees" : "branches"));
-            }
-          }}
+    <>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          {trigger ?? (
+            <button
+              type="button"
+              className="inline-flex min-w-0 cursor-pointer items-center gap-1 truncate text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground"
+            >
+              <GitBranch className="h-3 w-3 shrink-0" />
+              <span className="truncate">{currentBranch}</span>
+            </button>
+          )}
+        </PopoverTrigger>
+        <PopoverContent
+          align="start"
+          sideOffset={6}
+          className="w-80 gap-0 p-0"
         >
-          <TabButton
-            active={tab === "branches"}
-            onClick={() => setTab("branches")}
-          >
-            Branches
-          </TabButton>
-          <TabButton
-            active={tab === "worktrees"}
-            onClick={() => setTab("worktrees")}
-          >
-            Worktrees
-          </TabButton>
-        </div>
-
-        {tab === "branches" ? (
           <BranchesPanel
             query={branchListQuery}
             currentBranch={currentBranch}
@@ -401,68 +270,25 @@ export function BranchSwitcher({
               })
             }
             onCreateBranch={(name) => createMutation.mutate(name)}
+            onOpenWorktreeDialog={openWorktreeDialog}
             checkoutError={checkoutError}
           />
-        ) : (
-          <WorktreesPanel
-            query={worktreeListQuery}
-            currentBranch={currentBranch}
-            currentSessionProjectPath={projectPath}
-            pendingWorktreePath={pendingWorktreePath}
-            pendingCreateName={
-              createWorktreeMutation.isPending ? pendingBranch : null
-            }
-            isBusy={
-              createWorktreeMutation.isPending ||
-              removeWorktreeMutation.isPending
-            }
-            onOpenWorktree={(wt) => void openWorktreeSession(wt)}
-            onCreateWorktree={(name) => createWorktreeMutation.mutate(name)}
-            onRemoveWorktree={(wtPath) =>
-              removeWorktreeMutation.mutate({ wtPath, force: false })
-            }
-            worktreeError={worktreeError}
-            failedRemoval={failedRemoval}
-            onForceDelete={() => {
-              if (failedRemoval) {
-                removeWorktreeMutation.mutate({
-                  wtPath: failedRemoval,
-                  force: true,
-                });
-              }
-            }}
-          />
-        )}
-      </PopoverContent>
-    </Popover>
-  );
-}
+        </PopoverContent>
+      </Popover>
 
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      tabIndex={active ? 0 : -1}
-      onClick={onClick}
-      className={cn(
-        "rounded-md px-2.5 py-1 text-xs font-medium outline-none transition-colors",
-        active
-          ? "bg-muted text-foreground"
-          : "text-muted-foreground hover:text-foreground",
-      )}
-    >
-      {children}
-    </button>
+      <CreateWorktreeDialog
+        open={wtDialog.open}
+        onOpenChange={(v) => setWtDialog((prev) => ({ ...prev, open: v }))}
+        projectPath={parentProjectPath}
+        currentBranch={currentBranch}
+        initialBranchName={wtDialog.branchName}
+        initialCheckoutExisting={wtDialog.checkoutExisting}
+        onCreated={(wt) => {
+          setOpen(false);
+          void openWorktreeSession(wt);
+        }}
+      />
+    </>
   );
 }
 
@@ -474,6 +300,7 @@ function BranchesPanel({
   onCheckoutLocal,
   onCheckoutRemote,
   onCreateBranch,
+  onOpenWorktreeDialog,
   checkoutError,
 }: {
   query: ReturnType<typeof useQuery<import("@/lib/api").GitBranchList>>;
@@ -487,6 +314,9 @@ function BranchesPanel({
     localExists: boolean,
   ) => void;
   onCreateBranch: (name: string) => void;
+  /** Open the create-worktree dialog pre-filled with the given branch
+   *  name and checkout-existing toggle value. */
+  onOpenWorktreeDialog: (branchName: string, checkoutExisting: boolean) => void;
   checkoutError: string | null;
 }) {
   const [search, setSearch] = React.useState("");
@@ -500,9 +330,6 @@ function BranchesPanel({
   const showCreate = React.useMemo(() => {
     if (trimmedSearch === "") return false;
     if (locals.includes(trimmedSearch)) return false;
-    // `origin/feature/x` → local candidate `feature/x`; if the typed
-    // name matches any remote-derived local candidate, treat it as an
-    // existing branch rather than offering create.
     for (const remoteRef of remotes) {
       const slash = remoteRef.indexOf("/");
       const localName =
@@ -545,7 +372,7 @@ function BranchesPanel({
                   <Plus className="mt-0.5 shrink-0" />
                   <div className="flex min-w-0 flex-col gap-0.5">
                     <span className="truncate text-sm">
-                      Create Branch: "{trimmedSearch}"
+                      Create branch: "{trimmedSearch}"
                     </span>
                     <span className="truncate text-[11px] text-muted-foreground">
                       Based off {current}
@@ -554,6 +381,26 @@ function BranchesPanel({
                   {pendingBranch === trimmedSearch && (
                     <Loader2 className="ml-auto animate-spin" />
                   )}
+                </CommandItem>
+                <CommandItem
+                  forceMount
+                  value={`__create_worktree__${trimmedSearch}`}
+                  keywords={[trimmedSearch]}
+                  disabled={isBusy}
+                  onSelect={() =>
+                    onOpenWorktreeDialog(trimmedSearch, false)
+                  }
+                  className="items-start gap-2 py-2"
+                >
+                  <FolderGit2 className="mt-0.5 shrink-0" />
+                  <div className="flex min-w-0 flex-col gap-0.5">
+                    <span className="truncate text-sm">
+                      Create worktree: "{trimmedSearch}"
+                    </span>
+                    <span className="truncate text-[11px] text-muted-foreground">
+                      New branch based off {current}
+                    </span>
+                  </div>
                 </CommandItem>
               </CommandGroup>
             )}
@@ -572,11 +419,27 @@ function BranchesPanel({
                         if (isCurrent) return;
                         onCheckoutLocal(name);
                       }}
+                      className="pr-2"
                     >
                       <GitBranch className="shrink-0 opacity-70" />
-                      <span className="truncate">{name}</span>
-                      {isPending && (
-                        <Loader2 className="ml-auto animate-spin" />
+                      <span className="min-w-0 flex-1 truncate">{name}</span>
+                      {isPending ? (
+                        <Loader2 className="order-1 shrink-0 animate-spin" />
+                      ) : (
+                        <button
+                          type="button"
+                          aria-label={`Create worktree from ${name}`}
+                          title="Create worktree from this branch"
+                          className="order-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            onOpenWorktreeDialog(name, true);
+                          }}
+                          onMouseDown={(e) => e.stopPropagation()}
+                        >
+                          <FolderGit2 className="h-3.5 w-3.5" />
+                        </button>
                       )}
                     </CommandItem>
                   );
@@ -599,11 +462,27 @@ function BranchesPanel({
                       onSelect={() => {
                         onCheckoutRemote(remoteRef, localName, localExists);
                       }}
+                      className="pr-2"
                     >
                       <GitBranch className="shrink-0 opacity-50" />
-                      <span className="truncate">{remoteRef}</span>
-                      {isPending && (
-                        <Loader2 className="ml-auto animate-spin" />
+                      <span className="min-w-0 flex-1 truncate">{remoteRef}</span>
+                      {isPending ? (
+                        <Loader2 className="order-1 shrink-0 animate-spin" />
+                      ) : (
+                        <button
+                          type="button"
+                          aria-label={`Create worktree from ${localName}`}
+                          title="Create worktree from this branch"
+                          className="order-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            onOpenWorktreeDialog(localName, true);
+                          }}
+                          onMouseDown={(e) => e.stopPropagation()}
+                        >
+                          <FolderGit2 className="h-3.5 w-3.5" />
+                        </button>
                       )}
                     </CommandItem>
                   );
@@ -621,208 +500,3 @@ function BranchesPanel({
     </Command>
   );
 }
-
-function WorktreesPanel({
-  query,
-  currentBranch,
-  currentSessionProjectPath,
-  pendingWorktreePath,
-  pendingCreateName,
-  isBusy,
-  onOpenWorktree,
-  onCreateWorktree,
-  onRemoveWorktree,
-  worktreeError,
-  failedRemoval,
-  onForceDelete,
-}: {
-  query: ReturnType<typeof useQuery<GitWorktree[]>>;
-  currentBranch: string;
-  /** The current session's project path — used to mark the row the
-   *  user is currently "in" and hide its delete button (git refuses
-   *  to remove the active worktree anyway, but hiding the button up
-   *  front avoids confusing errors). */
-  currentSessionProjectPath: string;
-  pendingWorktreePath: string | null;
-  pendingCreateName: string | null;
-  isBusy: boolean;
-  onOpenWorktree: (wt: GitWorktree) => void;
-  onCreateWorktree: (name: string) => void;
-  onRemoveWorktree: (wtPath: string) => void;
-  worktreeError: string | null;
-  failedRemoval: string | null;
-  onForceDelete: () => void;
-}) {
-  const [search, setSearch] = React.useState("");
-  const worktrees = query.data ?? [];
-
-  const trimmedSearch = search.trim();
-  const showCreate = React.useMemo(() => {
-    if (trimmedSearch === "") return false;
-    // Only show create if the typed name doesn't exactly match an
-    // existing worktree's branch or last path segment.
-    for (const wt of worktrees) {
-      if (wt.branch === trimmedSearch) return false;
-      const tail = wt.path.split("/").filter(Boolean).pop() ?? "";
-      if (tail === trimmedSearch) return false;
-    }
-    return true;
-  }, [trimmedSearch, worktrees]);
-
-  return (
-    <Command>
-      <CommandInput
-        placeholder="Select or create worktree…"
-        autoFocus
-        value={search}
-        onValueChange={setSearch}
-      />
-      <CommandList className="max-h-[min(60vh,24rem)] overflow-y-auto">
-        {query.isLoading && !query.data ? (
-          <div className="px-3 py-4 text-xs text-muted-foreground">
-            Loading worktrees…
-          </div>
-        ) : query.isError ? (
-          <div className="px-3 py-4 text-xs text-destructive">
-            {(query.error as Error).message}
-          </div>
-        ) : (
-          <>
-            {!showCreate && <CommandEmpty>No worktree matches.</CommandEmpty>}
-            {showCreate && (
-              <CommandGroup forceMount>
-                <CommandItem
-                  forceMount
-                  value={`__create_worktree__${trimmedSearch}`}
-                  keywords={[trimmedSearch]}
-                  disabled={isBusy}
-                  onSelect={() => onCreateWorktree(trimmedSearch)}
-                  className="items-start gap-2 py-2"
-                >
-                  <Plus className="mt-0.5 shrink-0" />
-                  <div className="flex min-w-0 flex-col gap-0.5">
-                    <span className="truncate text-sm">
-                      Create Worktree: "{trimmedSearch}"
-                    </span>
-                    <span className="truncate text-[11px] text-muted-foreground">
-                      Based off {currentBranch}
-                    </span>
-                  </div>
-                  {pendingCreateName === trimmedSearch && (
-                    <Loader2 className="ml-auto animate-spin" />
-                  )}
-                </CommandItem>
-              </CommandGroup>
-            )}
-            <CommandGroup>
-              {worktrees.map((wt) => {
-                const label = wt.branch ?? "(detached)";
-                const shortSha = wt.head ? wt.head.slice(0, 7) : "";
-                const searchValue = `${label} ${wt.path} ${shortSha}`;
-                const isCurrent = wt.path === currentSessionProjectPath;
-                const isPending = pendingWorktreePath === wt.path;
-                return (
-                  <CommandItem
-                    key={wt.path}
-                    value={searchValue}
-                    disabled={isBusy}
-                    onSelect={() => onOpenWorktree(wt)}
-                    className="items-start gap-2 py-2 pr-2"
-                  >
-                    <GitBranch className="mt-0.5 shrink-0 opacity-70" />
-                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                      <span className="truncate text-sm">{label}</span>
-                      <span className="truncate text-[11px] text-muted-foreground">
-                        {shortSha && (
-                          <>
-                            <span className="font-mono">{shortSha}</span>
-                            <span className="mx-1 opacity-60">•</span>
-                          </>
-                        )}
-                        {wt.path}
-                      </span>
-                    </div>
-                    {isPending ? (
-                      <Loader2 className="ml-auto animate-spin" />
-                    ) : (
-                      !isCurrent && (
-                        <button
-                          type="button"
-                          aria-label={`Delete worktree ${label}`}
-                          className="ml-auto inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-destructive/10 hover:text-destructive"
-                          onClick={(e) => {
-                            // Prevent cmdk from treating this as a
-                            // row select — deleting a worktree should
-                            // not also open it.
-                            e.preventDefault();
-                            e.stopPropagation();
-                            onRemoveWorktree(wt.path);
-                          }}
-                          onMouseDown={(e) => e.stopPropagation()}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      )
-                    )}
-                  </CommandItem>
-                );
-              })}
-            </CommandGroup>
-          </>
-        )}
-      </CommandList>
-      {worktreeError && (
-        <div className="max-h-40 overflow-y-auto border-t border-border bg-destructive/10 p-2 text-[11px] text-destructive">
-          <pre className="whitespace-pre-wrap font-mono">{worktreeError}</pre>
-          {failedRemoval && (
-            <button
-              type="button"
-              className="mt-2 inline-flex h-6 items-center justify-center rounded-md border border-destructive/40 px-2 text-[11px] font-medium text-destructive outline-none hover:bg-destructive/20"
-              onClick={onForceDelete}
-            >
-              Force delete
-            </button>
-          )}
-        </div>
-      )}
-    </Command>
-  );
-}
-
-// Derive the on-disk folder path for a new worktree. Convention:
-// `<base>/<project-name>-worktrees/<project-name>-<sanitized>`
-// where `<base>` is either the user's configured worktree base path
-// from Settings or — when unset — `<dirname(parent-project-path)>/worktrees`,
-// `<project-name>` is the basename of the main project path, and
-// `<sanitized>` is the typed branch name lowercased with
-// non-alphanumeric characters collapsed to hyphens.
-function deriveWorktreePath(
-  parentProjectPath: string,
-  name: string,
-  configuredBase: string | null,
-): string {
-  const projectName = basename(parentProjectPath);
-  const sanitized = name
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-  const base =
-    configuredBase && configuredBase.length > 0
-      ? configuredBase
-      : `${dirname(parentProjectPath)}/worktrees`;
-  return `${base}/${projectName}-worktrees/${projectName}-${sanitized}`;
-}
-
-function basename(p: string): string {
-  const stripped = p.endsWith("/") ? p.slice(0, -1) : p;
-  const idx = stripped.lastIndexOf("/");
-  return idx >= 0 ? stripped.slice(idx + 1) : stripped;
-}
-
-function dirname(p: string): string {
-  const stripped = p.endsWith("/") ? p.slice(0, -1) : p;
-  const idx = stripped.lastIndexOf("/");
-  return idx >= 0 ? stripped.slice(0, idx) : ".";
-}
-

@@ -9,6 +9,7 @@ import {
   GitBranch,
   Loader2,
   MessageSquarePlus,
+  Plus,
   Search,
   Trash2,
 } from "lucide-react";
@@ -39,6 +40,7 @@ import {
   type GitWorktree,
 } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
+import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import type {
   AggregatedFileDiff,
 } from "@/lib/session-diff";
@@ -203,6 +205,9 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   const [failedRemovalPath, setFailedRemovalPath] = React.useState<
     string | null
   >(null);
+
+  // Create-worktree dialog visibility.
+  const [createWtOpen, setCreateWtOpen] = React.useState(false);
 
   // Diff dialog target — null when closed, the selected worktree
   // when the user clicks a row's diff button. The dialog body
@@ -450,13 +455,23 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       <div className="flex min-h-0 min-w-0 flex-1">
         <div className="min-w-0 flex-1 overflow-auto">
           <div className="mx-auto max-w-3xl p-6">
-            <div className="mb-3 flex items-baseline justify-between gap-2">
+            <div className="mb-3 flex items-center justify-between gap-2">
               <h2 className="text-sm font-medium">Worktrees</h2>
-            <span className="text-[11px] text-muted-foreground">
-              {worktreeQuery.isLoading
-                ? "Loading…"
-                : `${worktrees.length} ${worktrees.length === 1 ? "worktree" : "worktrees"}`}
-            </span>
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] text-muted-foreground">
+                  {worktreeQuery.isLoading
+                    ? "Loading…"
+                    : `${worktrees.length} ${worktrees.length === 1 ? "worktree" : "worktrees"}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCreateWtOpen(true)}
+                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
+                >
+                  <Plus className="h-3 w-3" />
+                  Create worktree
+                </button>
+              </div>
           </div>
 
           {worktreeQuery.isError ? (
@@ -465,7 +480,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
             </div>
           ) : worktrees.length === 0 && !worktreeQuery.isLoading ? (
             <div className="rounded-md border border-dashed border-border p-6 text-center text-xs text-muted-foreground">
-              No worktrees found. Create one from the branch switcher.
+              No worktrees found.
             </div>
           ) : (
             <ul className="space-y-2">
@@ -647,6 +662,17 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           </aside>
         )}
       </div>
+
+      <CreateWorktreeDialog
+        open={createWtOpen}
+        onOpenChange={setCreateWtOpen}
+        projectPath={projectPath}
+        currentBranch={currentBranch}
+        onCreated={(wt) => {
+          void worktreeQuery.refetch();
+          void startThreadOnWorktree(wt, defaultProvider);
+        }}
+      />
     </div>
   );
 }

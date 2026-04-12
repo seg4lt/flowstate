@@ -303,19 +303,28 @@ fn git_create_branch(path: String, branch: String) -> Result<(), String> {
 }
 
 /// Create a new git worktree for `project_path` at `worktree_path`.
-/// Runs `git -C <project_path> worktree add -b <branch> <worktree_path>
-/// <base_ref>`. The `base_ref` is typically the current HEAD or branch
-/// name the user wants to fork from. Returns the freshly-listed
-/// `GitWorktree` entry for the new path so the frontend can hydrate
-/// caches without a second round-trip. Stderr is forwarded verbatim
-/// on failure so errors like "pathspec is already checked out" or
-/// "a branch named X already exists" surface to the user.
+///
+/// When `checkout_existing` is `None` or `Some(false)` (the default),
+/// runs `git -C <project_path> worktree add -b <branch> <worktree_path>
+/// <base_ref>` to create a brand-new branch forked from `base_ref`.
+///
+/// When `checkout_existing` is `Some(true)`, runs
+/// `git -C <project_path> worktree add <worktree_path> <branch>` to
+/// check out an already-existing local or remote-tracking branch into
+/// the new worktree without creating a new branch.
+///
+/// Returns the freshly-listed `GitWorktree` entry for the new path so
+/// the frontend can hydrate caches without a second round-trip.
+/// Stderr is forwarded verbatim on failure so errors like
+/// "pathspec is already checked out" or "a branch named X already
+/// exists" surface to the user.
 #[tauri::command]
 fn create_git_worktree(
     project_path: String,
     worktree_path: String,
     branch: String,
     base_ref: String,
+    checkout_existing: Option<bool>,
 ) -> Result<GitWorktree, String> {
     if branch.trim().is_empty() {
         return Err("empty branch name".into());
@@ -323,19 +332,35 @@ fn create_git_worktree(
     if worktree_path.trim().is_empty() {
         return Err("empty worktree path".into());
     }
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &project_path,
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &worktree_path,
-            &base_ref,
-        ])
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
+    let output = if checkout_existing.unwrap_or(false) {
+        // Check out an existing branch into the new worktree.
+        Command::new("git")
+            .args([
+                "-C",
+                &project_path,
+                "worktree",
+                "add",
+                &worktree_path,
+                &branch,
+            ])
+            .output()
+            .map_err(|e| format!("failed to run git: {e}"))?
+    } else {
+        // Create a new branch and check it out into the new worktree.
+        Command::new("git")
+            .args([
+                "-C",
+                &project_path,
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &worktree_path,
+                &base_ref,
+            ])
+            .output()
+            .map_err(|e| format!("failed to run git: {e}"))?
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
