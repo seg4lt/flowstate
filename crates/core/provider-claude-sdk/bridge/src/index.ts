@@ -624,8 +624,46 @@ class ClaudeBridge {
           subtype: string;
           result?: string;
           session_id?: string;
+          usage?: {
+            input_tokens: number;
+            output_tokens: number;
+            cache_creation_input_tokens?: number | null;
+            cache_read_input_tokens?: number | null;
+          };
+          modelUsage?: Record<
+            string,
+            { contextWindow?: number; costUSD?: number }
+          >;
+          total_cost_usd?: number;
+          duration_ms?: number;
         };
         if (r.session_id) this.resumeSessionId = r.session_id;
+        // Forward token usage before returning the output text so the
+        // runtime-core drain loop sees a TurnUsage event before the
+        // turn finalises. Picks the first (usually only) key in
+        // modelUsage as the source of truth for contextWindow — the
+        // Claude SDK reports per-model totals but a single Flowzen
+        // turn runs on one model at a time.
+        if (r.usage) {
+          const modelKey = r.modelUsage
+            ? Object.keys(r.modelUsage)[0]
+            : undefined;
+          const mu = modelKey ? r.modelUsage![modelKey] : undefined;
+          writeStream({
+            event: 'turn_usage',
+            usage: {
+              inputTokens: r.usage.input_tokens,
+              outputTokens: r.usage.output_tokens,
+              cacheCreationInputTokens:
+                r.usage.cache_creation_input_tokens ?? null,
+              cacheReadInputTokens: r.usage.cache_read_input_tokens ?? null,
+              contextWindow: mu?.contextWindow ?? null,
+              totalCostUsd: r.total_cost_usd ?? null,
+              durationMs: r.duration_ms ?? null,
+              model: modelKey ?? null,
+            },
+          });
+        }
         if (r.subtype === 'success') {
           return r.result ?? '';
         }

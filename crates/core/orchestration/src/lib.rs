@@ -66,6 +66,7 @@ impl OrchestrationService {
             // is created and the per-image write_attachment() calls
             // succeed.
             input_attachments: Vec::new(),
+            usage: None,
         };
 
         session.summary.status = SessionStatus::Running;

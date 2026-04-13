@@ -373,6 +373,29 @@ pub struct AttachmentData {
     pub name: Option<String>,
 }
 
+/// Per-turn token accounting, populated from the Claude SDK's final
+/// result message. All fields optional because older providers and
+/// interrupted turns may not carry a full breakdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u64>,
+    /// Model's max context window (from SDKResultMessage.modelUsage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnRecord {
@@ -406,6 +429,11 @@ pub struct TurnRecord {
     /// lazily via `get_attachment` when the user clicks a chip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_attachments: Vec<AttachmentRef>,
+    /// Token usage and cost reported by the provider when the turn
+    /// finished. Absent on interrupted/failed turns and on providers
+    /// that don't surface usage data yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 // Display-only fields (`name`, `sort_order` here; `title`,
@@ -583,6 +611,11 @@ pub enum ProviderTurnEvent {
         title: String,
         steps: Vec<PlanStep>,
         raw: String,
+    },
+    /// Token usage for the current turn, emitted once when the
+    /// provider's final result message arrives.
+    TurnUsage {
+        usage: TokenUsage,
     },
 }
 

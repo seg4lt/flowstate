@@ -11,8 +11,8 @@ use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, ContentBlock, FileChangeRecord, ImageAttachment,
     PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
     ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
-    SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, ToolCall, ToolCallStatus,
-    TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
+    SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, TokenUsage, ToolCall,
+    ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -1155,6 +1155,7 @@ impl RuntimeCore {
         let mut file_changes: Vec<FileChangeRecord> = Vec::new();
         let mut subagents: Vec<SubagentRecord> = Vec::new();
         let mut plan: Option<PlanRecord> = None;
+        let mut usage: Option<TokenUsage> = None;
         // Ordered content stream — text, reasoning, and tool-call positions
         // captured in the exact order events arrived. Adjacent text or
         // reasoning deltas coalesce into the trailing block; a tool call
@@ -1177,6 +1178,7 @@ impl RuntimeCore {
             &subagents,
             &plan,
             &blocks,
+            &usage,
         );
 
         while let Some(ev) = event_rx.recv().await {
@@ -1362,6 +1364,9 @@ impl RuntimeCore {
                         error,
                     });
                 }
+                ProviderTurnEvent::TurnUsage { usage: u } => {
+                    usage = Some(u);
+                }
                 ProviderTurnEvent::PlanProposed {
                     plan_id,
                     title,
@@ -1400,6 +1405,7 @@ impl RuntimeCore {
                 &subagents,
                 &plan,
                 &blocks,
+                &usage,
             );
         }
 
@@ -1503,6 +1509,7 @@ impl RuntimeCore {
             t.subagents = subagents;
             t.plan = plan;
             t.blocks = blocks;
+            t.usage = usage;
             t.clone()
         } else {
             finished
@@ -1685,6 +1692,7 @@ fn write_in_flight_snapshot(
     subagents: &[SubagentRecord],
     plan: &Option<PlanRecord>,
     blocks: &[ContentBlock],
+    usage: &Option<TokenUsage>,
 ) {
     let mut snap = base.clone();
     snap.output = accumulated.to_string();
@@ -1698,6 +1706,7 @@ fn write_in_flight_snapshot(
     snap.subagents = subagents.to_vec();
     snap.plan = plan.clone();
     snap.blocks = blocks.to_vec();
+    snap.usage = usage.clone();
     if let Ok(mut map) = in_flight_turns.write() {
         map.insert(session_id.to_string(), snap);
     }
@@ -2703,6 +2712,7 @@ mod tests {
             reasoning_effort: None,
             blocks: Vec::new(),
             input_attachments: Vec::new(),
+            usage: None,
         });
         persistence.upsert_session(session).await;
 

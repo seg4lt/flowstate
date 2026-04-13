@@ -260,6 +260,8 @@ enum BridgeResponse {
         raw: Option<String>,
         #[serde(default)]
         nested_event: Option<Value>,
+        #[serde(default)]
+        usage: Option<Value>,
     },
 }
 
@@ -701,6 +703,7 @@ impl ClaudeSdkAdapter {
                     steps,
                     raw,
                     nested_event,
+                    usage,
                 } => {
                     // Log every non-delta stream event so "stuck"
                     // bugs are diagnosable from the log alone: if the
@@ -764,6 +767,13 @@ impl ClaudeSdkAdapter {
                             };
                             let _ = q_tx.send((req_id_for_writer, outcome));
                         });
+                    }
+                    "turn_usage" => {
+                        if let Some(u) = usage
+                            .and_then(|v| serde_json::from_value::<zenui_provider_api::TokenUsage>(v).ok())
+                        {
+                            events.send(ProviderTurnEvent::TurnUsage { usage: u }).await;
+                        }
                     }
                     other_event => {
                         forward_stream(

@@ -1147,6 +1147,10 @@ fn load_session(
             // Filled in by the per-session JOIN below so we don't pay
             // an extra query per turn.
             input_attachments: Vec::new(),
+            // Usage is transient — we don't persist it to sqlite yet.
+            // Historical turns reload with no usage; fresh turns
+            // populate it via ProviderTurnEvent::TurnUsage.
+            usage: None,
         })
     };
     let mut turns: Vec<TurnRecord> = match turn_limit_param {
