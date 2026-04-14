@@ -40,7 +40,7 @@ export function ChatToolbar({
         <span className="text-xs text-muted-foreground">{providerLabel}</span>
       )}
       <div className="ml-auto">
-        <ContextDisplay />
+        <ContextDisplay sessionId={sessionId} />
       </div>
     </div>
   );

@@ -105,6 +105,18 @@ export interface SubagentRecord {
   status: SubagentStatus;
 }
 
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationInputTokens?: number;
+  cacheReadInputTokens?: number;
+  /** Model's max context window, as reported by the SDK's modelUsage. */
+  contextWindow?: number;
+  totalCostUsd?: number;
+  durationMs?: number;
+  model?: string;
+}
+
 export interface TurnRecord {
   turnId: string;
   input: string;
@@ -124,6 +136,10 @@ export interface TurnRecord {
    * live on disk and are fetched lazily via `get_attachment` when the
    * user clicks a chip. */
   inputAttachments?: AttachmentRef[];
+  /** Token accounting and cost, set once per turn from the provider's
+   * final result message. Absent on interrupted/failed turns and on
+   * providers that don't surface usage yet. */
+  usage?: TokenUsage;
 }
 
 /** Pre-send (in-flux) image — lives in ChatInput state until submit.
