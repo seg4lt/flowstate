@@ -374,6 +374,29 @@ class CopilotBridge {
     // Subscribe to streaming events. Each returns an unsubscribe fn.
     const unsubs: Array<() => void> = [];
     let deltasSeen = 0;
+    // Context-window usage buffered from `session.usage_info` so that
+    // when `assistant.usage` fires we can compose a full turn_usage
+    // event in one shot. The Copilot SDK reports these in two
+    // separate events, so we hold the latest context snapshot here.
+    let latestTokenLimit: number | null = null;
+    let latestCurrentTokens: number | null = null;
+
+    // Copilot quota ids come from the SDK's `quotaSnapshots` map —
+    // known ids include "chat", "completions", "premium_interactions".
+    // Pretty-print the ones we know about, title-case the rest as a
+    // safe default so arbitrary future ids still read reasonably.
+    const copilotQuotaLabel = (id: string): string => {
+      const known: Record<string, string> = {
+        chat: 'Chat',
+        completions: 'Completions',
+        premium_interactions: 'Premium interactions',
+      };
+      if (known[id]) return known[id];
+      return id
+        .split('_')
+        .map((w) => (w.length > 0 ? w[0].toUpperCase() + w.slice(1) : w))
+        .join(' ');
+    };
 
     // Text deltas
     unsubs.push(
@@ -449,6 +472,93 @@ class CopilotBridge {
         const msg: string = event?.data?.message ?? 'Unknown Copilot error';
         console.error(`[bridge] Session error: ${msg}`);
         writeStream({ event: 'info', message: `Copilot error: ${msg}` });
+      }),
+    );
+
+    // Context window snapshot. Buffered; flushed when assistant.usage
+    // fires with concrete per-turn tokens.
+    unsubs.push(
+      this.session.on('session.usage_info', (event: any) => {
+        const d = event?.data ?? {};
+        if (typeof d.tokenLimit === 'number') latestTokenLimit = d.tokenLimit;
+        if (typeof d.currentTokens === 'number')
+          latestCurrentTokens = d.currentTokens;
+      }),
+    );
+
+    // Per-API-call token usage + rate-limit snapshots. Composes a
+    // turn_usage event combining the per-call tokens with the
+    // latest buffered context-window info, and fans out one
+    // rate_limit_update per quotaSnapshot entry.
+    unsubs.push(
+      this.session.on('assistant.usage', (event: any) => {
+        const d = event?.data ?? {};
+        if (d.inputTokens != null || d.outputTokens != null) {
+          // Prefer `currentTokens` from session.usage_info as the
+          // authoritative "how full is the window" reading —
+          // Copilot's SDK computes that for us, so we surface it
+          // via output_tokens being the delta we just added. Keep
+          // the contextWindow denominator from tokenLimit so the
+          // Flowzen UI renders N / M correctly.
+          writeStream({
+            event: 'turn_usage',
+            usage: {
+              inputTokens: latestCurrentTokens ?? d.inputTokens ?? 0,
+              outputTokens: d.outputTokens ?? 0,
+              cacheReadTokens: d.cacheReadTokens ?? null,
+              cacheWriteTokens: d.cacheWriteTokens ?? null,
+              contextWindow: latestTokenLimit ?? null,
+              totalCostUsd: d.cost ?? null,
+              durationMs: d.duration ?? null,
+              model: d.model ?? null,
+            },
+          });
+        }
+
+        const snapshots = d.quotaSnapshots as
+          | Record<
+              string,
+              {
+                isUnlimitedEntitlement?: boolean;
+                entitlementRequests?: number;
+                usedRequests?: number;
+                remainingPercentage?: number;
+                resetDate?: string;
+                overage?: number;
+                usageAllowedWithExhaustedQuota?: boolean;
+              }
+            >
+          | undefined;
+        if (snapshots) {
+          for (const [bucketId, q] of Object.entries(snapshots)) {
+            if (q.isUnlimitedEntitlement) continue;
+            const remaining = q.remainingPercentage ?? 1;
+            const utilization = Math.max(0, Math.min(1, 1 - remaining));
+            const isUsingOverage = (q.overage ?? 0) > 0;
+            const exhausted = utilization >= 1;
+            const status = exhausted
+              ? q.usageAllowedWithExhaustedQuota
+                ? 'allowed_warning'
+                : 'rejected'
+              : utilization >= 0.8
+                ? 'allowed_warning'
+                : 'allowed';
+            const resetsAt = q.resetDate
+              ? Date.parse(q.resetDate)
+              : null;
+            writeStream({
+              event: 'rate_limit_update',
+              rate_limit_info: {
+                bucket: bucketId,
+                label: copilotQuotaLabel(bucketId),
+                status,
+                utilization,
+                resetsAt: Number.isFinite(resetsAt) ? resetsAt : null,
+                isUsingOverage,
+              },
+            });
+          }
+        }
       }),
     );
 

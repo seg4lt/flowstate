@@ -262,6 +262,8 @@ enum BridgeResponse {
         nested_event: Option<Value>,
         #[serde(default)]
         usage: Option<Value>,
+        #[serde(default)]
+        rate_limit_info: Option<Value>,
     },
 }
 
@@ -704,6 +706,7 @@ impl ClaudeSdkAdapter {
                     raw,
                     nested_event,
                     usage,
+                    rate_limit_info,
                 } => {
                     // Log every non-delta stream event so "stuck"
                     // bugs are diagnosable from the log alone: if the
@@ -773,6 +776,15 @@ impl ClaudeSdkAdapter {
                             .and_then(|v| serde_json::from_value::<zenui_provider_api::TokenUsage>(v).ok())
                         {
                             events.send(ProviderTurnEvent::TurnUsage { usage: u }).await;
+                        }
+                    }
+                    "rate_limit_update" => {
+                        if let Some(info) = rate_limit_info
+                            .and_then(|v| serde_json::from_value::<zenui_provider_api::RateLimitInfo>(v).ok())
+                        {
+                            events
+                                .send(ProviderTurnEvent::RateLimitUpdated { info })
+                                .await;
                         }
                     }
                     other_event => {

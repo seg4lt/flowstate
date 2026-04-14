@@ -12,9 +12,24 @@ use tracing::{debug, info, warn};
 use zenui_provider_api::{
     FileOperation, PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind,
     ProviderModel, ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion,
+    ProviderTurnOutput, RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail, TokenUsage,
+    TurnEventSink, UserInput, UserInputOption, UserInputQuestion,
 };
+
+/// Maps Anthropic's rate-limit bucket ids to the human-readable
+/// labels the provider-api `RateLimitInfo.label` field expects.
+/// Duplicated in provider-claude-sdk's bridge to keep each Claude
+/// adapter self-contained; ids are stable upstream.
+fn claude_bucket_label(bucket: &str) -> String {
+    match bucket {
+        "five_hour" => "5-hour limit".to_string(),
+        "seven_day" => "Weekly · all models".to_string(),
+        "seven_day_opus" => "Weekly · Opus".to_string(),
+        "seven_day_sonnet" => "Weekly · Sonnet".to_string(),
+        "overage" => "Overage".to_string(),
+        other => other.to_string(),
+    }
+}
 
 const TURN_TIMEOUT_SECS: u64 = 600;
 
@@ -44,6 +59,42 @@ struct RawStreamEvent {
     kind: String,
     #[serde(default)]
     delta: Option<Value>,
+}
+
+/// Anthropic's `result.usage` shape, as emitted by the CLI's
+/// stream-json output. Mirrored from SDKResultMessage.usage.
+#[derive(Debug, Deserialize)]
+struct CliUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliModelUsage {
+    #[serde(default)]
+    context_window: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliRateLimitInfo {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    rate_limit_type: Option<String>,
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<i64>,
+    #[serde(default)]
+    is_using_overage: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +144,18 @@ enum CliEvent {
         errors: Option<Vec<String>>,
         #[serde(default)]
         is_error: Option<bool>,
+        /// Anthropic's per-turn token breakdown. Same shape the SDK
+        /// bridge sees in SDKResultMessage.usage.
+        #[serde(default)]
+        usage: Option<CliUsage>,
+        /// Keyed by model id. We pick the first (only) entry for
+        /// contextWindow.
+        #[serde(default, rename = "modelUsage")]
+        model_usage: Option<HashMap<String, CliModelUsage>>,
+        #[serde(default)]
+        total_cost_usd: Option<f64>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
     },
     /// Old-style per-tool permission prompt (some CLI versions / bridge mode).
     PermissionRequest {
@@ -109,8 +172,11 @@ enum CliEvent {
         request_id: String,
         request: Value,
     },
-    /// Rate-limit telemetry — safe to ignore.
-    RateLimitEvent {},
+    /// Rate-limit / plan-usage snapshot.
+    RateLimitEvent {
+        #[serde(default)]
+        rate_limit_info: Option<CliRateLimitInfo>,
+    },
     /// In-progress status for long-running tools — safe to ignore.
     ToolProgress {},
     /// Authentication status updates — safe to ignore.
@@ -648,9 +714,38 @@ impl ClaudeCliAdapter {
                     result,
                     errors,
                     is_error,
+                    usage: result_usage,
+                    model_usage,
+                    total_cost_usd,
+                    duration_ms,
                 } => {
                     if let Some(id) = sid {
                         cli_session_id = Some(id);
+                    }
+                    // Forward token usage before handling the subtype
+                    // branch so the runtime-core drain sees TurnUsage
+                    // before turn_completed. Skips when the CLI
+                    // version didn't populate the usage field.
+                    if let Some(u) = result_usage {
+                        let (model, ctx_window) = model_usage
+                            .as_ref()
+                            .and_then(|m| m.iter().next())
+                            .map(|(k, v)| (Some(k.clone()), v.context_window))
+                            .unwrap_or((None, None));
+                        events
+                            .send(ProviderTurnEvent::TurnUsage {
+                                usage: TokenUsage {
+                                    input_tokens: u.input_tokens,
+                                    output_tokens: u.output_tokens,
+                                    cache_write_tokens: u.cache_creation_input_tokens,
+                                    cache_read_tokens: u.cache_read_input_tokens,
+                                    context_window: ctx_window,
+                                    total_cost_usd,
+                                    duration_ms,
+                                    model,
+                                },
+                            })
+                            .await;
                     }
                     match subtype.as_str() {
                         "success" => {
@@ -685,8 +780,34 @@ impl ClaudeCliAdapter {
                     }
                 }
 
+                CliEvent::RateLimitEvent { rate_limit_info } => {
+                    if let Some(info) = rate_limit_info {
+                        let bucket = match info.rate_limit_type {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        let utilization = info.utilization.unwrap_or(0.0);
+                        let status = match info.status.as_deref() {
+                            Some("allowed_warning") => RateLimitStatus::AllowedWarning,
+                            Some("rejected") => RateLimitStatus::Rejected,
+                            _ => RateLimitStatus::Allowed,
+                        };
+                        events
+                            .send(ProviderTurnEvent::RateLimitUpdated {
+                                info: RateLimitInfo {
+                                    label: claude_bucket_label(&bucket),
+                                    bucket,
+                                    status,
+                                    utilization,
+                                    resets_at: info.resets_at,
+                                    is_using_overage: info.is_using_overage.unwrap_or(false),
+                                },
+                            })
+                            .await;
+                    }
+                }
                 // Safe to ignore.
-                CliEvent::RateLimitEvent {} | CliEvent::ToolProgress {} | CliEvent::AuthStatus {} => {}
+                CliEvent::ToolProgress {} | CliEvent::AuthStatus {} => {}
                 CliEvent::Unknown => {
                     // Log the raw line so we can identify event types we're missing.
                     warn!("claude-cli: unknown event type in line (ignored): {}", trimmed);

@@ -1367,6 +1367,12 @@ impl RuntimeCore {
                 ProviderTurnEvent::TurnUsage { usage: u } => {
                     usage = Some(u);
                 }
+                ProviderTurnEvent::RateLimitUpdated { info } => {
+                    // Rate limits are account-wide, not per-turn, so
+                    // we just forward them to the runtime event
+                    // stream without touching any turn-local state.
+                    self.publish(RuntimeEvent::RateLimitUpdated { info });
+                }
                 ProviderTurnEvent::PlanProposed {
                     plan_id,
                     title,

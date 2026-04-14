@@ -438,6 +438,48 @@ class ClaudeBridge {
         }
         return null;
       }
+      case 'rate_limit_event': {
+        // Claude subscription rate-limit snapshot. Maps
+        // Anthropic's bucket names to human-readable labels inside
+        // the bridge so the shared provider-api RateLimitInfo stays
+        // provider-agnostic. Drops events without a bucket type —
+        // those carry no actionable info.
+        const rl = msg as {
+          rate_limit_info: {
+            status: 'allowed' | 'allowed_warning' | 'rejected';
+            rateLimitType?:
+              | 'five_hour'
+              | 'seven_day'
+              | 'seven_day_opus'
+              | 'seven_day_sonnet'
+              | 'overage';
+            utilization?: number;
+            resetsAt?: number;
+            isUsingOverage?: boolean;
+          };
+        };
+        const info = rl.rate_limit_info;
+        if (!info.rateLimitType || info.utilization == null) return null;
+        const labels: Record<string, string> = {
+          five_hour: '5-hour limit',
+          seven_day: 'Weekly · all models',
+          seven_day_opus: 'Weekly · Opus',
+          seven_day_sonnet: 'Weekly · Sonnet',
+          overage: 'Overage',
+        };
+        writeStream({
+          event: 'rate_limit_update',
+          rate_limit_info: {
+            bucket: info.rateLimitType,
+            label: labels[info.rateLimitType] ?? info.rateLimitType,
+            status: info.status,
+            utilization: info.utilization,
+            resetsAt: info.resetsAt ?? null,
+            isUsingOverage: info.isUsingOverage ?? false,
+          },
+        });
+        return null;
+      }
       case 'stream_event': {
         // Incremental token streaming. With `includePartialMessages: true`, the SDK
         // emits Anthropic raw stream events. We forward `content_block_delta` chunks
@@ -640,10 +682,10 @@ class ClaudeBridge {
         if (r.session_id) this.resumeSessionId = r.session_id;
         // Forward token usage before returning the output text so the
         // runtime-core drain loop sees a TurnUsage event before the
-        // turn finalises. Picks the first (usually only) key in
-        // modelUsage as the source of truth for contextWindow — the
-        // Claude SDK reports per-model totals but a single Flowzen
-        // turn runs on one model at a time.
+        // turn finalises. Maps Anthropic's SDK field names onto the
+        // provider-agnostic TokenUsage shape. Picks the first key
+        // in modelUsage as the source of truth for contextWindow —
+        // a single Flowzen turn only runs on one model at a time.
         if (r.usage) {
           const modelKey = r.modelUsage
             ? Object.keys(r.modelUsage)[0]
@@ -654,9 +696,8 @@ class ClaudeBridge {
             usage: {
               inputTokens: r.usage.input_tokens,
               outputTokens: r.usage.output_tokens,
-              cacheCreationInputTokens:
-                r.usage.cache_creation_input_tokens ?? null,
-              cacheReadInputTokens: r.usage.cache_read_input_tokens ?? null,
+              cacheWriteTokens: r.usage.cache_creation_input_tokens ?? null,
+              cacheReadTokens: r.usage.cache_read_input_tokens ?? null,
               contextWindow: mu?.contextWindow ?? null,
               totalCostUsd: r.total_cost_usd ?? null,
               durationMs: r.duration_ms ?? null,

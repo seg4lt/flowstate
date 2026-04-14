@@ -373,19 +373,24 @@ pub struct AttachmentData {
     pub name: Option<String>,
 }
 
-/// Per-turn token accounting, populated from the Claude SDK's final
-/// result message. All fields optional because older providers and
-/// interrupted turns may not carry a full breakdown.
+/// Per-turn token accounting. All fields are optional so providers
+/// can emit whatever their underlying engine reports — a minimal
+/// provider only needs `input_tokens` + `output_tokens`. Cache
+/// fields describe prompt caching cost savings; providers without
+/// prompt caching leave them `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens written to the provider's prompt cache this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    /// Tokens read from the provider's prompt cache this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_input_tokens: Option<u64>,
-    /// Model's max context window (from SDKResultMessage.modelUsage).
+    pub cache_read_tokens: Option<u64>,
+    /// Model's max context window in tokens, when the provider
+    /// knows it. UIs use this as the denominator for "N of M" fills.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -394,6 +399,44 @@ pub struct TokenUsage {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+/// Current status of a rate-limit bucket. Generic across providers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitStatus {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+}
+
+/// Provider-reported usage against a rate-limit bucket. The shared
+/// shape is intentionally generic — each provider owns its own
+/// bucket taxonomy and human-readable labels, and maps its native
+/// rate-limit concepts onto this struct inside its own adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitInfo {
+    /// Stable provider-defined id for this bucket. Used as the map
+    /// key on the client side so updates replace prior values for
+    /// the same bucket. Example values: "five_hour",
+    /// "requests_per_minute", "monthly_tokens".
+    pub bucket: String,
+    /// Human-readable label decided by the provider. Shown to the
+    /// user as-is in the rate-limit UI, so providers should pick
+    /// concise phrasing like "5-hour limit" or "Weekly · Opus".
+    pub label: String,
+    pub status: RateLimitStatus,
+    /// Fraction 0.0 - 1.0 of the bucket that's currently used.
+    pub utilization: f64,
+    /// Unix milliseconds when the bucket resets. Absent for
+    /// buckets that don't reset on a schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+    /// True when the provider is currently drawing from overage
+    /// credit rather than the primary bucket allowance.
+    #[serde(default)]
+    pub is_using_overage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,6 +659,14 @@ pub enum ProviderTurnEvent {
     /// provider's final result message arrives.
     TurnUsage {
         usage: TokenUsage,
+    },
+    /// Rate-limit / plan-usage snapshot for a single bucket. Can fire
+    /// multiple times per turn if the provider updates several
+    /// buckets at once. Conceptually account-wide — runtime-core
+    /// promotes this to RuntimeEvent::RateLimitUpdated without
+    /// attaching it to the current TurnRecord.
+    RateLimitUpdated {
+        info: RateLimitInfo,
     },
 }
 
@@ -1009,6 +1060,13 @@ pub enum RuntimeEvent {
     },
     ProviderHealthUpdated {
         status: ProviderStatus,
+    },
+    /// A provider reported new rate-limit or plan-usage data. Keyed
+    /// by bucket id so clients can replace prior values for the
+    /// same bucket without losing others. Account-wide; not scoped
+    /// to any session even though it rides on a turn's event stream.
+    RateLimitUpdated {
+        info: RateLimitInfo,
     },
     ProjectCreated {
         project: ProjectRecord,

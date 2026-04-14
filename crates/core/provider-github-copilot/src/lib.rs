@@ -214,6 +214,10 @@ enum BridgeResponse {
         steps: Option<serde_json::Value>,
         #[serde(default)]
         raw: Option<String>,
+        #[serde(default)]
+        usage: Option<serde_json::Value>,
+        #[serde(default)]
+        rate_limit_info: Option<serde_json::Value>,
     },
 }
 
@@ -500,6 +504,8 @@ impl GitHubCopilotAdapter {
                     title,
                     steps,
                     raw,
+                    usage,
+                    rate_limit_info,
                 } => match event.as_str() {
                     "text_delta" => {
                         if let Some(d) = delta {
@@ -634,6 +640,24 @@ impl GitHubCopilotAdapter {
                                     steps: parsed_steps,
                                     raw: raw.unwrap_or_default(),
                                 })
+                                .await;
+                        }
+                    }
+                    "turn_usage" => {
+                        if let Some(u) = usage.and_then(|v| {
+                            serde_json::from_value::<zenui_provider_api::TokenUsage>(v).ok()
+                        }) {
+                            events
+                                .send(ProviderTurnEvent::TurnUsage { usage: u })
+                                .await;
+                        }
+                    }
+                    "rate_limit_update" => {
+                        if let Some(info) = rate_limit_info.and_then(|v| {
+                            serde_json::from_value::<zenui_provider_api::RateLimitInfo>(v).ok()
+                        }) {
+                            events
+                                .send(ProviderTurnEvent::RateLimitUpdated { info })
                                 .await;
                         }
                     }
