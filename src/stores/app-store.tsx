@@ -20,6 +20,7 @@ import type {
   PermissionDecision,
   ProviderStatus,
   ProjectRecord,
+  RateLimitInfo,
   RuntimeEvent,
   ServerMessage,
   SessionSummary,
@@ -83,6 +84,11 @@ interface AppState {
    *  as pendingPermissionsBySession — global so cross-thread events
    *  aren't dropped on the floor. */
   pendingQuestionBySession: Map<string, PendingQuestion>;
+  /** Latest rate-limit / plan-usage snapshot per bucket, keyed by
+   *  the provider-defined bucket id. Account-wide, not scoped to
+   *  any session — providers report these whenever they update.
+   *  Flowzen surfaces them in the Context Display popover. */
+  rateLimits: Record<string, RateLimitInfo>;
   ready: boolean;
 }
 
@@ -546,6 +552,16 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "rate_limit_updated": {
+      return {
+        ...state,
+        rateLimits: {
+          ...state.rateLimits,
+          [event.info.bucket]: event.info,
+        },
+      };
+    }
+
     case "session_model_updated": {
       const sessions = new Map(state.sessions);
       const s = sessions.get(event.session_id);
@@ -624,6 +640,7 @@ const initialState: AppState = {
   awaitingInputSessionIds: new Set(),
   pendingPermissionsBySession: new Map(),
   pendingQuestionBySession: new Map(),
+  rateLimits: {},
   ready: false,
 };
 

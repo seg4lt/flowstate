@@ -108,13 +108,30 @@ export interface SubagentRecord {
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
-  cacheCreationInputTokens?: number;
-  cacheReadInputTokens?: number;
-  /** Model's max context window, as reported by the SDK's modelUsage. */
+  /** Tokens written to the provider's prompt cache this turn. */
+  cacheWriteTokens?: number;
+  /** Tokens read from the provider's prompt cache this turn. */
+  cacheReadTokens?: number;
+  /** Model's max context window in tokens, when the provider knows it. */
   contextWindow?: number;
   totalCostUsd?: number;
   durationMs?: number;
   model?: string;
+}
+
+export type RateLimitStatus = "allowed" | "allowed_warning" | "rejected";
+
+export interface RateLimitInfo {
+  /** Stable provider-defined id; used as the store map key. */
+  bucket: string;
+  /** Human-readable label, provided by the adapter. */
+  label: string;
+  status: RateLimitStatus;
+  /** Fraction 0.0 - 1.0. */
+  utilization: number;
+  /** Unix ms when the bucket resets. Absent for non-resetting buckets. */
+  resetsAt?: number;
+  isUsingOverage?: boolean;
 }
 
 export interface TurnRecord {
@@ -308,6 +325,7 @@ export type RuntimeEvent =
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }
   | { type: "provider_health_updated"; status: ProviderStatus }
+  | { type: "rate_limit_updated"; info: RateLimitInfo }
   | { type: "session_model_updated"; session_id: string; model: string }
   | { type: "session_archived"; session_id: string }
   | { type: "session_unarchived"; session: SessionSummary }
