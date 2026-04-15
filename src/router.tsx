@@ -17,6 +17,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ContextDisplaySettingProvider } from "@/hooks/use-context-display-setting";
+import { ProviderEnabledProvider } from "@/hooks/use-provider-enabled";
 import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
 import { TerminalDock } from "@/components/terminal/TerminalDock";
 import { ChatView } from "@/components/chat/chat-view";
@@ -241,11 +242,13 @@ function AppLayout() {
   return (
     <ThemeProvider>
       <ContextDisplaySettingProvider>
-        <AppProvider>
-          <TerminalProvider>
-            <AppShell />
-          </TerminalProvider>
-        </AppProvider>
+        <ProviderEnabledProvider>
+          <AppProvider>
+            <TerminalProvider>
+              <AppShell />
+            </TerminalProvider>
+          </AppProvider>
+        </ProviderEnabledProvider>
       </ContextDisplaySettingProvider>
     </ThemeProvider>
   );

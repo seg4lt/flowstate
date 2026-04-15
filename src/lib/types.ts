@@ -42,10 +42,6 @@ export interface ProviderStatus {
   status: ProviderStatusLevel;
   message: string | null;
   models: ProviderModel[];
-  /** Runtime toggle. `false` means the user disabled this provider in
-   *  Settings — the daemon refuses new turns, the settings page greys
-   *  the row, and the sidebar hides it from the new-session picker. */
-  enabled: boolean;
 }
 
 export interface PlanStep {
@@ -281,7 +277,7 @@ export type ClientMessage =
   | { type: "accept_plan"; session_id: string; plan_id: string }
   | { type: "reject_plan"; session_id: string; plan_id: string }
   | { type: "refresh_models"; provider: ProviderKind }
-  | { type: "set_provider_enabled"; provider: ProviderKind; enabled: boolean }
+
   | { type: "create_project"; path?: string }
   | { type: "delete_project"; project_id: string }
   | { type: "assign_session_to_project"; session_id: string; project_id?: string }

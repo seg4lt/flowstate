@@ -27,6 +27,7 @@ import {
   writeDefaultModel,
 } from "@/lib/defaults-settings";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
+import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { EFFORT_OPTIONS } from "@/components/chat/effort-selector";
 import { MODE_ORDER, MODE_LABELS } from "@/lib/mode-cycling";
 import type {
@@ -205,6 +206,7 @@ function DefaultPermissionModeRow() {
 
 function DefaultModelRow() {
   const { state } = useApp();
+  const { isProviderEnabled } = useProviderEnabled();
   const [defaults, setDefaults] = React.useState<
     Record<ProviderKind, string | null>
   >({
@@ -247,11 +249,11 @@ function DefaultModelRow() {
       })).filter(
         (entry) =>
           entry.provider &&
-          entry.provider.enabled &&
+          isProviderEnabled(entry.kind) &&
           entry.provider.status === "ready" &&
           entry.provider.models.length > 0,
       ),
-    [state.providers],
+    [state.providers, isProviderEnabled],
   );
 
   function handleChange(kind: ProviderKind, model: string) {
@@ -356,13 +358,11 @@ function ProviderRow({
   refreshing: boolean;
   onToggleEnabled: (enabled: boolean) => void;
 }) {
+  const { isProviderEnabled } = useProviderEnabled();
   const label = PROVIDER_LABELS[kind];
   const modelCount = provider?.models.length ?? 0;
   const isReady = provider?.status === "ready";
-  // Provider entries from the daemon always carry an `enabled` flag
-  // after Phase 2, but during the cold-start bootstrap window we can
-  // render before the first `welcome` lands, so default to true.
-  const enabled = provider?.enabled ?? true;
+  const enabled = isProviderEnabled(kind);
   const statusText = !enabled
     ? "Disabled"
     : provider
@@ -628,6 +628,7 @@ function AppDataDirRow() {
 
 export function SettingsView() {
   const { state, send } = useApp();
+  const { setProviderEnabled } = useProviderEnabled();
   const [refreshingKind, setRefreshingKind] = React.useState<ProviderKind | null>(
     null,
   );
@@ -673,19 +674,12 @@ export function SettingsView() {
     }
   }
 
-  async function handleToggleEnabled(kind: ProviderKind, enabled: boolean) {
-    try {
-      await send({ type: "set_provider_enabled", provider: kind, enabled });
-      toast({
-        description: `${PROVIDER_LABELS[kind]} ${enabled ? "enabled" : "disabled"}`,
-        duration: 2000,
-      });
-    } catch (err) {
-      toast({
-        description: `Failed to update ${PROVIDER_LABELS[kind]}: ${(err as Error).message}`,
-        duration: 4000,
-      });
-    }
+  function handleToggleEnabled(kind: ProviderKind, enabled: boolean) {
+    setProviderEnabled(kind, enabled);
+    toast({
+      description: `${PROVIDER_LABELS[kind]} ${enabled ? "enabled" : "disabled"}`,
+      duration: 2000,
+    });
   }
 
   return (

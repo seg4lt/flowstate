@@ -33,6 +33,7 @@ import {
 } from "@/lib/defaults-settings";
 import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
+import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { MessageList } from "./messages/message-list";
 import { ChatInput } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
@@ -553,15 +554,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // Runtime enablement lookup for the session's provider. When the
   // user disables a provider from Settings, existing sessions stay
   // visible (history preserved) but the chat header shows a badge
-  // and the composer's send button is forced off. A disabled provider
-  // is also `undefined` here if its health check hasn't arrived yet,
-  // which matches the "start optimistic, reconcile on welcome" flow
-  // the rest of the view already uses.
+  // and the composer's send button is forced off. Uses the app-level
+  // enabled state, not the SDK's `ProviderStatus.enabled` flag.
+  const { isProviderEnabled } = useProviderEnabled();
   const providerDisabled = React.useMemo(() => {
     if (!session) return false;
-    const provider = state.providers.find((p) => p.kind === session.provider);
-    return provider?.enabled === false;
-  }, [session, state.providers]);
+    return !isProviderEnabled(session.provider);
+  }, [session, isProviderEnabled]);
   const projectPath = React.useMemo(() => {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;

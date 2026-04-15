@@ -40,6 +40,7 @@ import {
   type GitWorktree,
 } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
+import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import type {
   AggregatedFileDiff,
@@ -86,6 +87,7 @@ interface ProjectHomeViewProps {
 export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   const { state, dispatch, send, createProject, linkProjectWorktree } =
     useApp();
+  const { isProviderEnabled } = useProviderEnabled();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -118,12 +120,14 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   // affects the "open worktree as thread" flow, which will surface
   // its own toast if the provider can't actually start a session.
   const defaultProvider: ProviderKind = React.useMemo(() => {
-    const ready = state.providers.find((p) => p.status === "ready");
+    const ready = state.providers.find(
+      (p) => isProviderEnabled(p.kind) && p.status === "ready",
+    );
     if (ready) return ready.kind;
-    const any = state.providers.find((p) => p.enabled !== false);
+    const any = state.providers.find((p) => isProviderEnabled(p.kind));
     if (any) return any.kind;
     return "claude";
-  }, [state.providers]);
+  }, [state.providers, isProviderEnabled]);
 
   // Threads grouped by the SDK project's filesystem path. Used to
   // render the per-worktree thread chips — each worktree owns its

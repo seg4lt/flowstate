@@ -16,6 +16,23 @@ import type { PermissionMode, ProviderKind, ReasoningEffort } from "./types";
 const CONFIG_KEY_EFFORT = "defaults.effort";
 const CONFIG_KEY_PERMISSION_MODE = "defaults.permission_mode";
 const CONFIG_KEY_MODEL_PREFIX = "defaults.model.";
+const CONFIG_KEY_PROVIDER_ENABLED_PREFIX = "provider.enabled.";
+
+// --- Provider-enabled defaults ---
+
+/** Providers enabled out of the box. Everything else starts disabled. */
+export const DEFAULT_ENABLED_PROVIDERS: ReadonlySet<ProviderKind> = new Set([
+  "claude",
+  "github_copilot",
+]);
+
+const ALL_PROVIDER_KINDS: readonly ProviderKind[] = [
+  "claude",
+  "claude_cli",
+  "codex",
+  "github_copilot",
+  "github_copilot_cli",
+];
 
 // --- Validation helpers ---
 
@@ -105,4 +122,50 @@ export async function writeDefaultModel(
   } catch {
     /* storage may be unavailable */
   }
+}
+
+// --- Provider enabled/disabled (app-level) ---
+
+export async function readProviderEnabled(
+  provider: ProviderKind,
+): Promise<boolean | null> {
+  try {
+    const raw = await getUserConfig(
+      CONFIG_KEY_PROVIDER_ENABLED_PREFIX + provider,
+    );
+    if (raw === "true") return true;
+    if (raw === "false") return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeProviderEnabled(
+  provider: ProviderKind,
+  enabled: boolean,
+): Promise<void> {
+  try {
+    await setUserConfig(
+      CONFIG_KEY_PROVIDER_ENABLED_PREFIX + provider,
+      String(enabled),
+    );
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+/** Read enabled state for every provider. Unset keys fall back to
+ *  `DEFAULT_ENABLED_PROVIDERS` (claude + github_copilot on, rest off). */
+export async function readAllProviderEnabled(): Promise<
+  Map<ProviderKind, boolean>
+> {
+  const results = await Promise.all(
+    ALL_PROVIDER_KINDS.map(async (kind) => {
+      const stored = await readProviderEnabled(kind);
+      const value = stored ?? DEFAULT_ENABLED_PROVIDERS.has(kind);
+      return [kind, value] as const;
+    }),
+  );
+  return new Map(results);
 }

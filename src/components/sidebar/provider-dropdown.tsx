@@ -15,6 +15,7 @@ import {
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind, ProviderStatus } from "@/lib/types";
 import { readDefaultModel } from "@/lib/defaults-settings";
+import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
   claude: "bg-amber-500",
@@ -70,6 +71,7 @@ interface ProviderDropdownProps {
 
 export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropdownProps) {
   const { state, send } = useApp();
+  const { isProviderEnabled } = useProviderEnabled();
   const navigate = useNavigate();
 
   const providerMap = new Map(state.providers.map((p) => [p.kind, p]));
@@ -85,7 +87,7 @@ export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropd
   React.useEffect(() => {
     let cancelled = false;
     const readyProviders = state.providers.filter(
-      (p) => p.enabled && p.status === "ready",
+      (p) => isProviderEnabled(p.kind) && p.status === "ready",
     );
     Promise.all(
       readyProviders.map(async (p) => {
@@ -153,9 +155,8 @@ export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropd
           const info = providerMap.get(kind);
           // Disabled providers are hidden from the new-session picker
           // entirely. Users re-enable them from Settings, which updates
-          // `state.providers` via `provider_health_updated` and they
-          // reappear here without a reload.
-          if (info && info.enabled === false) return null;
+          // the app-level context and they reappear here without a reload.
+          if (!isProviderEnabled(kind)) return null;
           const isReady = info?.status === "ready";
           const hasModels = info && info.models.length > 0;
 
