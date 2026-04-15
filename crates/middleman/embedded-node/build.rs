@@ -14,21 +14,17 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
 
-    let tarball_path = out_dir.join("node.tar.gz");
-    if tarball_path.exists() {
-        // Incremental rebuilds — the tarball is already in OUT_DIR.
-        return;
-    }
-
     let (platform, arch) = match detect_platform(&target) {
         Some(p) => p,
         None => {
-            // Create an empty marker so `include_bytes!` at least finds
-            // a file. The runtime will fail loudly when it tries to use
-            // an empty tarball, which is better than a build failure on
-            // an unsupported target.
-            fs::write(&tarball_path, &[] as &[u8])
+            // Create empty markers so `include_bytes!` at least finds a
+            // file. The runtime will fail loudly when it tries to use an
+            // empty archive, which is better than a build failure on an
+            // unsupported target.
+            fs::write(out_dir.join("node.tar.gz"), &[] as &[u8])
                 .expect("failed to write empty node.tar.gz marker");
+            fs::write(out_dir.join("node.zip"), &[] as &[u8])
+                .expect("failed to write empty node.zip marker");
             println!(
                 "cargo:warning=Unsupported target {}; zenui-embedded-node will be non-functional",
                 target
@@ -37,23 +33,42 @@ fn main() {
         }
     };
 
-    // Use a persistent cache outside of OUT_DIR so the tarball survives
+    let is_windows = platform == "win";
+    let ext = if is_windows { "zip" } else { "tar.gz" };
+    let out_filename = format!("node.{ext}");
+    let archive_path = out_dir.join(&out_filename);
+
+    // Also write an empty file for the other format so include_bytes!
+    // compiles on every platform (the unused one is just empty bytes).
+    let other_filename = if is_windows { "node.tar.gz" } else { "node.zip" };
+    let other_path = out_dir.join(other_filename);
+    if !other_path.exists() {
+        fs::write(&other_path, &[] as &[u8]).ok();
+    }
+
+    if archive_path.exists() {
+        // Incremental rebuilds — the archive is already in OUT_DIR.
+        return;
+    }
+
+    // Use a persistent cache outside of OUT_DIR so the archive survives
     // `cargo clean` and OUT_DIR hash changes. Only download from the
     // network when the persistent cache is also empty.
     let cache_dir = dirs_for_build::cache_dir()
         .join("zenui")
         .join("node-downloads");
-    let cache_filename = format!("node-v{}-{}-{}.tar.gz", NODE_VERSION, platform, arch);
-    let cached_tarball = cache_dir.join(&cache_filename);
+    let cache_filename = format!("node-v{}-{}-{}.{}", NODE_VERSION, platform, arch, ext);
+    let cached_archive = cache_dir.join(&cache_filename);
 
-    if cached_tarball.exists() {
+    if cached_archive.exists() {
         // Cache hit — just copy to OUT_DIR for include_bytes!.
-        fs::copy(&cached_tarball, &tarball_path).expect("failed to copy cached node tarball to OUT_DIR");
+        fs::copy(&cached_archive, &archive_path)
+            .expect("failed to copy cached node archive to OUT_DIR");
         return;
     }
 
     // Cache miss — download from nodejs.org.
-    let filename = format!("node-v{}-{}-{}.tar.gz", NODE_VERSION, platform, arch);
+    let filename = format!("node-v{}-{}-{}.{}", NODE_VERSION, platform, arch, ext);
     let url = format!("https://nodejs.org/dist/v{}/{}", NODE_VERSION, filename);
 
     println!(
@@ -62,12 +77,7 @@ fn main() {
     );
 
     let status = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-o",
-            &tarball_path.to_string_lossy(),
-            &url,
-        ])
+        .args(["-fsSL", "-o", &archive_path.to_string_lossy(), &url])
         .status()
         .expect("failed to invoke curl");
     if !status.success() {
@@ -76,7 +86,7 @@ fn main() {
 
     // Persist to cache for future builds / cargo clean cycles.
     fs::create_dir_all(&cache_dir).ok();
-    fs::copy(&tarball_path, &cached_tarball).ok();
+    fs::copy(&archive_path, &cached_archive).ok();
 }
 
 fn detect_platform(target: &str) -> Option<(&'static str, &'static str)> {
@@ -92,6 +102,9 @@ fn detect_platform(target: &str) -> Option<(&'static str, &'static str)> {
         } else {
             Some(("linux", "x64"))
         }
+    } else if target.contains("windows") {
+        // Node.js uses "win" in its distribution filenames.
+        Some(("win", "x64"))
     } else {
         None
     }

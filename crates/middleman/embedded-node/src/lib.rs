@@ -1,13 +1,13 @@
 //! Self-contained Node.js runtime embedded into the zenui binary.
 //!
-//! The build script downloads the official Node.js tarball for the build
-//! target and this crate `include_bytes!`-es it into the compiled binary.
-//! At runtime, [`ensure_extracted`] lazily unpacks the tarball into a
-//! per-user cache directory (first call extracts, subsequent calls are
-//! a fast sentinel check) and returns the paths callers need to spawn
-//! the embedded `node` executable.
+//! The build script downloads the official Node.js tarball (Unix) or zip
+//! (Windows) for the build target and this crate `include_bytes!`-es it
+//! into the compiled binary. At runtime, [`ensure_extracted`] lazily
+//! unpacks the archive into a per-user cache directory (first call
+//! extracts, subsequent calls are a fast sentinel check) and returns the
+//! paths callers need to spawn the embedded `node` executable.
 //!
-//! The tarball is compressed (~20 MB) and shared by all providers that
+//! The archive is compressed (~20 MB) and shared by all providers that
 //! need a Node runtime, so embedding it once is much cheaper than each
 //! provider carrying its own copy.
 
@@ -16,8 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow};
-use flate2::read::GzDecoder;
-use tar::Archive;
 use tracing::info;
 
 /// Version of Node.js embedded by [`build.rs`]. Must match the version
@@ -25,10 +23,17 @@ use tracing::info;
 /// bumping the version automatically invalidates any stale extraction.
 pub const NODE_VERSION: &str = "20.11.1";
 
-/// The raw Node.js tarball bytes, embedded at compile time. Empty if
+/// The raw Node.js archive bytes, embedded at compile time. Empty if
 /// the build target is unsupported (in which case [`ensure_extracted`]
 /// will return an error).
-const NODE_TARBALL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node.tar.gz"));
+///
+/// Unix targets embed a `.tar.gz`, Windows embeds a `.zip`. Both files
+/// are always present in OUT_DIR (the unused one is an empty stub) so
+/// `include_bytes!` resolves on every platform.
+#[cfg(not(windows))]
+const NODE_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node.tar.gz"));
+#[cfg(windows)]
+const NODE_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node.zip"));
 
 /// Resolved paths inside an extracted Node.js runtime.
 #[derive(Debug, Clone)]
@@ -57,10 +62,23 @@ pub fn ensure_extracted() -> Result<NodeRuntime> {
     cached.clone().map_err(|e| anyhow!(e))
 }
 
+/// Platform-specific path to the `node` binary relative to the
+/// extraction root. On Unix the tarball layout puts it at `bin/node`;
+/// on Windows the zip puts `node.exe` at the root.
+#[cfg(not(windows))]
+fn node_bin_relative(root: &Path) -> PathBuf {
+    root.join("bin").join("node")
+}
+
+#[cfg(windows)]
+fn node_bin_relative(root: &Path) -> PathBuf {
+    root.join("node.exe")
+}
+
 fn extract_once() -> Result<NodeRuntime> {
-    if NODE_TARBALL.is_empty() {
+    if NODE_ARCHIVE.is_empty() {
         anyhow::bail!(
-            "zenui-embedded-node was built on an unsupported target; no Node.js tarball is embedded"
+            "zenui-embedded-node was built on an unsupported target; no Node.js archive is embedded"
         );
     }
 
@@ -69,19 +87,18 @@ fn extract_once() -> Result<NodeRuntime> {
         .join("zenui")
         .join(format!("embedded-node-v{NODE_VERSION}"));
 
-    let node_bin = cache_root.join("bin").join("node");
+    let node_bin = node_bin_relative(&cache_root);
 
-    // Fast path: already extracted. We treat the presence of bin/node as
-    // the only sentinel — if a previous extraction was interrupted the
-    // directory will lack this file and we'll re-extract.
+    // Fast path: already extracted. We treat the presence of the node
+    // binary as the only sentinel — if a previous extraction was
+    // interrupted the directory will lack this file and we'll
+    // re-extract.
     if node_bin.exists() {
-        return Ok(NodeRuntime {
-            node_bin: node_bin.clone(),
-            bin_dir: node_bin
-                .parent()
-                .expect("node_bin always has a parent")
-                .to_path_buf(),
-        });
+        let bin_dir = node_bin
+            .parent()
+            .expect("node_bin always has a parent")
+            .to_path_buf();
+        return Ok(NodeRuntime { node_bin, bin_dir });
     }
 
     info!(
@@ -100,13 +117,14 @@ fn extract_once() -> Result<NodeRuntime> {
     fs::create_dir_all(&staging)
         .with_context(|| format!("create staging dir {}", staging.display()))?;
 
-    unpack_tarball(NODE_TARBALL, &staging)?;
+    unpack_archive(NODE_ARCHIVE, &staging)?;
 
-    // The Node.js tarball has a top-level `node-v<version>-<os>-<arch>/`
+    // The Node.js archive has a top-level `node-v<version>-<os>-<arch>/`
     // directory we need to strip so the final layout is
-    // `embedded-node-v<version>/{bin,lib,include,share}`.
+    // `embedded-node-v<version>/{bin,lib,...}` (Unix) or
+    // `embedded-node-v<version>/{node.exe,...}` (Windows).
     let top = find_single_subdir(&staging)
-        .context("expected exactly one top-level directory in Node.js tarball")?;
+        .context("expected exactly one top-level directory in Node.js archive")?;
 
     if cache_root.exists() {
         fs::remove_dir_all(&cache_root)
@@ -128,8 +146,12 @@ fn extract_once() -> Result<NodeRuntime> {
     fs::remove_dir_all(&staging).ok();
 
     if !node_bin.exists() {
+        #[cfg(not(windows))]
+        let expected = "bin/node";
+        #[cfg(windows)]
+        let expected = "node.exe";
         anyhow::bail!(
-            "extracted Node.js runtime at {} is missing bin/node",
+            "extracted Node.js runtime at {} is missing {expected}",
             cache_root.display()
         );
     }
@@ -155,22 +177,41 @@ fn extract_once() -> Result<NodeRuntime> {
         node_bin.display()
     );
 
-    Ok(NodeRuntime {
-        node_bin: node_bin.clone(),
-        bin_dir: node_bin
-            .parent()
-            .expect("node_bin always has a parent")
-            .to_path_buf(),
-    })
+    let bin_dir = node_bin
+        .parent()
+        .expect("node_bin always has a parent")
+        .to_path_buf();
+    Ok(NodeRuntime { node_bin, bin_dir })
 }
 
-fn unpack_tarball(bytes: &[u8], dest: &Path) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Archive extraction — tar.gz on Unix, zip on Windows
+// ---------------------------------------------------------------------------
+
+#[cfg(not(windows))]
+fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
     let decoder = GzDecoder::new(bytes);
     let mut archive = Archive::new(decoder);
     archive.set_preserve_permissions(true);
     archive
         .unpack(dest)
         .with_context(|| format!("unpack Node.js tarball into {}", dest.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
+    use std::io::Cursor;
+
+    let reader = Cursor::new(bytes);
+    let mut archive = zip::ZipArchive::new(reader)
+        .context("failed to open Node.js zip archive")?;
+    archive
+        .extract(dest)
+        .with_context(|| format!("unpack Node.js zip into {}", dest.display()))?;
     Ok(())
 }
 

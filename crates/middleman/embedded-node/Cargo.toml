@@ -10,4 +10,5 @@ anyhow.workspace = true
 dirs = "5"
 flate2 = "1"
 tar = "0.4"
+zip = "2"
 tracing.workspace = true

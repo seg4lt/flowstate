@@ -391,7 +391,8 @@ impl ClaudeSdkAdapter {
         let new_path = if existing_path.is_empty() {
             node.bin_dir.to_string_lossy().into_owned()
         } else {
-            format!("{}:{}", node.bin_dir.display(), existing_path)
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            format!("{}{sep}{}", node.bin_dir.display(), existing_path)
         };
 
         let mut child = Command::new(&node.node_bin)
