@@ -30,11 +30,11 @@ const PROVIDER_COLORS: Record<ProviderKind, string> = {
 };
 
 const PROVIDER_LABELS: Record<ProviderKind, string> = {
-  claude: "Claude (SDK)",
-  claude_cli: "Claude (CLI)",
+  claude: "Claude",
+  claude_cli: "Claude 2",
   codex: "Codex",
   github_copilot: "GitHub Copilot",
-  github_copilot_cli: "GitHub Copilot (CLI)",
+  github_copilot_cli: "GitHub Copilot 2",
 };
 
 const PROVIDER_ORDER: ProviderKind[] = [

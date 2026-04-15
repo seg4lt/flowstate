@@ -26,10 +26,10 @@ const PROVIDER_COLORS: Record<ProviderKind, string> = {
 // Shown before health checks complete
 const ALL_PROVIDERS: { kind: ProviderKind; label: string }[] = [
   { kind: "claude", label: "Claude" },
-  { kind: "claude_cli", label: "Claude (CLI)" },
+  { kind: "claude_cli", label: "Claude 2" },
   { kind: "codex", label: "Codex" },
   { kind: "github_copilot", label: "GitHub Copilot" },
-  { kind: "github_copilot_cli", label: "GitHub Copilot (CLI)" },
+  { kind: "github_copilot_cli", label: "GitHub Copilot 2" },
 ];
 
 function statusBadge(provider: ProviderStatus | undefined) {
