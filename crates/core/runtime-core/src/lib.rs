@@ -108,10 +108,11 @@ pub struct RuntimeCore {
     interrupted_sessions: Arc<Mutex<HashSet<String>>>,
     /// Runtime enabled/disabled flag per provider. Seeded from the
     /// `provider_enablement` persistence table on boot and mutated via
-    /// `ClientMessage::SetProviderEnabled`. Missing entries default to
-    /// `true` — newly-added providers are enabled until the user says
-    /// otherwise. Read by `bootstrap`, `spawn_health_check`, and
-    /// `handle_send_turn` to gate downstream behavior.
+    /// `ClientMessage::SetProviderEnabled`. Missing entries fall back
+    /// to per-provider defaults: Claude and GitHub Copilot are enabled,
+    /// CLI variants and Codex are disabled. Read by `bootstrap`,
+    /// `spawn_health_check`, and `handle_send_turn` to gate downstream
+    /// behavior.
     provider_enablement: Arc<RwLock<HashMap<ProviderKind, bool>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
@@ -199,15 +200,20 @@ impl RuntimeCore {
         }
     }
 
-    /// Read-side helper. Returns `true` when the provider has no row in
-    /// the `provider_enablement` table or its row is `enabled = 1`,
-    /// `false` only when the user has explicitly disabled it.
+    /// Read-side helper. When the provider has a row in the
+    /// `provider_enablement` table, returns that persisted value.
+    /// Otherwise falls back to a per-provider default: Claude and
+    /// GitHub Copilot are enabled out of the box; CLI variants and
+    /// Codex default to disabled until the user turns them on in
+    /// Settings.
     pub fn is_provider_enabled(&self, kind: ProviderKind) -> bool {
         self.provider_enablement
             .read()
             .ok()
             .and_then(|lock| lock.get(&kind).copied())
-            .unwrap_or(true)
+            .unwrap_or_else(|| {
+                matches!(kind, ProviderKind::Claude | ProviderKind::GitHubCopilot)
+            })
     }
 
     /// Mutation side of the provider-enablement toggle. Writes through
