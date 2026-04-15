@@ -105,6 +105,7 @@ export function ChatInput({
   const [editText, setEditText] = React.useState("");
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const editTextareaRef = React.useRef<HTMLTextAreaElement>(null);
+  const steerRef = React.useRef<QueuedMessage | null>(null);
 
   // Land focus in the composer on every mount *and* whenever the
   // composer transitions from non-interactive → interactive. ChatView
@@ -165,6 +166,26 @@ export function ChatInput({
     const nowReady = sessionStatus === "ready" || sessionStatus === "interrupted";
     prevStatusRef.current = sessionStatus;
     if (!wasRunning || !nowReady) return;
+
+    // Steer takes priority over normal queue drain. When the user
+    // clicked "Send now" on a specific queued message, steerRef holds
+    // that message — send it instead of the queue head, then return so
+    // the remaining queue items drain on subsequent turn completions.
+    const steered = steerRef.current;
+    if (steered) {
+      steerRef.current = null;
+      if (editingId === steered.id) {
+        setEditingId(null);
+        setEditText("");
+      }
+      onSend(steered.text, steered.images);
+      for (const img of steered.images) {
+        URL.revokeObjectURL(img.previewUrl);
+      }
+      return;
+    }
+
+    // Normal drain — pop the head of the queue.
     if (queued.length === 0) return;
     const [first, ...rest] = queued;
     // Clear editing state if the drained message was being edited.
@@ -202,6 +223,26 @@ export function ChatInput({
       }
       return q.filter((item) => item.id !== id);
     });
+  }
+
+  /** Steer: interrupt the current turn and send a specific queued
+   *  message immediately, plucking it from the queue while preserving
+   *  the order of remaining items. The drain effect picks up the
+   *  steered message (via steerRef) on the running→interrupted
+   *  transition instead of popping the queue head. */
+  function steerMessage(id: string) {
+    if (sessionStatus !== "running") return;
+    const target = queued.find((item) => item.id === id);
+    if (!target) return;
+    if (editingId === id) {
+      setEditingId(null);
+      setEditText("");
+    }
+    steerRef.current = target;
+    // Remove from queue WITHOUT revoking image URLs — the drain
+    // effect will revoke them after sending the steered message.
+    setQueued((q) => q.filter((item) => item.id !== id));
+    onInterrupt();
   }
 
   function startEditQueued(id: string, currentText: string) {
@@ -457,6 +498,16 @@ export function ChatInput({
                 </div>
                 {editingId === item.id ? null : (
                   <>
+                    {isRunning && (
+                      <button
+                        type="button"
+                        onClick={() => steerMessage(item.id)}
+                        className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-primary/10 hover:text-primary"
+                        title="Send now (interrupts current turn)"
+                      >
+                        <Send className="h-3 w-3" />
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => startEditQueued(item.id, item.text)}
