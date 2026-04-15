@@ -291,7 +291,7 @@ export function AppSidebar() {
                         tooltip={projectName(project.projectId)}
                         isActive={isActive}
                         onClick={() => handleProjectClick(project.projectId)}
-                        className="pl-7"
+                        className="pl-7 pr-14"
                       >
                         <FolderIcon />
                         <span className="flex-1 truncate">
@@ -315,7 +315,7 @@ export function AppSidebar() {
                           <ChevronRight className="h-4 w-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
                         </button>
                       </CollapsibleTrigger>
-                      <div className="absolute right-1 top-1 flex items-center gap-1">
+                      <div className="absolute right-1 top-1 flex items-center gap-1.5">
                         <button
                           type="button"
                           title="Remove project"
