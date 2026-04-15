@@ -775,7 +775,19 @@ impl RuntimeCore {
             ClientMessage::UpdateSessionModel { session_id, model } => {
                 if let Some(mut session) = self.persistence.get_session(&session_id).await {
                     session.summary.model = Some(model.clone());
-                    self.persistence.upsert_session(session).await;
+                    self.persistence.upsert_session(session.clone()).await;
+                    // Forward the model change to the provider adapter so
+                    // any cached bridge process picks up the new model
+                    // before the next turn. Errors are logged but not
+                    // surfaced — the model is already persisted, so the
+                    // worst case is the bridge picks it up on next restart.
+                    if let Some(adapter) = self.adapters.get(&session.summary.provider) {
+                        if let Err(e) = adapter.update_session_model(&session, model.clone()).await {
+                            tracing::warn!(
+                                "Failed to forward model change to adapter: {e}"
+                            );
+                        }
+                    }
                     self.publish(RuntimeEvent::SessionModelUpdated {
                         session_id,
                         model,

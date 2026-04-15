@@ -207,6 +207,12 @@ class ClaudeBridge {
     return sessionId;
   }
 
+  /** Mid-session model switch. Updates the model used by subsequent
+   *  `query()` calls without restarting the bridge process. */
+  setModel(model: string): void {
+    this.model = model;
+  }
+
   /**
    * Current Claude SDK session id captured from the most recent query, if any.
    * Round-tripped to the Rust adapter so it can be persisted on
@@ -990,6 +996,15 @@ async function main(): Promise<void> {
             });
           }
         })();
+        break;
+      }
+
+      case 'set_model': {
+        // Mid-session model switch. Updates the model used by subsequent
+        // query() calls. Synchronous — no async work needed.
+        const model = msg.model as string;
+        bridge.setModel(model);
+        writeJson({ type: 'model_set', model });
         break;
       }
 

@@ -173,6 +173,12 @@ enum BridgeRequest {
     /// until changed again).
     #[serde(rename = "set_permission_mode")]
     SetPermissionMode { permission_mode: String },
+    /// Mid-session model switch. Updates `this.model` on the TS bridge
+    /// so that the next `query()` call uses the new model. No-op if no
+    /// bridge exists yet — the runtime will pick up the new model from
+    /// the session summary on the next `ensure_session_process`.
+    #[serde(rename = "set_model")]
+    SetModel { model: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -989,6 +995,24 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             },
         )
         .await?;
+        Ok(())
+    }
+
+    async fn update_session_model(
+        &self,
+        session: &SessionDetail,
+        model: String,
+    ) -> Result<(), String> {
+        // Forward a set_model request to the live bridge so the next
+        // query() call uses the new model. Same stdin-grab pattern as
+        // update_permission_mode — avoids blocking on the outer process
+        // Mutex held during run_turn. No-op if no bridge exists yet;
+        // the next ensure_session_process will create one with the model
+        // already persisted in session.summary.model.
+        let Some(stdin) = self.session_stdin(&session.summary.session_id).await else {
+            return Ok(());
+        };
+        write_request(&stdin, &BridgeRequest::SetModel { model }).await?;
         Ok(())
     }
 

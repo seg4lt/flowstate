@@ -1309,6 +1309,19 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Mid-session model switch. Adapters that keep a long-lived bridge
+    /// process (the Claude SDK adapter) should forward the new model so
+    /// the next turn uses it. Default is a no-op — the runtime persists
+    /// the model to the session summary regardless, so adapters that
+    /// read it at turn-start time pick it up automatically.
+    async fn update_session_model(
+        &self,
+        _session: &SessionDetail,
+        _model: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Tear down any long-lived resources held for this session (subprocesses, connections).
     async fn end_session(&self, _session: &SessionDetail) -> Result<(), String> {
         Ok(())
