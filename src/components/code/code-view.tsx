@@ -104,18 +104,29 @@ function defaultContentSearchUiOptions(): ContentSearchUiOptions {
 
 type SearchMode = "files" | "content";
 
-export function CodeView({ sessionId }: { sessionId: string }) {
+interface CodeViewProps {
+  sessionId?: string;
+  projectPath?: string;
+}
+
+export function CodeView(props: CodeViewProps) {
   const { state } = useApp();
   const navigate = useNavigate();
 
-  const session = state.sessions.get(sessionId);
-  const projectPath = React.useMemo(() => {
+  // Derive projectPath from the session when not provided directly.
+  const session = props.sessionId
+    ? state.sessions.get(props.sessionId)
+    : undefined;
+  const derivedPath = React.useMemo(() => {
+    if (props.projectPath) return props.projectPath;
     if (!session?.projectId) return null;
     return (
       state.projects.find((p) => p.projectId === session.projectId)?.path ??
       null
     );
-  }, [session?.projectId, state.projects]);
+  }, [props.projectPath, session?.projectId, state.projects]);
+  const projectPath = derivedPath;
+  const sessionId = props.sessionId;
 
   // ─── tree resize / collapse state ────────────────────────────
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
@@ -448,12 +459,14 @@ export function CodeView({ sessionId }: { sessionId: string }) {
           variant="ghost"
           size="xs"
           onClick={() =>
-            navigate({ to: "/chat/$sessionId", params: { sessionId } })
+            sessionId
+              ? navigate({ to: "/chat/$sessionId", params: { sessionId } })
+              : window.history.back()
           }
-          title="Back to chat"
+          title={sessionId ? "Back to chat" : "Back"}
         >
           <ArrowLeft className="h-3 w-3" />
-          Chat
+          {sessionId ? "Chat" : "Back"}
         </Button>
         <div className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
           {projectLabel && (

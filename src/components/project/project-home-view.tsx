@@ -216,9 +216,9 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   const [diffFor, setDiffFor] = React.useState<GitWorktree | null>(null);
 
   // Route the search click to the most recent session on each
-  // worktree. The /code route is sessionId-keyed, so worktrees
-  // with no session have this action disabled — the tooltip
-  // explains why instead of silently failing.
+  // worktree. When a session exists we use /code/$sessionId;
+  // otherwise we fall back to /browse?path=... which opens the
+  // file browser directly without a session context.
   const firstSessionPathFor = React.useCallback(
     (wtPath: string): string | null => {
       const list = sessionsByPath.get(wtPath);
@@ -229,10 +229,13 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
   const handleSearchForWorktree = React.useCallback(
     (wt: GitWorktree) => {
-      const sid = firstSessionPathFor(wt.path);
-      if (!sid) return;
       prefetchProjectFiles(queryClient, wt.path);
-      navigate({ to: "/code/$sessionId", params: { sessionId: sid } });
+      const sid = firstSessionPathFor(wt.path);
+      if (sid) {
+        navigate({ to: "/code/$sessionId", params: { sessionId: sid } });
+      } else {
+        navigate({ to: "/browse", search: { path: wt.path } });
+      }
     },
     [firstSessionPathFor, navigate, queryClient],
   );
@@ -488,7 +491,6 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                 const isMain = wt.path === projectPath;
                 const label = wt.branch ?? "(detached)";
                 const shortSha = wt.head ? wt.head.slice(0, 7) : "";
-                const firstSession = firstSessionPathFor(wt.path);
                 const isOpening = openingWtPath === wt.path;
                 const isRemoving = removingWtPath === wt.path;
                 const failed = failedRemovalPath === wt.path;
@@ -530,12 +532,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                       <button
                         type="button"
                         aria-label={`Search files in ${label}`}
-                        title={
-                          firstSession
-                            ? "Search files"
-                            : "Search needs an existing thread on this worktree"
-                        }
-                        disabled={!firstSession}
+                        title="Search files"
                         onMouseEnter={() =>
                           prefetchProjectFiles(queryClient, wt.path)
                         }
@@ -543,7 +540,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                           prefetchProjectFiles(queryClient, wt.path)
                         }
                         onClick={() => handleSearchForWorktree(wt)}
-                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground disabled:opacity-40"
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground"
                       >
                         <Search className="h-3.5 w-3.5" />
                       </button>

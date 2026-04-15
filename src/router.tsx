@@ -291,6 +291,25 @@ const codeRoute = createRoute({
   },
 });
 
+const browseRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/browse",
+  validateSearch: (search: Record<string, unknown>): { path: string } => ({
+    path: String(search.path ?? ""),
+  }),
+  component: function BrowsePage() {
+    const { path } = browseRoute.useSearch();
+    if (!path) {
+      return (
+        <div className="flex h-svh items-center justify-center text-sm text-muted-foreground">
+          No path specified.
+        </div>
+      );
+    }
+    return <CodeView projectPath={path} />;
+  },
+});
+
 const projectRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/project/$projectId",
@@ -310,6 +329,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
   codeRoute,
+  browseRoute,
   projectRoute,
   settingsRoute,
 ]);
