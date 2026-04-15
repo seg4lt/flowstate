@@ -19,6 +19,7 @@ import type {
 import { connectStream, sendMessage } from "@/lib/api";
 import {
   gitBranchQueryOptions,
+  gitRootQueryOptions,
   loadFullSession,
   pathExistsQueryOptions,
   sessionQueryKey,
@@ -587,6 +588,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       state.projects.find((p) => p.projectId === parentProjectId)?.path ?? null
     );
   }, [parentProjectId, state.projects]);
+  // Resolve the git root for the parent project — when the project
+  // directory is a submodule or linked worktree, the raw path may
+  // differ from what git considers the repo root. Worktree
+  // operations (create/remove/list) need the resolved root.
+  const parentGitRootQuery = useQuery(gitRootQueryOptions(parentProjectPath));
+  const parentGitRoot = parentGitRootQuery.data ?? parentProjectPath;
   // Branch + diff summary are fetched via project-scoped queries,
   // so switching between threads in the same project reuses the
   // cached values rather than re-shelling out to git on every
@@ -1155,12 +1162,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             </span>
           )}
           <div className="flex items-center gap-2">
-            {gitBranch && projectPath && session && parentProjectId && parentProjectPath && (
+            {gitBranch && projectPath && session && parentProjectId && parentGitRoot && (
               <BranchSwitcher
                 projectPath={projectPath}
                 currentBranch={gitBranch}
                 parentProjectId={parentProjectId}
-                parentProjectPath={parentProjectPath}
+                parentProjectPath={parentGitRoot}
                 provider={session.provider}
                 model={session.model ?? null}
                 onCheckedOut={() => refreshDiffs({ force: true })}

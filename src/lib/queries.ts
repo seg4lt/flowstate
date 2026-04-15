@@ -6,6 +6,7 @@ import {
   listGitWorktrees,
   listProjectFiles,
   pathExists,
+  resolveGitRoot,
   sendMessage,
 } from "./api";
 import type { GitBranchList, GitWorktree } from "./api";
@@ -95,6 +96,23 @@ export function sessionQueryOptions(sessionId: string) {
 // query deduplicates in-flight fetches and no-ops on warm cache.
 export function prefetchSession(client: QueryClient, sessionId: string) {
   void client.prefetchQuery(sessionQueryOptions(sessionId));
+}
+
+// Resolve the git repository root for `path` via
+// `git rev-parse --show-toplevel`. Returns the repo root when the
+// path is inside a submodule or linked worktree (where `.git` is
+// a file, not a directory). Cached forever — the git root for a
+// given filesystem path never changes during an app session.
+export function gitRootQueryOptions(path: string | null) {
+  return queryOptions({
+    queryKey: ["git", "root", path] as const,
+    queryFn: async () => {
+      if (!path) return null;
+      return resolveGitRoot(path);
+    },
+    enabled: !!path,
+    staleTime: Infinity,
+  });
 }
 
 export function gitBranchQueryOptions(path: string | null) {

@@ -30,6 +30,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import {
   gitBranchQueryOptions,
+  gitRootQueryOptions,
   gitWorktreeListQueryOptions,
   prefetchProjectFiles,
 } from "@/lib/queries";
@@ -47,6 +48,13 @@ import type {
   AggregatedFileDiff,
 } from "@/lib/session-diff";
 import type { ProviderKind, SessionSummary } from "@/lib/types";
+
+/** Strip trailing slash for path comparison — git's porcelain output
+ * and the file picker may disagree on a trailing `/`. */
+function normPath(p: string | null): string {
+  if (!p) return "";
+  return p.endsWith("/") ? p.slice(0, -1) : p;
+}
 
 interface EditorChoice {
   id: string;
@@ -97,6 +105,14 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
     state.projectDisplay.get(projectId)?.name ?? "Untitled project";
   const projectPath = project?.path ?? null;
 
+  // Resolve the git repository root — when the project directory is
+  // a submodule or a linked worktree the raw file-picker path may
+  // differ from the path git uses internally. All git commands
+  // (branch list, worktree list, create/remove worktree) need the
+  // resolved root so the paths they produce are consistent.
+  const gitRootQuery = useQuery(gitRootQueryOptions(projectPath));
+  const gitRoot = gitRootQuery.data ?? projectPath;
+
   // Clicking a project row is an explicit exit from any open thread —
   // mirror the sidebar highlight by clearing the active session so the
   // sidebar's ThreadItem `isActive` state doesn't lag behind the route.
@@ -104,10 +120,10 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
     dispatch({ type: "set_active_session", sessionId: null });
   }, [dispatch, projectId]);
 
-  const branchQuery = useQuery(gitBranchQueryOptions(projectPath));
+  const branchQuery = useQuery(gitBranchQueryOptions(gitRoot));
   const currentBranch = branchQuery.data ?? "";
 
-  const worktreeQuery = useQuery(gitWorktreeListQueryOptions(projectPath));
+  const worktreeQuery = useQuery(gitWorktreeListQueryOptions(gitRoot));
   const worktrees = React.useMemo<GitWorktree[]>(
     () => worktreeQuery.data ?? [],
     [worktreeQuery.data],
@@ -275,7 +291,9 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       if (!projectPath) return;
       setOpeningWtPath(wt.path);
       try {
-        const isMain = wt.path === projectPath;
+        const isMain =
+          normPath(wt.path) === normPath(projectPath) ||
+          normPath(wt.path) === normPath(gitRoot);
         let wtProjectId =
           state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
         if (!wtProjectId) {
@@ -318,6 +336,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
     },
     [
       projectPath,
+      gitRoot,
       projectId,
       state.projects,
       state.projectWorktrees,
@@ -330,15 +349,15 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
   const removeWorktreeImpl = React.useCallback(
     async (wt: GitWorktree, force: boolean) => {
-      if (!projectPath) return;
+      if (!gitRoot) return;
       setRemovingWtPath(wt.path);
       try {
-        await removeGitWorktree(projectPath, wt.path, force);
+        await removeGitWorktree(gitRoot, wt.path, force);
         queryClient.invalidateQueries({
-          queryKey: ["git", "worktree-list", projectPath],
+          queryKey: ["git", "worktree-list", gitRoot],
         });
         queryClient.invalidateQueries({
-          queryKey: ["git", "branch-list", projectPath],
+          queryKey: ["git", "branch-list", gitRoot],
         });
         setFailedRemovalPath(null);
         toast({
@@ -358,20 +377,21 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
         setRemovingWtPath(null);
       }
     },
-    [projectPath, queryClient],
+    [gitRoot, queryClient],
   );
 
   const removeWorktree = React.useCallback(
     (wt: GitWorktree) => {
-      if (!projectPath) return;
-      if (wt.path === projectPath) return;
+      if (!gitRoot) return;
+      if (normPath(wt.path) === normPath(projectPath) ||
+          normPath(wt.path) === normPath(gitRoot)) return;
       const ok = window.confirm(
         `Remove worktree ${wt.branch ?? wt.path}?\n\n${wt.path}`,
       );
       if (!ok) return;
       void removeWorktreeImpl(wt, false);
     },
-    [projectPath, removeWorktreeImpl],
+    [projectPath, gitRoot, removeWorktreeImpl],
   );
 
   const forceRemoveWorktree = React.useCallback(
@@ -407,10 +427,10 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           <span className="truncate font-medium">{displayName}</span>
           <div className="flex items-center gap-2">
             <BranchSwitcher
-              projectPath={projectPath}
+              projectPath={gitRoot ?? projectPath}
               currentBranch={currentBranch || "HEAD"}
               parentProjectId={projectId}
-              parentProjectPath={projectPath}
+              parentProjectPath={gitRoot ?? projectPath}
               provider={defaultProvider}
               model={null}
               onCheckedOut={() => {
@@ -506,7 +526,9 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           ) : (
             <ul className="space-y-2">
               {worktrees.map((wt) => {
-                const isMain = wt.path === projectPath;
+                const isMain =
+                  normPath(wt.path) === normPath(projectPath) ||
+                  normPath(wt.path) === normPath(gitRoot);
                 const label = wt.branch ?? "(detached)";
                 const shortSha = wt.head ? wt.head.slice(0, 7) : "";
                 const isOpening = openingWtPath === wt.path;
@@ -681,7 +703,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       <CreateWorktreeDialog
         open={createWtOpen}
         onOpenChange={setCreateWtOpen}
-        projectPath={projectPath}
+        projectPath={gitRoot ?? projectPath}
         currentBranch={currentBranch}
         onCreated={(wt) => {
           void worktreeQuery.refetch();

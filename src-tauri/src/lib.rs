@@ -37,6 +37,33 @@ fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
 }
 
+/// Resolve the git repository root for `path` by running
+/// `git rev-parse --show-toplevel`. Returns `None` if `path` is not
+/// inside a git repo. Used by the frontend to normalise the project
+/// path before running worktree / branch commands — critical when the
+/// project directory is a git submodule (`.git` is a file, not a
+/// directory) or a linked worktree, where the raw file-picker path
+/// may differ from what git considers the repo root.
+#[tauri::command]
+async fn resolve_git_root(path: String) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || resolve_git_root_sync(&path))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn resolve_git_root_sync(path: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", path, "rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if root.is_empty() { None } else { Some(root) }
+}
+
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
 /// surface the active branch under the thread title.
@@ -382,9 +409,17 @@ fn create_git_worktree(
     // side). Linear scan — the list is short. Call the sync helper
     // directly so we don't need to make this command async just to
     // chain an `.await`.
-    let all = list_git_worktrees_sync(project_path)?;
+    //
+    // Resolve the git root first — when the project path is a
+    // submodule directory git may report worktree paths relative to
+    // the resolved repo root rather than the raw project path.
+    let effective_path = resolve_git_root_sync(&project_path)
+        .unwrap_or(project_path);
+    let all = list_git_worktrees_sync(effective_path)?;
     all.into_iter()
-        .find(|w| w.path == worktree_path)
+        .find(|w| {
+            w.path.trim_end_matches('/') == worktree_path.trim_end_matches('/')
+        })
         .ok_or_else(|| {
             format!(
                 "worktree add succeeded but {worktree_path} not found in subsequent list"
@@ -1918,6 +1953,7 @@ pub fn run() {
             git_create_branch,
             create_git_worktree,
             remove_git_worktree,
+            resolve_git_root,
             path_exists,
             get_git_diff_summary,
             get_git_diff_file,

@@ -55,6 +55,14 @@ export function gitCreateBranch(path: string, branch: string): Promise<void> {
   return invoke<void>("git_create_branch", { path, branch });
 }
 
+/** Resolve the git repository root for `path` via
+ * `git rev-parse --show-toplevel`. Returns `null` when the path is
+ * not inside a git repo. Critical for submodule / linked-worktree
+ * directories where the raw path may differ from the repo root. */
+export function resolveGitRoot(path: string): Promise<string | null> {
+  return invoke<string | null>("resolve_git_root", { path });
+}
+
 export interface GitWorktree {
   path: string;
   head: string | null;
