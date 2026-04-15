@@ -56,13 +56,13 @@ const STUCK_TIMEOUT_MS = 45_000;
 
 // Diff-panel sizing. Clamped so neither the chat column nor the diff
 // pane can collapse to nothing when the user drags the handle.
-const DIFF_WIDTH_KEY = "flowzen:diff-width";
-const DIFF_STYLE_KEY = "flowzen:diff-style";
+const DIFF_WIDTH_KEY = "flowstate:diff-width";
+const DIFF_STYLE_KEY = "flowstate:diff-style";
 const DIFF_MIN_WIDTH = 360;
 const DIFF_DEFAULT_WIDTH = 560;
 const DIFF_CHAT_MIN_WIDTH = 420;
 
-const CONTEXT_WIDTH_KEY = "flowzen:context-width";
+const CONTEXT_WIDTH_KEY = "flowstate:context-width";
 const CONTEXT_MIN_WIDTH = 320;
 const CONTEXT_DEFAULT_WIDTH = 440;
 
@@ -358,7 +358,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return q ?? null;
   }, [state.pendingQuestionBySession, sessionId]);
   const [effort, setEffort] = React.useState<ReasoningEffort>("high");
-  const permissionStorageKey = `flowzen:permissionMode:${sessionId}`;
+  const permissionStorageKey = `flowstate:permissionMode:${sessionId}`;
   const [permissionMode, setPermissionMode] =
     React.useState<PermissionMode>(
       () =>

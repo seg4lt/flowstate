@@ -26,7 +26,7 @@ export function createPierreDiffsWorker(): Worker {
 // Workers are message-passing: they consume zero CPU when idle, so
 // the only ongoing cost is memory. There is no background work.
 //
-// The setting persists in flowzen's own SQLite via the Tauri
+// The setting persists in flowstate's own SQLite via the Tauri
 // `get_user_config` / `set_user_config` commands — separate from
 // the agent SDK's daemon persistence. SDK and app each own their
 // own database; nothing about app-level config belongs in the
@@ -66,7 +66,7 @@ function clampPoolSize(value: number): number {
 }
 
 // Read + clamp + fallback. Async because the value lives in
-// flowzen's SQLite (via Tauri IPC, not localStorage). Resolves
+// flowstate's SQLite (via Tauri IPC, not localStorage). Resolves
 // quickly — local SQLite read is sub-millisecond — but main.tsx
 // has to await it before mounting the worker pool provider.
 export async function readPoolSizeSetting(): Promise<number> {

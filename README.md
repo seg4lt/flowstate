@@ -1,4 +1,4 @@
-# flowzen
+# flowstate
 
 Tauri + React + TypeScript desktop app.
 

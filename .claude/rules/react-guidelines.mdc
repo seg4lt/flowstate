@@ -1,5 +1,5 @@
 ---
-description: React component composition, state management, and code style guidelines for the flowzen frontend
+description: React component composition, state management, and code style guidelines for the flowstate frontend
 globs: "*.tsx, *.ts"
 alwaysApply: false
 ---

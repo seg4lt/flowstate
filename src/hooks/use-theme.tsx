@@ -20,7 +20,7 @@ interface ThemeContextValue {
 // Constants
 // ---------------------------------------------------------------------------
 
-const THEME_KEY = "flowzen:theme";
+const THEME_KEY = "flowstate:theme";
 const DEFAULT_THEME: ThemePreference = "dark";
 const MQL = "(prefers-color-scheme: dark)";
 

@@ -60,8 +60,8 @@ const PICKER_RESULT_LIMIT = 50;
 // so only the latest query's results ever land.
 const CONTENT_SEARCH_DEBOUNCE_MS = 600;
 
-const TREE_WIDTH_KEY = "flowzen:code-tree-width";
-const TREE_COLLAPSED_KEY = "flowzen:code-tree-collapsed";
+const TREE_WIDTH_KEY = "flowstate:code-tree-width";
+const TREE_COLLAPSED_KEY = "flowstate:code-tree-collapsed";
 const TREE_DEFAULT_WIDTH = 260;
 const TREE_MIN_WIDTH = 160;
 const TREE_MAX_WIDTH = 520;

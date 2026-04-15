@@ -4,7 +4,7 @@ import { Switch as SwitchPrimitive } from "radix-ui";
 import { cn } from "@/lib/utils";
 
 // Thin wrapper around radix-ui's Switch, styled to match the rest of
-// the flowzen UI (same border/ring language as Button). Used on the
+// the flowstate UI (same border/ring language as Button). Used on the
 // settings page to toggle providers on and off.
 const Switch = React.forwardRef<
   React.ElementRef<typeof SwitchPrimitive.Root>,

@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 /// Cheap "does this filesystem entry exist?" probe. Used by the
 /// chat view to flip a worktree thread into read-only mode when
-/// the user has removed its folder out from under flowzen — the
+/// the user has removed its folder out from under flowstate — the
 /// banner explains why the composer is disabled and the existing
 /// archived-readonly infra is reused to enforce it.
 #[tauri::command]
@@ -397,7 +397,7 @@ fn create_git_worktree(
 /// locked state — the frontend surfaces stderr inline and can offer
 /// a retry with `force = true`, which runs `git worktree remove -f`.
 /// Does NOT soft-delete the SDK project linked to this worktree; the
-/// caller is responsible for cleaning up any flowzen-side metadata
+/// caller is responsible for cleaning up any flowstate-side metadata
 /// so history stays visible until the user explicitly deletes the
 /// threads.
 #[tauri::command]
@@ -1225,7 +1225,7 @@ fn read_project_file(path: String, file: String) -> Result<String, String> {
 ///
 /// We spawn and detach a reaper thread that calls `wait()` on the
 /// child so it doesn't sit around as a `<defunct>` zombie after it
-/// exits. We intentionally don't kill the editor when flowzen quits.
+/// exits. We intentionally don't kill the editor when flowstate quits.
 ///
 /// Returns `Err` with a readable message when:
 ///   * `path` isn't a directory (no project to open)
@@ -1593,20 +1593,20 @@ struct AppLifecycle {
 /// file alongside the daemon log.
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("flowzen=info,zenui=info,warn"));
+        .unwrap_or_else(|_| EnvFilter::new("flowstate=info,zenui=info,warn"));
 
     if cfg!(debug_assertions) {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_writer(std::io::stderr)
             .try_init();
-        eprintln!("flowzen: dev build, logging to stderr");
+        eprintln!("flowstate: dev build, logging to stderr");
         return;
     }
 
-    let log_dir = std::env::temp_dir().join("flowzen").join("logs");
+    let log_dir = std::env::temp_dir().join("flowstate").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join("flowzen.log");
+    let log_path = log_dir.join("flowstate.log");
 
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -1620,7 +1620,7 @@ fn init_tracing() {
             .with_writer(std::sync::Mutex::new(file))
             .with_ansi(false)
             .try_init();
-        eprintln!("flowzen: logging to {}", log_path.display());
+        eprintln!("flowstate: logging to {}", log_path.display());
     } else {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
@@ -1666,10 +1666,10 @@ fn pty_kill(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// user_config — flowzen-app-owned key/value store
+// user_config — flowstate-app-owned key/value store
 // ─────────────────────────────────────────────────────────────────
 //
-// Backed by `~/.flowzen/user_config.sqlite` (its own file, not the
+// Backed by `~/.flowstate/user_config.sqlite` (its own file, not the
 // daemon's database). Used for app-level UI tunables like the
 // highlighter pool size. Frontend wraps these as
 // `getUserConfig` / `setUserConfig` in `src/lib/api.ts`.
@@ -1763,7 +1763,7 @@ fn delete_project_display(
     store.delete_project_display(&project_id)
 }
 
-// Parent/child worktree links — a flowzen-app concept, not an SDK
+// Parent/child worktree links — a flowstate-app concept, not an SDK
 // concept. Each worktree has its own SDK project (so the SDK's
 // existing cwd resolution picks up the worktree folder), and this
 // table just records "project X is a worktree of project Y, on
@@ -1803,7 +1803,7 @@ fn delete_project_worktree(
     store.delete_project_worktree(&project_id)
 }
 
-/// Resolved cross-platform app data dir for Flowzen — the same
+/// Resolved cross-platform app data dir for Flowstate — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
 /// path and open it in Finder / Explorer / their terminal.
@@ -1841,22 +1841,22 @@ pub fn run() {
             //   - macOS:   ~/Library/Application Support/<bundle.id>/
             //   - Linux:   ~/.local/share/<bundle.id>/
             //   - Windows: %APPDATA%/<bundle.id>/
-            // Everything flowzen owns — daemon SQLite + threads dir +
+            // Everything flowstate owns — daemon SQLite + threads dir +
             // the app's own user_config sqlite — lives under here.
-            let flowzen_root = app
+            let flowstate_root = app
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
-            std::fs::create_dir_all(&flowzen_root)
+            std::fs::create_dir_all(&flowstate_root)
                 .expect("failed to create app data dir");
-            std::fs::create_dir_all(flowzen_root.join("threads")).ok();
+            std::fs::create_dir_all(flowstate_root.join("threads")).ok();
 
-            // Open the flowzen-app-owned user config store. Lives in
+            // Open the flowstate-app-owned user config store. Lives in
             // its own file at <app_data_dir>/user_config.sqlite — a
             // separate database from the daemon's. SDK and app each
             // own their own SQLite; nothing about app-level UI config
             // belongs in the daemon's schema.
-            let user_config_store = UserConfigStore::open(&flowzen_root)
+            let user_config_store = UserConfigStore::open(&flowstate_root)
                 .expect("failed to open user_config store");
             app.manage(user_config_store);
 
@@ -1871,7 +1871,7 @@ pub fn run() {
             // runtime"; bootstrap_core_async removes that need by
             // letting us share the host runtime.
             tauri::async_runtime::spawn(async move {
-                let mut config = DaemonConfig::with_project_root(flowzen_root);
+                let mut config = DaemonConfig::with_project_root(flowstate_root);
                 config.idle_timeout = Duration::MAX;
 
                 let core = bootstrap_core_async(&config)

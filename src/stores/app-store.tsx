@@ -55,7 +55,7 @@ interface AppState {
   projectDisplay: Map<string, ProjectDisplay>;
   /** Parent/child worktree links, keyed by the worktree's SDK
    *  project_id. A row here marks the project as a git worktree of
-   *  its `parentProjectId`. Lives in flowzen's user_config, not the
+   *  its `parentProjectId`. Lives in flowstate's user_config, not the
    *  SDK — each worktree has its own SDK project so cwd resolution
    *  works natively; this table is purely for sidebar grouping and
    *  the tooltip/branch-icon indicator. */
@@ -87,7 +87,7 @@ interface AppState {
   /** Latest rate-limit / plan-usage snapshot per bucket, keyed by
    *  the provider-defined bucket id. Account-wide, not scoped to
    *  any session — providers report these whenever they update.
-   *  Flowzen surfaces them in the Context Display popover. */
+   *  Flowstate surfaces them in the Context Display popover. */
   rateLimits: Record<string, RateLimitInfo>;
   ready: boolean;
 }

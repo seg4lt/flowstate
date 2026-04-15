@@ -1,4 +1,4 @@
-// Flowzen-app-owned store for app-level state.
+// Flowstate-app-owned store for app-level state.
 //
 // Lives in its own SQLite file under Tauri's app_data_dir,
 // deliberately separate from the agent SDK's persistence layer:
@@ -19,7 +19,7 @@
 //                         sort order) keyed by project_id
 //   * `project_worktree` — parent/child link marking an SDK
 //                         project as a git worktree of another
-//                         SDK project. Flowzen groups them under
+//                         SDK project. Flowstate groups them under
 //                         the parent in the sidebar; the SDK never
 //                         sees this relationship.
 
@@ -45,9 +45,9 @@ pub struct ProjectDisplay {
 }
 
 /// Parent/child link between two SDK projects where the child is a
-/// git worktree of the parent. Stored in flowzen's user_config —
+/// git worktree of the parent. Stored in flowstate's user_config —
 /// the agent SDK treats both as ordinary independent projects and
-/// has no notion of worktree ancestry. The flowzen sidebar reads
+/// has no notion of worktree ancestry. The flowstate sidebar reads
 /// this table to group worktree threads under the parent project
 /// visually, and the branch-switcher reads it to find-or-create the
 /// worktree project when a user clicks or creates a worktree.
@@ -75,7 +75,7 @@ impl UserConfigStore {
     /// `setup`. Failing here is fatal — there's nothing useful the
     /// app can do without its config store.
     ///
-    /// `data_dir` should be `~/.flowzen` so the file sits next to
+    /// `data_dir` should be `~/.flowstate` so the file sits next to
     /// the daemon's database in its own dedicated file. SDK and
     /// app each own their own SQLite; this module never touches
     /// the daemon's schema or connection.

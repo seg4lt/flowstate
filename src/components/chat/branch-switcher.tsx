@@ -158,12 +158,12 @@ export function BranchSwitcher({
     }
   }, [open]);
 
-  // Find-or-create flow for opening a worktree as a flowzen thread.
+  // Find-or-create flow for opening a worktree as a flowstate thread.
   // Each worktree has its own SDK project (so the agent SDK's existing
   // cwd resolution picks up the worktree folder without any SDK-level
   // worktree awareness). If a thread already exists under that SDK
   // project we focus it; otherwise we start a new session and link it
-  // to the parent project via the flowzen-side `project_worktree`
+  // to the parent project via the flowstate-side `project_worktree`
   // table. The parent link is what the sidebar reads to visually
   // group worktree threads under the main repo's project header.
   const openWorktreeSession = React.useCallback(

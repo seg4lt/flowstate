@@ -61,7 +61,7 @@ const KNOWN_EDITORS: EditorChoice[] = [
   { id: "idea", label: "IntelliJ IDEA", command: "idea" },
 ];
 
-const DEFAULT_EDITOR_KEY = "flowzen:default-editor";
+const DEFAULT_EDITOR_KEY = "flowstate:default-editor";
 
 function loadDefaultEditorId(): string | null {
   try {

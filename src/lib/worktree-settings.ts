@@ -1,4 +1,4 @@
-// Flowzen-app-level setting: the base directory under which new
+// Flowstate-app-level setting: the base directory under which new
 // git worktrees are created. Stored in `user_config.sqlite` via the
 // same key/value plumbing the highlighter pool size uses — this is
 // an app-level tunable, not something the agent SDK's daemon

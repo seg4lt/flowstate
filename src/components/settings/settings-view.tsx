@@ -170,7 +170,7 @@ function ProviderRow({
 }
 
 // Single row in the Performance group. The current value lives in
-// flowzen's own SQLite (`user_config` table) — fetched once on
+// flowstate's own SQLite (`user_config` table) — fetched once on
 // mount via `readPoolSizeSetting`, written back on every commit
 // via `writePoolSizeSetting`. Both calls are async because they
 // cross the Tauri IPC bridge, but local SQLite reads are
@@ -229,7 +229,7 @@ function PoolSizeRow() {
         <div className="mt-1 text-[11px] text-muted-foreground">
           Detected {cores} {cores === 1 ? "core" : "cores"} · range{" "}
           {POOL_SIZE_MIN}–{maxPoolSize} · default {getDefaultPoolSize()} ·
-          restart Flowzen to apply.
+          restart Flowstate to apply.
         </div>
       </div>
       <input
@@ -366,7 +366,7 @@ function AppDataDirRow() {
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium">App data folder</div>
         <div className="mt-0.5 text-xs text-muted-foreground">
-          Where Flowzen keeps its databases, sessions, and config on disk.
+          Where Flowstate keeps its databases, sessions, and config on disk.
           Click the field to select, then Cmd/Ctrl+C to copy.
         </div>
         <div className="mt-2">
@@ -461,7 +461,7 @@ export function SettingsView() {
         <div className="mx-auto max-w-2xl px-6 py-8">
           <SettingsGroup
             title="Appearance"
-            description="Customize how Flowzen looks."
+            description="Customize how Flowstate looks."
           >
             <ThemeRow />
           </SettingsGroup>
@@ -482,7 +482,7 @@ export function SettingsView() {
           </SettingsGroup>
           <SettingsGroup
             title="Performance"
-            description="Tune how Flowzen uses your machine's resources."
+            description="Tune how Flowstate uses your machine's resources."
           >
             <PoolSizeRow />
           </SettingsGroup>
@@ -494,7 +494,7 @@ export function SettingsView() {
           </SettingsGroup>
           <SettingsGroup
             title="Storage"
-            description="Where Flowzen keeps its data on disk."
+            description="Where Flowstate keeps its data on disk."
           >
             <AppDataDirRow />
           </SettingsGroup>

@@ -25,12 +25,12 @@ import { SettingsView } from "@/components/settings/settings-view";
 import { Toaster } from "@/components/ui/toaster";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
-const SIDEBAR_WIDTH_KEY = "flowzen:sidebar-width";
+const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
 const SIDEBAR_MAX_WIDTH = 500;
 const SIDEBAR_DEFAULT_WIDTH = 256;
 
-const ZOOM_KEY = "flowzen:webview-zoom";
+const ZOOM_KEY = "flowstate:webview-zoom";
 const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 3.0;
 const ZOOM_STEP = 0.1;

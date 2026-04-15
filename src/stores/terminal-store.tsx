@@ -54,8 +54,8 @@ type TerminalAction =
   | { type: "set_tab_title"; projectKey: string; tabId: string; title: string }
   | { type: "prune_projects"; keep: Set<string> };
 
-const DOCK_OPEN_KEY = "flowzen:terminal-dock-open";
-const DOCK_HEIGHT_KEY = "flowzen:terminal-dock-height";
+const DOCK_OPEN_KEY = "flowstate:terminal-dock-open";
+const DOCK_HEIGHT_KEY = "flowstate:terminal-dock-height";
 const DOCK_DEFAULT_HEIGHT = 320;
 const DOCK_MIN_HEIGHT = 120;
 const DOCK_MAX_HEIGHT = 900;

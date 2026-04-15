@@ -1,6 +1,6 @@
 //! GUI-launched PATH hydration.
 //!
-//! When flowzen is launched from Finder / the dock / a .desktop
+//! When flowstate is launched from Finder / the dock / a .desktop
 //! file, the process starts with the bare launchd/systemd env —
 //! roughly `PATH=/usr/bin:/bin:/usr/sbin:/sbin` plus locale. None of
 //! the user's shell rc-file PATH additions (Homebrew, mise, nvm,
@@ -50,7 +50,7 @@ use std::process::{Command, Stdio};
 /// delimiter discards all of it so only the real env dump is
 /// parsed. Long + improbable on purpose.
 #[cfg(unix)]
-const DELIMITER: &str = "__FLOWZEN_SHELL_ENV_DELIMITER__";
+const DELIMITER: &str = "__FLOWSTATE_SHELL_ENV_DELIMITER__";
 
 pub fn hydrate_from_login_shell() {
     if path_already_rich() {
@@ -154,7 +154,7 @@ fn hydrate_unix() {
 
     // Carry every variable the login shell exposed, minus a short
     // blocklist of vars that describe the shell session itself and
-    // would actively confuse the flowzen process if overwritten:
+    // would actively confuse the flowstate process if overwritten:
     //   PWD     — our cwd, not the shell's
     //   OLDPWD  — meaningless outside that shell session
     //   SHLVL   — shell nesting depth counter

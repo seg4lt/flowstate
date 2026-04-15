@@ -30,7 +30,7 @@ const queryClient = new QueryClient({
 });
 
 // Async boot: we read the user's chosen highlighter pool size from
-// the flowzen-app-owned SQLite (via Tauri IPC) before mounting the
+// the flowstate-app-owned SQLite (via Tauri IPC) before mounting the
 // worker pool provider. The pool is a singleton built at provider
 // mount, so we can't change it after — the value has to be in hand
 // before the first React render. Local SQLite reads are
@@ -62,7 +62,7 @@ async function bootstrap() {
             workerFactory: createPierreDiffsWorker,
             // User-configurable from Settings → Performance. Read
             // above before mounting; changing the setting requires
-            // restarting Flowzen because the @pierre/diffs pool is
+            // restarting Flowstate because the @pierre/diffs pool is
             // a singleton built at provider mount. More workers
             // tokenize big diffs in parallel at the cost of
             // resident memory; see pierre-diffs-worker.ts for the

@@ -1,12 +1,12 @@
 [package]
-name = "flowzen"
+name = "flowstate"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
 
 [lib]
-name = "flowzen_lib"
+name = "flowstate_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -32,7 +32,7 @@ grep-searcher = "0.1"
 grep-matcher = "0.1"
 
 # Daemon core with opted-in features: every provider adapter, plus
-# the Tauri transport. flowzen ships with all providers compiled in
+# the Tauri transport. flowstate ships with all providers compiled in
 # and lets users toggle them at runtime from Settings. transport-tauri
 # is re-exported by daemon-core as `zenui_daemon_core::transport_tauri`.
 zenui-daemon-core = { path = "../../rs-agent-sdk/crates/middleman/daemon-core", features = ["all-providers", "transport-tauri"] }
@@ -51,7 +51,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # wezterm's battle-tested abstraction.
 portable-pty = "0.9"
 
-# Flowzen-app-owned key/value store for user-tunable settings
+# Flowstate-app-owned key/value store for user-tunable settings
 # (highlighter pool size, future tweaks). Lives in its own SQLite
 # file under Tauri's app_data_dir, intentionally separate from the
 # agent SDK's persistence — the SDK owns session/agent state, the

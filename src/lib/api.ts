@@ -105,7 +105,7 @@ export function removeGitWorktree(
 }
 
 // Cheap existence probe used by the chat view to detect when a
-// worktree folder has been removed out from under flowzen — the
+// worktree folder has been removed out from under flowstate — the
 // composer flips to read-only via the same infra as archived
 // threads.
 export function pathExists(path: string): Promise<boolean> {
@@ -218,7 +218,7 @@ export function listProjectFiles(path: string): Promise<string[]> {
   return invoke<string[]>("list_project_files", { path });
 }
 
-// Flowzen-app-owned key/value store. Backed by SQLite at
+// Flowstate-app-owned key/value store. Backed by SQLite at
 // <app_data_dir>/user_config.sqlite — separate from the agent
 // SDK's daemon database. SDK and app each own their own SQLite;
 // app-level UI tunables (pool size, future toggles) live here, not
@@ -296,7 +296,7 @@ export function deleteProjectDisplay(projectId: string): Promise<void> {
 // Parent/child worktree links. Each worktree has its own SDK
 // project so the agent SDK's existing cwd resolution "just works",
 // and this table records "this SDK project is a git worktree of
-// that SDK project, on branch Z". The flowzen sidebar reads these
+// that SDK project, on branch Z". The flowstate sidebar reads these
 // to group worktree threads under the parent project visually —
 // the SDK has no concept of worktrees.
 export interface ProjectWorktree {
@@ -331,7 +331,7 @@ export function deleteProjectWorktree(projectId: string): Promise<void> {
   return invoke<void>("delete_project_worktree", { projectId });
 }
 
-// Resolved cross-platform app data dir for Flowzen — the same
+// Resolved cross-platform app data dir for Flowstate — the same
 // directory the daemon database, threads dir, and user_config
 // sqlite live under. Surfaced to the Settings UI as a read-only
 // path so users can copy it and open in Finder / Explorer / a

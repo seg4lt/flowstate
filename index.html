@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>flowzen</title>
+    <title>flowstate</title>
     <style>
       html, body { margin: 0; }
       html.dark body { background-color: #252525; color: #fbfbfb; }
@@ -22,7 +22,7 @@
       }
       .splash-text {
         display: inline-block;
-        width: 8ch;
+        width: 10ch;
         text-align: left;
         white-space: nowrap;
       }
@@ -31,7 +31,7 @@
         overflow: hidden;
         vertical-align: bottom;
         width: 0;
-        animation: type 0.7s steps(7, end) forwards;
+        animation: type 0.7s steps(9, end) forwards;
       }
       .cursor {
         display: inline-block;
@@ -39,7 +39,7 @@
         animation: blink 1s infinite;
       }
       @keyframes type {
-        to { width: 7ch; }
+        to { width: 9ch; }
       }
       @keyframes blink {
         0%, 49.99% { opacity: 1; }
@@ -51,7 +51,7 @@
       // flash-of-wrong-theme. Reads the persisted preference from
       // localStorage and applies the .dark class on <html> immediately.
       (function () {
-        var pref = localStorage.getItem("flowzen:theme") || "dark";
+        var pref = localStorage.getItem("flowstate:theme") || "dark";
         var dark =
           pref === "dark" ||
           (pref === "system" &&
@@ -65,7 +65,7 @@
     <div id="root">
       <div class="splash">
         <div class="splash-text">
-          <span class="typewriter">flowzen</span><span class="cursor">_</span>
+          <span class="typewriter">flowstate</span><span class="cursor">_</span>
         </div>
       </div>
     </div>
