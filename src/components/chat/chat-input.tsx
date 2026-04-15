@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Clock, Pencil, Send, Square, X } from "lucide-react";
+import { Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
 import type { AttachedImage, SessionStatus } from "@/lib/types";
 import { getCompletions } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
@@ -471,7 +471,7 @@ export function ChatInput({
                       className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                       title="Remove from queue"
                     >
-                      <X className="h-3 w-3" />
+                      <Trash2 className="h-3 w-3" />
                     </button>
                   </>
                 )}
