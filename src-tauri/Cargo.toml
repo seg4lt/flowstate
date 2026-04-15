@@ -35,11 +35,11 @@ grep-matcher = "0.1"
 # the Tauri transport. flowstate ships with all providers compiled in
 # and lets users toggle them at runtime from Settings. transport-tauri
 # is re-exported by daemon-core as `zenui_daemon_core::transport_tauri`.
-zenui-daemon-core = { path = "../../rs-agent-sdk/crates/middleman/daemon-core", features = ["all-providers", "transport-tauri"] }
+zenui-daemon-core = { git = "https://github.com/seg4lt/rs-agent-sdk.git", branch = "main", features = ["all-providers", "transport-tauri"] }
 
 # Types used in Tauri commands
-zenui-provider-api = { path = "../../rs-agent-sdk/crates/core/provider-api" }
-zenui-runtime-core = { path = "../../rs-agent-sdk/crates/core/runtime-core" }
+zenui-provider-api = { git = "https://github.com/seg4lt/rs-agent-sdk.git", branch = "main" }
+zenui-runtime-core = { git = "https://github.com/seg4lt/rs-agent-sdk.git", branch = "main" }
 
 # Async
 tokio = { version = "1", features = ["sync"] }

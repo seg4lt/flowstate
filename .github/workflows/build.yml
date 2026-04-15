@@ -36,6 +36,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Configure private repo access
+        run: git config --global url."https://x-access-token:${{ secrets.RS_AGENT_SDK_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
       - name: Enable long paths (Windows)
         if: runner.os == 'Windows'
         run: git config --system core.longpaths true
