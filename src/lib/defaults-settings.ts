@@ -17,6 +17,7 @@ const CONFIG_KEY_EFFORT = "defaults.effort";
 const CONFIG_KEY_PERMISSION_MODE = "defaults.permission_mode";
 const CONFIG_KEY_MODEL_PREFIX = "defaults.model.";
 const CONFIG_KEY_PROVIDER_ENABLED_PREFIX = "provider.enabled.";
+const CONFIG_KEY_DEFAULT_PROVIDER = "defaults.provider";
 
 // --- Provider-enabled defaults ---
 
@@ -26,7 +27,7 @@ export const DEFAULT_ENABLED_PROVIDERS: ReadonlySet<ProviderKind> = new Set([
   "github_copilot",
 ]);
 
-const ALL_PROVIDER_KINDS: readonly ProviderKind[] = [
+export const ALL_PROVIDER_KINDS: readonly ProviderKind[] = [
   "claude",
   "claude_cli",
   "codex",
@@ -49,6 +50,10 @@ const VALID_PERMISSION_MODES: ReadonlySet<string> = new Set<PermissionMode>([
   "plan",
   "bypass",
 ]);
+
+const VALID_PROVIDER_KINDS: ReadonlySet<string> = new Set<ProviderKind>(
+  ALL_PROVIDER_KINDS,
+);
 
 // --- Effort ---
 
@@ -93,6 +98,34 @@ export async function writeDefaultPermissionMode(
 ): Promise<void> {
   try {
     await setUserConfig(CONFIG_KEY_PERMISSION_MODE, value);
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+// --- Default provider ---
+
+/** The provider used by default when starting new threads (e.g.
+ *  from worktree creation) without an explicit provider pick. */
+export const DEFAULT_PROVIDER: ProviderKind = "claude";
+
+export async function readDefaultProvider(): Promise<ProviderKind | null> {
+  try {
+    const raw = await getUserConfig(CONFIG_KEY_DEFAULT_PROVIDER);
+    if (raw !== null && VALID_PROVIDER_KINDS.has(raw)) {
+      return raw as ProviderKind;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeDefaultProvider(
+  value: ProviderKind,
+): Promise<void> {
+  try {
+    await setUserConfig(CONFIG_KEY_DEFAULT_PROVIDER, value);
   } catch {
     /* storage may be unavailable */
   }

@@ -25,6 +25,9 @@ import {
   writeDefaultPermissionMode,
   readDefaultModel,
   writeDefaultModel,
+  readDefaultProvider,
+  writeDefaultProvider,
+  DEFAULT_PROVIDER,
 } from "@/lib/defaults-settings";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
@@ -116,6 +119,57 @@ function ContextDisplayRow() {
         onCheckedChange={setShowContextDisplay}
         aria-label="Show context size display"
       />
+    </div>
+  );
+}
+
+function DefaultProviderRow() {
+  const { isProviderEnabled } = useProviderEnabled();
+  const [value, setValue] = React.useState<ProviderKind>(DEFAULT_PROVIDER);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultProvider().then((saved) => {
+      if (!cancelled && saved) setValue(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Show only enabled providers (ready or not — the user may enable a
+  // provider that hasn't finished its health check yet).
+  const enabledProviders = React.useMemo(
+    () => PROVIDER_ORDER.filter((kind) => isProviderEnabled(kind)),
+    [isProviderEnabled],
+  );
+
+  function handleChange(next: ProviderKind) {
+    setValue(next);
+    void writeDefaultProvider(next);
+  }
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Default provider</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Provider used when opening new threads — for example when creating
+          a worktree or starting a session without explicitly picking one.
+        </div>
+      </div>
+      <select
+        value={value}
+        onChange={(e) => handleChange(e.target.value as ProviderKind)}
+        className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+        aria-label="Default provider"
+      >
+        {enabledProviders.map((kind) => (
+          <option key={kind} value={kind}>
+            {PROVIDER_LABELS[kind]}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -676,6 +730,12 @@ export function SettingsView() {
 
   function handleToggleEnabled(kind: ProviderKind, enabled: boolean) {
     setProviderEnabled(kind, enabled);
+    // When enabling, also tell the daemon so it starts health-checking
+    // and reporting models for this provider. Disabling is app-level
+    // only — the daemon always keeps all providers active.
+    if (enabled) {
+      send({ type: "set_provider_enabled", provider: kind, enabled: true }).catch(() => {});
+    }
     toast({
       description: `${PROVIDER_LABELS[kind]} ${enabled ? "enabled" : "disabled"}`,
       duration: 2000,
@@ -701,6 +761,7 @@ export function SettingsView() {
             title="Defaults"
             description="Default values for new sessions. These apply across all providers."
           >
+            <DefaultProviderRow />
             <DefaultEffortRow />
             <DefaultPermissionModeRow />
             <DefaultModelRow />

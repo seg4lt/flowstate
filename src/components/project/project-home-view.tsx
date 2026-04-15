@@ -41,6 +41,7 @@ import {
 } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
+import { readDefaultProvider, DEFAULT_PROVIDER } from "@/lib/defaults-settings";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import type {
   AggregatedFileDiff,
@@ -114,20 +115,33 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
   // BranchSwitcher starts a new session when the user creates or
   // opens a worktree. From the project page we have no ambient
-  // session to inherit from, so pick the first ready provider as
-  // the default. Worktree-only operations (create branch, checkout)
-  // never reach this code path, so a stale fallback here only
-  // affects the "open worktree as thread" flow, which will surface
-  // its own toast if the provider can't actually start a session.
+  // session to inherit from, so use the user's configured default
+  // provider from Settings → Defaults → Default provider. When the
+  // preferred provider isn't ready (or not enabled), fall back to
+  // the first ready enabled provider, then finally to `DEFAULT_PROVIDER`.
+  const [savedProvider, setSavedProvider] = React.useState<ProviderKind | null>(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultProvider().then((saved) => {
+      if (!cancelled) setSavedProvider(saved);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
   const defaultProvider: ProviderKind = React.useMemo(() => {
+    // Prefer the user's saved choice if it's enabled and ready.
+    if (savedProvider && isProviderEnabled(savedProvider)) {
+      const info = state.providers.find((p) => p.kind === savedProvider);
+      if (info?.status === "ready") return savedProvider;
+    }
+    // Fall back to the first ready enabled provider.
     const ready = state.providers.find(
       (p) => isProviderEnabled(p.kind) && p.status === "ready",
     );
     if (ready) return ready.kind;
-    const any = state.providers.find((p) => isProviderEnabled(p.kind));
-    if (any) return any.kind;
-    return "claude";
-  }, [state.providers, isProviderEnabled]);
+    // Nothing ready — return the saved choice or the hardcoded default.
+    return savedProvider ?? DEFAULT_PROVIDER;
+  }, [state.providers, isProviderEnabled, savedProvider]);
 
   // Threads grouped by the SDK project's filesystem path. Used to
   // render the per-worktree thread chips — each worktree owns its

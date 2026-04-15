@@ -277,7 +277,7 @@ export type ClientMessage =
   | { type: "accept_plan"; session_id: string; plan_id: string }
   | { type: "reject_plan"; session_id: string; plan_id: string }
   | { type: "refresh_models"; provider: ProviderKind }
-
+  | { type: "set_provider_enabled"; provider: ProviderKind; enabled: boolean }
   | { type: "create_project"; path?: string }
   | { type: "delete_project"; project_id: string }
   | { type: "assign_session_to_project"; session_id: string; project_id?: string }

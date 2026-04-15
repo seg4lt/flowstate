@@ -26,6 +26,7 @@ import type {
   SessionSummary,
   UserInputQuestion,
 } from "@/lib/types";
+import { ALL_PROVIDER_KINDS } from "@/lib/defaults-settings";
 
 /** Single permission prompt awaiting the user's answer. */
 export interface PendingPermission {
@@ -694,6 +695,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     connectStream((message) => {
       if (!active) return;
       dispatchRef.current({ type: "server_message", message });
+      // After the daemon signals readiness, ensure all providers are
+      // enabled at the SDK level so health checks run for every one.
+      // The app-level toggle (ProviderEnabledProvider) controls what
+      // the user sees — the daemon should always track everything.
+      if (message.type === "welcome") {
+        for (const kind of ALL_PROVIDER_KINDS) {
+          sendMessage({
+            type: "set_provider_enabled",
+            provider: kind,
+            enabled: true,
+          }).catch(() => {/* best effort */});
+        }
+      }
       // Side-effect cleanup: when the SDK reports a session or
       // project as permanently deleted, drop its app-side display
       // row too. We don't clean on archive — archived rows may be
