@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind, ProviderStatus } from "@/lib/types";
+import { readDefaultModel } from "@/lib/defaults-settings";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
   claude: "bg-amber-500",
@@ -74,15 +75,46 @@ export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropd
   const providerMap = new Map(state.providers.map((p) => [p.kind, p]));
   const stillLoading = !state.ready;
 
+  // Pre-load per-provider default models from user settings so that
+  // clicking a provider (without picking a specific model from the
+  // submenu) uses the user's configured default.
+  const [defaultModels, setDefaultModels] = React.useState<
+    Map<ProviderKind, string>
+  >(new Map());
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const readyProviders = state.providers.filter(
+      (p) => p.enabled && p.status === "ready",
+    );
+    Promise.all(
+      readyProviders.map(async (p) => {
+        const model = await readDefaultModel(p.kind);
+        return [p.kind, model] as const;
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const map = new Map<ProviderKind, string>();
+      for (const [kind, model] of entries) {
+        if (model) map.set(kind, model);
+      }
+      setDefaultModels(map);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.providers]);
+
   async function createThread(provider: ProviderKind, model?: string) {
+    const resolvedModel = model ?? defaultModels.get(provider);
     if (onSelect) {
-      onSelect(provider, model);
+      onSelect(provider, resolvedModel);
       return;
     }
     const res = await send({
       type: "start_session",
       provider,
-      model,
+      model: resolvedModel,
       project_id: projectId,
     });
     if (res && res.type === "session_created") {

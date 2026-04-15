@@ -8,7 +8,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import type { ReasoningEffort } from "@/lib/types";
 
-const EFFORT_OPTIONS: { value: ReasoningEffort; label: string }[] = [
+export const EFFORT_OPTIONS: { value: ReasoningEffort; label: string }[] = [
   { value: "high", label: "High" },
   { value: "medium", label: "Medium" },
   { value: "low", label: "Low" },

@@ -18,8 +18,23 @@ import {
   readWorktreeBasePath,
   writeWorktreeBasePath,
 } from "@/lib/worktree-settings";
+import {
+  readDefaultEffort,
+  writeDefaultEffort,
+  readDefaultPermissionMode,
+  writeDefaultPermissionMode,
+  readDefaultModel,
+  writeDefaultModel,
+} from "@/lib/defaults-settings";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
-import type { ProviderKind, ProviderStatus } from "@/lib/types";
+import { EFFORT_OPTIONS } from "@/components/chat/effort-selector";
+import { MODE_ORDER, MODE_LABELS } from "@/lib/mode-cycling";
+import type {
+  PermissionMode,
+  ProviderKind,
+  ProviderStatus,
+  ReasoningEffort,
+} from "@/lib/types";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
   claude: "bg-amber-500",
@@ -100,6 +115,206 @@ function ContextDisplayRow() {
         onCheckedChange={setShowContextDisplay}
         aria-label="Show context size display"
       />
+    </div>
+  );
+}
+
+function DefaultEffortRow() {
+  const [value, setValue] = React.useState<ReasoningEffort>("high");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultEffort().then((saved) => {
+      if (!cancelled && saved) setValue(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function handleChange(next: ReasoningEffort) {
+    setValue(next);
+    void writeDefaultEffort(next);
+  }
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Default effort</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Reasoning effort level applied to new turns.
+        </div>
+      </div>
+      <select
+        value={value}
+        onChange={(e) => handleChange(e.target.value as ReasoningEffort)}
+        className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+        aria-label="Default effort"
+      >
+        {EFFORT_OPTIONS.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function DefaultPermissionModeRow() {
+  const [value, setValue] = React.useState<PermissionMode>("accept_edits");
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultPermissionMode().then((saved) => {
+      if (!cancelled && saved) setValue(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function handleChange(next: PermissionMode) {
+    setValue(next);
+    void writeDefaultPermissionMode(next);
+  }
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Default permission mode</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Permission mode applied to new sessions.
+        </div>
+      </div>
+      <select
+        value={value}
+        onChange={(e) => handleChange(e.target.value as PermissionMode)}
+        className="h-8 rounded-md border border-input bg-background px-2 text-sm"
+        aria-label="Default permission mode"
+      >
+        {MODE_ORDER.map((mode) => (
+          <option key={mode} value={mode}>
+            {MODE_LABELS[mode]}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
+function DefaultModelRow() {
+  const { state } = useApp();
+  const [defaults, setDefaults] = React.useState<
+    Record<ProviderKind, string | null>
+  >({
+    claude: null,
+    claude_cli: null,
+    codex: null,
+    github_copilot: null,
+    github_copilot_cli: null,
+  });
+  const [loaded, setLoaded] = React.useState(false);
+
+  // Read saved defaults for all providers on mount.
+  React.useEffect(() => {
+    let cancelled = false;
+    Promise.all(
+      PROVIDER_ORDER.map(async (kind) => {
+        const model = await readDefaultModel(kind);
+        return [kind, model] as const;
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const next: Record<string, string | null> = {};
+      for (const [kind, model] of entries) {
+        next[kind] = model;
+      }
+      setDefaults(next as Record<ProviderKind, string | null>);
+      setLoaded(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Only show providers that are ready and have models.
+  const readyProviders = React.useMemo(
+    () =>
+      PROVIDER_ORDER.map((kind) => ({
+        kind,
+        provider: state.providers.find((p) => p.kind === kind),
+      })).filter(
+        (entry) =>
+          entry.provider &&
+          entry.provider.enabled &&
+          entry.provider.status === "ready" &&
+          entry.provider.models.length > 0,
+      ),
+    [state.providers],
+  );
+
+  function handleChange(kind: ProviderKind, model: string) {
+    // Empty string means "use first / no preference"
+    const resolved = model === "" ? null : model;
+    setDefaults((prev) => ({ ...prev, [kind]: resolved }));
+    if (resolved) {
+      void writeDefaultModel(kind, resolved);
+    } else {
+      // Write empty string to clear the default
+      void writeDefaultModel(kind, "");
+    }
+  }
+
+  if (!loaded) return null;
+
+  return (
+    <div className="border-b border-border px-4 py-3 last:border-b-0">
+      <div className="mb-3">
+        <div className="text-sm font-medium">Default model</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Preferred model per provider. New sessions auto-select this model when
+          available.
+        </div>
+      </div>
+      {readyProviders.length === 0 ? (
+        <div className="text-xs text-muted-foreground">
+          No providers with models available.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {readyProviders.map(({ kind, provider }) => {
+            const models = provider!.models;
+            const current = defaults[kind];
+            return (
+              <div
+                key={kind}
+                className="flex items-center gap-3"
+              >
+                <span
+                  className={`inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[kind]}`}
+                />
+                <span className="min-w-0 flex-1 truncate text-xs font-medium">
+                  {PROVIDER_LABELS[kind]}
+                </span>
+                <select
+                  value={current ?? ""}
+                  onChange={(e) => handleChange(kind, e.target.value)}
+                  className="h-7 max-w-48 truncate rounded-md border border-input bg-background px-2 text-xs"
+                  aria-label={`Default model for ${PROVIDER_LABELS[kind]}`}
+                >
+                  <option value="">Use first available</option>
+                  {models.map((m) => (
+                    <option key={m.value} value={m.value}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -487,6 +702,14 @@ export function SettingsView() {
           >
             <ThemeRow />
             <ContextDisplayRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Defaults"
+            description="Default values for new sessions. These apply across all providers."
+          >
+            <DefaultEffortRow />
+            <DefaultPermissionModeRow />
+            <DefaultModelRow />
           </SettingsGroup>
           <SettingsGroup
             title="Providers"

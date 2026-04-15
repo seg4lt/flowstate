@@ -27,6 +27,10 @@ import {
 } from "@/lib/queries";
 import { useStreamedGitDiffSummary } from "@/lib/git-diff-stream";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
+import {
+  readDefaultEffort,
+  readDefaultPermissionMode,
+} from "@/lib/defaults-settings";
 import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
 import { MessageList } from "./messages/message-list";
@@ -357,7 +361,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     const q = state.pendingQuestionBySession.get(sessionId);
     return q ?? null;
   }, [state.pendingQuestionBySession, sessionId]);
-  const [effort, setEffort] = React.useState<ReasoningEffort>("high");
+  const effortStorageKey = `flowstate:effort:${sessionId}`;
+  const [effort, setEffort] = React.useState<ReasoningEffort>(
+    () =>
+      (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high",
+  );
   const permissionStorageKey = `flowstate:permissionMode:${sessionId}`;
   const [permissionMode, setPermissionMode] =
     React.useState<PermissionMode>(
@@ -366,8 +374,39 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         "accept_edits",
     );
 
-  // Persist permission mode to sessionStorage so it survives navigation
-  // (e.g. Settings → back) without losing the user's choice.
+  // Load user-configured defaults from Settings for fresh sessions.
+  // Only override when sessionStorage has no value (i.e. the session
+  // hasn't been touched yet). Once the user changes a value in-session
+  // it sticks — navigating away and back won't reset it.
+  React.useEffect(() => {
+    if (sessionStorage.getItem(effortStorageKey)) return;
+    let cancelled = false;
+    readDefaultEffort().then((saved) => {
+      if (!cancelled && saved) setEffort(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [effortStorageKey]);
+
+  React.useEffect(() => {
+    if (sessionStorage.getItem(permissionStorageKey)) return;
+    let cancelled = false;
+    readDefaultPermissionMode().then((saved) => {
+      if (!cancelled && saved) setPermissionMode(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [permissionStorageKey]);
+
+  // Persist effort and permission mode to sessionStorage so they
+  // survive navigation (e.g. Settings → back) without losing the
+  // user's in-session choice.
+  React.useEffect(() => {
+    sessionStorage.setItem(effortStorageKey, effort);
+  }, [effortStorageKey, effort]);
+
   React.useEffect(() => {
     sessionStorage.setItem(permissionStorageKey, permissionMode);
   }, [permissionStorageKey, permissionMode]);
