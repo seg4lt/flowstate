@@ -1,8 +1,5 @@
 name: Build
 
-# Build only when a release tag is pushed. Tag format: v<version>
-# (e.g. v0.2.0, v1.0.0-rc1). Pushes to branches and PRs do not trigger
-# this workflow.
 on:
   push:
     tags:
@@ -14,49 +11,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Apple Silicon (M1/M2/M3) — produces .app and .dmg under
-          # src-tauri/target/aarch64-apple-darwin/release/bundle/.
           - name: macos-arm
             runner: macos-14
             target: aarch64-apple-darwin
             tauri-args: --target aarch64-apple-darwin
-            bundle-path: flowstate/src-tauri/target/aarch64-apple-darwin/release/bundle/
+            bundle-path: src-tauri/target/aarch64-apple-darwin/release/bundle/
 
-          # Windows (.msi + nsis .exe) — disabled for now. Uncomment to enable.
-          # - name: windows-x64
-          #   runner: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   tauri-args: ""
-          #   bundle-path: flowstate/src-tauri/target/release/bundle/
+          - name: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            tauri-args: ""
+            bundle-path: src-tauri/target/release/bundle/
 
-          # Linux (.deb + .AppImage) — disabled for now. Uncomment to enable
-          # AND uncomment the "Install Linux deps" step below.
           # - name: linux-x64
           #   runner: ubuntu-22.04
           #   target: x86_64-unknown-linux-gnu
           #   tauri-args: ""
-          #   bundle-path: flowstate/src-tauri/target/release/bundle/
+          #   bundle-path: src-tauri/target/release/bundle/
 
     name: build (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
 
     steps:
-      # Check out flowstate into ./flowstate and the agent SDK into
-      # ./rs-agent-sdk so the path dependency `../../rs-agent-sdk`
-      # resolves identically to local development.
-      - name: Checkout flowstate
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: flowstate
 
-      - name: Checkout agent SDK
-        uses: actions/checkout@v4
-        with:
-          repository: seg4lt/rs-agent-sdk
-          path: rs-agent-sdk
-          # If the agent SDK repo is private, set a PAT secret with read
-          # access and uncomment the next line:
-          # token: ${{ secrets.RS_AGENT_SDK_TOKEN }}
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -68,7 +50,6 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
-          cache-dependency-path: flowstate/pnpm-lock.yaml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -78,19 +59,15 @@ jobs:
       - name: Cache Rust target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: flowstate/src-tauri -> target
+          workspaces: src-tauri -> target
 
       - name: Install bun
-        # The agent SDK provider crates have build.rs scripts that run
-        # `bun install && bun run build` to compile the Claude SDK and
-        # GitHub Copilot bridges. Without bun the bridges won't compile
-        # and the daemon will refuse to start at runtime.
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
       # - name: Install Linux deps
-      #   if: matrix.runner == 'ubuntu-22.04'
+      #   if: runner.os == 'Linux'
       #   run: |
       #     sudo apt-get update
       #     sudo apt-get install -y \
@@ -100,12 +77,32 @@ jobs:
       #       patchelf
 
       - name: Install frontend dependencies
-        working-directory: flowstate
         run: pnpm install --frozen-lockfile
 
-      - name: Build (pnpm tauri build)
-        working-directory: flowstate
+      - name: Build
         run: pnpm tauri build ${{ matrix.tauri-args }}
+
+      - name: Repackage DMG with install script (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          APP_PATH=$(find src-tauri/target -name "flowstate.app" -path "*/release/bundle/macos/*" | head -1)
+          DMG_DIR=$(dirname "$APP_PATH" | sed 's|/macos$|/dmg|')
+          OLD_DMG=$(find src-tauri/target -name "*.dmg" -path "*/release/bundle/dmg/*" | head -1)
+
+          rm -f "$OLD_DMG"
+
+          STAGING=$(mktemp -d)
+          cp -R "$APP_PATH" "$STAGING/"
+          cp scripts/install-macos.command "$STAGING/Install Flowstate.command"
+          chmod +x "$STAGING/Install Flowstate.command"
+
+          hdiutil create \
+            -volname "Flowstate" \
+            -srcfolder "$STAGING" \
+            -ov -format UDZO \
+            "$DMG_DIR/Flowstate.dmg"
+
+          rm -rf "$STAGING"
 
       - name: Upload bundles
         uses: actions/upload-artifact@v4
