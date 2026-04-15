@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Clock, Send, Square, X } from "lucide-react";
+import { Clock, Pencil, Send, Square, X } from "lucide-react";
 import type { AttachedImage, SessionStatus } from "@/lib/types";
 import { getCompletions } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
@@ -101,7 +101,10 @@ export function ChatInput({
   const [lightboxSource, setLightboxSource] = React.useState<LightboxSource | null>(
     null,
   );
+  const [editingId, setEditingId] = React.useState<string | null>(null);
+  const [editText, setEditText] = React.useState("");
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+  const editTextareaRef = React.useRef<HTMLTextAreaElement>(null);
 
   // Land focus in the composer on every mount *and* whenever the
   // composer transitions from non-interactive → interactive. ChatView
@@ -114,6 +117,17 @@ export function ChatInput({
     if (disabled || providerDisabled || archived) return;
     textareaRef.current?.focus();
   }, [disabled, providerDisabled, archived]);
+
+  // Auto-focus the inline edit textarea when entering edit mode.
+  React.useEffect(() => {
+    if (editingId && editTextareaRef.current) {
+      const el = editTextareaRef.current;
+      el.focus();
+      el.selectionStart = el.selectionEnd = el.value.length;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    }
+  }, [editingId]);
 
   const isRunning = sessionStatus === "running";
 
@@ -153,6 +167,11 @@ export function ChatInput({
     if (!wasRunning || !nowReady) return;
     if (queued.length === 0) return;
     const [first, ...rest] = queued;
+    // Clear editing state if the drained message was being edited.
+    if (editingId === first.id) {
+      setEditingId(null);
+      setEditText("");
+    }
     // Drain the head of the queue. Carry its images along with the
     // text — the pasted attachments rode in the queued chip and need
     // to fire when the queued text fires. Object URLs are revoked
@@ -163,13 +182,17 @@ export function ChatInput({
       URL.revokeObjectURL(img.previewUrl);
     }
     setQueued(rest);
-  }, [sessionStatus, queued, onSend]);
+  }, [sessionStatus, queued, onSend, editingId]);
 
   function enqueue(text: string, images: AttachedImage[]) {
     setQueued((q) => [...q, { id: newQueueId(), text, images }]);
   }
 
   function removeQueued(id: string) {
+    if (editingId === id) {
+      setEditingId(null);
+      setEditText("");
+    }
     setQueued((q) => {
       const target = q.find((item) => item.id === id);
       if (target) {
@@ -179,6 +202,50 @@ export function ChatInput({
       }
       return q.filter((item) => item.id !== id);
     });
+  }
+
+  function startEditQueued(id: string, currentText: string) {
+    setEditingId(id);
+    setEditText(currentText);
+  }
+
+  function saveEditQueued() {
+    if (editingId === null) return;
+    const trimmed = editText.trim();
+    if (trimmed.length === 0) {
+      removeQueued(editingId);
+    } else {
+      setQueued((q) =>
+        q.map((item) =>
+          item.id === editingId ? { ...item, text: trimmed } : item,
+        ),
+      );
+    }
+    setEditingId(null);
+    setEditText("");
+  }
+
+  function cancelEditQueued() {
+    setEditingId(null);
+    setEditText("");
+  }
+
+  function handleEditKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      saveEditQueued();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation(); // prevent ChatView's Escape-to-interrupt
+      cancelEditQueued();
+    }
+  }
+
+  function handleEditInput() {
+    const el = editTextareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }
 
   function removeAttachedImage(id: string) {
@@ -371,18 +438,43 @@ export function ChatInput({
                   <div className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
                     Queued{queued.length > 1 ? ` · ${idx + 1} of ${queued.length}` : ""}
                   </div>
-                  <div className="mt-0.5 break-words whitespace-pre-wrap text-foreground/85">
-                    {item.text}
-                  </div>
+                  {editingId === item.id ? (
+                    <textarea
+                      ref={editTextareaRef}
+                      value={editText}
+                      onChange={(e) => setEditText(e.target.value)}
+                      onKeyDown={handleEditKeyDown}
+                      onBlur={() => requestAnimationFrame(() => saveEditQueued())}
+                      onInput={handleEditInput}
+                      rows={1}
+                      className="mt-0.5 w-full resize-none rounded border border-input bg-background px-1.5 py-1 text-xs text-foreground/85 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    />
+                  ) : (
+                    <div className="mt-0.5 break-words whitespace-pre-wrap text-foreground/85">
+                      {item.text}
+                    </div>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => removeQueued(item.id)}
-                  className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                  title="Remove from queue"
-                >
-                  <X className="h-3 w-3" />
-                </button>
+                {editingId === item.id ? null : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => startEditQueued(item.id, item.text)}
+                      className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                      title="Edit queued message"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => removeQueued(item.id)}
+                      className="mt-0.5 shrink-0 rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      title="Remove from queue"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </>
+                )}
               </div>
             ))}
           </div>
