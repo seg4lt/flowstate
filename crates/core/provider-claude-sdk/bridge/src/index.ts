@@ -685,7 +685,7 @@ class ClaudeBridge {
         // turn finalises. Maps Anthropic's SDK field names onto the
         // provider-agnostic TokenUsage shape. Picks the first key
         // in modelUsage as the source of truth for contextWindow —
-        // a single Flowzen turn only runs on one model at a time.
+        // a single Flowstate turn only runs on one model at a time.
         if (r.usage) {
           const modelKey = r.modelUsage
             ? Object.keys(r.modelUsage)[0]

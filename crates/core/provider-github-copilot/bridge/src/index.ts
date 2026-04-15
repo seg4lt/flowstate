@@ -499,7 +499,7 @@ class CopilotBridge {
           // Copilot's SDK computes that for us, so we surface it
           // via output_tokens being the delta we just added. Keep
           // the contextWindow denominator from tokenLimit so the
-          // Flowzen UI renders N / M correctly.
+          // Flowstate UI renders N / M correctly.
           writeStream({
             event: 'turn_usage',
             usage: {

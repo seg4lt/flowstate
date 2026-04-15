@@ -6,7 +6,7 @@ publish = false
 
 [features]
 # Nothing on by default — every concrete provider AND transport must
-# be opted in by the consumer. Apps like flowzen enable
+# be opted in by the consumer. Apps like flowstate enable
 # `all-providers` + `transport-tauri`; the zenui binary enables
 # `all-providers` + `transport-http`. Unused adapter / transport code
 # is stripped from the binary entirely.
