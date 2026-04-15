@@ -16,6 +16,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider } from "@/stores/app-store";
 import { ThemeProvider } from "@/hooks/use-theme";
+import { ContextDisplaySettingProvider } from "@/hooks/use-context-display-setting";
 import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
 import { TerminalDock } from "@/components/terminal/TerminalDock";
 import { ChatView } from "@/components/chat/chat-view";
@@ -239,11 +240,13 @@ function AppShell() {
 function AppLayout() {
   return (
     <ThemeProvider>
-      <AppProvider>
-        <TerminalProvider>
-          <AppShell />
-        </TerminalProvider>
-      </AppProvider>
+      <ContextDisplaySettingProvider>
+        <AppProvider>
+          <TerminalProvider>
+            <AppShell />
+          </TerminalProvider>
+        </AppProvider>
+      </ContextDisplaySettingProvider>
     </ThemeProvider>
   );
 }

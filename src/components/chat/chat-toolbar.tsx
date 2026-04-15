@@ -3,6 +3,7 @@ import { EffortSelector } from "./effort-selector";
 import { ModeSelector } from "./mode-selector";
 import { ContextDisplay } from "./context-display";
 import { useApp } from "@/stores/app-store";
+import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import type { ProviderKind, ReasoningEffort, PermissionMode } from "@/lib/types";
 
 interface ChatToolbarProps {
@@ -25,6 +26,7 @@ export function ChatToolbar({
   onPermissionModeChange,
 }: ChatToolbarProps) {
   const { state } = useApp();
+  const { showContextDisplay } = useContextDisplaySetting();
   const providerLabel = state.providers.find((p) => p.kind === provider)?.label;
 
   return (
@@ -39,9 +41,11 @@ export function ChatToolbar({
       {providerLabel && (
         <span className="text-xs text-muted-foreground">{providerLabel}</span>
       )}
-      <div className="ml-auto">
-        <ContextDisplay sessionId={sessionId} />
-      </div>
+      {showContextDisplay && (
+        <div className="ml-auto">
+          <ContextDisplay sessionId={sessionId} />
+        </div>
+      )}
     </div>
   );
 }

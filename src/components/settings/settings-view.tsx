@@ -18,6 +18,7 @@ import {
   readWorktreeBasePath,
   writeWorktreeBasePath,
 } from "@/lib/worktree-settings";
+import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import type { ProviderKind, ProviderStatus } from "@/lib/types";
 
 const PROVIDER_COLORS: Record<ProviderKind, string> = {
@@ -78,6 +79,27 @@ function ThemeRow() {
           </Button>
         ))}
       </div>
+    </div>
+  );
+}
+
+function ContextDisplayRow() {
+  const { showContextDisplay, setShowContextDisplay } =
+    useContextDisplaySetting();
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Show context size</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Display token usage and context window size in the chat toolbar.
+        </div>
+      </div>
+      <Switch
+        checked={showContextDisplay}
+        onCheckedChange={setShowContextDisplay}
+        aria-label="Show context size display"
+      />
     </div>
   );
 }
@@ -464,6 +486,7 @@ export function SettingsView() {
             description="Customize how Flowstate looks."
           >
             <ThemeRow />
+            <ContextDisplayRow />
           </SettingsGroup>
           <SettingsGroup
             title="Providers"
