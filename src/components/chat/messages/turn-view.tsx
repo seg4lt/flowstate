@@ -1,5 +1,5 @@
 import * as React from "react";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown, ChevronUp, Timer } from "lucide-react";
 import type { AttachmentRef, ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
 import { ToolOutputContent } from "../tool-renderers";
@@ -337,6 +337,18 @@ export interface MessageItem {
    * optimistic-echo row — they only appear once `turn_started` fires
    * and the daemon has persisted the bytes to disk. */
   inputAttachments?: AttachmentRef[];
+  /** Wall-clock duration of the completed turn in milliseconds.
+   *  Sourced from `TurnRecord.usage.durationMs`. Absent on streaming/
+   *  interrupted turns and on providers that don't report it. */
+  durationMs?: number;
+}
+
+function formatTurnDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.round((ms % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
 }
 
 interface TurnViewProps {
@@ -421,6 +433,17 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
             );
         }
       })}
+
+      {/* Tail call latency — shows the wall-clock turn duration once the
+          turn completes and the provider has reported usage.durationMs. */}
+      {!item.streaming && item.durationMs != null && (
+        <div className="flex items-center gap-1 text-[11px] text-muted-foreground/60">
+          <Timer className="h-3 w-3" />
+          <span className="tabular-nums">
+            {formatTurnDuration(item.durationMs)}
+          </span>
+        </div>
+      )}
     </div>
   );
 }
@@ -434,6 +457,7 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
     a.input === b.input &&
     a.status === b.status &&
     a.streaming === b.streaming &&
+    a.durationMs === b.durationMs &&
     // Reference equality on both arrays — chat-view always builds new
     // arrays when blocks or tool calls change, so this catches every
     // streaming update.

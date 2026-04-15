@@ -38,6 +38,7 @@ function turnToItem(turn: TurnRecord): MessageItem {
     toolCalls: turn.toolCalls ?? null,
     streaming: turn.status === "running",
     inputAttachments: turn.inputAttachments,
+    durationMs: turn.usage?.durationMs,
   };
 }
 

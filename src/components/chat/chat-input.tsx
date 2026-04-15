@@ -24,6 +24,14 @@ interface ChatInputProps {
   toolbar?: React.ReactNode;
   /** Command metadata for the autocomplete popup. */
   commands?: { name: string; description: string }[];
+  /** Seed text to restore when the component remounts after a tab
+   *  switch. The component is keyed by sessionId so it remounts on
+   *  every thread change — this prop lets the parent supply the saved
+   *  draft so the user's in-progress message isn't lost. */
+  initialValue?: string;
+  /** Fires on every keystroke so the parent can persist the draft
+   *  text outside this component's lifecycle. */
+  onDraftChange?: (value: string) => void;
 }
 
 interface QueuedMessage {
@@ -93,8 +101,22 @@ export function ChatInput({
   providerDisabled = false,
   archived = false,
   toolbar,
+  initialValue = "",
+  onDraftChange,
 }: ChatInputProps) {
-  const [value, setValue] = React.useState("");
+  const [value, setValueRaw] = React.useState(initialValue);
+  // Notify the parent of every draft change so it can persist the text
+  // across component remounts (tab switches). The ref avoids stale
+  // closure issues and keeps the wrapper allocation-free.
+  const onDraftChangeRef = React.useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+  const setValue = React.useCallback((next: React.SetStateAction<string>) => {
+    setValueRaw((prev) => {
+      const resolved = typeof next === "function" ? next(prev) : next;
+      onDraftChangeRef.current?.(resolved);
+      return resolved;
+    });
+  }, []);
   const [queued, setQueued] = React.useState<QueuedMessage[]>([]);
   const [popupIndex, setPopupIndex] = React.useState(0);
   const [attachedImages, setAttachedImages] = React.useState<AttachedImage[]>([]);
@@ -116,7 +138,15 @@ export function ChatInput({
   // start typing immediately.
   React.useEffect(() => {
     if (disabled || providerDisabled || archived) return;
-    textareaRef.current?.focus();
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    // When restoring a saved draft the textarea starts at rows=1;
+    // auto-size it so the full draft is visible on mount.
+    if (el.value.length > 0) {
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    }
   }, [disabled, providerDisabled, archived]);
 
   // Auto-focus the inline edit textarea when entering edit mode.

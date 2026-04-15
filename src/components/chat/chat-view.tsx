@@ -52,6 +52,11 @@ import { DiffPanel, type DiffStyle } from "./diff-panel";
 import { ImageLightbox } from "./image-lightbox";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 
+// Per-session draft text. Module-level so it survives ChatView
+// re-renders and ChatInput remounts (keyed by sessionId). Cleared
+// on send so completed messages don't linger as stale drafts.
+const sessionDrafts = new Map<string, string>();
+
 // Trip the watchdog after this many seconds of silence while a tool
 // call is pending. Picked to be well past a normal tool round-trip
 // (even a slow Bash / Git command rarely exceeds 15–20s) but short
@@ -838,7 +843,23 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [queryClient, navigate, refreshDiffs, activateDiffSubscription]);
 
+  // --- Draft persistence callbacks ---
+  const handleDraftChange = React.useCallback(
+    (draft: string) => {
+      if (draft.length > 0) {
+        sessionDrafts.set(sessionId, draft);
+      } else {
+        sessionDrafts.delete(sessionId);
+      }
+    },
+    [sessionId],
+  );
+
   async function handleSend(input: string, images: AttachedImage[] = []) {
+    // Clear the persisted draft on send — the message is gone from
+    // the composer and we don't want it to reappear if the user
+    // navigates away and back before the component remounts.
+    sessionDrafts.delete(sessionId);
     if (isArchived) {
       // Defense in depth — the composer is disabled when archived,
       // but slash-command and keyboard shortcut paths could still
@@ -1290,13 +1311,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           )}
           <ChatInput
             // Remount the composer on every thread switch so its
-            // internal state (textarea draft, pendingSend queue
-            // flag, slash-command popup) resets cleanly. Without
-            // the key the draft from session A would leak into
-            // session B; the old pendingSend bug — where a queued
-            // message in A auto-flushed against B the moment B's
-            // status flipped to ready — is the scarier version
-            // of the same leak.
+            // internal state (pendingSend queue flag, slash-command
+            // popup) resets cleanly. Draft text is now preserved
+            // via initialValue / onDraftChange so the user's
+            // in-progress message survives tab switches.
             key={sessionId}
             onSend={handleSend}
             onInterrupt={handleInterrupt}
@@ -1306,6 +1324,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             archived={isArchived || worktreeFolderMissing}
             toolbar={toolbar}
             commands={COMMAND_META}
+            initialValue={sessionDrafts.get(sessionId) ?? ""}
+            onDraftChange={handleDraftChange}
           />
         </div>
 
