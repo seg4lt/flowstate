@@ -15,11 +15,10 @@ import * as React from "react";
 // running on the Rust side regardless, so a long `cargo build`
 // doesn't freeze when the user switches to a sibling tab.
 //
-// On project switch we currently tear down the previous project's
-// tabs (the React components unmount → they kill their PTYs).
-// Cross-project background persistence would need an xterm
-// registry that survives unmount, which is left for a future
-// pass.
+// All projects' tabs stay mounted (hidden via display:none) so
+// switching threads/projects doesn't kill PTYs. Tabs are pruned
+// when a project is deleted or its last active session is
+// archived/deleted (see TerminalDock's prune_projects effect).
 
 export const NO_PROJECT_KEY = "__none__";
 

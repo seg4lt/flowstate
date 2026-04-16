@@ -98,11 +98,29 @@ export function TerminalDock() {
   const { projectKey, cwd, resolved } = useActiveProject();
 
   // Prune terminals for projects that no longer exist in app state
-  // (user deleted the folder). Keeps NO_PROJECT_KEY alive.
+  // (user deleted the folder) OR whose last active session was
+  // archived / deleted. Keeps NO_PROJECT_KEY alive.
   React.useEffect(() => {
-    const keep = new Set(appState.projects.map((p) => p.projectId));
+    const existingProjects = new Set(appState.projects.map((p) => p.projectId));
+
+    // Collect projects that still have at least one active (non-archived) session.
+    const activeProjectIds = new Set<string>();
+    for (const session of appState.sessions.values()) {
+      if (session.projectId) {
+        activeProjectIds.add(session.projectId);
+      }
+    }
+
+    // Keep only projects that exist AND have active sessions.
+    const keep = new Set<string>();
+    for (const pid of existingProjects) {
+      if (activeProjectIds.has(pid)) {
+        keep.add(pid);
+      }
+    }
+
     dispatch({ type: "prune_projects", keep });
-  }, [appState.projects, dispatch]);
+  }, [appState.projects, appState.sessions, dispatch]);
 
   const projectState = state.projects.get(projectKey);
 
@@ -247,38 +265,44 @@ export function TerminalDock() {
         </button>
       </div>
 
-      {/* Terminal grid area — all tabs mounted, only active is shown */}
+      {/* Terminal grid area — ALL projects' tabs stay mounted so
+          switching threads doesn't kill PTYs. Only the active
+          project's active tab is visible; the rest use display:none
+          (same pattern as inactive tabs within a single project). */}
       <div className="relative min-h-0 flex-1">
-        {projectState?.tabs.map((tab) => {
-          const isActive = tab.id === activeTab?.id;
-          return (
-          <div
-            key={tab.id}
-            className="absolute inset-0 p-1"
-            style={{ display: isActive ? "block" : "none" }}
-          >
-            <TerminalTab
-              tabId={tab.id}
-              cwd={tab.cwd}
-              isVisible={state.dockOpen && isActive}
-              onTitleChange={(title) =>
-                dispatch({
-                  type: "set_tab_title",
-                  projectKey,
-                  tabId: tab.id,
-                  title,
-                })
-              }
-              onExit={() =>
-                dispatch({
-                  type: "close_tab",
-                  projectKey,
-                  tabId: tab.id,
-                })
-              }
-            />
-          </div>
-          );
+        {Array.from(state.projects.entries()).map(([pKey, pState]) => {
+          const isActiveProject = pKey === projectKey;
+          return pState.tabs.map((tab) => {
+            const isActive = isActiveProject && tab.id === activeTab?.id;
+            return (
+              <div
+                key={tab.id}
+                className="absolute inset-0 p-1"
+                style={{ display: isActive ? "block" : "none" }}
+              >
+                <TerminalTab
+                  tabId={tab.id}
+                  cwd={tab.cwd}
+                  isVisible={state.dockOpen && isActive}
+                  onTitleChange={(title) =>
+                    dispatch({
+                      type: "set_tab_title",
+                      projectKey: pKey,
+                      tabId: tab.id,
+                      title,
+                    })
+                  }
+                  onExit={() =>
+                    dispatch({
+                      type: "close_tab",
+                      projectKey: pKey,
+                      tabId: tab.id,
+                    })
+                  }
+                />
+              </div>
+            );
+          });
         })}
       </div>
     </div>
