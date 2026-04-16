@@ -292,14 +292,27 @@ function WorktreeDropdownInner({
             </>
           )}
 
-          {/* Loaded but no multiple worktrees — direct provider list */}
+          {/* Loaded but no multiple worktrees — direct provider list + create worktree */}
           {!worktreeQuery.isLoading &&
             !worktreeQuery.isError &&
-            !hasMultipleWorktrees &&
-            renderProviderItems((provider, model) => {
-              const resolvedModel = model ?? defaultModels.get(provider);
-              void createThreadDirect(provider, resolvedModel);
-            })}
+            !hasMultipleWorktrees && (
+              <>
+                {renderProviderItems((provider, model) => {
+                  const resolvedModel = model ?? defaultModels.get(provider);
+                  void createThreadDirect(provider, resolvedModel);
+                })}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => {
+                    setOpen(false);
+                    setCreateWtOpen(true);
+                  }}
+                >
+                  <Plus className="mr-2 h-3.5 w-3.5" />
+                  Create worktree...
+                </DropdownMenuItem>
+              </>
+            )}
 
           {/* Loaded with multiple worktrees — two-level menu */}
           {!worktreeQuery.isLoading &&
