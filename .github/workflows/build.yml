@@ -165,13 +165,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload bundles (debug)
-        uses: actions/upload-artifact@v4
-        with:
-          name: flowstate-${{ matrix.name }}-${{ github.ref_name }}
-          path: ${{ matrix.bundle-path }}
-          if-no-files-found: error
-          retention-days: 30
+      # Full raw bundler output (the entire .../release/bundle/ dir,
+      # including the unsigned .app, debug-symbols, MSI/NSIS
+      # intermediates). Disabled because we already upload the
+      # curated installers as `release-assets-*` above and they get
+      # published to the public release, so this step only serves
+      # post-mortem investigation. Re-enable if you hit a weird
+      # shipped-build issue and want the raw bundle handy for 30
+      # days. Tradeoff: ~500 MB/build of private-repo Actions
+      # storage (~$0.10–0.40/month over the 500 MB free tier).
+      # - name: Upload bundles (debug)
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: flowstate-${{ matrix.name }}-${{ github.ref_name }}
+      #     path: ${{ matrix.bundle-path }}
+      #     if-no-files-found: error
+      #     retention-days: 30
 
   release:
     name: Publish Release
