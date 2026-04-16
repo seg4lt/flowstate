@@ -68,6 +68,7 @@ export function TerminalTab({
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
+      macOptionIsMeta: true,
       fontFamily:
         '"JetBrains Mono", "Geist Mono", ui-monospace, Menlo, Consolas, monospace',
       fontSize: 13,
@@ -95,6 +96,47 @@ export function TerminalTab({
     }
 
     term.open(host);
+
+    // Mac natural text navigation — translate common macOS editing
+    // shortcuts into the escape sequences shells understand.
+    const enc = new TextEncoder();
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== "keydown") return true;
+      const id = ptyIdRef.current;
+      if (id == null) return true;
+
+      // Option (Alt) + Arrow / Backspace
+      if (ev.altKey && !ev.metaKey && !ev.ctrlKey) {
+        switch (ev.key) {
+          case "ArrowLeft":
+            writePty(id, enc.encode("\x1bb")).catch(() => {});
+            return false;
+          case "ArrowRight":
+            writePty(id, enc.encode("\x1bf")).catch(() => {});
+            return false;
+          case "Backspace":
+            writePty(id, enc.encode("\x1b\x7f")).catch(() => {});
+            return false;
+        }
+      }
+
+      // Cmd (Meta) + Arrow / Backspace
+      if (ev.metaKey && !ev.altKey && !ev.ctrlKey) {
+        switch (ev.key) {
+          case "ArrowLeft":
+            writePty(id, enc.encode("\x01")).catch(() => {});
+            return false;
+          case "ArrowRight":
+            writePty(id, enc.encode("\x05")).catch(() => {});
+            return false;
+          case "Backspace":
+            writePty(id, enc.encode("\x15")).catch(() => {});
+            return false;
+        }
+      }
+
+      return true;
+    });
 
     let disposed = false;
     let pending = 0;
@@ -158,11 +200,10 @@ export function TerminalTab({
     });
 
     // Stdin: xterm -> pty
-    const encoder = new TextEncoder();
     const inputDisp = term.onData((data) => {
       const id = ptyIdRef.current;
       if (id != null) {
-        writePty(id, encoder.encode(data)).catch(() => {});
+        writePty(id, enc.encode(data)).catch(() => {});
       }
     });
 
