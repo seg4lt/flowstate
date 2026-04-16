@@ -1363,6 +1363,14 @@ async fn forward_stream(
                     .await;
             }
         }
+        "plan_mode_entered" => {
+            // Informational — the frontend handles mode sync via the
+            // tool_call_completed / permission_requested paths. Log
+            // for observability.
+            if let Some(cid) = call_id {
+                tracing::info!(call_id = %cid, "EnterPlanMode tool detected");
+            }
+        }
         "info" | "warning" => {
             if let Some(msg) = message {
                 events.send(ProviderTurnEvent::Info { message: msg }).await;

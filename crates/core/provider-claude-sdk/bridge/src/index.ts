@@ -604,7 +604,8 @@ class ClaudeBridge {
               });
             }
 
-            // Plan mode tool: ExitPlanMode emits the plan.
+            // Plan mode tools: ExitPlanMode emits the plan,
+            // EnterPlanMode signals the model wants plan mode.
             if (name === 'ExitPlanMode') {
               const raw = (input.plan as string) ?? '';
               writeStream({
@@ -613,6 +614,12 @@ class ClaudeBridge {
                 title: 'Proposed plan',
                 steps: parsePlanSteps(raw),
                 raw,
+              });
+            }
+            if (name === 'EnterPlanMode') {
+              writeStream({
+                event: 'plan_mode_entered',
+                call_id: callId,
               });
             }
           }

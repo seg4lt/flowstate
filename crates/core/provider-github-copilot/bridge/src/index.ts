@@ -326,6 +326,15 @@ class CopilotBridge {
       });
     });
 
+    // Placeholder: when the Copilot SDK exposes an enter_plan_mode
+    // event, wire it here so the frontend can sync the mode selector.
+    // this.session.on('enter_plan_mode.requested', (event: any) => {
+    //   writeStream({
+    //     event: 'plan_mode_entered',
+    //     call_id: event?.data?.requestId ?? randomUUID(),
+    //   });
+    // });
+
     // CopilotSession exposes a non-optional `sessionId: string` per the
     // SDK's type definition. If the SDK ever violates that contract we
     // want a loud error, not a silent fallback to a dead label string.
