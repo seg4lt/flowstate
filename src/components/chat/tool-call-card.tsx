@@ -55,6 +55,8 @@ function toolPreview(name: string, args: unknown): string | null {
       const cleaned = firstLine.replace(/^#+\s*/, "").trim();
       return cleaned.length > 40 ? cleaned.slice(0, 40) + "…" : cleaned;
     }
+    case "EnterPlanMode":
+      return "Switching to plan mode";
     default:
       return null;
   }

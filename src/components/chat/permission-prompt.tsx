@@ -1,14 +1,14 @@
 import * as React from "react";
 import type { PermissionDecision, PermissionMode } from "@/lib/types";
-import { isPlanExitTool, renderPlanBody, renderToolArgs } from "./tool-renderers";
+import { isPlanExitTool, isPlanEnterTool, renderPlanBody, renderToolArgs } from "./tool-renderers";
 
 interface PermissionPromptProps {
   toolName: string;
   input: unknown;
   /** Called when the user approves or denies the request. The optional
-   *  modeOverride is only set by the plan-exit flow and is bundled into
-   *  the daemon's answer_permission so the SDK applies the mode change
-   *  as part of accepting the tool call. */
+   *  modeOverride is set by the plan-exit and plan-enter flows and is
+   *  bundled into the daemon's answer_permission so the SDK applies the
+   *  mode change as part of accepting the tool call. */
   onDecision: (
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
@@ -34,6 +34,7 @@ function PermissionPromptInner({
   queueDepth = 1,
 }: PermissionPromptProps) {
   const planExit = isPlanExitTool(toolName);
+  const planEnter = isPlanEnterTool(toolName);
 
   return (
     <div className="shrink-0 border-t border-amber-500/40 bg-amber-500/5 px-3 py-2.5">
@@ -44,6 +45,8 @@ function PermissionPromptInner({
       )}
       {planExit ? (
         <PlanExitPrompt input={input} onDecision={onDecision} />
+      ) : planEnter ? (
+        <PlanEnterPrompt onDecision={onDecision} />
       ) : (
         <DefaultPrompt
           toolName={toolName}
@@ -174,6 +177,58 @@ function PlanExitPrompt({
         The chosen mode applies for the rest of this turn (Claude SDK) and
         every subsequent message.
       </p>
+    </div>
+  );
+}
+
+function PlanEnterPrompt({
+  onDecision,
+}: {
+  onDecision: (
+    decision: PermissionDecision,
+    modeOverride?: PermissionMode,
+  ) => void;
+}) {
+  const [pending, setPending] = React.useState(false);
+
+  function approve() {
+    if (pending) return;
+    setPending(true);
+    // Bundle "plan" as the mode override so the SDK applies the mode
+    // change atomically with the tool approval — same pattern as
+    // PlanExitPrompt. The bridge attaches updatedPermissions:
+    // [{ type: 'setMode', mode: 'plan', destination: 'session' }]
+    // and the SDK switches to plan mode within the same turn.
+    onDecision("allow", "plan");
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="text-sm font-medium">
+        Agent wants to switch to Plan mode
+      </div>
+      <p className="text-xs text-muted-foreground">
+        In plan mode the agent investigates and plans without making changes.
+        You can switch back to a different mode at any time.
+      </p>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          disabled={pending}
+          onClick={approve}
+          className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          Allow
+        </button>
+        <button
+          type="button"
+          disabled={pending}
+          onClick={() => onDecision("deny")}
+          className="rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+        >
+          Deny
+        </button>
+      </div>
     </div>
   );
 }

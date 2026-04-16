@@ -715,6 +715,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   React.useEffect(() => {
     const data = sessionQuery.data;
     if (!data || data.detail.turns.length === 0) return;
+
+    // Scan last turn for an unmatched EnterPlanMode (entered plan but
+    // didn't exit). This handles agent-initiated plan mode changes that
+    // happened while the user was viewing a different session — the
+    // tool_call_completed handler only runs for the active session.
+    const lastTurn = data.detail.turns[data.detail.turns.length - 1];
+    const tools = lastTurn.toolCalls ?? [];
+    let planModeActive = false;
+    for (const tc of tools) {
+      if (tc.name === "EnterPlanMode" && !tc.error) planModeActive = true;
+      if (tc.name === "ExitPlanMode" && !tc.error) planModeActive = false;
+    }
+    if (planModeActive) {
+      setPermissionMode("plan");
+      return;
+    }
+
+    // Original: restore from turn's permissionMode when no sessionStorage.
     if (sessionStorage.getItem(permissionStorageKey)) return;
     const lastMode = [...data.detail.turns]
       .reverse()
@@ -834,6 +852,34 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           activateDiffSubscription();
           refreshDiffs();
           break;
+
+        case "tool_call_completed": {
+          // Detect auto-approved EnterPlanMode completing successfully.
+          // When it goes through the permission prompt, PlanEnterPrompt
+          // already sets the mode via modeOverride. This catches the
+          // bypass/allow-always case where no permission_requested fires.
+          if (!event.error) {
+            const cached = queryClient.getQueryData<SessionPage>(
+              sessionQueryKey(sessionIdRef.current),
+            );
+            if (cached) {
+              const turn = cached.detail.turns.find(
+                (t) => t.turnId === event.turn_id,
+              );
+              const tc = turn?.toolCalls?.find(
+                (c) => c.callId === event.call_id,
+              );
+              if (tc?.name === "EnterPlanMode" && !tc.parentCallId) {
+                setPermissionMode("plan");
+                toast({
+                  description: "Agent switched to Plan mode",
+                  duration: 3000,
+                });
+              }
+            }
+          }
+          break;
+        }
 
         // permission_requested / user_question_asked are handled in
         // the global store reducer (app-store.tsx). chat-view reads

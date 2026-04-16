@@ -649,8 +649,15 @@ function ScheduleWakeupRenderer({ args }: RendererProps) {
 
 type RendererFn = (props: RendererProps) => React.ReactElement;
 
+function EnterPlanModeRenderer({ args: _args }: RendererProps) {
+  return (
+    <div className="text-sm text-muted-foreground">Switched to plan mode</div>
+  );
+}
+
 const RENDERERS: Record<string, RendererFn> = {
   ExitPlanMode: ExitPlanModeRenderer,
+  EnterPlanMode: EnterPlanModeRenderer,
   Bash: BashRenderer,
   Edit: EditRenderer,
   Write: WriteRenderer,
@@ -677,4 +684,9 @@ export function renderToolArgs(toolName: string, args: unknown): React.ReactElem
 /** True if this tool's permission prompt should offer a post-approval mode picker. */
 export function isPlanExitTool(toolName: string): boolean {
   return toolName === "ExitPlanMode";
+}
+
+/** True if this tool signals the agent wants to enter plan mode. */
+export function isPlanEnterTool(toolName: string): boolean {
+  return toolName === "EnterPlanMode";
 }
