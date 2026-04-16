@@ -1,5 +1,6 @@
 import * as React from "react";
 import { PatchDiff } from "@pierre/diffs/react";
+import { useTheme } from "@/hooks/use-theme";
 
 interface DiffCodeBlockProps {
   code: string;
@@ -42,6 +43,7 @@ function ensureUnifiedPatch(raw: string, ext: string): string {
 }
 
 function DiffCodeBlockInner({ code, language = "tsx" }: DiffCodeBlockProps) {
+  const { resolvedTheme } = useTheme();
   const patch = React.useMemo(
     () => ensureUnifiedPatch(code, language),
     [code, language],
@@ -54,7 +56,9 @@ function DiffCodeBlockInner({ code, language = "tsx" }: DiffCodeBlockProps) {
         options={{
           diffStyle: "unified",
           theme: { dark: "pierre-dark", light: "pierre-light" },
-          themeType: "system",
+          // Track the app's theme preference rather than the OS so the
+          // diff matches the rest of the markdown output.
+          themeType: resolvedTheme,
           diffIndicators: "classic",
           overflow: "scroll",
           disableFileHeader: true,
@@ -66,7 +70,4 @@ function DiffCodeBlockInner({ code, language = "tsx" }: DiffCodeBlockProps) {
   );
 }
 
-export const DiffCodeBlock = React.memo(
-  DiffCodeBlockInner,
-  (prev, next) => prev.code === next.code && prev.language === next.language,
-);
+export const DiffCodeBlock = React.memo(DiffCodeBlockInner);
