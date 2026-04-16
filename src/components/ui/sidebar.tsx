@@ -68,6 +68,20 @@ function SidebarProvider({
   const isMobile = useIsMobile()
   const [openMobile, setOpenMobile] = React.useState(false)
 
+  // Reset the mobile sheet flag whenever the breakpoint crosses.
+  // `openMobile` and `open` are independent state machines (the Sheet
+  // branch reads one, the desktop branch reads the other), and
+  // without this sync they drift out of phase across zoom transitions:
+  // a sheet the user left open in mobile mode would spontaneously
+  // reappear the next time they zoomed back past 768px, because the
+  // stale `openMobile=true` would still be sitting in state. Desktop
+  // `open` is a deliberate Cmd+B choice and must persist across
+  // zoom; the mobile sheet is a transient overlay and shouldn't
+  // survive a resize.
+  React.useEffect(() => {
+    setOpenMobile(false)
+  }, [isMobile])
+
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.
   const [_open, _setOpen] = React.useState(defaultOpen)
