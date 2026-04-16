@@ -8,6 +8,7 @@ import {
   Diff,
   FolderOpen,
   Search,
+  Terminal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,6 +21,7 @@ import { openInEditor } from "@/lib/api";
 import { prefetchProjectFiles } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
+import { selectDockOpen, useTerminal } from "@/stores/terminal-store";
 
 interface HeaderActionsProps {
   sessionId: string;
@@ -88,6 +90,13 @@ export function HeaderActions({
 }: HeaderActionsProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  // Terminal store is a global context — read it directly rather
+  // than prop-drilling dockOpen through ChatView. The toggle button
+  // below dispatches the same `toggle_dock` action the Cmd+J
+  // shortcut (src/router.tsx) uses, so both entry points stay in
+  // sync via `selectDockOpen`.
+  const { state: terminalState, dispatch: terminalDispatch } = useTerminal();
+  const dockOpen = selectDockOpen(terminalState, sessionId);
   // Hover-driven prefetch for the /code view's file list. Wired to
   // both onMouseEnter and onFocus on the Search button so mouse and
   // keyboard users get the same head-start: by the time the click
@@ -227,6 +236,21 @@ export function HeaderActions({
             </span>
           </>
         )}
+      </Button>
+      <Button
+        variant={dockOpen ? "secondary" : "outline"}
+        size="xs"
+        onClick={() =>
+          terminalDispatch({ type: "toggle_dock", sessionId })
+        }
+        aria-pressed={dockOpen}
+        title={
+          dockOpen
+            ? "Hide integrated terminal (⌘J)"
+            : "Open integrated terminal (⌘J)"
+        }
+      >
+        <Terminal className="h-3 w-3" />
       </Button>
       <Button
         variant="outline"
