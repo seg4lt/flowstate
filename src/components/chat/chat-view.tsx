@@ -63,6 +63,16 @@ const sessionDrafts = new Map<string, string>();
 // preserves queued messages when the user switches threads mid-turn.
 const sessionQueues = new Map<string, QueuedMessage[]>();
 
+// Per-session diff / context panel open flags. Module-level so they
+// survive thread switches (ChatView does NOT remount on sessionId
+// change — sessionId is a prop, not a key). Lost on reload, which is
+// intentional: "did I leave the diff open" is transient UI state, not
+// a persisted preference. Width / style live in localStorage below
+// because those ARE preferences. Fullscreen is deliberately NOT
+// per-thread (plain useState) — it's a momentary intent.
+const sessionDiffOpen = new Map<string, boolean>();
+const sessionContextOpen = new Map<string, boolean>();
+
 // Trip the watchdog after this many seconds of silence while a tool
 // call is pending. Picked to be well past a normal tool round-trip
 // (even a slow Bash / Git command rarely exceeds 15–20s) but short
@@ -489,8 +499,29 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // preferences persisted to localStorage so they survive
   // restarts.
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
-  const [diffOpen, setDiffOpen] = React.useState(false);
+  const [diffOpen, setDiffOpenState] = React.useState<boolean>(
+    () => sessionDiffOpen.get(sessionId) ?? false,
+  );
   const [diffFullscreen, setDiffFullscreen] = React.useState(false);
+  // Write-through wrapper: every update also records the session's
+  // new open flag in the module-level map so it's still there when
+  // the user returns to this thread after visiting another.
+  const setDiffOpen = React.useCallback<
+    React.Dispatch<React.SetStateAction<boolean>>
+  >(
+    (value) => {
+      setDiffOpenState((prev) => {
+        const next =
+          typeof value === "function"
+            ? (value as (p: boolean) => boolean)(prev)
+            : value;
+        if (next) sessionDiffOpen.set(sessionId, true);
+        else sessionDiffOpen.delete(sessionId);
+        return next;
+      });
+    },
+    [sessionId],
+  );
   /** When set, a lightbox is open on top of everything for a persisted
    * attachment. The bytes are fetched lazily via attachmentQueryOptions
    * the first time it opens. */
@@ -535,8 +566,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // Agent-context pane state — mirrors the diff pane state. The two
   // panes are mutually exclusive (enforced in the toggle handlers
   // below); they share the split-right slot inside splitContainerRef.
-  const [contextOpen, setContextOpen] = React.useState(false);
+  const [contextOpen, setContextOpenState] = React.useState<boolean>(
+    () => sessionContextOpen.get(sessionId) ?? false,
+  );
   const [contextFullscreen, setContextFullscreen] = React.useState(false);
+  const setContextOpen = React.useCallback<
+    React.Dispatch<React.SetStateAction<boolean>>
+  >(
+    (value) => {
+      setContextOpenState((prev) => {
+        const next =
+          typeof value === "function"
+            ? (value as (p: boolean) => boolean)(prev)
+            : value;
+        if (next) sessionContextOpen.set(sessionId, true);
+        else sessionContextOpen.delete(sessionId);
+        return next;
+      });
+    },
+    [sessionId],
+  );
   const [contextWidth, setContextWidth] = React.useState<number>(() => {
     try {
       const saved = window.localStorage.getItem(CONTEXT_WIDTH_KEY);
@@ -755,6 +804,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setPendingInput(null);
     setLastEventAt(Date.now());
     setStuckSince(null);
+    // Resync per-thread panel open flags from the module-level maps.
+    // ChatView doesn't remount on session switch, so the lazy
+    // useState initializers only ran for the very first session —
+    // this effect brings the mirror state into sync with the map on
+    // every subsequent switch. Fullscreen is intentionally reset
+    // (it's a momentary intent, not a thread preference).
+    setDiffOpenState(sessionDiffOpen.get(sessionId) ?? false);
+    setContextOpenState(sessionContextOpen.get(sessionId) ?? false);
+    setDiffFullscreen(false);
+    setContextFullscreen(false);
   }, [sessionId]);
 
   // Single stream listener for the lifetime of ChatView. It
