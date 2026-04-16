@@ -554,7 +554,10 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                 return (
                   <li
                     key={wt.path}
-                    className="rounded-md border border-border bg-background"
+                    aria-busy={isRemoving}
+                    className={`rounded-md border border-border bg-background transition-opacity ${
+                      isRemoving ? "pointer-events-none opacity-50" : ""
+                    }`}
                   >
                     <div className="flex items-center gap-2 px-3 py-2">
                       <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
