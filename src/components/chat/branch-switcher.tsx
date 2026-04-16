@@ -5,7 +5,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { FolderGit2, GitBranch, Loader2, Plus } from "lucide-react";
+import { FolderGit2, GitBranch, Loader2, Plus, Trash2 } from "lucide-react";
 
 import {
   Popover,
@@ -23,6 +23,7 @@ import {
 import {
   gitCheckout,
   gitCreateBranch,
+  gitDeleteBranch,
   type GitWorktree,
 } from "@/lib/api";
 import { gitBranchListQueryOptions } from "@/lib/queries";
@@ -152,6 +153,32 @@ export function BranchSwitcher({
     },
   });
 
+  const deleteMutation = useMutation({
+    mutationFn: async (name: string) => {
+      setPendingBranch(name);
+      await gitDeleteBranch(projectPath, name);
+    },
+    onSuccess: (_data, name) => {
+      setPendingBranch(null);
+      setCheckoutError(null);
+      invalidateAfterBranchChange();
+      toast({
+        title: `Deleted branch ${name}`,
+        duration: 2500,
+      });
+    },
+    onError: (err, name) => {
+      setPendingBranch(null);
+      const msg = err instanceof Error ? err.message : String(err);
+      setCheckoutError(msg);
+      toast({
+        title: `Failed to delete branch ${name}`,
+        description: msg,
+        duration: 6000,
+      });
+    },
+  });
+
   React.useEffect(() => {
     if (open) {
       setCheckoutError(null);
@@ -259,7 +286,7 @@ export function BranchSwitcher({
             query={branchListQuery}
             currentBranch={currentBranch}
             pendingBranch={pendingBranch}
-            isBusy={checkoutMutation.isPending || createMutation.isPending}
+            isBusy={checkoutMutation.isPending || createMutation.isPending || deleteMutation.isPending}
             onCheckoutLocal={(name) =>
               checkoutMutation.mutate({ branch: name, createTrack: null })
             }
@@ -270,6 +297,11 @@ export function BranchSwitcher({
               })
             }
             onCreateBranch={(name) => createMutation.mutate(name)}
+            onDeleteBranch={(name) => {
+              const ok = window.confirm(`Delete local branch "${name}"?`);
+              if (!ok) return;
+              deleteMutation.mutate(name);
+            }}
             onOpenWorktreeDialog={openWorktreeDialog}
             checkoutError={checkoutError}
           />
@@ -300,6 +332,7 @@ function BranchesPanel({
   onCheckoutLocal,
   onCheckoutRemote,
   onCreateBranch,
+  onDeleteBranch,
   onOpenWorktreeDialog,
   checkoutError,
 }: {
@@ -314,6 +347,7 @@ function BranchesPanel({
     localExists: boolean,
   ) => void;
   onCreateBranch: (name: string) => void;
+  onDeleteBranch: (name: string) => void;
   /** Open the create-worktree dialog pre-filled with the given branch
    *  name and checkout-existing toggle value. */
   onOpenWorktreeDialog: (branchName: string, checkoutExisting: boolean) => void;
@@ -426,20 +460,38 @@ function BranchesPanel({
                       {isPending ? (
                         <Loader2 className="order-1 shrink-0 animate-spin" />
                       ) : (
-                        <button
-                          type="button"
-                          aria-label={`Create worktree from ${name}`}
-                          title="Create worktree from this branch"
-                          className="order-1 inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground"
-                          onClick={(e) => {
-                            e.preventDefault();
-                            e.stopPropagation();
-                            onOpenWorktreeDialog(name, true);
-                          }}
-                          onMouseDown={(e) => e.stopPropagation()}
-                        >
-                          <FolderGit2 className="h-3.5 w-3.5" />
-                        </button>
+                        <span className="order-1 flex shrink-0 items-center gap-0.5">
+                          <button
+                            type="button"
+                            aria-label={`Create worktree from ${name}`}
+                            title="Create worktree from this branch"
+                            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              onOpenWorktreeDialog(name, true);
+                            }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                          >
+                            <FolderGit2 className="h-3.5 w-3.5" />
+                          </button>
+                          {!isCurrent && (
+                            <button
+                              type="button"
+                              aria-label={`Delete branch ${name}`}
+                              title="Delete local branch"
+                              className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-destructive/10 hover:text-destructive"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                onDeleteBranch(name);
+                              }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                        </span>
                       )}
                     </CommandItem>
                   );

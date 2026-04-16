@@ -329,6 +329,35 @@ fn git_create_branch(path: String, branch: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Force-delete a local branch via `git branch -D <branch>`.
+/// Cannot delete the currently checked-out branch — git itself rejects
+/// that with a clear error message which we forward verbatim.
+#[tauri::command]
+fn git_delete_branch(path: String, branch: String) -> Result<(), String> {
+    if branch.trim().is_empty() {
+        return Err("empty branch name".into());
+    }
+    let output = Command::new("git")
+        .args(["-C", &path, "branch", "-D", &branch])
+        .output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!(
+                "git branch -D exited with status {:?}",
+                output.status.code()
+            )
+        });
+    }
+    Ok(())
+}
+
 /// Create a new git worktree for `project_path` at `worktree_path`.
 ///
 /// When `checkout_existing` is `None` or `Some(false)` (the default),
@@ -1951,6 +1980,7 @@ pub fn run() {
             list_git_worktrees,
             git_checkout,
             git_create_branch,
+            git_delete_branch,
             create_git_worktree,
             remove_git_worktree,
             resolve_git_root,

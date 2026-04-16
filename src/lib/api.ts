@@ -55,6 +55,10 @@ export function gitCreateBranch(path: string, branch: string): Promise<void> {
   return invoke<void>("git_create_branch", { path, branch });
 }
 
+export function gitDeleteBranch(path: string, branch: string): Promise<void> {
+  return invoke<void>("git_delete_branch", { path, branch });
+}
+
 /** Resolve the git repository root for `path` via
  * `git rev-parse --show-toplevel`. Returns `null` when the path is
  * not inside a git repo. Critical for submodule / linked-worktree
