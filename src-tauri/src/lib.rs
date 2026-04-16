@@ -64,6 +64,18 @@ fn resolve_git_root_sync(path: &str) -> Option<String> {
     if root.is_empty() { None } else { Some(root) }
 }
 
+/// When git reports a worktree path inside a `.git/` directory
+/// (submodule gitdir), resolve it back to the actual working
+/// directory. For normal paths this is a cheap no-op string check.
+fn resolve_worktree_path(path: &str) -> String {
+    if path.contains("/.git/") {
+        if let Some(resolved) = resolve_git_root_sync(path) {
+            return resolved;
+        }
+    }
+    path.to_string()
+}
+
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
 /// surface the active branch under the thread title.
@@ -272,7 +284,7 @@ fn list_git_worktrees_sync(path: String) -> Result<Vec<GitWorktree>, String> {
                 &mut current_branch,
                 &mut current_bare,
             );
-            current_path = Some(rest.to_string());
+            current_path = Some(resolve_worktree_path(rest));
         } else if let Some(rest) = line.strip_prefix("HEAD ") {
             current_head = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("branch ") {
