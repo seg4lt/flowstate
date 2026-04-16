@@ -107,10 +107,81 @@ jobs:
 
           rm -rf "$STAGING"
 
-      - name: Upload bundles
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          TAG="${{ github.ref_name }}"
+
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            DMG=$(find src-tauri/target -name "Flowstate.dmg" -path "*/release/bundle/dmg/*" | head -1)
+            cp "$DMG" "release-assets/Flowstate-${TAG}-macos-arm64.dmg"
+          fi
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            MSI=$(find src-tauri/target -name "*.msi" -path "*/release/bundle/msi/*" | head -1)
+            EXE=$(find src-tauri/target -name "*-setup.exe" -path "*/release/bundle/nsis/*" | head -1)
+            cp "$MSI" "release-assets/Flowstate-${TAG}-windows-x64.msi"
+            cp "$EXE" "release-assets/Flowstate-${TAG}-windows-x64-setup.exe"
+          fi
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ matrix.name }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload bundles (debug)
         uses: actions/upload-artifact@v4
         with:
           name: flowstate-${{ matrix.name }}-${{ github.ref_name }}
           path: ${{ matrix.bundle-path }}
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: List release assets
+        run: ls -la release-assets/
+
+      - name: Create release on public repo
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: seg4lt/flowstate-releases
+          tag_name: ${{ github.ref_name }}
+          name: Flowstate ${{ github.ref_name }}
+          body: |
+            ## Flowstate ${{ github.ref_name }}
+
+            ### Downloads
+            | Platform | File |
+            |----------|------|
+            | macOS (Apple Silicon) | `Flowstate-${{ github.ref_name }}-macos-arm64.dmg` |
+            | Windows (x64) MSI | `Flowstate-${{ github.ref_name }}-windows-x64.msi` |
+            | Windows (x64) Setup | `Flowstate-${{ github.ref_name }}-windows-x64-setup.exe` |
+
+            ### macOS Installation
+            1. Download the `.dmg` file
+            2. Open it and double-click "Install Flowstate.command"
+            3. This installs to /Applications and clears the quarantine flag
+
+            ### Windows Installation
+            Download either the `.msi` (standard Windows Installer) or the `-setup.exe` (NSIS installer).
+          draft: false
+          prerelease: false
+          files: release-assets/*
+          token: ${{ secrets.PUBLIC_REPO_PAT }}
