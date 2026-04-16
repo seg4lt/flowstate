@@ -11,6 +11,7 @@ import {
   MessageSquarePlus,
   Plus,
   Search,
+  Terminal,
   Trash2,
 } from "lucide-react";
 
@@ -44,6 +45,7 @@ import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { readDefaultProvider, DEFAULT_PROVIDER } from "@/lib/defaults-settings";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
+import { useTerminal } from "@/stores/terminal-store";
 import type {
   AggregatedFileDiff,
 } from "@/lib/session-diff";
@@ -96,6 +98,7 @@ interface ProjectHomeViewProps {
 export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   const { state, dispatch, send, createProject, linkProjectWorktree } =
     useApp();
+  const { dispatch: terminalDispatch } = useTerminal();
   const { isProviderEnabled } = useProviderEnabled();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -272,6 +275,20 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       }
     },
     [firstSessionPathFor, navigate, queryClient],
+  );
+
+  // Open a terminal tab rooted in the given worktree directory.
+  // Opens the dock if it isn't already visible.
+  const openTerminalForWorktree = React.useCallback(
+    (wt: GitWorktree) => {
+      terminalDispatch({ type: "set_dock_open", open: true });
+      terminalDispatch({
+        type: "open_tab",
+        projectKey: projectId,
+        cwd: wt.path,
+      });
+    },
+    [terminalDispatch, projectId],
   );
 
   // Start a new thread rooted in this worktree. Mirrors the
@@ -624,6 +641,15 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                           })}
                         </DropdownMenuContent>
                       </DropdownMenu>
+                      <button
+                        type="button"
+                        aria-label={`Open terminal in ${label}`}
+                        title="Open terminal"
+                        onClick={() => openTerminalForWorktree(wt)}
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-muted hover:text-foreground"
+                      >
+                        <Terminal className="h-3.5 w-3.5" />
+                      </button>
                       <ProviderDropdown
                         onSelect={(provider, model) =>
                           void startThreadOnWorktree(wt, provider, model)
