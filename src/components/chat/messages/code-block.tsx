@@ -1,5 +1,6 @@
 import * as React from "react";
 import type { BundledLanguage, Highlighter } from "shiki";
+import { useTheme } from "@/hooks/use-theme";
 
 // Languages preloaded into the highlighter. Adding more is free at
 // runtime cost — shiki bundles the grammars statically. Trim if the
@@ -28,7 +29,11 @@ const PRELOAD_LANGS: BundledLanguage[] = [
   "php",
 ];
 
-const THEME = "github-dark";
+// Both themes are bundled into the singleton highlighter so swapping
+// between light and dark on theme toggle is a synchronous re-highlight
+// (no extra grammar/theme load).
+const LIGHT_THEME = "github-light";
+const DARK_THEME = "github-dark";
 
 // Singleton highlighter promise. The first <CodeBlock> on the page
 // triggers the dynamic import + grammar load (~100-300ms cold), every
@@ -40,7 +45,7 @@ function getHighlighter(): Promise<Highlighter> {
     highlighterPromise = (async () => {
       const { createHighlighter } = await import("shiki");
       return createHighlighter({
-        themes: [THEME],
+        themes: [LIGHT_THEME, DARK_THEME],
         langs: PRELOAD_LANGS,
       });
     })();
@@ -54,10 +59,12 @@ interface CodeBlockProps {
 }
 
 function CodeBlockInner({ code, language }: CodeBlockProps) {
+  const { resolvedTheme } = useTheme();
   const [html, setHtml] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
+    const theme = resolvedTheme === "dark" ? DARK_THEME : LIGHT_THEME;
     getHighlighter()
       .then((highlighter) => {
         if (cancelled) return;
@@ -69,7 +76,7 @@ function CodeBlockInner({ code, language }: CodeBlockProps) {
         try {
           const result = highlighter.codeToHtml(code, {
             lang,
-            theme: THEME,
+            theme,
           });
           setHtml(result);
         } catch (err) {
@@ -83,7 +90,7 @@ function CodeBlockInner({ code, language }: CodeBlockProps) {
     return () => {
       cancelled = true;
     };
-  }, [code, language]);
+  }, [code, language, resolvedTheme]);
 
   if (html === null) {
     // Plain fallback while shiki initializes (one-time, ~100-300ms cold)
