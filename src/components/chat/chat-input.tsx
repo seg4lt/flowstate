@@ -32,9 +32,15 @@ interface ChatInputProps {
   /** Fires on every keystroke so the parent can persist the draft
    *  text outside this component's lifecycle. */
   onDraftChange?: (value: string) => void;
+  /** Seed queue to restore when the component remounts after a tab
+   *  switch. Same pattern as initialValue/onDraftChange for draft text. */
+  initialQueue?: QueuedMessage[];
+  /** Fires whenever the queue changes so the parent can persist it
+   *  outside this component's lifecycle. */
+  onQueueChange?: (queue: QueuedMessage[]) => void;
 }
 
-interface QueuedMessage {
+export interface QueuedMessage {
   id: string;
   text: string;
   images: AttachedImage[];
@@ -103,6 +109,8 @@ export function ChatInput({
   toolbar,
   initialValue = "",
   onDraftChange,
+  initialQueue,
+  onQueueChange,
 }: ChatInputProps) {
   const [value, setValueRaw] = React.useState(initialValue);
   // Notify the parent of every draft change so it can persist the text
@@ -117,7 +125,22 @@ export function ChatInput({
       return resolved;
     });
   }, []);
-  const [queued, setQueued] = React.useState<QueuedMessage[]>([]);
+  const [queued, setQueuedRaw] = React.useState<QueuedMessage[]>(initialQueue ?? []);
+  // Mirror the setValue / onDraftChange pattern: notify the parent on
+  // every queue mutation so it can persist the queue outside this
+  // component's lifecycle (survives remounts on thread switch).
+  const onQueueChangeRef = React.useRef(onQueueChange);
+  onQueueChangeRef.current = onQueueChange;
+  const setQueued = React.useCallback(
+    (next: React.SetStateAction<QueuedMessage[]>) => {
+      setQueuedRaw((prev) => {
+        const resolved = typeof next === "function" ? next(prev) : next;
+        onQueueChangeRef.current?.(resolved);
+        return resolved;
+      });
+    },
+    [],
+  );
   const [popupIndex, setPopupIndex] = React.useState(0);
   const [attachedImages, setAttachedImages] = React.useState<AttachedImage[]>([]);
   const [lightboxSource, setLightboxSource] = React.useState<LightboxSource | null>(
@@ -190,7 +213,17 @@ export function ChatInput({
   // (running -> ready) and an explicit interrupt (running -> interrupted)
   // drain the head of the queue, because after a stop there is no
   // in-flight send_turn to race against.
-  const prevStatusRef = React.useRef(sessionStatus);
+  const prevStatusRef = React.useRef(
+    // If mounting with a non-empty queue and the session already
+    // finished, pretend the previous status was "running" so the
+    // drain effect fires on this render and picks up where we left off.
+    // This handles the case where the user switched threads, the turn
+    // completed while they were away, and they switched back.
+    initialQueue && initialQueue.length > 0 &&
+    (sessionStatus === "ready" || sessionStatus === "interrupted")
+      ? "running"
+      : sessionStatus,
+  );
   React.useEffect(() => {
     const wasRunning = prevStatusRef.current === "running";
     const nowReady = sessionStatus === "ready" || sessionStatus === "interrupted";

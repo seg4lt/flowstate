@@ -36,7 +36,7 @@ import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/sl
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { MessageList } from "./messages/message-list";
-import { ChatInput } from "./chat-input";
+import { ChatInput, type QueuedMessage } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
@@ -57,6 +57,11 @@ import type { AggregatedFileDiff } from "@/lib/session-diff";
 // re-renders and ChatInput remounts (keyed by sessionId). Cleared
 // on send so completed messages don't linger as stale drafts.
 const sessionDrafts = new Map<string, string>();
+
+// Per-session message queue. Module-level so it survives ChatInput
+// remounts (keyed by sessionId). Same pattern as sessionDrafts —
+// preserves queued messages when the user switches threads mid-turn.
+const sessionQueues = new Map<string, QueuedMessage[]>();
 
 // Trip the watchdog after this many seconds of silence while a tool
 // call is pending. Picked to be well past a normal tool round-trip
@@ -862,11 +867,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     [sessionId],
   );
 
+  // --- Queue persistence callbacks ---
+  const handleQueueChange = React.useCallback(
+    (queue: QueuedMessage[]) => {
+      if (queue.length > 0) {
+        sessionQueues.set(sessionId, queue);
+      } else {
+        sessionQueues.delete(sessionId);
+      }
+    },
+    [sessionId],
+  );
+
   async function handleSend(input: string, images: AttachedImage[] = []) {
     // Clear the persisted draft on send — the message is gone from
     // the composer and we don't want it to reappear if the user
     // navigates away and back before the component remounts.
     sessionDrafts.delete(sessionId);
+    sessionQueues.delete(sessionId);
     if (isArchived) {
       // Defense in depth — the composer is disabled when archived,
       // but slash-command and keyboard shortcut paths could still
@@ -1333,6 +1351,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             commands={COMMAND_META}
             initialValue={sessionDrafts.get(sessionId) ?? ""}
             onDraftChange={handleDraftChange}
+            initialQueue={sessionQueues.get(sessionId)}
+            onQueueChange={handleQueueChange}
           />
         </div>
 
