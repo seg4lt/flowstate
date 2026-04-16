@@ -132,10 +132,28 @@ export function TerminalDock() {
   // time and pass it straight into TerminalTab's effect, so a tab
   // born with an empty cwd would later see its prop change and
   // rebuild the xterm/PTY from scratch.
+  //
+  // We only auto-spawn on a false→true transition of `dockOpen` or
+  // when the user switches into a project that has no tab pool yet.
+  // We deliberately do NOT auto-spawn just because the current
+  // project's tab list went empty — that path fires when close_tab
+  // or prune_projects removes the last tab, and respawning there
+  // would make it impossible for the user to actually close all
+  // terminals (close_tab also folds the dock, but this guards the
+  // prune_projects path and any future removal paths).
+  const prevDockOpen = React.useRef(state.dockOpen);
+  const prevProjectKey = React.useRef(projectKey);
   React.useEffect(() => {
+    const justOpened = state.dockOpen && !prevDockOpen.current;
+    const projectSwitched = projectKey !== prevProjectKey.current;
+    prevDockOpen.current = state.dockOpen;
+    prevProjectKey.current = projectKey;
+
     if (!state.dockOpen) return;
     if (!resolved) return;
     if (projectKey !== NO_PROJECT_KEY && !cwd) return;
+    if (!justOpened && !projectSwitched) return;
+
     const current = state.projects.get(projectKey);
     if (!current || current.tabs.length === 0) {
       dispatch({
