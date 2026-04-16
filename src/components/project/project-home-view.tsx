@@ -281,7 +281,11 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   // Opens the dock if it isn't already visible.
   const openTerminalForWorktree = React.useCallback(
     (wt: GitWorktree) => {
-      terminalDispatch({ type: "set_dock_open", open: true });
+      // No session in scope on the project-home view → write to
+      // the global default so the dock shows immediately. When the
+      // user later navigates into a thread, that thread inherits
+      // the default unless it has its own explicit override.
+      terminalDispatch({ type: "set_dock_open", open: true, sessionId: null });
       terminalDispatch({
         type: "open_tab",
         projectKey: projectId,

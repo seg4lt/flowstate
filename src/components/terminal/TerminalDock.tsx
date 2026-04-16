@@ -2,7 +2,11 @@ import * as React from "react";
 import { useMatches } from "@tanstack/react-router";
 import { Plus, X } from "lucide-react";
 import { useApp } from "@/stores/app-store";
-import { NO_PROJECT_KEY, useTerminal } from "@/stores/terminal-store";
+import {
+  NO_PROJECT_KEY,
+  selectDockOpen,
+  useTerminal,
+} from "@/stores/terminal-store";
 import { TerminalTab } from "./TerminalTab";
 import "@xterm/xterm/css/xterm.css";
 
@@ -17,6 +21,10 @@ interface ActiveProject {
    *  this `false` so the auto-open effect waits rather than
    *  spawning a shell in $HOME under NO_PROJECT_KEY. */
   resolved: boolean;
+  /** Current thread, if any. Used to look up per-session dock open
+   *  state via `selectDockOpen`. Null when the user is on a route
+   *  without a session (home / /browse / /project/$projectId). */
+  sessionId: string | null;
 }
 
 function useActiveProject(): ActiveProject {
@@ -43,29 +51,50 @@ function useActiveProject(): ActiveProject {
   // NO_PROJECT_KEY and spawning a throwaway $HOME shell.
   if (projectId) {
     if (!state.ready) {
-      return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: false };
+      return {
+        projectKey: NO_PROJECT_KEY,
+        cwd: null,
+        resolved: false,
+        sessionId: null,
+      };
     }
     const project = state.projects.find((p) => p.projectId === projectId);
     if (!project) {
-      return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+      return {
+        projectKey: NO_PROJECT_KEY,
+        cwd: null,
+        resolved: true,
+        sessionId: null,
+      };
     }
     return {
       projectKey: project.projectId,
       cwd: project.path ?? null,
       resolved: true,
+      sessionId: null,
     };
   }
 
   // No session in the URL → we know this is NO_PROJECT_KEY. That
   // answer is stable, so resolved is true.
   if (!sessionId) {
-    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+    return {
+      projectKey: NO_PROJECT_KEY,
+      cwd: null,
+      resolved: true,
+      sessionId: null,
+    };
   }
 
   // sessionId is in the URL but the daemon snapshot hasn't arrived
   // yet. Report unresolved so the dock holds off on auto-opening.
   if (!state.ready) {
-    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: false };
+    return {
+      projectKey: NO_PROJECT_KEY,
+      cwd: null,
+      resolved: false,
+      sessionId,
+    };
   }
 
   const session =
@@ -74,32 +103,55 @@ function useActiveProject(): ActiveProject {
   // Snapshot is loaded but the session still isn't there — it may
   // arrive via a later event. Hold off.
   if (!session) {
-    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: false };
+    return {
+      projectKey: NO_PROJECT_KEY,
+      cwd: null,
+      resolved: false,
+      sessionId,
+    };
   }
   if (!session.projectId) {
-    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+    return {
+      projectKey: NO_PROJECT_KEY,
+      cwd: null,
+      resolved: true,
+      sessionId,
+    };
   }
 
   const project = state.projects.find((p) => p.projectId === session.projectId);
   if (!project) {
-    return { projectKey: NO_PROJECT_KEY, cwd: null, resolved: true };
+    return {
+      projectKey: NO_PROJECT_KEY,
+      cwd: null,
+      resolved: true,
+      sessionId,
+    };
   }
 
   return {
     projectKey: project.projectId,
     cwd: project.path ?? null,
     resolved: true,
+    sessionId,
   };
 }
 
 export function TerminalDock() {
   const { state, dispatch } = useTerminal();
   const { state: appState } = useApp();
-  const { projectKey, cwd, resolved } = useActiveProject();
+  const { projectKey, cwd, resolved, sessionId } = useActiveProject();
+  // Effective open flag for the current route: per-session override
+  // if the user explicitly set one, otherwise the global default
+  // (`defaultDockOpen`). Computed once so downstream reads stay
+  // consistent across a single render.
+  const dockOpen = selectDockOpen(state, sessionId);
 
   // Prune terminals for projects that no longer exist in app state
   // (user deleted the folder) OR whose last active session was
-  // archived / deleted. Keeps NO_PROJECT_KEY alive.
+  // archived / deleted. Keeps NO_PROJECT_KEY alive. Also prunes
+  // per-session dock-open entries so we don't leak booleans for
+  // sessions the user has deleted or archived.
   React.useEffect(() => {
     const existingProjects = new Set(appState.projects.map((p) => p.projectId));
 
@@ -120,6 +172,10 @@ export function TerminalDock() {
     }
 
     dispatch({ type: "prune_projects", keep });
+    dispatch({
+      type: "prune_sessions",
+      keep: new Set(appState.sessions.keys()),
+    });
   }, [appState.projects, appState.sessions, dispatch]);
 
   const projectState = state.projects.get(projectKey);
@@ -133,7 +189,7 @@ export function TerminalDock() {
   // born with an empty cwd would later see its prop change and
   // rebuild the xterm/PTY from scratch.
   React.useEffect(() => {
-    if (!state.dockOpen) return;
+    if (!dockOpen) return;
     if (!resolved) return;
     if (projectKey !== NO_PROJECT_KEY && !cwd) return;
     const current = state.projects.get(projectKey);
@@ -144,7 +200,7 @@ export function TerminalDock() {
         cwd: cwd ?? "",
       });
     }
-  }, [state.dockOpen, resolved, projectKey, cwd, dispatch, state.projects]);
+  }, [dockOpen, resolved, projectKey, cwd, dispatch, state.projects]);
 
   const handleResize = React.useCallback(
     (startY: number, startHeight: number) => {
@@ -183,7 +239,7 @@ export function TerminalDock() {
       className="absolute bottom-0 left-0 right-0 z-20 flex flex-col border-t border-border bg-[#0f0f10] text-xs"
       style={{
         height: state.dockHeight,
-        display: state.dockOpen ? "flex" : "none",
+        display: dockOpen ? "flex" : "none",
       }}
     >
       {/* Drag handle */}
@@ -259,7 +315,9 @@ export function TerminalDock() {
           type="button"
           aria-label="Hide terminal"
           className="flex h-6 w-6 items-center justify-center rounded-sm hover:bg-background/50"
-          onClick={() => dispatch({ type: "set_dock_open", open: false })}
+          onClick={() =>
+            dispatch({ type: "set_dock_open", open: false, sessionId })
+          }
         >
           <X className="h-3.5 w-3.5" />
         </button>
@@ -283,7 +341,7 @@ export function TerminalDock() {
                 <TerminalTab
                   tabId={tab.id}
                   cwd={tab.cwd}
-                  isVisible={state.dockOpen && isActive}
+                  isVisible={dockOpen && isActive}
                   onTitleChange={(title) =>
                     dispatch({
                       type: "set_tab_title",

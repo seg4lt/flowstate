@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarTrigger } from "@/components/ui/sidebar";
-import { AppProvider } from "@/stores/app-store";
+import { AppProvider, useApp } from "@/stores/app-store";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ContextDisplaySettingProvider } from "@/hooks/use-context-display-setting";
 import { ProviderEnabledProvider } from "@/hooks/use-provider-enabled";
@@ -129,13 +129,25 @@ function DragHandle({
 // composer, matching VS Code behavior.
 function useTerminalShortcut() {
   const { dispatch } = useTerminal();
+  const { state: appState } = useApp();
+  // Ref-shadow activeSessionId so the listener doesn't rebind on
+  // every thread switch. The Cmd+J handler reads the ref at press
+  // time to route the toggle to either the global default (no
+  // session → null) or the per-session override (on a thread).
+  const activeSessionIdRef = React.useRef(appState.activeSessionId);
+  React.useEffect(() => {
+    activeSessionIdRef.current = appState.activeSessionId;
+  }, [appState.activeSessionId]);
   React.useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const mod = e.metaKey || e.ctrlKey;
       if (!mod || e.altKey || e.shiftKey) return;
       if (e.key.toLowerCase() !== "j") return;
       e.preventDefault();
-      dispatch({ type: "toggle_dock" });
+      dispatch({
+        type: "toggle_dock",
+        sessionId: activeSessionIdRef.current,
+      });
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
