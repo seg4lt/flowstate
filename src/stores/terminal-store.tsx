@@ -53,17 +53,19 @@ type TerminalAction =
   | { type: "set_tab_title"; projectKey: string; tabId: string; title: string }
   | { type: "prune_projects"; keep: Set<string> };
 
-const DOCK_OPEN_KEY = "flowstate:terminal-dock-open";
 const DOCK_HEIGHT_KEY = "flowstate:terminal-dock-height";
 const DOCK_DEFAULT_HEIGHT = 320;
 const DOCK_MIN_HEIGHT = 120;
 const DOCK_MAX_HEIGHT = 900;
 
 function readInitial(): TerminalState {
-  let dockOpen = false;
+  // Always start with the dock closed. We intentionally do not
+  // persist dockOpen: tab metadata isn't persisted either, so
+  // restoring "open" on launch would just trigger the auto-spawn
+  // effect and resurrect a throwaway shell the user never asked for.
+  const dockOpen = false;
   let dockHeight = DOCK_DEFAULT_HEIGHT;
   try {
-    dockOpen = window.localStorage.getItem(DOCK_OPEN_KEY) === "1";
     const saved = window.localStorage.getItem(DOCK_HEIGHT_KEY);
     if (saved) {
       const parsed = Number.parseInt(saved, 10);
@@ -137,8 +139,14 @@ function terminalReducer(
       if (idx === -1) return state;
       const tabs = current.tabs.filter((_, i) => i !== idx);
       const projects = new Map(state.projects);
+      let dockOpen = state.dockOpen;
       if (tabs.length === 0) {
         projects.delete(action.projectKey);
+        // If no project has any tabs left, fold the dock away so the
+        // auto-spawn effect in TerminalDock doesn't resurrect a shell.
+        if (projects.size === 0) {
+          dockOpen = false;
+        }
       } else {
         const activeTabIndex = Math.min(
           current.activeTabIndex > idx
@@ -148,7 +156,7 @@ function terminalReducer(
         );
         projects.set(action.projectKey, { tabs, activeTabIndex });
       }
-      return { ...state, projects };
+      return { ...state, projects, dockOpen };
     }
     case "set_active_tab": {
       const current = state.projects.get(action.projectKey);
@@ -194,14 +202,6 @@ const TerminalContext = React.createContext<TerminalContextValue | null>(null);
 
 export function TerminalProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = React.useReducer(terminalReducer, undefined, readInitial);
-
-  React.useEffect(() => {
-    try {
-      window.localStorage.setItem(DOCK_OPEN_KEY, state.dockOpen ? "1" : "0");
-    } catch {
-      // ignore
-    }
-  }, [state.dockOpen]);
 
   React.useEffect(() => {
     try {
