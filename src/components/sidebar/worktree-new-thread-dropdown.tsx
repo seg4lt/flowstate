@@ -1,0 +1,374 @@
+import * as React from "react";
+import { useQuery } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
+import { GitBranch, Loader2, Plus, SquarePen } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { useApp } from "@/stores/app-store";
+import type { ProviderKind } from "@/lib/types";
+import type { GitWorktree } from "@/lib/api";
+import { readDefaultModel } from "@/lib/defaults-settings";
+import { useProviderEnabled } from "@/hooks/use-provider-enabled";
+import {
+  gitWorktreeListQueryOptions,
+  gitBranchQueryOptions,
+} from "@/lib/queries";
+import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
+import { toast } from "@/hooks/use-toast";
+import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constants";
+import { ProviderDropdown } from "./provider-dropdown";
+
+interface WorktreeAwareNewThreadProps {
+  projectId: string;
+  projectPath: string | undefined;
+}
+
+/**
+ * Sidebar "new thread" button that, for projects with multiple git
+ * worktrees, adds a worktree selection step before the provider
+ * picker. For projects without worktrees (or with only the main one)
+ * it falls through to the standard ProviderDropdown behavior.
+ */
+export function WorktreeAwareNewThread({
+  projectId,
+  projectPath,
+}: WorktreeAwareNewThreadProps) {
+  // If the project has no filesystem path we can't query worktrees —
+  // fall back to the plain provider dropdown.
+  if (!projectPath) {
+    return <ProviderDropdown projectId={projectId} />;
+  }
+
+  return (
+    <WorktreeDropdownInner
+      projectId={projectId}
+      projectPath={projectPath}
+    />
+  );
+}
+
+// ── Inner component — only rendered when projectPath is defined ─────
+
+function WorktreeDropdownInner({
+  projectId,
+  projectPath,
+}: {
+  projectId: string;
+  projectPath: string;
+}) {
+  const [open, setOpen] = React.useState(false);
+  const [createWtOpen, setCreateWtOpen] = React.useState(false);
+
+  const { state, send, createProject, linkProjectWorktree } = useApp();
+  const { isProviderEnabled } = useProviderEnabled();
+  const navigate = useNavigate();
+
+  // ── Worktree query (lazy — only when dropdown is open) ────────
+  const worktreeQuery = useQuery({
+    ...gitWorktreeListQueryOptions(projectPath),
+    enabled: open,
+  });
+  const worktrees = worktreeQuery.data ?? [];
+  const hasMultipleWorktrees = worktrees.length > 1;
+
+  // Current branch — needed by CreateWorktreeDialog as baseRef.
+  const branchQuery = useQuery({
+    ...gitBranchQueryOptions(projectPath),
+    enabled: createWtOpen,
+  });
+  const currentBranch = branchQuery.data ?? "";
+
+  // ── Provider readiness ────────────────────────────────────────
+  const providerMap = new Map(state.providers.map((p) => [p.kind, p]));
+  const stillLoading = !state.ready;
+
+  const [defaultModels, setDefaultModels] = React.useState<
+    Map<ProviderKind, string>
+  >(new Map());
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const readyProviders = state.providers.filter(
+      (p) => isProviderEnabled(p.kind) && p.status === "ready",
+    );
+    Promise.all(
+      readyProviders.map(async (p) => {
+        const model = await readDefaultModel(p.kind);
+        return [p.kind, model] as const;
+      }),
+    ).then((entries) => {
+      if (cancelled) return;
+      const map = new Map<ProviderKind, string>();
+      for (const [kind, model] of entries) {
+        if (model) map.set(kind, model);
+      }
+      setDefaultModels(map);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [state.providers, isProviderEnabled]);
+
+  // ── Thread creation (mirrors project-home-view startThreadOnWorktree) ──
+
+  const startThreadOnWorktree = React.useCallback(
+    async (wt: GitWorktree, provider: ProviderKind, model?: string) => {
+      try {
+        const isMain = wt.path === projectPath;
+        let wtProjectId =
+          state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
+
+        if (!wtProjectId) {
+          const name = wt.branch ?? "(worktree)";
+          wtProjectId = await createProject(wt.path, name);
+          if (!isMain) {
+            await linkProjectWorktree(wtProjectId, projectId, wt.branch);
+          }
+        } else if (!isMain && !state.projectWorktrees.has(wtProjectId)) {
+          await linkProjectWorktree(wtProjectId, projectId, wt.branch);
+        }
+
+        const res = await send({
+          type: "start_session",
+          provider,
+          model,
+          project_id: wtProjectId,
+        });
+        if (res?.type === "session_created") {
+          navigate({
+            to: "/chat/$sessionId",
+            params: { sessionId: res.session.sessionId },
+          });
+        } else if (res?.type === "error") {
+          toast({
+            title: "Failed to start thread",
+            description: res.message,
+            duration: 4000,
+          });
+        }
+      } catch (err) {
+        toast({
+          title: "Failed to start thread",
+          description: String(err),
+          duration: 4000,
+        });
+      }
+    },
+    [
+      projectPath,
+      projectId,
+      state.projects,
+      state.projectWorktrees,
+      createProject,
+      linkProjectWorktree,
+      send,
+      navigate,
+    ],
+  );
+
+  // Direct thread on the main project (no worktree provisioning).
+  async function createThreadDirect(provider: ProviderKind, model?: string) {
+    const resolvedModel = model ?? defaultModels.get(provider);
+    const res = await send({
+      type: "start_session",
+      provider,
+      model: resolvedModel,
+      project_id: projectId,
+    });
+    if (res && res.type === "session_created") {
+      navigate({
+        to: "/chat/$sessionId",
+        params: { sessionId: res.session.sessionId },
+      });
+    }
+  }
+
+  // ── Provider items renderer (reused in both modes) ────────────
+
+  function renderProviderItems(
+    onPick: (provider: ProviderKind, model?: string) => void,
+  ) {
+    return (
+      <>
+        {stillLoading && (
+          <>
+            <DropdownMenuLabel className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Checking providers...
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+          </>
+        )}
+        {ALL_PROVIDERS.map(({ kind, label }) => {
+          const info = providerMap.get(kind);
+          if (!isProviderEnabled(kind)) return null;
+          const isReady = info?.status === "ready";
+          const hasModels = info && info.models.length > 0;
+
+          if (hasModels && isReady) {
+            return (
+              <DropdownMenuSub key={kind}>
+                <DropdownMenuSubTrigger>
+                  <span
+                    className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[kind]}`}
+                  />
+                  New {label} thread
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  {info.models.map((m) => (
+                    <DropdownMenuItem
+                      key={m.value}
+                      onClick={() => onPick(kind, m.value)}
+                    >
+                      {m.label}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            );
+          }
+
+          return (
+            <DropdownMenuItem
+              key={kind}
+              disabled={!isReady}
+              onClick={() => isReady && onPick(kind)}
+            >
+              <span
+                className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${isReady ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"}`}
+              />
+              New {label} thread
+              {statusBadge(info)}
+            </DropdownMenuItem>
+          );
+        })}
+      </>
+    );
+  }
+
+  // ── Render ─────────────────────────────────────────────────────
+
+  return (
+    <>
+      <DropdownMenu open={open} onOpenChange={setOpen}>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <SquarePen className="h-3.5 w-3.5" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-64">
+          {/* Loading worktrees */}
+          {worktreeQuery.isLoading && (
+            <DropdownMenuLabel className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Loading worktrees...
+            </DropdownMenuLabel>
+          )}
+
+          {/* Error loading worktrees — show error + fallback to direct provider items */}
+          {worktreeQuery.isError && (
+            <>
+              <DropdownMenuLabel className="text-xs text-destructive">
+                {(worktreeQuery.error as Error).message}
+              </DropdownMenuLabel>
+              <DropdownMenuSeparator />
+              {renderProviderItems((provider, model) => {
+                const resolvedModel = model ?? defaultModels.get(provider);
+                void createThreadDirect(provider, resolvedModel);
+              })}
+            </>
+          )}
+
+          {/* Loaded but no multiple worktrees — direct provider list */}
+          {!worktreeQuery.isLoading &&
+            !worktreeQuery.isError &&
+            !hasMultipleWorktrees &&
+            renderProviderItems((provider, model) => {
+              const resolvedModel = model ?? defaultModels.get(provider);
+              void createThreadDirect(provider, resolvedModel);
+            })}
+
+          {/* Loaded with multiple worktrees — two-level menu */}
+          {!worktreeQuery.isLoading &&
+            !worktreeQuery.isError &&
+            hasMultipleWorktrees && (
+              <>
+                <DropdownMenuLabel className="text-xs text-muted-foreground">
+                  Pick a worktree
+                </DropdownMenuLabel>
+                {worktrees.map((wt) => {
+                  const isMain = wt.path === projectPath;
+                  const label = wt.branch ?? "(detached)";
+                  return (
+                    <DropdownMenuSub key={wt.path}>
+                      <DropdownMenuSubTrigger>
+                        <GitBranch className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        <span className="flex-1 truncate">{label}</span>
+                        {isMain && (
+                          <span className="ml-1.5 rounded bg-muted px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-muted-foreground">
+                            main
+                          </span>
+                        )}
+                      </DropdownMenuSubTrigger>
+                      <DropdownMenuSubContent className="w-56">
+                        {renderProviderItems((provider, model) => {
+                          const resolvedModel =
+                            model ?? defaultModels.get(provider);
+                          setOpen(false);
+                          void startThreadOnWorktree(
+                            wt,
+                            provider,
+                            resolvedModel,
+                          );
+                        })}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuSub>
+                  );
+                })}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => {
+                    setOpen(false);
+                    setCreateWtOpen(true);
+                  }}
+                >
+                  <Plus className="mr-2 h-3.5 w-3.5" />
+                  Create worktree...
+                </DropdownMenuItem>
+              </>
+            )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <CreateWorktreeDialog
+        open={createWtOpen}
+        onOpenChange={setCreateWtOpen}
+        projectPath={projectPath}
+        currentBranch={currentBranch}
+        onCreated={(wt) => {
+          // After creating a worktree, start a thread on it with the
+          // first ready enabled provider (same fallback logic as
+          // project-home-view).
+          const readyProvider = state.providers.find(
+            (p) => isProviderEnabled(p.kind) && p.status === "ready",
+          );
+          const provider: ProviderKind = readyProvider?.kind ?? "claude";
+          void startThreadOnWorktree(wt, provider);
+        }}
+      />
+    </>
+  );
+}

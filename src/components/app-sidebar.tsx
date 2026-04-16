@@ -43,6 +43,7 @@ import {
 } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
+import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
 import type { SessionSummary } from "@/lib/types";
 
@@ -327,7 +328,7 @@ export function AppSidebar() {
                         >
                           <FolderMinus className="h-3.5 w-3.5" />
                         </button>
-                        <ProviderDropdown projectId={project.projectId} />
+                        <WorktreeAwareNewThread projectId={project.projectId} projectPath={project.path} />
                       </div>
                       <CollapsibleContent>
                         <SidebarMenuSub>
