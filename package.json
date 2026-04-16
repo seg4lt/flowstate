@@ -13,6 +13,7 @@
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.8",
     "@pierre/diffs": "^1.1.15",
+    "@pierre/theme": "0.0.28",
     "@tailwindcss/vite": "^4.2.2",
     "@tanstack/react-query": "^5.99.0",
     "@tanstack/react-router": "^1.168.18",

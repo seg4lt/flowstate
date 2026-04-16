@@ -1,5 +1,11 @@
 import * as React from "react";
-import type { BundledLanguage, Highlighter } from "shiki";
+import type {
+  BundledLanguage,
+  Highlighter,
+  ThemeRegistrationAny,
+} from "shiki";
+import pierreDark from "@pierre/theme/pierre-dark";
+import pierreLight from "@pierre/theme/pierre-light";
 import { useTheme } from "@/hooks/use-theme";
 
 // Languages preloaded into the highlighter. Adding more is free at
@@ -31,9 +37,12 @@ const PRELOAD_LANGS: BundledLanguage[] = [
 
 // Both themes are bundled into the singleton highlighter so swapping
 // between light and dark on theme toggle is a synchronous re-highlight
-// (no extra grammar/theme load).
-const LIGHT_THEME = "github-light";
-const DARK_THEME = "github-dark";
+// (no extra grammar/theme load). Pierre themes are imported as theme
+// objects to match the look of diff blocks (@pierre/diffs), which render
+// with pierre-light / pierre-dark — so every code surface in the app
+// shares one palette.
+const LIGHT_THEME = pierreLight as unknown as ThemeRegistrationAny;
+const DARK_THEME = pierreDark as unknown as ThemeRegistrationAny;
 
 // Singleton highlighter promise. The first <CodeBlock> on the page
 // triggers the dynamic import + grammar load (~100-300ms cold), every
