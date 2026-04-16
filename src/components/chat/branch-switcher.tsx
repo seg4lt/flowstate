@@ -101,6 +101,26 @@ export function BranchSwitcher({
     setOpen(false);
   }, [onCheckedOut, projectPath, queryClient]);
 
+  // Fire-and-forget refresh of the current-branch label whenever the
+  // user opens the popover. This catches out-of-band checkouts (e.g.
+  // the user ran `git checkout` in a terminal) without blocking the
+  // click — React Query refetches in the background and the label
+  // updates on the next render.
+  const handleOpenChange = React.useCallback(
+    (next: boolean) => {
+      setOpen(next);
+      if (next) {
+        void queryClient.invalidateQueries({
+          queryKey: ["git", "branch", projectPath],
+        });
+        void queryClient.invalidateQueries({
+          queryKey: ["git", "branch-list", projectPath],
+        });
+      }
+    },
+    [projectPath, queryClient],
+  );
+
   const checkoutMutation = useMutation({
     mutationFn: async (args: {
       branch: string;
@@ -265,7 +285,7 @@ export function BranchSwitcher({
 
   return (
     <>
-      <Popover open={open} onOpenChange={setOpen}>
+      <Popover open={open} onOpenChange={handleOpenChange}>
         <PopoverTrigger asChild>
           {trigger ?? (
             <button

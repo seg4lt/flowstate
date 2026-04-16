@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { GitBranch, Loader2, Plus, SquarePen } from "lucide-react";
 import {
@@ -71,6 +71,20 @@ function WorktreeDropdownInner({
   const { state, send, createProject, linkProjectWorktree } = useApp();
   const { isProviderEnabled } = useProviderEnabled();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
+
+  // Fire-and-forget: the ChatView we're about to navigate into reads
+  // the cached branch for its project path. Poking the cache here means
+  // the new thread loads with a fresh branch even if git state moved
+  // out-of-band since the last fetch.
+  const refreshBranchAsync = React.useCallback(
+    (path: string) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["git", "branch", path],
+      });
+    },
+    [queryClient],
+  );
 
   // ── Worktree query (lazy — only when dropdown is open) ────────
   const worktreeQuery = useQuery({
@@ -123,6 +137,7 @@ function WorktreeDropdownInner({
   const startThreadOnWorktree = React.useCallback(
     async (wt: GitWorktree, provider: ProviderKind, model?: string) => {
       try {
+        refreshBranchAsync(wt.path);
         const isMain = wt.path === projectPath;
         let wtProjectId =
           state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
@@ -172,11 +187,13 @@ function WorktreeDropdownInner({
       linkProjectWorktree,
       send,
       navigate,
+      refreshBranchAsync,
     ],
   );
 
   // Direct thread on the main project (no worktree provisioning).
   async function createThreadDirect(provider: ProviderKind, model?: string) {
+    refreshBranchAsync(projectPath);
     const resolvedModel = model ?? defaultModels.get(provider);
     const res = await send({
       type: "start_session",

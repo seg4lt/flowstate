@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { Loader2, SquarePen } from "lucide-react";
 import {
@@ -20,6 +21,12 @@ import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constant
 
 interface ProviderDropdownProps {
   projectId?: string;
+  /** Filesystem path of the project the new thread will target. When
+   *  provided, picking a provider fires a fire-and-forget invalidation
+   *  of the cached git branch for this path so the new ChatView (or
+   *  the upstream consumer via `onSelect`) sees a fresh branch even
+   *  if git state moved out-of-band since the last fetch. */
+  projectPath?: string;
   /** Override the default pencil-icon trigger. Used by the project-home
    *  page to render the action as a sized button instead of the tiny
    *  hover-only icon the sidebar shows. */
@@ -30,10 +37,16 @@ interface ProviderDropdownProps {
   onSelect?: (provider: ProviderKind, model?: string) => void;
 }
 
-export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropdownProps) {
+export function ProviderDropdown({
+  projectId,
+  projectPath,
+  trigger,
+  onSelect,
+}: ProviderDropdownProps) {
   const { state, send } = useApp();
   const { isProviderEnabled } = useProviderEnabled();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const providerMap = new Map(state.providers.map((p) => [p.kind, p]));
   const stillLoading = !state.ready;
@@ -69,6 +82,14 @@ export function ProviderDropdown({ projectId, trigger, onSelect }: ProviderDropd
   }, [state.providers]);
 
   async function createThread(provider: ProviderKind, model?: string) {
+    // Fire-and-forget branch refresh so the ChatView (or the onSelect
+    // consumer, which typically navigates into a worktree thread)
+    // picks up out-of-band `git checkout` changes without blocking.
+    if (projectPath) {
+      void queryClient.invalidateQueries({
+        queryKey: ["git", "branch", projectPath],
+      });
+    }
     const resolvedModel = model ?? defaultModels.get(provider);
     if (onSelect) {
       onSelect(provider, resolvedModel);
