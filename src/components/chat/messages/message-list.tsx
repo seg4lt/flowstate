@@ -24,6 +24,12 @@ interface MessageListProps {
   /** Triggered when the user clicks "Load older". Chat-view owns the
    *  query cache mutation; the list component is just a button. */
   onLoadOlder?: () => void;
+  /** Monotonically-increasing counter bumped by chat-view every time the
+   *  user dispatches a message. A change here forces an unconditional
+   *  smooth scroll to the latest item, even if the user had scrolled up
+   *  to read history. Decoupled from `pendingInput` so the effect fires
+   *  exactly once per send and doesn't get skipped if React batches. */
+  userSendTick: number;
 }
 
 const PENDING_KEY = "__pending__";
@@ -68,6 +74,7 @@ export function MessageList({
   loadingOlder = false,
   onLoadOlder,
   onOpenAttachment,
+  userSendTick,
 }: MessageListProps) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
@@ -110,6 +117,28 @@ export function MessageList({
     });
     return () => cancelAnimationFrame(raf);
   }, [sessionId, displayItems.length]);
+
+  // Force a scroll to the latest message every time the user dispatches
+  // a new message. Unlike Virtuoso's `followOutput`, this fires even
+  // when the user is scrolled up reading history — sending a message
+  // should always pop them back to the bottom so they can see their
+  // own input land. The ref guard makes the "skip initial mount" intent
+  // explicit and protects against StrictMode double-invocation in dev.
+  // The rAF defer matches the thread-open effect: Virtuoso needs a
+  // layout pass after `displayItems` grows by the optimistic pending row.
+  const lastSendTickRef = React.useRef(userSendTick);
+  React.useEffect(() => {
+    if (userSendTick === lastSendTickRef.current) return;
+    lastSendTickRef.current = userSendTick;
+    const raf = requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: "LAST",
+        align: "end",
+        behavior: "smooth",
+      });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [userSendTick]);
 
   // Cold-cache case: no turns in hand yet AND the daemon hasn't
   // replied. Render a small loader inline in the scroll region

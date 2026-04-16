@@ -434,6 +434,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, [permissionStorageKey, permissionMode]);
 
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
+  // Monotonically-increasing tick bumped each time the user dispatches a
+  // message via handleSend. MessageList watches this to force a scroll-
+  // to-bottom on every send, regardless of current scroll position. A
+  // counter (rather than a boolean) ensures every send fires the effect
+  // even when consecutive sends would otherwise debounce to the same value.
+  const [userSendTick, setUserSendTick] = React.useState(0);
   // Watchdog state: `lastEventAt` bumps on every stream event for this
   // session so the 45s inactivity timer resets. `stuckSince` is set
   // when the timer fires and a pending tool call exists; rendering the
@@ -1065,6 +1071,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // round-trip. turn_started will clear this and replace it with the
     // real turn from the daemon.
     setPendingInput(input);
+    // Signal MessageList to force-scroll to the bottom. handleSend is the
+    // single funnel for actually-dispatched user messages (queued-while-
+    // running submissions don't reach here, and they don't show up in the
+    // list either, so they correctly don't trigger a scroll).
+    setUserSendTick((n) => n + 1);
     try {
       await sendMessage({
         type: "send_turn",
@@ -1366,6 +1377,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             turns={turns}
             loading={loading}
             pendingInput={pendingInput}
+            userSendTick={userSendTick}
             hiddenOlderCount={hiddenOlderCount}
             loadingOlder={loadingOlder}
             onLoadOlder={handleLoadOlder}
