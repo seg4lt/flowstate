@@ -105,7 +105,7 @@ export function AppSidebar() {
   for (const list of sessionsByProject.values()) {
     list.sort(
       (a, b) =>
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
   }
 
@@ -131,7 +131,7 @@ export function AppSidebar() {
   for (const list of archivedByProject.values()) {
     list.sort(
       (a, b) =>
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
   }
 
