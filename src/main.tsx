@@ -9,6 +9,7 @@ import {
   getDefaultPoolSize,
   readPoolSizeSetting,
 } from "@/lib/pierre-diffs-worker";
+import { checkForUpdate } from "@/lib/updater";
 import "./index.css";
 
 // Single QueryClient for the whole app. Defaults chosen for a
@@ -108,3 +109,14 @@ async function bootstrap() {
 }
 
 void bootstrap();
+
+// Fire-and-forget startup update check. Runs once a few seconds
+// after boot so the network call doesn't compete with the rest of
+// the app coming up. The updater singleton (src/lib/updater.ts)
+// captures the result; if an update is available, <UpdateBanner />
+// renders the install CTA. No-op + silent on errors so a flaky
+// network never blocks startup. Settings exposes a manual
+// "Check now" button that hits the same code path.
+window.setTimeout(() => {
+  void checkForUpdate();
+}, 5000);

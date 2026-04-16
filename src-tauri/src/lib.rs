@@ -1907,6 +1907,14 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Auto-updater + process plugins. The frontend calls
+        // `check()` on startup (see src/main.tsx) and from a
+        // manual button in Settings; on accept it
+        // `downloadAndInstall()`s and then `relaunch()`s the
+        // app. Manifests are served from the public release
+        // repo and verified against the embedded pubkey.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(PtyManager::new())
         .manage(DiffTasks::default())
         .setup(|app| {

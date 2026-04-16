@@ -25,6 +25,7 @@ import { CodeView } from "@/components/code/code-view";
 import { ProjectHomeView } from "@/components/project/project-home-view";
 import { SettingsView } from "@/components/settings/settings-view";
 import { Toaster } from "@/components/ui/toaster";
+import { UpdateBanner } from "@/components/update-banner";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
@@ -156,6 +157,9 @@ function useTerminalShortcut() {
 
 // Cmd/Ctrl +=, +-, +0 control the webview zoom. Same no-text-input-guard
 // rationale as useTerminalShortcut: these are chrome-level shortcuts.
+// useIsMobile observes documentElement via ResizeObserver, so it picks
+// up the viewport change automatically once the WKWebView reflows after
+// setZoom() — no explicit cross-component notification needed here.
 function useZoomShortcuts() {
   const zoomRef = React.useRef<number>(ZOOM_DEFAULT);
 
@@ -246,6 +250,7 @@ function AppShell() {
         </SidebarInset>
       </SidebarProvider>
       <Toaster />
+      <UpdateBanner />
     </TooltipProvider>
   );
 }

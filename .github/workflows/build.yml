@@ -83,6 +83,18 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        env:
+          # Minisign key used by the Tauri updater. Built bundles are
+          # signed with this; the matching pubkey is embedded in
+          # src-tauri/tauri.conf.json (`plugins.updater.pubkey`) and
+          # the desktop plugin verifies every manifest against it
+          # before downloading. `createUpdaterArtifacts: true` in
+          # tauri.conf.json makes this a hard build requirement —
+          # if the secret is missing, `pnpm tauri build` fails here.
+          # The key was generated with `tauri signer generate --ci`
+          # (no password), so the PASSWORD env var can stay empty.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: pnpm tauri build ${{ matrix.tauri-args }}
 
       - name: Repackage DMG with install script (macOS)
@@ -116,6 +128,17 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ]; then
             DMG=$(find src-tauri/target -name "Flowstate.dmg" -path "*/release/bundle/dmg/*" | head -1)
             cp "$DMG" "release-assets/Flowstate-${TAG}-macos-arm64.dmg"
+
+            # Updater artifacts. createUpdaterArtifacts in tauri.conf.json
+            # makes the bundler drop an .app.tar.gz (the delta the
+            # updater swaps in on macOS) and a .app.tar.gz.sig
+            # (minisign signature over it) next to the .app in
+            # bundle/macos/. Both get uploaded; the release job reads
+            # the .sig contents to populate latest.json.
+            APP_TAR=$(find src-tauri/target -name "*.app.tar.gz" -path "*/release/bundle/macos/*" | head -1)
+            APP_SIG=$(find src-tauri/target -name "*.app.tar.gz.sig" -path "*/release/bundle/macos/*" | head -1)
+            cp "$APP_TAR" "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz"
+            cp "$APP_SIG" "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz.sig"
           fi
 
           if [ "${{ runner.os }}" = "Windows" ]; then
@@ -123,6 +146,15 @@ jobs:
             EXE=$(find src-tauri/target -name "*-setup.exe" -path "*/release/bundle/nsis/*" | head -1)
             cp "$MSI" "release-assets/Flowstate-${TAG}-windows-x64.msi"
             cp "$EXE" "release-assets/Flowstate-${TAG}-windows-x64-setup.exe"
+
+            # Updater artifacts. On Windows the NSIS setup.exe itself
+            # is what the updater runs; tauri emits `<name>-setup.exe.sig`
+            # and `<name>.msi.sig` alongside the installers in the
+            # respective bundle dirs. We ship the NSIS sig because
+            # `latest.json` below points at the NSIS URL — MSI is
+            # kept as a standard-installer download only.
+            EXE_SIG=$(find src-tauri/target -name "*-setup.exe.sig" -path "*/release/bundle/nsis/*" | head -1)
+            cp "$EXE_SIG" "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig"
           fi
 
       - name: Upload release assets
@@ -158,10 +190,50 @@ jobs:
       - name: List release assets
         run: ls -la release-assets/
 
+      - name: Generate updater manifest (latest.json)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          REPO="seg4lt/flowstate"
+          PUB_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          # The Tauri updater fetches latest.json from the release,
+          # matches its current platform against the `platforms` map,
+          # verifies the `signature` field against the embedded
+          # pubkey, and then downloads `url`. URLs must be the final
+          # GitHub release download URLs (which don't exist until
+          # the release is published), but GitHub's /releases/download/
+          # scheme is deterministic from tag + filename, so we can
+          # precompute them here.
+          MAC_SIG="$(cat "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz.sig")"
+          WIN_SIG="$(cat "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig")"
+
+          cat > release-assets/latest.json <<EOF
+          {
+            "version": "${TAG}",
+            "notes": "See the release page for details.",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${MAC_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-macos-arm64.app.tar.gz"
+              },
+              "windows-x86_64": {
+                "signature": "${WIN_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-windows-x64-setup.exe"
+              }
+            }
+          }
+          EOF
+
+          echo "--- latest.json ---"
+          cat release-assets/latest.json
+
       - name: Create release on public repo
         uses: softprops/action-gh-release@v2
         with:
-          repository: seg4lt/flowstate-releases
+          repository: seg4lt/flowstate
           tag_name: ${{ github.ref_name }}
           name: Flowstate ${{ github.ref_name }}
           body: |
@@ -181,6 +253,13 @@ jobs:
 
             ### Windows Installation
             Download either the `.msi` (standard Windows Installer) or the `-setup.exe` (NSIS installer).
+
+            ### Auto-updates
+            Existing installs will see this version via the in-app
+            updater (Settings → Updates, or the startup check). The
+            `.app.tar.gz` / `-setup.exe.sig` / `latest.json` assets
+            are consumed by the updater — you don't need to touch
+            them manually.
           draft: false
           prerelease: false
           files: release-assets/*

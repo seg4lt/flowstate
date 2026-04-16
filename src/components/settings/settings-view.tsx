@@ -8,6 +8,12 @@ import { useTheme, type ThemePreference } from "@/hooks/use-theme";
 import { toast } from "@/hooks/use-toast";
 import { getAppDataDir } from "@/lib/api";
 import {
+  checkForUpdate,
+  resetUpdaterStatus,
+  useUpdaterStatus,
+} from "@/lib/updater";
+import { getVersion } from "@tauri-apps/api/app";
+import {
   POOL_SIZE_MIN,
   getDefaultPoolSize,
   getMaxPoolSize,
@@ -680,6 +686,91 @@ function AppDataDirRow() {
   );
 }
 
+// Manual "Check for updates" row. The app also fires a silent
+// startup check from main.tsx; this row lets the user poke it
+// on demand and see a result inline via the toast helper. If an
+// update is found, the global <UpdateBanner /> (mounted in
+// router.tsx) takes over the install UX — we just confirm we
+// found one here. Shares the singleton store at `lib/updater.ts`.
+function CheckForUpdatesRow() {
+  const status = useUpdaterStatus();
+  const [version, setVersion] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    getVersion()
+      .then((v) => {
+        if (!cancelled) setVersion(v);
+      })
+      .catch(() => {
+        if (!cancelled) setVersion(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const busy =
+    status.kind === "checking" ||
+    status.kind === "downloading" ||
+    status.kind === "installing";
+
+  async function handleCheck() {
+    const result = await checkForUpdate();
+    if (result.kind === "up-to-date") {
+      toast({
+        description: `You're on the latest version of Flowstate${
+          version ? ` (v${version})` : ""
+        }.`,
+        duration: 3000,
+      });
+      resetUpdaterStatus();
+    } else if (result.kind === "error") {
+      toast({
+        description: `Update check failed: ${result.message}`,
+        duration: 4000,
+      });
+      resetUpdaterStatus();
+    } else if (result.kind === "available") {
+      toast({
+        description: `Flowstate ${result.update.version} is available — see the banner to install.`,
+        duration: 4000,
+      });
+    }
+  }
+
+  const buttonLabel =
+    status.kind === "checking"
+      ? "Checking…"
+      : status.kind === "downloading"
+        ? "Downloading…"
+        : status.kind === "installing"
+          ? "Installing…"
+          : "Check now";
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Check for updates</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          {version ? `You're running Flowstate v${version}. ` : ""}
+          Flowstate checks for signed updates from GitHub Releases at
+          startup; use this to poll on demand.
+        </div>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={busy}
+        onClick={() => void handleCheck()}
+      >
+        {busy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+        {buttonLabel}
+      </Button>
+    </div>
+  );
+}
+
 export function SettingsView() {
   const { state, send } = useApp();
   const { setProviderEnabled } = useProviderEnabled();
@@ -798,6 +889,12 @@ export function SettingsView() {
             description="Where Flowstate keeps its data on disk."
           >
             <AppDataDirRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Updates"
+            description="Keep Flowstate up to date. Updates are cryptographically signed and delivered via GitHub Releases."
+          >
+            <CheckForUpdatesRow />
           </SettingsGroup>
         </div>
       </div>
