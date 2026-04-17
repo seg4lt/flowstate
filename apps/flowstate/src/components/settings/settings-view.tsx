@@ -33,8 +33,11 @@ import {
   writeDefaultModel,
   readDefaultProvider,
   writeDefaultProvider,
+  readStrictPlanMode,
+  writeStrictPlanMode,
   DEFAULT_PROVIDER,
 } from "@/lib/defaults-settings";
+import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { EFFORT_OPTIONS } from "@/components/chat/effort-selector";
@@ -260,6 +263,43 @@ function DefaultPermissionModeRow() {
           </option>
         ))}
       </select>
+    </div>
+  );
+}
+
+function StrictPlanModeRow() {
+  const [enabled, setEnabled] = React.useState(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readStrictPlanMode().then((saved) => {
+      if (!cancelled) setEnabled(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function handleChange(next: boolean) {
+    setEnabled(next);
+    void writeStrictPlanMode(next);
+  }
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Strict plan mode</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Auto-deny {PLAN_MODE_MUTATING_TOOLS_LABEL} while in plan mode, so an
+          accidental Allow click can't exit plan mode early. The baseline
+          plan-mode gate still prompts without this.
+        </div>
+      </div>
+      <Switch
+        checked={enabled}
+        onCheckedChange={handleChange}
+        aria-label="Strict plan mode"
+      />
     </div>
   );
 }
@@ -855,6 +895,7 @@ export function SettingsView() {
             <DefaultProviderRow />
             <DefaultEffortRow />
             <DefaultPermissionModeRow />
+            <StrictPlanModeRow />
             <DefaultModelRow />
           </SettingsGroup>
           <SettingsGroup

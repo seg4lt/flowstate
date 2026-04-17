@@ -1280,14 +1280,47 @@ impl RuntimeCore {
                     input,
                     suggested_decision,
                 } => {
-                    self.publish(RuntimeEvent::PermissionRequested {
-                        session_id: sid.clone(),
-                        turn_id: tid.clone(),
-                        request_id,
-                        tool_name,
-                        input,
-                        suggested: suggested_decision,
-                    });
+                    // Bypass-mode safety net. The user explicitly
+                    // opted out of permission prompting for this turn
+                    // by selecting Bypass Permissions. Primary fix
+                    // lives at each adapter's emission site (e.g. the
+                    // Claude SDK bridge short-circuits inside
+                    // canUseTool before ever emitting), but this
+                    // cross-provider net catches any permission
+                    // request that still slips through — CLI-backed
+                    // adapters whose upstream binary forwards prompts
+                    // in danger-mode, future adapters that don't know
+                    // about bypass yet, or a stale bridge build on
+                    // someone's disk. Auto-answer Allow on the sink
+                    // and skip the publish so no dialog reaches the
+                    // UI. The adapter's canUseTool promise resolves
+                    // with approved and the tool runs.
+                    if permission_mode == PermissionMode::Bypass {
+                        let sink =
+                            self.active_sinks.lock().await.get(&sid).cloned();
+                        if let Some(sink) = sink {
+                            sink.resolve_permission(
+                                &request_id,
+                                PermissionDecision::Allow,
+                            )
+                            .await;
+                        } else {
+                            tracing::warn!(
+                                session_id = %sid,
+                                request_id,
+                                "bypass safety net: no active sink to auto-allow"
+                            );
+                        }
+                    } else {
+                        self.publish(RuntimeEvent::PermissionRequested {
+                            session_id: sid.clone(),
+                            turn_id: tid.clone(),
+                            request_id,
+                            tool_name,
+                            input,
+                            suggested: suggested_decision,
+                        });
+                    }
                 }
                 ProviderTurnEvent::UserQuestion {
                     request_id,

@@ -31,7 +31,9 @@ import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
 import {
   readDefaultEffort,
   readDefaultPermissionMode,
+  readStrictPlanMode,
 } from "@/lib/defaults-settings";
+import { PLAN_MODE_MUTATING_TOOLS } from "@/lib/tool-policy";
 import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
@@ -421,6 +423,27 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       cancelled = true;
     };
   }, [permissionStorageKey]);
+
+  // Strict Plan Mode preference — opt-in frontend policy that auto-
+  // denies any mutating-tool permission request while the session is
+  // in plan mode (see `PLAN_MODE_MUTATING_TOOLS` + the enforcement
+  // useEffect below). We refresh on window focus so flipping the
+  // toggle in Settings takes effect without a reload.
+  const [strictPlanMode, setStrictPlanMode] = React.useState(false);
+  React.useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      readStrictPlanMode().then((saved) => {
+        if (!cancelled) setStrictPlanMode(saved);
+      });
+    };
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", refresh);
+    };
+  }, []);
 
   // Persist effort and permission mode to sessionStorage so they
   // survive navigation (e.g. Settings → back) without losing the
@@ -1192,6 +1215,47 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       setPermissionMode(modeOverride);
     }
   }
+
+  // Strict Plan Mode enforcement. When enabled AND the session is in
+  // plan mode, any pending permission request for a mutating tool
+  // (Bash / Write / Edit / NotebookEdit) is auto-denied before the
+  // PermissionPrompt UI has a chance to render. This prevents an
+  // accidental Allow click from exiting plan mode mid-investigation.
+  //
+  // Provider-agnostic: operates on the queue any adapter feeds into
+  // `pendingPermissions`, so every provider gets the behaviour for
+  // free. The `autoDeniedRef` guards against double-answers during
+  // the dispatch → sendMessage round-trip (the queue head can still
+  // be the same request_id on the next render tick until the
+  // `consume_pending_permission` dispatch settles).
+  const autoDeniedRef = React.useRef<Set<string>>(new Set());
+  React.useEffect(() => {
+    if (!strictPlanMode) return;
+    if (permissionMode !== "plan") return;
+    const head = pendingPermissions[0];
+    if (!head) return;
+    if (!PLAN_MODE_MUTATING_TOOLS.has(head.toolName)) return;
+    if (autoDeniedRef.current.has(head.requestId)) return;
+    autoDeniedRef.current.add(head.requestId);
+    void handlePermissionDecision("deny");
+  }, [
+    strictPlanMode,
+    permissionMode,
+    pendingPermissions,
+    // handlePermissionDecision is defined in component scope and
+    // closes over dispatch/sessionId; not memoized, but stable
+    // across renders for our purposes (the autoDeniedRef guard
+    // prevents re-triggering anyway).
+  ]);
+
+  // Prune `autoDeniedRef` of request ids no longer in the queue so
+  // it can't grow unbounded over a long session.
+  React.useEffect(() => {
+    const live = new Set(pendingPermissions.map((p) => p.requestId));
+    for (const id of autoDeniedRef.current) {
+      if (!live.has(id)) autoDeniedRef.current.delete(id);
+    }
+  }, [pendingPermissions]);
 
   async function handleQuestionSubmit(answers: UserInputAnswer[]) {
     if (!pendingQuestion) return;

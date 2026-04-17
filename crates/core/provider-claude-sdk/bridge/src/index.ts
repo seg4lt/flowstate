@@ -276,6 +276,20 @@ class ClaudeBridge {
         });
       }
 
+      // Bypass mode: the user explicitly opted out of permission
+      // prompting for this turn. Resolve every non-question tool call
+      // as-is without round-tripping through the host. Without this
+      // the SDK would still call canUseTool for mutating tools
+      // (Bash/Write/Edit/...), we'd emit permission_request, and the
+      // UI would show a dialog the user explicitly said they didn't
+      // want. See also the runtime-core safety net which auto-answers
+      // any permission_request that slips through for a bypass turn —
+      // this short-circuit is the primary fix; the safety net covers
+      // other provider adapters.
+      if (permissionMode === 'bypassPermissions') {
+        return { behavior: 'allow', updatedInput: input };
+      }
+
       const requestId = randomUUID();
       writeStream({
         event: 'permission_request',

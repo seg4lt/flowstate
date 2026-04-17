@@ -23,8 +23,8 @@ interface PermissionPromptProps {
 
 const PLAN_EXIT_MODES: { mode: PermissionMode; label: string; hint: string }[] = [
   { mode: "default", label: "Default", hint: "ask before each edit" },
-  { mode: "accept_edits", label: "Auto-edit", hint: "edits without asking" },
-  { mode: "bypass", label: "Full access", hint: "no permission prompts at all" },
+  { mode: "accept_edits", label: "Accept Edits", hint: "edits without asking" },
+  { mode: "bypass", label: "Bypass Permissions", hint: "no permission prompts at all" },
 ];
 
 function PermissionPromptInner({
