@@ -714,7 +714,7 @@ export function ChatInput({
                 type="button"
                 onClick={onInterrupt}
                 className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                title="Interrupt (Esc)"
+                title="Interrupt (Esc Esc)"
               >
                 <Square className="h-4 w-4" />
               </button>

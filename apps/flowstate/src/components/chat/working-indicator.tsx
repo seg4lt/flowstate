@@ -66,9 +66,9 @@ function WorkingIndicatorInner({
         type="button"
         onClick={onInterrupt}
         className="ml-auto rounded px-1 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
-        title="Interrupt (Esc)"
+        title="Interrupt (Esc Esc)"
       >
-        esc
+        esc esc
       </button>
     </div>
   );
