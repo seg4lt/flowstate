@@ -13,12 +13,13 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
+    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
+    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion,
+    UserInputQuestion, skills_disk,
 };
 
 const BRIDGE_TIMEOUT_MS: u64 = 120_000;
@@ -112,6 +113,53 @@ impl Drop for ActivityGuard {
     }
 }
 
+/// Wire shape of one skill inside a `capabilities` response. Mirrors
+/// the Copilot SDK's `SessionSkillsListResult.skills[]` entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeSkill {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    source: String,
+    #[serde(default)]
+    user_invocable: bool,
+    #[serde(default)]
+    #[allow(dead_code)]
+    enabled: bool,
+}
+
+/// Wire shape of one sub-agent inside a `capabilities` response.
+/// Mirrors `SessionAgentListResult.agents[]`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeCopilotAgent {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    display_name: Option<String>,
+}
+
+/// Wire shape of one MCP server inside a `capabilities` response.
+/// Mirrors `SessionMcpListResult.servers[]`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeCopilotMcp {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    source: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    error: Option<String>,
+}
+
 /// ZenUI Bridge Protocol Messages (Rust → TS)
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -152,6 +200,13 @@ enum BridgeRequest {
     CancelUserInput { request_id: String },
     #[serde(rename = "list_models")]
     ListModels,
+    /// Enumerate the session's Copilot skills, sub-agents, and MCP
+    /// servers by calling `session.rpc.{skills,agent,mcp}.list()` in
+    /// the bridge. Requires a live session — callers must go through
+    /// `ensure_session_process` first. Fired from
+    /// [`ProviderAdapter::session_command_catalog`] on popup open.
+    #[serde(rename = "list_capabilities")]
+    ListCapabilities,
     #[serde(rename = "interrupt")]
     Interrupt,
 }
@@ -166,6 +221,21 @@ enum BridgeResponse {
     SessionCreated { session_id: String },
     #[serde(rename = "models")]
     Models { models: Vec<ProviderModel> },
+    /// Response to `BridgeRequest::ListCapabilities`. Skills come with
+    /// the SDK's `userInvocable` flag preserved — the frontend filters
+    /// `!user_invocable` entries out of the popup in
+    /// `mergeCommandsWithCatalog`, so the wire stays rich enough for
+    /// future surfaces (e.g. a Settings pane) to inspect the complete
+    /// set.
+    #[serde(rename = "capabilities")]
+    Capabilities {
+        #[serde(default)]
+        skills: Vec<BridgeSkill>,
+        #[serde(default)]
+        agents: Vec<BridgeCopilotAgent>,
+        #[serde(default)]
+        mcp_servers: Vec<BridgeCopilotMcp>,
+    },
     #[serde(rename = "response")]
     Response { output: String },
     #[serde(rename = "interrupted")]
@@ -991,6 +1061,132 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             "GitHub Copilot turn interrupted for session '{}'.",
             session.summary.session_id
         ))
+    }
+
+    /// Copilot-specific scan roots: skills can live in any of the
+    /// Copilot, Claude, `agents`, or `.github` conventions depending on
+    /// how the user's repo is organised. We walk all four so the popup
+    /// surfaces every SKILL.md regardless of convention.
+    fn skill_scan_roots(&self) -> (&'static [&'static str], &'static [&'static str]) {
+        (
+            &[".copilot", ".claude"],
+            &[
+                ".copilot/skills",
+                ".claude/skills",
+                ".agents/skills",
+                ".github/skills",
+            ],
+        )
+    }
+
+    /// Merge disk SKILL.md entries with the Copilot session's live
+    /// skills / agents / MCP servers. Requires a bridge — calls
+    /// `ensure_session_process(session)` to boot one if needed — and
+    /// invokes `session.rpc.{skills,agent,mcp}.list()` via the
+    /// `list_capabilities` RPC.
+    ///
+    /// On any failure (bridge spawn fail, timeout, malformed response)
+    /// we fall through to disk-only so the popup is resilient. The
+    /// `!user_invocable` filter is intentionally NOT applied here —
+    /// the frontend's `mergeCommandsWithCatalog` handles that so the
+    /// wire stays rich enough for future inspectors.
+    async fn session_command_catalog(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<CommandCatalog, String> {
+        let (home_dirs, project_dirs) = self.skill_scan_roots();
+        let cwd_path = session.cwd.as_deref().map(Path::new);
+        let roots = skills_disk::scan_roots_for(home_dirs, project_dirs, cwd_path);
+        let mut commands = skills_disk::scan(&roots, self.kind());
+
+        let capabilities = self.fetch_capabilities(session).await;
+        let (sdk_skills, sdk_agents, sdk_mcp) = match capabilities {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("copilot session_command_catalog: falling back to disk-only ({err})");
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        };
+
+        let disk_names: std::collections::HashSet<String> =
+            commands.iter().map(|c| c.name.clone()).collect();
+        for skill in sdk_skills {
+            if disk_names.contains(&skill.name) {
+                // On-disk SKILL.md wins — it carries the real source
+                // (project vs global) from the scanner.
+                continue;
+            }
+            commands.push(ProviderCommand {
+                id: format!("github_copilot:builtin:{}", skill.name),
+                name: skill.name,
+                description: skill.description,
+                kind: CommandKind::Builtin,
+                user_invocable: skill.user_invocable,
+                arg_hint: None,
+            });
+        }
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let agents = sdk_agents
+            .into_iter()
+            .map(|a| ProviderAgent {
+                id: format!("github_copilot:agent:{}", a.name),
+                name: a.name,
+                description: a.description,
+            })
+            .collect();
+
+        let mcp_servers = sdk_mcp
+            .into_iter()
+            .map(|m| McpServerInfo {
+                enabled: matches!(
+                    m.status.as_deref(),
+                    Some("connected") | Some("pending")
+                ),
+                id: format!("github_copilot:mcp:{}", m.name),
+                name: m.name,
+            })
+            .collect();
+
+        Ok(CommandCatalog {
+            commands,
+            agents,
+            mcp_servers,
+        })
+    }
+}
+
+impl GitHubCopilotAdapter {
+    /// Send `list_capabilities` over the session's cached bridge. The
+    /// bridge must have a live session — callers go through
+    /// `ensure_session_process` first so this is safe to invoke.
+    async fn fetch_capabilities(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<
+        (Vec<BridgeSkill>, Vec<BridgeCopilotAgent>, Vec<BridgeCopilotMcp>),
+        String,
+    > {
+        let cached = self.ensure_session_process(session).await?;
+        let _guard = cached.activity_guard();
+        let mut process = cached.process.lock().await;
+        let response = self
+            .bridge_request(&mut process, BridgeRequest::ListCapabilities)
+            .await?;
+        match response {
+            BridgeResponse::Capabilities {
+                skills,
+                agents,
+                mcp_servers,
+            } => Ok((skills, agents, mcp_servers)),
+            BridgeResponse::Error { error } => {
+                Err(format!("copilot list_capabilities error: {error}"))
+            }
+            other => Err(format!(
+                "Unexpected bridge response for list_capabilities: {:?}",
+                other
+            )),
+        }
     }
 }
 

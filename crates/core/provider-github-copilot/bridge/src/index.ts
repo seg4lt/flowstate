@@ -612,6 +612,64 @@ class CopilotBridge {
     }));
   }
 
+  /**
+   * Enumerate the Copilot session's skills, sub-agents, and MCP
+   * servers. Unlike listModels (client-scoped), these live on the
+   * session object — so this RPC requires the bridge to already have
+   * a session created via `create_session`. Returns the raw SDK
+   * shapes; the Rust side maps `userInvocable`, etc. onto our wire
+   * types.
+   */
+  async listCapabilities(): Promise<{
+    skills: Array<{
+      name: string;
+      description: string;
+      source: string;
+      userInvocable: boolean;
+      enabled: boolean;
+    }>;
+    agents: Array<{
+      name: string;
+      displayName: string;
+      description: string;
+    }>;
+    mcpServers: Array<{
+      name: string;
+      status: string;
+      source?: string;
+      error?: string;
+    }>;
+  }> {
+    if (!this.session) {
+      throw new Error('Session not created');
+    }
+    const [skillsResult, agentResult, mcpResult] = await Promise.all([
+      this.session.rpc.skills.list(),
+      this.session.rpc.agent.list(),
+      this.session.rpc.mcp.list(),
+    ]);
+    return {
+      skills: (skillsResult.skills ?? []).map((s: any) => ({
+        name: s.name,
+        description: s.description ?? '',
+        source: s.source ?? '',
+        userInvocable: s.userInvocable === true,
+        enabled: s.enabled !== false,
+      })),
+      agents: (agentResult.agents ?? []).map((a: any) => ({
+        name: a.name,
+        displayName: a.displayName ?? a.name,
+        description: a.description ?? '',
+      })),
+      mcpServers: (mcpResult.servers ?? []).map((m: any) => ({
+        name: m.name,
+        status: String(m.status ?? 'unknown'),
+        source: m.source,
+        error: m.error,
+      })),
+    };
+  }
+
   async stop(): Promise<void> {
     if (this.session) {
       try {
@@ -776,6 +834,28 @@ async function main(): Promise<void> {
                 JSON.stringify({
                   type: 'error',
                   error: `list_models failed: ${err instanceof Error ? err.message : String(err)}`,
+                }) + '\n',
+              );
+            }
+            break;
+          }
+
+          case 'list_capabilities': {
+            try {
+              const caps = await bridge.listCapabilities();
+              process.stdout.write(
+                JSON.stringify({
+                  type: 'capabilities',
+                  skills: caps.skills,
+                  agents: caps.agents,
+                  mcp_servers: caps.mcpServers,
+                }) + '\n',
+              );
+            } catch (err) {
+              process.stdout.write(
+                JSON.stringify({
+                  type: 'error',
+                  error: `list_capabilities failed: ${err instanceof Error ? err.message : String(err)}`,
                 }) + '\n',
               );
             }
