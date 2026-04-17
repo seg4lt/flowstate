@@ -5,6 +5,10 @@ on:
     tags:
       - 'v*'
 
+# Releases publish to this repo (github.repository). No cross-repo
+# auth needed — default GITHUB_TOKEN is enough because softprops/
+# action-gh-release defaults `repository` to the current repo.
+
 jobs:
   build:
     strategy:
@@ -15,19 +19,19 @@ jobs:
             runner: macos-14
             target: aarch64-apple-darwin
             tauri-args: --target aarch64-apple-darwin
-            bundle-path: src-tauri/target/aarch64-apple-darwin/release/bundle/
+            bundle-subpath: aarch64-apple-darwin/release/bundle
 
           - name: windows-x64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             tauri-args: ""
-            bundle-path: src-tauri/target/release/bundle/
+            bundle-subpath: release/bundle
 
           # - name: linux-x64
           #   runner: ubuntu-22.04
           #   target: x86_64-unknown-linux-gnu
           #   tauri-args: ""
-          #   bundle-path: src-tauri/target/release/bundle/
+          #   bundle-subpath: release/bundle
 
     name: build (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
@@ -35,9 +39,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Configure private repo access
-        run: git config --global url."https://x-access-token:${{ secrets.RS_AGENT_SDK_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Enable long paths (Windows)
         if: runner.os == 'Windows'
@@ -53,6 +54,7 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
+          cache-dependency-path: apps/flowstate/pnpm-lock.yaml
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -62,7 +64,8 @@ jobs:
       - name: Cache Rust target
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          # Unified workspace at repo root — target/ lives at root now.
+          workspaces: . -> target
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
@@ -80,9 +83,11 @@ jobs:
       #       patchelf
 
       - name: Install frontend dependencies
+        working-directory: apps/flowstate
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        working-directory: apps/flowstate
         env:
           # Minisign key used by the Tauri updater. Built bundles are
           # signed with this; the matching pubkey is embedded in
@@ -99,16 +104,18 @@ jobs:
 
       - name: Repackage DMG with install script (macOS)
         if: runner.os == 'macOS'
+        shell: bash
         run: |
-          APP_PATH=$(find src-tauri/target -name "flowstate.app" -path "*/release/bundle/macos/*" | head -1)
+          set -euo pipefail
+          APP_PATH=$(find . -name "flowstate.app" -path "*/release/bundle/macos/*" | head -1)
           DMG_DIR=$(dirname "$APP_PATH" | sed 's|/macos$|/dmg|')
-          OLD_DMG=$(find src-tauri/target -name "*.dmg" -path "*/release/bundle/dmg/*" | head -1)
+          OLD_DMG=$(find . -name "*.dmg" -path "*/release/bundle/dmg/*" | head -1)
 
           rm -f "$OLD_DMG"
 
           STAGING=$(mktemp -d)
           cp -R "$APP_PATH" "$STAGING/"
-          cp scripts/install-macos.command "$STAGING/Install Flowstate.command"
+          cp apps/flowstate/scripts/install-macos.command "$STAGING/Install Flowstate.command"
           chmod +x "$STAGING/Install Flowstate.command"
 
           hdiutil create \
@@ -122,11 +129,12 @@ jobs:
       - name: Stage release assets
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p release-assets
           TAG="${{ github.ref_name }}"
 
           if [ "${{ runner.os }}" = "macOS" ]; then
-            DMG=$(find src-tauri/target -name "Flowstate.dmg" -path "*/release/bundle/dmg/*" | head -1)
+            DMG=$(find . -name "Flowstate.dmg" -path "*/release/bundle/dmg/*" | head -1)
             cp "$DMG" "release-assets/Flowstate-${TAG}-macos-arm64.dmg"
 
             # Updater artifacts. createUpdaterArtifacts in tauri.conf.json
@@ -135,15 +143,15 @@ jobs:
             # (minisign signature over it) next to the .app in
             # bundle/macos/. Both get uploaded; the release job reads
             # the .sig contents to populate latest.json.
-            APP_TAR=$(find src-tauri/target -name "*.app.tar.gz" -path "*/release/bundle/macos/*" | head -1)
-            APP_SIG=$(find src-tauri/target -name "*.app.tar.gz.sig" -path "*/release/bundle/macos/*" | head -1)
+            APP_TAR=$(find . -name "*.app.tar.gz" -path "*/release/bundle/macos/*" | head -1)
+            APP_SIG=$(find . -name "*.app.tar.gz.sig" -path "*/release/bundle/macos/*" | head -1)
             cp "$APP_TAR" "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz"
             cp "$APP_SIG" "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz.sig"
           fi
 
           if [ "${{ runner.os }}" = "Windows" ]; then
-            MSI=$(find src-tauri/target -name "*.msi" -path "*/release/bundle/msi/*" | head -1)
-            EXE=$(find src-tauri/target -name "*-setup.exe" -path "*/release/bundle/nsis/*" | head -1)
+            MSI=$(find . -name "*.msi" -path "*/release/bundle/msi/*" | head -1)
+            EXE=$(find . -name "*-setup.exe" -path "*/release/bundle/nsis/*" | head -1)
             cp "$MSI" "release-assets/Flowstate-${TAG}-windows-x64.msi"
             cp "$EXE" "release-assets/Flowstate-${TAG}-windows-x64-setup.exe"
 
@@ -153,7 +161,7 @@ jobs:
             # respective bundle dirs. We ship the NSIS sig because
             # `latest.json` below points at the NSIS URL — MSI is
             # kept as a standard-installer download only.
-            EXE_SIG=$(find src-tauri/target -name "*-setup.exe.sig" -path "*/release/bundle/nsis/*" | head -1)
+            EXE_SIG=$(find . -name "*-setup.exe.sig" -path "*/release/bundle/nsis/*" | head -1)
             cp "$EXE_SIG" "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig"
           fi
 
@@ -165,28 +173,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # Full raw bundler output (the entire .../release/bundle/ dir,
-      # including the unsigned .app, debug-symbols, MSI/NSIS
-      # intermediates). Disabled because we already upload the
-      # curated installers as `release-assets-*` above and they get
-      # published to the public release, so this step only serves
-      # post-mortem investigation. Re-enable if you hit a weird
-      # shipped-build issue and want the raw bundle handy for 30
-      # days. Tradeoff: ~500 MB/build of private-repo Actions
-      # storage (~$0.10–0.40/month over the 500 MB free tier).
-      # - name: Upload bundles (debug)
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: flowstate-${{ matrix.name }}-${{ github.ref_name }}
-      #     path: ${{ matrix.bundle-path }}
-      #     if-no-files-found: error
-      #     retention-days: 30
-
   release:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      # Required so the default GITHUB_TOKEN can create releases.
+      contents: write
 
     steps:
       - name: Download all release assets
@@ -204,7 +198,8 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ github.ref_name }}"
-          REPO="seg4lt/flowstate"
+          # Publish to this repo — matches tauri.conf.json updater endpoint.
+          REPO="${{ github.repository }}"
           PUB_DATE="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 
           # The Tauri updater fetches latest.json from the release,
@@ -239,10 +234,12 @@ jobs:
           echo "--- latest.json ---"
           cat release-assets/latest.json
 
-      - name: Create release on public repo
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          repository: seg4lt/flowstate
+          # No `repository:` override — defaults to github.repository
+          # (this repo). No `token:` override — default GITHUB_TOKEN
+          # has `contents: write` from the permissions block above.
           tag_name: ${{ github.ref_name }}
           name: Flowstate ${{ github.ref_name }}
           body: |
@@ -272,4 +269,3 @@ jobs:
           draft: false
           prerelease: false
           files: release-assets/*
-          token: ${{ secrets.PUBLIC_REPO_PAT }}
