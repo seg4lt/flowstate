@@ -3,7 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
-import { useApp } from "@/stores/app-store";
+import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
   AttachmentRef,
@@ -32,7 +32,11 @@ import {
   readDefaultEffort,
   readDefaultPermissionMode,
 } from "@/lib/defaults-settings";
-import { resolveCommand, COMMAND_META, type SlashCommandContext } from "@/lib/slash-commands";
+import {
+  mergeCommandsWithCatalog,
+  resolveCommand,
+  type SlashCommandContext,
+} from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { MessageList } from "./messages/message-list";
@@ -627,6 +631,31 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!session) return false;
     return !isProviderEnabled(session.provider);
   }, [session, isProviderEnabled]);
+
+  // Per-session slash-command catalog. Populated by the daemon via
+  // `session_command_catalog_updated` on session start / load and on
+  // explicit refresh. Merged with core commands for the popup.
+  const commandCatalog = useSessionCommandCatalog(sessionId);
+  const slashCommands = React.useMemo(
+    () => mergeCommandsWithCatalog(commandCatalog),
+    [commandCatalog],
+  );
+
+  // Debounced catalog refresh triggered by the composer when the
+  // slash popup opens. Keeps disk changes (e.g. a new SKILL.md)
+  // visible without a full session reload while coalescing rapid
+  // re-opens (e.g. slash → delete → slash) into a single round-trip.
+  const REFRESH_SKILLS_DEBOUNCE_MS = 400;
+  const lastRefreshRef = React.useRef(0);
+  const handlePopupOpen = React.useCallback(() => {
+    const now = Date.now();
+    if (now - lastRefreshRef.current < REFRESH_SKILLS_DEBOUNCE_MS) return;
+    lastRefreshRef.current = now;
+    void sendMessage({
+      type: "refresh_session_commands",
+      session_id: sessionId,
+    });
+  }, [sessionId]);
   const projectPath = React.useMemo(() => {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
@@ -1015,9 +1044,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       return;
     }
     // --- Slash command interception ---
-    const resolved = resolveCommand(input);
+    const resolved = resolveCommand(input, slashCommands, session?.provider);
     if (resolved) {
-      if (!resolved.command) {
+      if (resolved.kind === "unknown") {
         toast({
           description: `Unknown command: ${resolved.raw}`,
           duration: 3000,
@@ -1035,15 +1064,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         toast({ description: "No active session", duration: 3000 });
         return;
       }
-      const ctx: SlashCommandContext = {
-        sessionId,
-        session,
-        send,
-        navigate,
-        toast,
-      };
-      await resolved.command.execute(ctx, resolved.args);
-      return;
+      if (resolved.kind === "core") {
+        const ctx: SlashCommandContext = {
+          sessionId,
+          session,
+          send,
+          navigate,
+          toast,
+        };
+        await resolved.command.execute(ctx, resolved.args);
+        return;
+      }
+      // resolved.kind === "skill" — rewrite to the canonical invocation
+      // form (e.g. "/compact args" or "$skill args" for Codex) and fall
+      // through to the normal send_turn path. The provider itself
+      // interprets the invocation; we just forward it verbatim.
+      input = resolved.args
+        ? `${resolved.invocation} ${resolved.args}`
+        : resolved.invocation;
     }
 
     // --- Normal message flow ---
@@ -1465,7 +1503,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             providerDisabled={providerDisabled}
             archived={isArchived || worktreeFolderMissing}
             toolbar={toolbar}
-            commands={COMMAND_META}
+            commands={slashCommands}
+            provider={session?.provider}
+            onPopupOpen={handlePopupOpen}
             initialValue={sessionDrafts.get(sessionId) ?? ""}
             onDraftChange={handleDraftChange}
             initialQueue={sessionQueues.get(sessionId)}

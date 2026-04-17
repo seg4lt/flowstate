@@ -33,6 +33,58 @@ export interface ProviderModel {
   label: string;
 }
 
+/** Where a user-authored SKILL.md came from on disk. Drives the
+ * project / global badge next to skill entries in the slash popup. */
+export type SkillSource = "disk_global" | "disk_project";
+
+/** Discriminator for entries in a `CommandCatalog`. Flattened into
+ * `ProviderCommand` on the wire — the Rust side uses
+ * `#[serde(flatten)]` so the `kind` field lands at the top level of
+ * the command object, and `UserSkill` additionally carries its
+ * `source` alongside. */
+export type CommandKind =
+  | { kind: "builtin" }
+  | { kind: "user_skill"; source: SkillSource }
+  | { kind: "tui_only" };
+
+/** One slash-command / skill entry for a given session. The frontend
+ * renders one popup row per command. `id` is stable across sessions
+ * for the same command; the store reducer compares `commands[].id`
+ * arrays to short-circuit re-renders when a refresh returns the same
+ * set. */
+export type ProviderCommand = {
+  id: string;
+  name: string;
+  description: string;
+  userInvocable: boolean;
+  argHint?: string;
+} & CommandKind;
+
+/** A sub-agent exposed by the provider (e.g. Claude SDK's
+ * supportedAgents). Rendered in the popup under an "agent" badge. */
+export interface ProviderAgent {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** An MCP server the provider is aware of. Carried on the wire but
+ * not rendered in the popup in v1 — reserved for future session-header
+ * status chips. */
+export interface McpServerInfo {
+  id: string;
+  name: string;
+  enabled: boolean;
+}
+
+/** Full per-session capability enumeration: commands, sub-agents,
+ * MCP servers. Broadcast as `session_command_catalog_updated`. */
+export interface CommandCatalog {
+  commands: ProviderCommand[];
+  agents: ProviderAgent[];
+  mcpServers: McpServerInfo[];
+}
+
 export interface ProviderStatus {
   kind: ProviderKind;
   label: string;
@@ -284,7 +336,8 @@ export type ClientMessage =
   | { type: "update_session_model"; session_id: string; model: string }
   | { type: "archive_session"; session_id: string }
   | { type: "unarchive_session"; session_id: string }
-  | { type: "list_archived_sessions" };
+  | { type: "list_archived_sessions" }
+  | { type: "refresh_session_commands"; session_id: string };
 
 export type ServerMessage =
   | { type: "welcome"; bootstrap: BootstrapPayload }
@@ -327,4 +380,5 @@ export type RuntimeEvent =
   | { type: "session_unarchived"; session: SessionSummary }
   | { type: "project_created"; project: ProjectRecord }
   | { type: "project_deleted"; project_id: string; reassigned_session_ids: string[] }
-  | { type: "session_project_assigned"; session_id: string; project_id?: string };
+  | { type: "session_project_assigned"; session_id: string; project_id?: string }
+  | { type: "session_command_catalog_updated"; session_id: string; catalog: CommandCatalog };

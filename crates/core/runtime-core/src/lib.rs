@@ -8,9 +8,9 @@ use tokio::sync::{Mutex, broadcast};
 use zenui_orchestration::OrchestrationService;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
-    AppSnapshot, BootstrapPayload, ClientMessage, ContentBlock, FileChangeRecord, ImageAttachment,
-    PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter, ProviderKind,
-    ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
+    AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
+    ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter,
+    ProviderKind, ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
     SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, TokenUsage, ToolCall,
     ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
 };
@@ -114,6 +114,17 @@ pub struct RuntimeCore {
     /// `spawn_health_check`, and `handle_send_turn` to gate downstream
     /// behavior.
     provider_enablement: Arc<RwLock<HashMap<ProviderKind, bool>>>,
+    /// Cached per-session command catalogs (slash commands, agents,
+    /// MCP servers). Populated by `spawn_catalog_refresh` after a
+    /// `StartSession` / `LoadSession` and whenever the client asks for
+    /// a refresh. The value is also broadcast as
+    /// `RuntimeEvent::SessionCommandCatalogUpdated`; the cache lets
+    /// late-joining transports reseed without re-running the adapter.
+    session_command_catalogs: Arc<RwLock<HashMap<String, CommandCatalog>>>,
+    /// Dedupe guard — session ids with a catalog refresh currently in
+    /// flight. Prevents a `RefreshSessionCommands` burst (e.g. rapid
+    /// popup opens) from piling up adapter calls.
+    in_flight_catalog_refreshes: Arc<Mutex<HashSet<String>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
@@ -184,6 +195,8 @@ impl RuntimeCore {
             in_flight_turns: Arc::new(RwLock::new(HashMap::new())),
             interrupted_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_enablement: Arc::new(RwLock::new(HashMap::new())),
+            session_command_catalogs: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_catalog_refreshes: Arc::new(Mutex::new(HashSet::new())),
             turn_observer,
         }
     }
@@ -585,6 +598,72 @@ impl RuntimeCore {
         );
     }
 
+    /// Read-side accessor for the cached command catalog. Returns `None`
+    /// when the catalog hasn't been fetched yet; callers should fire a
+    /// `RefreshSessionCommands` to prime the cache.
+    pub fn session_command_catalog(&self, session_id: &str) -> Option<CommandCatalog> {
+        self.session_command_catalogs
+            .read()
+            .ok()
+            .and_then(|map| map.get(session_id).cloned())
+    }
+
+    /// Background-refresh the command catalog for a session. Dedup guard
+    /// keyed by session id; repeated calls while a refresh is in flight
+    /// are ignored. Errors are logged and swallowed — the catalog is a
+    /// best-effort UX affordance, never essential to a turn.
+    fn spawn_catalog_refresh(&self, session: SessionDetail) {
+        let Some(adapter) = self.adapters.get(&session.summary.provider).cloned() else {
+            return;
+        };
+        let event_tx = self.event_tx.clone();
+        let catalogs = self.session_command_catalogs.clone();
+        let in_flight = self.in_flight_catalog_refreshes.clone();
+        let session_id = session.summary.session_id.clone();
+        tokio::spawn(async move {
+            {
+                let mut guard = in_flight.lock().await;
+                if !guard.insert(session_id.clone()) {
+                    tracing::debug!(
+                        %session_id,
+                        "skipping duplicate catalog refresh"
+                    );
+                    return;
+                }
+            }
+
+            let result = adapter.session_command_catalog(&session).await;
+
+            {
+                let mut guard = in_flight.lock().await;
+                guard.remove(&session_id);
+            }
+
+            match result {
+                Ok(catalog) => {
+                    tracing::debug!(
+                        %session_id,
+                        provider = ?session.summary.provider,
+                        commands = catalog.commands.len(),
+                        agents = catalog.agents.len(),
+                        mcp_servers = catalog.mcp_servers.len(),
+                        "catalog refresh complete"
+                    );
+                    if let Ok(mut map) = catalogs.write() {
+                        map.insert(session_id.clone(), catalog.clone());
+                    }
+                    let _ = event_tx.send(RuntimeEvent::SessionCommandCatalogUpdated {
+                        session_id,
+                        catalog,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "catalog refresh failed");
+                }
+            }
+        });
+    }
+
     pub async fn handle_client_message(&self, message: ClientMessage) -> Option<ServerMessage> {
         tracing::debug!(?message, "Received client message");
         match message {
@@ -594,7 +673,14 @@ impl RuntimeCore {
             }),
             ClientMessage::LoadSession { session_id, limit } => {
                 match self.live_session_detail_limited(&session_id, limit).await {
-                    Some(session) => Some(ServerMessage::SessionLoaded { session }),
+                    Some(mut session) => {
+                        // Populate cwd so the catalog refresh can scan
+                        // project-local skills. Fire-and-forget — the
+                        // SessionLoaded response doesn't wait for it.
+                        self.resolve_session_cwd(&mut session).await;
+                        self.spawn_catalog_refresh(session.clone());
+                        Some(ServerMessage::SessionLoaded { session })
+                    }
                     None => Some(ServerMessage::Error {
                         message: format!("Session `{session_id}` not found."),
                     }),
@@ -607,9 +693,14 @@ impl RuntimeCore {
             } => {
                 tracing::info!(?provider, ?model, ?project_id, "Starting session");
                 match self.start_session(provider, model, project_id).await {
-                    Ok(session) => Some(ServerMessage::SessionCreated {
-                        session: session.summary,
-                    }),
+                    Ok(session) => {
+                        let summary = session.summary.clone();
+                        // Prime the command catalog on the very first
+                        // StartSession so the composer popup has data
+                        // before the user even focuses the textarea.
+                        self.spawn_catalog_refresh(session);
+                        Some(ServerMessage::SessionCreated { session: summary })
+                    }
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
@@ -713,6 +804,24 @@ impl RuntimeCore {
                 Some(ServerMessage::Ack {
                     message: format!("Refreshing models for {}.", provider.label()),
                 })
+            }
+            ClientMessage::RefreshSessionCommands { session_id } => {
+                // Resolve cwd off the live session before handing the
+                // detail to the spawned refresh — the default adapter
+                // scan relies on `session.cwd` to find project-local
+                // SKILL.md files.
+                match self.live_session_detail(&session_id).await {
+                    Some(mut session) => {
+                        self.resolve_session_cwd(&mut session).await;
+                        self.spawn_catalog_refresh(session);
+                        Some(ServerMessage::Ack {
+                            message: format!("Refreshing commands for `{session_id}`."),
+                        })
+                    }
+                    None => Some(ServerMessage::Error {
+                        message: format!("Session `{session_id}` not found."),
+                    }),
+                }
             }
             ClientMessage::SetProviderEnabled { provider, enabled } => {
                 self.set_provider_enabled(provider, enabled).await;

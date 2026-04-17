@@ -1,7 +1,12 @@
 import * as React from "react";
 import { Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
-import type { AttachedImage, SessionStatus } from "@/lib/types";
-import { getCompletions } from "@/lib/slash-commands";
+import type { AttachedImage, ProviderKind, SessionStatus } from "@/lib/types";
+import {
+  formatSkillInvocation,
+  getCompletions,
+  isCoreCommand,
+  type SlashCommandItem,
+} from "@/lib/slash-commands";
 import { toast } from "@/hooks/use-toast";
 import { SlashCommandPopup } from "./slash-command-popup";
 import { InFluxAttachmentChip } from "./attachment-chip";
@@ -22,8 +27,16 @@ interface ChatInputProps {
    *  for history viewing. */
   archived?: boolean;
   toolbar?: React.ReactNode;
-  /** Command metadata for the autocomplete popup. */
-  commands?: { name: string; description: string }[];
+  /** Command metadata for the autocomplete popup. Merged list of
+   *  core commands + provider-native commands + user skills + agents. */
+  commands?: SlashCommandItem[];
+  /** Active session's provider. Drives invocation formatting — Codex
+   *  uses `$name`, everyone else uses `/name`. */
+  provider?: ProviderKind;
+  /** Fires on the false→true edge of the popup opening. ChatView uses
+   *  this to trigger a debounced `refresh_session_commands` so disk
+   *  changes (e.g. a new SKILL.md) surface without a session reload. */
+  onPopupOpen?: () => void;
   /** Seed text to restore when the component remounts after a tab
    *  switch. The component is keyed by sessionId so it remounts on
    *  every thread change — this prop lets the parent supply the saved
@@ -107,6 +120,9 @@ export function ChatInput({
   providerDisabled = false,
   archived = false,
   toolbar,
+  commands,
+  provider,
+  onPopupOpen,
   initialValue = "",
   onDraftChange,
   initialQueue,
@@ -186,15 +202,39 @@ export function ChatInput({
   const isRunning = sessionStatus === "running";
 
   // --- Slash command autocomplete ---
-  // Show popup when the input starts with "/" and the session isn't busy.
+  // Show popup when the input starts with `/` (all providers) or `$`
+  // (Codex skill invocations) and the session isn't busy.
   const inputToken = value.trim().split(/\s/)[0] ?? "";
-  const showPopup = inputToken.startsWith("/") && !isRunning && !disabled;
-  const matches = showPopup ? getCompletions(inputToken) : [];
+  const showPopup =
+    (inputToken.startsWith("/") || inputToken.startsWith("$")) &&
+    !isRunning &&
+    !disabled;
+  const matches: SlashCommandItem[] = showPopup
+    ? getCompletions(inputToken, commands)
+    : [];
 
   // Reset the highlighted index when the match list changes.
   React.useEffect(() => {
     setPopupIndex(0);
   }, [matches.length, inputToken]);
+
+  // Rising-edge fire: every time the popup opens (false→true), ping
+  // the parent so it can trigger a debounced catalog refresh. Keeps
+  // disk changes (new SKILL.md) visible without a full session reload.
+  const prevShowPopupRef = React.useRef(false);
+  React.useEffect(() => {
+    const prev = prevShowPopupRef.current;
+    prevShowPopupRef.current = showPopup;
+    if (!prev && showPopup) {
+      onPopupOpen?.();
+    }
+  }, [showPopup, onPopupOpen]);
+
+  // Track the last skill token we pre-filled into the composer from a
+  // popup select. When the user hits Enter on that exact token (no
+  // extra args appended), we send it straight through instead of
+  // re-entering handlePopupSelect and looping forever.
+  const lastSelectedSkillTokenRef = React.useRef<string | null>(null);
 
   function resetHeight() {
     if (textareaRef.current) {
@@ -449,12 +489,30 @@ export function ChatInput({
   }
 
   function handlePopupSelect(name: string) {
-    // Fill the command and immediately submit. Slash commands never
-    // carry image attachments — they're all text-driven shortcuts.
-    const cmd = `/${name}`;
-    setValue("");
-    resetHeight();
-    onSend(cmd, []);
+    // Core app commands (e.g. /flowstate-clear) fire immediately —
+    // they don't take arguments. Everything else (provider built-ins,
+    // user skills, agents) pre-fills the composer so the user can
+    // optionally append args before pressing Enter again.
+    if (isCoreCommand(name)) {
+      const cmd = `/${name}`;
+      lastSelectedSkillTokenRef.current = null;
+      setValue("");
+      resetHeight();
+      onSend(cmd, []);
+      return;
+    }
+    const invocation = formatSkillInvocation(name, provider);
+    const token = `${invocation} `;
+    lastSelectedSkillTokenRef.current = invocation;
+    setValue(token);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.selectionStart = el.selectionEnd = el.value.length;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    });
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -490,6 +548,16 @@ export function ChatInput({
       // Enter with popup open — submit the highlighted command.
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
+        // If the user already picked a non-core command (via an
+        // earlier Enter or click) and is just pressing Enter again to
+        // send the pre-filled invocation, treat this as a submit rather
+        // than re-selecting and looping forever on the same item.
+        const pending = lastSelectedSkillTokenRef.current;
+        if (pending && value.trim().startsWith(pending)) {
+          lastSelectedSkillTokenRef.current = null;
+          handleSubmit();
+          return;
+        }
         const selected = matches[popupIndex];
         if (selected) {
           handlePopupSelect(selected.name);

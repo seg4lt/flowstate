@@ -1,4 +1,5 @@
 mod binary_resolver;
+pub mod skills_disk;
 
 pub use binary_resolver::find_cli_binary;
 
@@ -310,6 +311,101 @@ pub struct ProviderStatus {
 
 fn default_true() -> bool {
     true
+}
+
+/// Where a user-authored `SKILL.md` came from. Drives the "project" /
+/// "global" badge in the slash-command popup. `DiskProject` is a skill
+/// discovered under the session's cwd; `DiskGlobal` lives in a home
+/// directory like `~/.claude/skills` and applies across every project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    DiskGlobal,
+    DiskProject,
+}
+
+/// Discriminator for entries in a provider's [`CommandCatalog`].
+///
+/// - `Builtin` — a native slash command exposed by the provider runtime
+///   (Claude's `/compact`, `/context`; Copilot's built-ins).
+/// - `UserSkill` — a user-authored `SKILL.md` discovered on disk. Carries
+///   its source so the popup can badge project-local vs global skills.
+/// - `TuiOnly` — best-effort string extracted from a provider that has
+///   no programmatic registry (currently unused; reserved for future
+///   Codex integration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandKind {
+    Builtin,
+    UserSkill { source: SkillSource },
+    TuiOnly,
+}
+
+/// A single slash-command / skill entry in a provider's session command
+/// catalog. The frontend renders one popup row per `ProviderCommand`.
+///
+/// - `id` is stable across sessions for the same command, shaped
+///   `"{provider}:{kind}:{name}"`. Used as the React key and for reducer
+///   id-equality short-circuits that avoid re-renders when a catalog
+///   refresh returns the same set.
+/// - `user_invocable` lets providers expose internal commands in the
+///   catalog without offering them to users. The Copilot SDK's
+///   `customize-cloud-agent` is the canonical example. The frontend
+///   filters `!user_invocable` entries before rendering.
+/// - `arg_hint` is the provider's suggested argument placeholder, e.g.
+///   `"[path]"`, rendered muted inline after the command name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCommand {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    #[serde(flatten)]
+    pub kind: CommandKind,
+    #[serde(default = "default_true")]
+    pub user_invocable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_hint: Option<String>,
+}
+
+/// A sub-agent exposed by a provider (currently Claude SDK's
+/// `supportedAgents`). Rendered in the slash-command popup under an
+/// "agent" badge; selecting one inserts the agent invocation into the
+/// composer. Still fully wire-carried when unused so future UIs can
+/// surface them without an adapter change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderAgent {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+/// An MCP server the provider is aware of. Carried on the wire for
+/// future UI (session header chip, Settings tab). Not rendered in the
+/// slash popup in v1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerInfo {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+/// Everything a provider can enumerate for a given session at a point
+/// in time: slash commands (builtin + user-authored disk skills),
+/// sub-agents, and MCP servers. Produced by
+/// [`ProviderAdapter::session_command_catalog`] and broadcast to the
+/// frontend as [`RuntimeEvent::SessionCommandCatalogUpdated`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandCatalog {
+    pub commands: Vec<ProviderCommand>,
+    #[serde(default)]
+    pub agents: Vec<ProviderAgent>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerInfo>,
 }
 
 /// Multimodal user input for a single turn. Adapters that only
@@ -1089,6 +1185,17 @@ pub enum RuntimeEvent {
     SessionUnarchived {
         session: SessionSummary,
     },
+    /// Full per-session command catalog — slash commands, sub-agents,
+    /// and MCP servers — produced by
+    /// [`ProviderAdapter::session_command_catalog`]. Fires on session
+    /// start, session load, and explicit refresh. Replaces the prior
+    /// payload for this `session_id`; clients key their cache by
+    /// `session_id` and do id-equality short-circuits on
+    /// `catalog.commands[].id` to avoid unnecessary popup re-renders.
+    SessionCommandCatalogUpdated {
+        session_id: String,
+        catalog: CommandCatalog,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1218,6 +1325,14 @@ pub enum ClientMessage {
         session_id: String,
     },
     ListArchivedSessions,
+    /// Ask the runtime to refetch the command catalog for a session.
+    /// Triggered by the frontend when the user opens the slash-command
+    /// popup, so disk changes (e.g. a new SKILL.md) appear without
+    /// requiring a session reload. Runtime-core dedupes concurrent
+    /// refreshes per session id.
+    RefreshSessionCommands {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1325,5 +1440,62 @@ pub trait ProviderAdapter: Send + Sync {
     /// Tear down any long-lived resources held for this session (subprocesses, connections).
     async fn end_session(&self, _session: &SessionDetail) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Per-provider disk directories the default
+    /// [`session_command_catalog`] implementation scans for user-authored
+    /// `SKILL.md` files.
+    ///
+    /// Returns `(home_dirs, project_dirs)`:
+    /// - `home_dirs` are resolved under the user's home directory as
+    ///   `~/<entry>/skills`. e.g. `"`.claude`"` → `~/.claude/skills`.
+    /// - `project_dirs` are resolved under the session's cwd.
+    ///
+    /// Adapters override this when their ecosystem conventionally scans
+    /// extra locations (Copilot adds `.claude/skills` + `.agents/skills`
+    /// alongside its own `.copilot/skills`). The default returns a
+    /// conservative set that matches Claude's convention, which is the
+    /// shared baseline across providers.
+    ///
+    /// [`session_command_catalog`]: ProviderAdapter::session_command_catalog
+    fn skill_scan_roots(&self) -> (&'static [&'static str], &'static [&'static str]) {
+        (
+            &[".claude"],
+            &[".claude/skills", ".agents/skills"],
+        )
+    }
+
+    /// Enumerate the slash commands, agents, and MCP servers available
+    /// for this session, merging:
+    /// - provider-native commands (adapter-specific; the default impl
+    ///   contributes none),
+    /// - user-authored `SKILL.md` files on disk (scanned under the
+    ///   roots from [`skill_scan_roots`]),
+    /// - MCP servers known to the provider (adapter-specific).
+    ///
+    /// Runtime-core calls this on session start, session load, and
+    /// explicit `RefreshSessionCommands`, and broadcasts the result via
+    /// [`RuntimeEvent::SessionCommandCatalogUpdated`].
+    ///
+    /// The default implementation runs a pure disk scan so every
+    /// adapter picks up user skills without extra work. Adapters with
+    /// a programmatic registry (Claude SDK, Copilot SDK, Claude CLI,
+    /// Copilot CLI) override this to merge their native built-ins on
+    /// top of the disk scan.
+    ///
+    /// [`skill_scan_roots`]: ProviderAdapter::skill_scan_roots
+    async fn session_command_catalog(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<CommandCatalog, String> {
+        let (home_dirs, project_dirs) = self.skill_scan_roots();
+        let cwd = session.cwd.as_deref().map(std::path::Path::new);
+        let roots = skills_disk::scan_roots_for(home_dirs, project_dirs, cwd);
+        let commands = skills_disk::scan(&roots, self.kind());
+        Ok(CommandCatalog {
+            commands,
+            agents: Vec::new(),
+            mcp_servers: Vec::new(),
+        })
     }
 }

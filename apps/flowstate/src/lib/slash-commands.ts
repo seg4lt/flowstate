@@ -1,7 +1,11 @@
 import type {
   ClientMessage,
+  CommandCatalog,
+  CommandKind,
+  ProviderKind,
   ServerMessage,
   SessionSummary,
+  SkillSource,
 } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -114,47 +118,196 @@ const newCommand: SlashCommand = {
 
 export const COMMANDS: SlashCommand[] = [clearCommand, newCommand];
 
-/** Metadata subset safe to pass as a prop (no execute function). */
-export const COMMAND_META: { name: string; description: string }[] =
-  COMMANDS.map(({ name, description }) => ({ name, description }));
+// ---------------------------------------------------------------------------
+// SlashCommandItem — the prop shape passed to ChatInput
+// ---------------------------------------------------------------------------
+
+/**
+ * One row in the slash-command popup. Unions three sources:
+ * - app-core commands (no `kind`, matched by name against COMMANDS)
+ * - provider-native commands (kind: "builtin")
+ * - user-authored SKILL.md entries (kind: "user_skill", with source)
+ * - sub-agents (kind: "agent" — synthesized from CommandCatalog.agents)
+ *
+ * `userInvocable: false` entries are filtered out by
+ * `mergeCommandsWithCatalog` before reaching the popup.
+ */
+export interface SlashCommandItem {
+  name: string;
+  description: string;
+  /**
+   * Undefined for core (app-level) commands. For provider commands
+   * carries the wire-level discriminator; for agents it's the sentinel
+   * string "agent" which is NOT a `CommandKind` variant — we use the
+   * same field so the popup has a single dispatch point for badges.
+   */
+  kind?: CommandKind["kind"] | "agent";
+  /** Only meaningful when kind is "user_skill". */
+  source?: SkillSource;
+  /** Provider-suggested argument placeholder, rendered muted inline. */
+  argHint?: string;
+  /**
+   * Wire id for provider commands. Used by the reducer's id-equality
+   * short-circuit and by React keys. Core commands don't have one.
+   */
+  id?: string;
+}
+
+/** Metadata subset safe to pass as a prop (no execute function). Core
+ * commands have no `kind` — the popup renders them without a badge. */
+export const COMMAND_META: SlashCommandItem[] = COMMANDS.map(
+  ({ name, description }) => ({ name, description }),
+);
+
+// ---------------------------------------------------------------------------
+// Catalog merge + invocation formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge the core app commands with a provider catalog into a single
+ * list suitable for the popup. Core commands come first and win name
+ * collisions against provider commands. Non-user-invocable provider
+ * commands (e.g. Copilot's `customize-cloud-agent`) are filtered out.
+ * Sub-agents from `catalog.agents` are appended as synthetic entries
+ * with `kind: "agent"`.
+ */
+export function mergeCommandsWithCatalog(
+  catalog: CommandCatalog | undefined,
+): SlashCommandItem[] {
+  const core = COMMAND_META;
+  if (!catalog) return core;
+
+  const seen = new Set(core.map((c) => c.name));
+  const out: SlashCommandItem[] = [...core];
+
+  for (const cmd of catalog.commands) {
+    if (!cmd.userInvocable) continue;
+    if (seen.has(cmd.name)) continue;
+    seen.add(cmd.name);
+    out.push({
+      id: cmd.id,
+      name: cmd.name,
+      description: cmd.description,
+      kind: cmd.kind,
+      source: cmd.kind === "user_skill" ? cmd.source : undefined,
+      argHint: cmd.argHint,
+    });
+  }
+
+  for (const agent of catalog.agents) {
+    // Namespace agent names away from slash-commands so a collision
+    // (e.g. a skill named "general-purpose") doesn't silently replace
+    // the agent. The popup already distinguishes kinds visually.
+    const key = `agent:${agent.name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: agent.id,
+      name: agent.name,
+      description: agent.description,
+      kind: "agent",
+    });
+  }
+
+  return out;
+}
+
+/** True when `name` matches a core app command. Used by chat-input
+ * to decide whether to fire the command immediately on selection or
+ * pre-fill the composer (for user skills / provider commands that can
+ * take args). */
+export function isCoreCommand(name: string): boolean {
+  return COMMANDS.some((c) => c.name === name);
+}
+
+/** Format the string that should land in the composer when the user
+ * selects a non-core command. Codex uses `$name` for its skill-like
+ * invocations; every other provider uses `/name`. */
+export function formatSkillInvocation(
+  name: string,
+  provider: ProviderKind | undefined,
+): string {
+  if (provider === "codex") return `$${name}`;
+  return `/${name}`;
+}
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
+export type ResolveResult =
+  | { kind: "core"; command: SlashCommand; args: string }
+  | {
+      kind: "skill";
+      item: SlashCommandItem;
+      invocation: string;
+      args: string;
+    }
+  | { kind: "unknown"; raw: string };
+
 /**
- * If `input` looks like a slash command (`/foo …`), return the matched
- * command and any trailing arguments. Returns `null` when the input is
- * not a command at all, or `{ command: undefined, raw }` when the slash
- * prefix is present but the name doesn't match any registered command.
+ * Classify `input` against the merged command list. Returns `null`
+ * when the input isn't a slash command at all. When `commands` is
+ * omitted the function falls back to core-only matching — handy for
+ * legacy call sites that haven't been migrated yet.
  */
 export function resolveCommand(
   input: string,
-): { command: SlashCommand; args: string } | { command: undefined; raw: string } | null {
+  commands?: SlashCommandItem[],
+  provider?: ProviderKind,
+): ResolveResult | null {
   const trimmed = input.trim();
-  if (!trimmed.startsWith("/")) return null;
+  if (!trimmed.startsWith("/") && !trimmed.startsWith("$")) return null;
 
+  const prefix = trimmed[0];
   const spaceIdx = trimmed.indexOf(" ");
-  const name =
-    spaceIdx === -1
-      ? trimmed.slice(1).toLowerCase()
-      : trimmed.slice(1, spaceIdx).toLowerCase();
+  const rawName =
+    spaceIdx === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIdx);
+  const name = rawName.toLowerCase();
   const args = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-  const command = COMMANDS.find((c) => c.name === name);
-  if (command) return { command, args };
-  return { command: undefined, raw: trimmed.split(" ")[0] };
+  // Core commands always use `/` and are matched by lowercase name.
+  if (prefix === "/") {
+    const core = COMMANDS.find((c) => c.name === name);
+    if (core) return { kind: "core", command: core, args };
+  }
+
+  if (commands && commands.length > 0) {
+    const item = commands.find(
+      (c) => c.name.toLowerCase() === name && !isCoreCommand(c.name),
+    );
+    if (item) {
+      return {
+        kind: "skill",
+        item,
+        invocation: formatSkillInvocation(item.name, provider),
+        args,
+      };
+    }
+  }
+
+  return { kind: "unknown", raw: trimmed.split(" ")[0] };
 }
 
 /**
  * Return commands whose `/name` starts with the given partial input.
- * Used by the autocomplete popup in ChatInput.
+ * Used by the autocomplete popup in ChatInput. When `commands` is
+ * provided it's used as the source of truth; otherwise we fall back
+ * to the hardcoded core commands.
  */
 export function getCompletions(
   partial: string,
-): { name: string; description: string }[] {
+  commands?: SlashCommandItem[],
+): SlashCommandItem[] {
+  const source = commands ?? COMMAND_META;
   const lower = partial.toLowerCase();
-  // Match against "/name" so the user can type "/" and see everything,
-  // or "/flow" and narrow down to "/flowstate-clear".
-  return COMMAND_META.filter((c) => `/${c.name}`.startsWith(lower));
+  // The popup is triggered by either `/` (slash commands + skills) or
+  // `$` (Codex skill invocations). We match against both prefix forms
+  // so Codex sessions see their `$skill` entries when the user starts
+  // typing `$`.
+  return source.filter((c) => {
+    const slashMatch = `/${c.name.toLowerCase()}`.startsWith(lower);
+    const dollarMatch = `$${c.name.toLowerCase()}`.startsWith(lower);
+    return slashMatch || dollarMatch;
+  });
 }

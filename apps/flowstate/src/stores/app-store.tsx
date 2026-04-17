@@ -17,6 +17,7 @@ import {
 } from "@/lib/api";
 import type {
   ClientMessage,
+  CommandCatalog,
   PermissionDecision,
   ProviderStatus,
   ProjectRecord,
@@ -90,6 +91,13 @@ interface AppState {
    *  any session — providers report these whenever they update.
    *  Flowstate surfaces them in the Context Display popover. */
   rateLimits: Record<string, RateLimitInfo>;
+  /** Per-session command catalog (slash commands + sub-agents + MCP
+   *  servers). Populated by `session_command_catalog_updated` events,
+   *  which fire on session start, session load, and explicit refresh.
+   *  The reducer short-circuits updates whose `commands[].id` array
+   *  matches the cached one, so the slash-popup memo stays stable
+   *  across no-op refreshes. */
+  sessionCommands: Map<string, CommandCatalog>;
   ready: boolean;
 }
 
@@ -623,6 +631,30 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "session_command_catalog_updated": {
+      // id-equality short-circuit: if every command in the new payload
+      // matches the cached id (same length, same order), skip the
+      // dispatch. ChatView's memoized `mergeCommandsWithCatalog` depends
+      // on the Map reference changing only when the popup actually
+      // needs to re-render.
+      const prev = state.sessionCommands.get(event.session_id);
+      const next = event.catalog;
+      if (
+        prev &&
+        prev.commands.length === next.commands.length &&
+        prev.agents.length === next.agents.length &&
+        prev.mcpServers.length === next.mcpServers.length &&
+        prev.commands.every((c, i) => c.id === next.commands[i]?.id) &&
+        prev.agents.every((a, i) => a.id === next.agents[i]?.id) &&
+        prev.mcpServers.every((m, i) => m.id === next.mcpServers[i]?.id)
+      ) {
+        return state;
+      }
+      const sessionCommands = new Map(state.sessionCommands);
+      sessionCommands.set(event.session_id, next);
+      return { ...state, sessionCommands };
+    }
+
     default:
       return state;
   }
@@ -642,6 +674,7 @@ const initialState: AppState = {
   pendingPermissionsBySession: new Map(),
   pendingQuestionBySession: new Map(),
   rateLimits: {},
+  sessionCommands: new Map(),
   ready: false,
 };
 
@@ -954,4 +987,16 @@ export function useApp() {
   const ctx = React.useContext(AppContext);
   if (!ctx) throw new Error("useApp must be used within AppProvider");
   return ctx;
+}
+
+/** Subscribe to the per-session command catalog (slash commands,
+ *  sub-agents, MCP servers). Returns `undefined` until the first
+ *  `session_command_catalog_updated` event lands for this session;
+ *  consumers should treat that as "show core commands only". */
+export function useSessionCommandCatalog(
+  sessionId: string | undefined,
+): CommandCatalog | undefined {
+  const { state } = useApp();
+  if (!sessionId) return undefined;
+  return state.sessionCommands.get(sessionId);
 }
