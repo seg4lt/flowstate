@@ -41,7 +41,7 @@ export function SlashCommandPopup({
     <div
       ref={listRef}
       role="listbox"
-      className="absolute bottom-full left-0 z-50 mb-1 max-h-80 w-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-md"
+      className="absolute inset-x-0 bottom-full z-50 mb-1 max-h-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-md"
     >
       {matches.map((cmd, i) => {
         const badge = badgeFor(cmd);
