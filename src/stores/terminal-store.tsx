@@ -47,9 +47,11 @@ interface TerminalState {
   defaultDockOpen: boolean;
   /** Per-session dock open flag. When an entry exists it is the
    *  authoritative answer for that session (explicit user choice);
-   *  when absent, callers fall back to `defaultDockOpen` via
-   *  `selectDockOpen`. In-memory only — restart loses per-session
-   *  flags, which matches the "transient UI" scope. */
+   *  when absent, the session is treated as closed. `defaultDockOpen`
+   *  only applies to session-less screens (see `selectDockOpen`), so
+   *  a new thread never auto-inherits an "open" state the user set
+   *  elsewhere. In-memory only — restart loses per-session flags,
+   *  which matches the "transient UI" scope. */
   dockOpenBySession: Map<string, boolean>;
   dockHeight: number;
   projects: Map<string, ProjectTerminalState>;
@@ -107,10 +109,12 @@ function readInitial(): TerminalState {
  * Resolve the effective dock-open flag for a given session. When
  * sessionId is null (home / project page / any route without an
  * active session) callers get the global default. When an entry
- * exists in the per-session map it's the authoritative answer —
- * an explicit user choice overrides the global default, so
- * "closed on thread A" sticks even if the user opens the dock
- * from the home screen later.
+ * exists in the per-session map it's the authoritative answer for
+ * that thread. Sessions without an explicit choice default to
+ * closed — the global `defaultDockOpen` is intentionally NOT used
+ * as a fallback here, so a fresh thread (or any thread after a
+ * reload, since per-session state is in-memory only) never inherits
+ * an "open" state the user never asked for on that thread.
  */
 export function selectDockOpen(
   state: TerminalState,
@@ -118,7 +122,7 @@ export function selectDockOpen(
 ): boolean {
   if (sessionId === null) return state.defaultDockOpen;
   const sessionValue = state.dockOpenBySession.get(sessionId);
-  return sessionValue ?? state.defaultDockOpen;
+  return sessionValue ?? false;
 }
 
 function basename(path: string): string {
