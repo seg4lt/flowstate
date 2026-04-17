@@ -832,7 +832,26 @@ fn extract_model_entry(entry: &Value) -> Option<ProviderModel> {
         .and_then(Value::as_str)
         .unwrap_or(&value)
         .to_string();
-    Some(ProviderModel { value, label })
+    // Pick up context window / max output tokens when Codex's
+    // `model/list` response carries them. Supports a few common key
+    // spellings so a minor schema tweak doesn't silently drop the
+    // value on the floor.
+    let context_window = obj
+        .get("contextWindow")
+        .or_else(|| obj.get("context_window"))
+        .or_else(|| obj.get("maxContextWindowTokens"))
+        .or_else(|| obj.get("max_context_window_tokens"))
+        .and_then(Value::as_u64);
+    let max_output_tokens = obj
+        .get("maxOutputTokens")
+        .or_else(|| obj.get("max_output_tokens"))
+        .and_then(Value::as_u64);
+    Some(ProviderModel {
+        value,
+        label,
+        context_window,
+        max_output_tokens,
+    })
 }
 
 /// Parse a `ToolRequestUserInputParams` value (from `item/tool/requestUserInput`)
@@ -918,18 +937,27 @@ fn map_permission_mode(mode: PermissionMode) -> (&'static str, &'static str) {
 }
 
 fn codex_models() -> Vec<ProviderModel> {
+    // Fallback capability values for when Codex doesn't return
+    // model metadata via `model/list`. Numbers follow OpenAI's
+    // current public model cards.
     vec![
         ProviderModel {
             value: "gpt-5".to_string(),
             label: "GPT-5 (Codex)".to_string(),
+            context_window: Some(400_000),
+            max_output_tokens: Some(128_000),
         },
         ProviderModel {
             value: "o3".to_string(),
             label: "o3".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(100_000),
         },
         ProviderModel {
             value: "gpt-4o".to_string(),
             label: "GPT-4o".to_string(),
+            context_window: Some(128_000),
+            max_output_tokens: Some(16_384),
         },
     ]
 }

@@ -911,6 +911,7 @@ impl ClaudeSdkAdapter {
                             steps,
                             raw,
                             nested_event,
+                            model,
                         )
                         .await;
                     }
@@ -1163,7 +1164,34 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 if models.is_empty() {
                     Err("Claude bridge returned no models".to_string())
                 } else {
-                    Ok(models)
+                    // The SDK's `supportedModels()` returns
+                    // `{value, label}` only — no context window
+                    // metadata. Overlay our declared capabilities
+                    // table so the UI can show an authoritative
+                    // context window regardless of which path
+                    // populated the entry.
+                    let capabilities = claude_models();
+                    let enriched: Vec<ProviderModel> = models
+                        .into_iter()
+                        .map(|m| {
+                            if let Some(cap) =
+                                capabilities.iter().find(|c| c.value == m.value)
+                            {
+                                ProviderModel {
+                                    context_window: m
+                                        .context_window
+                                        .or(cap.context_window),
+                                    max_output_tokens: m
+                                        .max_output_tokens
+                                        .or(cap.max_output_tokens),
+                                    ..m
+                                }
+                            } else {
+                                m
+                            }
+                        })
+                        .collect();
+                    Ok(enriched)
                 }
             }
             BridgeResponse::Error { error } => Err(format!("Claude list_models error: {error}")),
@@ -1456,6 +1484,7 @@ async fn forward_stream(
     steps: Option<Value>,
     raw: Option<String>,
     nested_event: Option<Value>,
+    model: Option<String>,
 ) {
     use zenui_provider_api::{FileOperation, PlanStep};
     match event {
@@ -1544,6 +1573,7 @@ async fn forward_stream(
                         agent_id: aid,
                         agent_type: atype,
                         prompt: prompt.unwrap_or_default(),
+                        model: model.clone(),
                     })
                     .await;
             }
@@ -1567,6 +1597,22 @@ async fn forward_stream(
                         error,
                     })
                     .await;
+            }
+        }
+        "subagent_model_observed" => {
+            // Bridge emits this once per subagent when the first
+            // assistant message under `parent_tool_use_id` arrives —
+            // `message.model` is the SDK-resolved pinned id. Runtime-
+            // core overwrites `SubagentRecord.model` from here.
+            if let (Some(aid), Some(m)) = (agent_id, model) {
+                if !m.is_empty() {
+                    events
+                        .send(ProviderTurnEvent::SubagentModelObserved {
+                            agent_id: aid,
+                            model: m,
+                        })
+                        .await;
+                }
             }
         }
         "plan_proposed" => {
@@ -1604,26 +1650,41 @@ async fn forward_stream(
 }
 
 fn claude_models() -> Vec<ProviderModel> {
+    // Context/output ceilings follow Anthropic's public model-card
+    // defaults (200k context across the 4.x family; output ceilings
+    // vary by tier). The 1M beta context for Sonnet 4.5 is not
+    // surfaced here because it requires an explicit opt-in header —
+    // reporting 1M universally would be misleading.
     vec![
         ProviderModel {
             value: "claude-opus-4-6".to_string(),
             label: "Claude Opus 4.6".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
         },
         ProviderModel {
             value: "claude-sonnet-4-6".to_string(),
             label: "Claude Sonnet 4.6".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
         ProviderModel {
             value: "claude-haiku-4-5".to_string(),
             label: "Claude Haiku 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
         ProviderModel {
             value: "claude-opus-4-5".to_string(),
             label: "Claude Opus 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
     ]
 }

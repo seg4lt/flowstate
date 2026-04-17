@@ -1239,22 +1239,36 @@ fn parse_decision(value: &str) -> PermissionDecision {
 }
 
 fn copilot_models() -> Vec<ProviderModel> {
+    // Fallback capability values used only when the live
+    // `listModels()` call fails or returns an empty list. Live
+    // responses beat these via `fetch_models` (which now carries
+    // `context_window` / `max_output_tokens` straight through from
+    // the Copilot SDK's ModelCapabilities.limits). Numbers follow
+    // each vendor's public model cards.
     vec![
         ProviderModel {
             value: "gpt-4.1".to_string(),
             label: "GPT-4.1".to_string(),
+            context_window: Some(1_047_576),
+            max_output_tokens: Some(32_768),
         },
         ProviderModel {
             value: "gpt-4o".to_string(),
             label: "GPT-4o".to_string(),
+            context_window: Some(128_000),
+            max_output_tokens: Some(16_384),
         },
         ProviderModel {
             value: "gpt-5".to_string(),
             label: "GPT-5".to_string(),
+            context_window: Some(400_000),
+            max_output_tokens: Some(128_000),
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
     ]
 }

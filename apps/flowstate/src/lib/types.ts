@@ -31,6 +31,14 @@ export type PlanStatus = "proposed" | "accepted" | "rejected";
 export interface ProviderModel {
   value: string;
   label: string;
+  /** Authoritative context window in tokens for this model. When
+   *  present, the UI prefers this over the SDK-reported
+   *  `TokenUsage.contextWindow` (which can drift, e.g. Anthropic's
+   *  1M beta auto-negotiation). Omitted when the adapter doesn't
+   *  know the ceiling. */
+  contextWindow?: number;
+  /** Authoritative max output tokens for this model, when known. */
+  maxOutputTokens?: number;
 }
 
 /** Where a user-authored SKILL.md came from on disk. Drives the
@@ -147,6 +155,12 @@ export interface SubagentRecord {
   parentCallId: string;
   agentType: string;
   prompt: string;
+  /** Raw provider-level model id this subagent is running on. Set
+   *  at spawn time from the provider's static agent catalog when
+   *  available, and upgraded to the SDK-observed value on the first
+   *  assistant message. Undefined when the provider doesn't
+   *  distinguish per-subagent models. */
+  model?: string;
   events: unknown[];
   output?: string;
   error?: string;
@@ -366,9 +380,10 @@ export type RuntimeEvent =
   | { type: "permission_requested"; session_id: string; turn_id: string; request_id: string; tool_name: string; input: unknown; suggested: PermissionDecision }
   | { type: "user_question_asked"; session_id: string; turn_id: string; request_id: string; questions: UserInputQuestion[] }
   | { type: "file_changed"; session_id: string; turn_id: string; call_id: string; path: string; operation: FileOperation; before?: string; after?: string }
-  | { type: "subagent_started"; session_id: string; turn_id: string; parent_call_id: string; agent_id: string; agent_type: string; prompt: string }
+  | { type: "subagent_started"; session_id: string; turn_id: string; parent_call_id: string; agent_id: string; agent_type: string; prompt: string; model?: string }
   | { type: "subagent_event"; session_id: string; turn_id: string; agent_id: string; event: unknown }
   | { type: "subagent_completed"; session_id: string; turn_id: string; agent_id: string; output: string; error?: string }
+  | { type: "subagent_model_observed"; session_id: string; turn_id: string; agent_id: string; model: string }
   | { type: "plan_proposed"; session_id: string; turn_id: string; plan_id: string; title: string; steps: PlanStep[]; raw: string }
   | { type: "error"; message: string }
   | { type: "info"; message: string }

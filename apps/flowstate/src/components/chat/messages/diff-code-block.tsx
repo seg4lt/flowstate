@@ -1,6 +1,7 @@
 import * as React from "react";
 import { PatchDiff } from "@pierre/diffs/react";
 import { useTheme } from "@/hooks/use-theme";
+import { CopyButton } from "./copy-button";
 
 interface DiffCodeBlockProps {
   code: string;
@@ -50,7 +51,13 @@ function DiffCodeBlockInner({ code, language = "tsx" }: DiffCodeBlockProps) {
   );
 
   return (
-    <div className="mb-3 overflow-x-auto rounded-md border border-border text-xs last:mb-0">
+    <div className="group relative mb-3 overflow-x-auto rounded-md border border-border text-xs last:mb-0">
+      <CopyButton
+        text={code}
+        title="Copy diff"
+        label="Copied diff"
+        className="absolute right-1.5 top-1.5 z-10 bg-background/70 opacity-0 backdrop-blur transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+      />
       <PatchDiff
         patch={patch}
         options={{

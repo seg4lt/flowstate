@@ -1553,12 +1553,14 @@ impl RuntimeCore {
                     agent_id,
                     agent_type,
                     prompt,
+                    model,
                 } => {
                     subagents.push(SubagentRecord {
                         agent_id: agent_id.clone(),
                         parent_call_id: parent_call_id.clone(),
                         agent_type: agent_type.clone(),
                         prompt: prompt.clone(),
+                        model: model.clone(),
                         events: Vec::new(),
                         output: None,
                         error: None,
@@ -1571,6 +1573,7 @@ impl RuntimeCore {
                         agent_id,
                         agent_type,
                         prompt,
+                        model,
                     });
                 }
                 ProviderTurnEvent::SubagentEvent { agent_id, event } => {
@@ -1604,6 +1607,20 @@ impl RuntimeCore {
                         agent_id,
                         output,
                         error,
+                    });
+                }
+                ProviderTurnEvent::SubagentModelObserved { agent_id, model } => {
+                    // The observed (SDK-resolved) model is stronger
+                    // than the planned catalog value, so always
+                    // overwrite when this event fires.
+                    if let Some(rec) = subagents.iter_mut().find(|r| r.agent_id == agent_id) {
+                        rec.model = Some(model.clone());
+                    }
+                    self.publish(RuntimeEvent::SubagentModelObserved {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        agent_id,
+                        model,
                     });
                 }
                 ProviderTurnEvent::TurnUsage { usage: u } => {
@@ -3341,6 +3358,7 @@ mod tests {
         zenui_provider_api::ProviderModel {
             value: value.to_string(),
             label: label.to_string(),
+            ..Default::default()
         }
     }
 

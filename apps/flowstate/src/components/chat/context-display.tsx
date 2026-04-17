@@ -113,8 +113,39 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
     (r) => r.status === "allowed_warning" || r.status === "rejected",
   );
 
-  const used = usage ? usage.inputTokens + usage.outputTokens : null;
-  const total = usage?.contextWindow ?? null;
+  // Real KV-cache occupancy for this turn = fresh input + fresh
+  // output + cache reads + cache creation. The raw input_tokens
+  // field from Anthropic excludes cached content, so on a heavily
+  // cached turn it reads artificially low (104 etc.) — adding the
+  // cache counters brings the numerator in line with what Claude
+  // Code's own context indicator reports.
+  const used = usage
+    ? usage.inputTokens +
+      usage.outputTokens +
+      (usage.cacheReadTokens ?? 0) +
+      (usage.cacheWriteTokens ?? 0)
+    : null;
+
+  // Denominator resolution: provider-declared ProviderModel
+  // capability wins over the SDK-reported TokenUsage.contextWindow,
+  // because SDK values drift when the provider auto-negotiates a
+  // beta window (e.g. Anthropic's 1M context beta). Key the lookup
+  // on the resolved pinned model from usage when we have it, else
+  // fall back to whatever the session's configured model is.
+  const session = data?.detail.summary;
+  const modelId = usage?.model ?? session?.model;
+  const providerEntry = React.useMemo(() => {
+    if (!session || !modelId) return undefined;
+    return state.providers
+      .find((p) => p.kind === session.provider)
+      ?.models.find((m) => m.value === modelId);
+  }, [state.providers, session, modelId]);
+  const declaredWindow = providerEntry?.contextWindow ?? null;
+  const sdkWindow = usage?.contextWindow ?? null;
+  const total = declaredWindow ?? sdkWindow;
+  const windowSource: "declared" | "sdk" | null =
+    declaredWindow != null ? "declared" : sdkWindow != null ? "sdk" : null;
+
   const pct =
     used != null && total != null && total > 0
       ? Math.min(100, Math.round((used / total) * 100))
@@ -176,6 +207,22 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
               className={`h-full transition-all ${barFillClass}`}
               style={{ width: `${pct}%` }}
             />
+          </div>
+        )}
+        {windowSource && (
+          <div className="mt-2 text-[10px] text-muted-foreground/70">
+            window source:{" "}
+            <span className="tabular-nums">
+              {windowSource === "declared"
+                ? "provider-declared"
+                : "sdk-reported"}
+            </span>
+            {modelId && (
+              <>
+                {" · "}
+                <span className="font-mono">{modelId}</span>
+              </>
+            )}
           </div>
         )}
         {!usage && (

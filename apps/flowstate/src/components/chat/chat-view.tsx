@@ -226,6 +226,72 @@ function applyEventToTurns(
           ),
         };
       });
+    // Subagent lifecycle. Previously these only landed via the
+    // whole-turn refetch triggered by turn_completed, so the
+    // subagent box stayed empty during long-running dispatches.
+    // Handling them here lets the UI stream the subagent's state
+    // (including its per-agent model, once observed) live.
+    case "subagent_started":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              subagents: [
+                ...(t.subagents ?? []),
+                {
+                  agentId: event.agent_id,
+                  parentCallId: event.parent_call_id,
+                  agentType: event.agent_type,
+                  prompt: event.prompt,
+                  model: event.model,
+                  events: [],
+                  status: "running" as const,
+                },
+              ],
+            }
+          : t,
+      );
+    case "subagent_event":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.subagents) return t;
+        return {
+          ...t,
+          subagents: t.subagents.map((s) =>
+            s.agentId === event.agent_id
+              ? { ...s, events: [...s.events, event.event] }
+              : s,
+          ),
+        };
+      });
+    case "subagent_completed":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.subagents) return t;
+        return {
+          ...t,
+          subagents: t.subagents.map((s) =>
+            s.agentId === event.agent_id
+              ? {
+                  ...s,
+                  output: event.output,
+                  error: event.error,
+                  status: event.error
+                    ? ("failed" as const)
+                    : ("completed" as const),
+                }
+              : s,
+          ),
+        };
+      });
+    case "subagent_model_observed":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.subagents) return t;
+        return {
+          ...t,
+          subagents: t.subagents.map((s) =>
+            s.agentId === event.agent_id ? { ...s, model: event.model } : s,
+          ),
+        };
+      });
     default:
       return prev;
   }
@@ -1555,6 +1621,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             loadingOlder={loadingOlder}
             onLoadOlder={handleLoadOlder}
             onOpenAttachment={handleOpenPersistedAttachment}
+            providerKind={sessionQuery.data?.detail.summary.provider}
+            sessionModel={sessionQuery.data?.detail.summary.model}
           />
 
           {isRunning && session && runningTurn && (

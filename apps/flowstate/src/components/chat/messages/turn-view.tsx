@@ -1,6 +1,13 @@
 import * as React from "react";
 import { ChevronDown, ChevronUp, Timer } from "lucide-react";
-import type { AttachmentRef, ContentBlock, ToolCall, TurnStatus } from "@/lib/types";
+import type {
+  AttachmentRef,
+  ContentBlock,
+  ProviderKind,
+  SubagentRecord,
+  ToolCall,
+  TurnStatus,
+} from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
 import { ToolOutputContent } from "../tool-renderers";
 import { UserMessage } from "./user-message";
@@ -168,10 +175,15 @@ function ToolCallGroup({
   callIds,
   parentCallId,
   callsById,
+  subagentsByParent,
 }: {
   callIds: string[];
   parentCallId: string | undefined;
   callsById: Map<string, ToolCall>;
+  /** Optional record of every subagent in the turn, keyed by the
+   *  dispatcher's call id (== `parentCallId`). Used to surface the
+   *  per-subagent model in the box header. */
+  subagentsByParent: Map<string, SubagentRecord>;
 }) {
   const [expanded, setExpanded] = React.useState(false);
 
@@ -271,6 +283,16 @@ function ToolCallGroup({
     )?.description;
     const subtext = description ?? agentLabel;
 
+    // Pull the model this specific subagent ran on, when the record
+    // exists and carries it. Populated lazily: the catalog value
+    // shows up at spawn time if the Claude SDK exposed one, else
+    // the first assistant message from the subagent overwrites it
+    // with the observed pinned id.
+    const subagentRecord = parentCallId
+      ? subagentsByParent.get(parentCallId)
+      : undefined;
+    const subagentModel = subagentRecord?.model;
+
     return (
       <details
         open
@@ -278,6 +300,11 @@ function ToolCallGroup({
       >
         <summary className="cursor-pointer select-none text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground">
           ↳ {agentLabel}{" "}
+          {subagentModel && (
+            <span className="text-muted-foreground/60 normal-case tracking-normal">
+              · <span className="font-mono">{subagentModel}</span>
+            </span>
+          )}
           <span className="text-muted-foreground/60">· {calls.length}</span>
           {statusText && (
             <span className={`ml-1 ${statusClass}`}>· {statusText}</span>
@@ -341,6 +368,18 @@ export interface MessageItem {
    *  Sourced from `TurnRecord.usage.durationMs`. Absent on streaming/
    *  interrupted turns and on providers that don't report it. */
   durationMs?: number;
+  /** Raw provider-level model id used for this turn's reply. Sourced
+   *  from `TurnRecord.usage.model` when available, falling back to
+   *  `SessionSummary.model` mid-stream. Drives the agent-message
+   *  info popover and (via subagents[]) the subagent header. */
+  model?: string;
+  /** Provider kind for this session. Identical across turns of a
+   *  session but threaded per-item so the UI layer never has to
+   *  cross-reference the session cache. */
+  providerKind?: ProviderKind;
+  /** Subagents spawned during this turn, carried forward so the
+   *  per-subagent model can show up in the subagent box header. */
+  subagents?: SubagentRecord[];
 }
 
 function formatTurnDuration(ms: number): string {
@@ -362,6 +401,16 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
     for (const tc of item.toolCalls ?? []) map.set(tc.callId, tc);
     return map;
   }, [item.toolCalls]);
+
+  // Index subagents by the spawning Task's call id so ToolCallGroup
+  // can look the record up directly when rendering a subagent box.
+  // Identity matches `SubagentRecord.parentCallId` === the
+  // dispatcher `ToolCall.callId`. Built once per turn-view render.
+  const subagentsByParent = React.useMemo(() => {
+    const map = new Map<string, SubagentRecord>();
+    for (const rec of item.subagents ?? []) map.set(rec.parentCallId, rec);
+    return map;
+  }, [item.subagents]);
 
   const renderBlocks = React.useMemo(
     () => groupBlocks(item.blocks, callsById),
@@ -405,6 +454,8 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
                 output={block.text}
                 streaming={item.streaming && idx === lastTextRenderIdx}
                 status={item.status}
+                model={item.model}
+                providerKind={item.providerKind}
               />
             );
           case "reasoning":
@@ -429,6 +480,7 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
                 callIds={block.callIds}
                 parentCallId={block.parentCallId}
                 callsById={callsById}
+                subagentsByParent={subagentsByParent}
               />
             );
         }
@@ -463,6 +515,12 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
     // streaming update.
     a.blocks === b.blocks &&
     a.toolCalls === b.toolCalls &&
-    a.inputAttachments === b.inputAttachments
+    a.inputAttachments === b.inputAttachments &&
+    // Model may upgrade mid-turn when ModelResolved promotes the
+    // session alias to a pinned id; subagents[] grows as subagents
+    // stream in and flips `model` when SubagentModelObserved fires.
+    a.model === b.model &&
+    a.providerKind === b.providerKind &&
+    a.subagents === b.subagents
   );
 });

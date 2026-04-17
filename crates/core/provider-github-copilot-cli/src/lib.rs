@@ -1179,7 +1179,33 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     .and_then(Value::as_str)
                     .unwrap_or(&value)
                     .to_string();
-                Some(ProviderModel { value, label })
+                // Live response may carry the model's ceilings at a few
+                // spellings; grab whichever is present. Falls back to
+                // the static capability table below when absent.
+                let context_window = m
+                    .get("contextWindow")
+                    .or_else(|| m.get("maxContextWindowTokens"))
+                    .or_else(|| {
+                        m.get("capabilities")
+                            .and_then(|c| c.get("limits"))
+                            .and_then(|l| l.get("max_context_window_tokens"))
+                    })
+                    .and_then(Value::as_u64);
+                let max_output_tokens = m
+                    .get("maxOutputTokens")
+                    .or_else(|| m.get("max_output_tokens"))
+                    .or_else(|| {
+                        m.get("capabilities")
+                            .and_then(|c| c.get("limits"))
+                            .and_then(|l| l.get("max_output_tokens"))
+                    })
+                    .and_then(Value::as_u64);
+                Some(ProviderModel {
+                    value,
+                    label,
+                    context_window,
+                    max_output_tokens,
+                })
             })
             .collect();
 
@@ -1489,15 +1515,58 @@ struct CliMcpServer {
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
 fn copilot_cli_models() -> Vec<ProviderModel> {
+    // Fallback capability values for when the CLI's `listModels`
+    // output doesn't carry them. Live responses beat these when
+    // present (see the parser above).
     vec![
-        ProviderModel { value: "gpt-4o".to_string(),          label: "GPT-4o".to_string() },
-        ProviderModel { value: "gpt-4.1".to_string(),         label: "GPT-4.1".to_string() },
-        ProviderModel { value: "gpt-5".to_string(),           label: "GPT-5".to_string() },
-        ProviderModel { value: "claude-sonnet-4-5".to_string(), label: "Claude Sonnet 4.5".to_string() },
-        ProviderModel { value: "claude-sonnet-4-6".to_string(), label: "Claude Sonnet 4.6".to_string() },
-        ProviderModel { value: "o3".to_string(),              label: "o3".to_string() },
-        ProviderModel { value: "o4-mini".to_string(),         label: "o4-mini".to_string() },
-        ProviderModel { value: "gemini-2.5-pro".to_string(),  label: "Gemini 2.5 Pro".to_string() },
+        ProviderModel {
+            value: "gpt-4o".to_string(),
+            label: "GPT-4o".to_string(),
+            context_window: Some(128_000),
+            max_output_tokens: Some(16_384),
+        },
+        ProviderModel {
+            value: "gpt-4.1".to_string(),
+            label: "GPT-4.1".to_string(),
+            context_window: Some(1_047_576),
+            max_output_tokens: Some(32_768),
+        },
+        ProviderModel {
+            value: "gpt-5".to_string(),
+            label: "GPT-5".to_string(),
+            context_window: Some(400_000),
+            max_output_tokens: Some(128_000),
+        },
+        ProviderModel {
+            value: "claude-sonnet-4-5".to_string(),
+            label: "Claude Sonnet 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
+        },
+        ProviderModel {
+            value: "claude-sonnet-4-6".to_string(),
+            label: "Claude Sonnet 4.6".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
+        },
+        ProviderModel {
+            value: "o3".to_string(),
+            label: "o3".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(100_000),
+        },
+        ProviderModel {
+            value: "o4-mini".to_string(),
+            label: "o4-mini".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(100_000),
+        },
+        ProviderModel {
+            value: "gemini-2.5-pro".to_string(),
+            label: "Gemini 2.5 Pro".to_string(),
+            context_window: Some(1_048_576),
+            max_output_tokens: Some(65_536),
+        },
     ]
 }
 

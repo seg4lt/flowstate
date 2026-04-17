@@ -224,6 +224,15 @@ pub struct SubagentRecord {
     pub parent_call_id: String,
     pub agent_type: String,
     pub prompt: String,
+    /// Raw provider-level model this subagent is running on, when
+    /// the provider differentiates subagent models from the main
+    /// agent's. Populated lazily: set from the static agent catalog
+    /// at spawn time (via `ProviderTurnEvent::SubagentStarted.model`)
+    /// and upgraded to the observed value when the first assistant
+    /// message lands (via `SubagentModelObserved`). `None` when the
+    /// provider can't or doesn't distinguish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -281,11 +290,24 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
     pub value: String,
     pub label: String,
+    /// Authoritative context window for this model in tokens. When
+    /// present, UIs prefer this over the runtime-reported
+    /// `TokenUsage.context_window`, which comes from the provider's
+    /// SDK and can drift (e.g. Anthropic's 1M beta context auto-
+    /// negotiation reports a window the user's tier may not actually
+    /// support).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Authoritative maximum output tokens for this model, when known.
+    /// Used for warnings and UI ceilings. Purely advisory — adapters
+    /// never enforce this locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,6 +757,12 @@ pub enum ProviderTurnEvent {
         agent_id: String,
         agent_type: String,
         prompt: String,
+        /// Raw provider-level model this subagent will run on, when
+        /// known at spawn time (i.e. the adapter can read a model
+        /// override from its static agent catalog). Adapters that
+        /// don't distinguish pass `None`; the runtime then falls
+        /// back to the session model for display.
+        model: Option<String>,
     },
     SubagentEvent {
         agent_id: String,
@@ -744,6 +772,17 @@ pub enum ProviderTurnEvent {
         agent_id: String,
         output: String,
         error: Option<String>,
+    },
+    /// Emitted when the provider tells us — usually via the first
+    /// assistant message from the subagent — which model the SDK
+    /// actually resolved to run the subagent on. Distinct from the
+    /// planned value on `SubagentStarted.model` because SDKs can
+    /// resolve aliases, honour runtime overrides, or fall back
+    /// when the requested model is unavailable. Runtime-core
+    /// overwrites `SubagentRecord.model` with this when it fires.
+    SubagentModelObserved {
+        agent_id: String,
+        model: String,
     },
     PlanProposed {
         plan_id: String,
@@ -1134,6 +1173,8 @@ pub enum RuntimeEvent {
         agent_id: String,
         agent_type: String,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     SubagentEvent {
         session_id: String,
@@ -1147,6 +1188,18 @@ pub enum RuntimeEvent {
         agent_id: String,
         output: String,
         error: Option<String>,
+    },
+    /// Broadcast when `ProviderTurnEvent::SubagentModelObserved`
+    /// fires — the frontend can upgrade its in-memory
+    /// `SubagentRecord.model` so the subagent header shows the
+    /// SDK-resolved pinned id rather than the planned catalog
+    /// value. Persisted via the `SubagentRecord` itself; this event
+    /// just nudges the streaming UI.
+    SubagentModelObserved {
+        session_id: String,
+        turn_id: String,
+        agent_id: String,
+        model: String,
     },
     PlanProposed {
         session_id: String,

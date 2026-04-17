@@ -601,15 +601,52 @@ class CopilotBridge {
     }
   }
 
-  async listModels(): Promise<Array<{ value: string; label: string }>> {
+  async listModels(): Promise<
+    Array<{
+      value: string;
+      label: string;
+      contextWindow?: number;
+      maxOutputTokens?: number;
+    }>
+  > {
     if (!this.client) {
       throw new Error('Client not started');
     }
     const models = await this.client.listModels();
-    return models.map((m: any) => ({
-      value: (m.id ?? m.value ?? '') as string,
-      label: (m.name ?? m.displayName ?? m.id ?? '') as string,
-    }));
+    return models.map((m: any) => {
+      // The Copilot SDK exposes the model's ceilings on
+      // `capabilities.limits`. Older SDK builds expose them flat on
+      // the entry (see node_modules/@github/copilot/sdk/index.d.ts
+      // around the OpenRouter provider shape). Accept both so a
+      // Copilot CLI upgrade doesn't silently drop the value.
+      const limits = (m.capabilities?.limits ?? {}) as Record<string, unknown>;
+      const ctx =
+        (typeof m.maxContextWindowTokens === 'number'
+          ? m.maxContextWindowTokens
+          : undefined) ??
+        (typeof limits.max_context_window_tokens === 'number'
+          ? (limits.max_context_window_tokens as number)
+          : undefined);
+      const out =
+        (typeof m.maxOutputTokens === 'number'
+          ? m.maxOutputTokens
+          : undefined) ??
+        (typeof limits.max_output_tokens === 'number'
+          ? (limits.max_output_tokens as number)
+          : undefined);
+      const entry: {
+        value: string;
+        label: string;
+        contextWindow?: number;
+        maxOutputTokens?: number;
+      } = {
+        value: (m.id ?? m.value ?? '') as string,
+        label: (m.name ?? m.displayName ?? m.id ?? '') as string,
+      };
+      if (typeof ctx === 'number') entry.contextWindow = ctx;
+      if (typeof out === 'number') entry.maxOutputTokens = out;
+      return entry;
+    });
   }
 
   /**

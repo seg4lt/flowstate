@@ -1,7 +1,12 @@
 import * as React from "react";
 import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { ArrowDown, Loader2 } from "lucide-react";
-import type { AttachmentRef, ContentBlock, TurnRecord } from "@/lib/types";
+import type {
+  AttachmentRef,
+  ContentBlock,
+  ProviderKind,
+  TurnRecord,
+} from "@/lib/types";
 import { TurnView, type MessageItem } from "./turn-view";
 
 interface MessageListProps {
@@ -30,12 +35,23 @@ interface MessageListProps {
    *  to read history. Decoupled from `pendingInput` so the effect fires
    *  exactly once per send and doesn't get skipped if React batches. */
   userSendTick: number;
+  /** Provider kind of the current session — used to label the model
+   *  info popover on each agent reply. */
+  providerKind?: ProviderKind;
+  /** Session-level configured model. Used as the per-turn model
+   *  fallback when `turn.usage.model` hasn't been populated yet
+   *  (happens mid-stream and on very old rows). */
+  sessionModel?: string;
 }
 
 const PENDING_KEY = "__pending__";
 const EMPTY_BLOCKS: ContentBlock[] = [];
 
-function turnToItem(turn: TurnRecord): MessageItem {
+function turnToItem(
+  turn: TurnRecord,
+  providerKind: ProviderKind | undefined,
+  sessionModel: string | undefined,
+): MessageItem {
   return {
     turnId: turn.turnId,
     input: turn.input,
@@ -45,10 +61,21 @@ function turnToItem(turn: TurnRecord): MessageItem {
     streaming: turn.status === "running",
     inputAttachments: turn.inputAttachments,
     durationMs: turn.usage?.durationMs,
+    // Prefer the pinned resolved model (authoritative post-turn)
+    // over the session-configured alias. Either is fine for display;
+    // the pinned id is better because it encodes exactly which
+    // build answered this specific turn.
+    model: turn.usage?.model ?? sessionModel,
+    providerKind,
+    subagents: turn.subagents,
   };
 }
 
-function pendingItem(input: string): MessageItem {
+function pendingItem(
+  input: string,
+  providerKind: ProviderKind | undefined,
+  sessionModel: string | undefined,
+): MessageItem {
   return {
     turnId: PENDING_KEY,
     input,
@@ -56,6 +83,8 @@ function pendingItem(input: string): MessageItem {
     blocks: EMPTY_BLOCKS,
     toolCalls: null,
     streaming: true,
+    model: sessionModel,
+    providerKind,
   };
 }
 
@@ -75,6 +104,8 @@ export function MessageList({
   onLoadOlder,
   onOpenAttachment,
   userSendTick,
+  providerKind,
+  sessionModel,
 }: MessageListProps) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
@@ -93,12 +124,14 @@ export function MessageList({
   // gap between sendMessage and turn_started; it's cleared the moment
   // chat-view sees turn_started arrive.
   const displayItems = React.useMemo<MessageItem[]>(() => {
-    const items: MessageItem[] = turns.map(turnToItem);
+    const items: MessageItem[] = turns.map((t) =>
+      turnToItem(t, providerKind, sessionModel),
+    );
     if (pendingInput !== null) {
-      items.push(pendingItem(pendingInput));
+      items.push(pendingItem(pendingInput, providerKind, sessionModel));
     }
     return items;
-  }, [turns, pendingInput]);
+  }, [turns, pendingInput, providerKind, sessionModel]);
 
   // Jump to the latest message whenever the user navigates to a
   // new thread. MessageList doesn't remount between sessions (that

@@ -232,6 +232,26 @@ class ClaudeBridge {
    * still get prompted for the next Bash" bug.
    */
   private livePermissionMode?: SdkPermissionMode;
+  /**
+   * Per-turn catalog mapping `subagent_type` (the string Claude's
+   * Task tool uses) → raw provider model id, populated on
+   * `system.init` from `q.supportedAgents()`. Populated best-effort:
+   * if `supportedAgents()` hasn't resolved by the time a Task
+   * tool_use arrives, we emit `subagent_started` without a model
+   * and rely on `subagent_model_observed` (fired from the
+   * subagent's first assistant message) to fill the UI in. Cleared
+   * at the start of each turn so a model override doesn't leak
+   * between turns.
+   */
+  private agentModelByType: Map<string, string> = new Map();
+  /**
+   * Per-turn set of sub-agent ids we've already emitted a
+   * `subagent_model_observed` for. The SDK produces many assistant
+   * messages per sub-agent (streaming deltas, tool_use blocks,
+   * etc.) and they all carry the same `message.model`; we only
+   * want to forward it once.
+   */
+  private observedSubagentIds: Set<string> = new Set();
 
   createSession(cwd: string, model?: string, resumeSessionId?: string): string {
     this.cwd = cwd;
@@ -276,6 +296,12 @@ class ClaudeBridge {
     // mid-turn mode change updates this field so canUseTool reads
     // the CURRENT mode, not the frozen turn-start one.
     this.livePermissionMode = permissionMode;
+    // Per-turn subagent caches. Recomputed each turn from the
+    // SDK's own supportedAgents() snapshot on `system.init`; the
+    // observed-ids set prevents re-emitting the same
+    // subagent_model_observed event on every assistant chunk.
+    this.agentModelByType.clear();
+    this.observedSubagentIds.clear();
 
     const canUseTool: CanUseTool = async (
       toolName: string,
@@ -523,6 +549,32 @@ class ClaudeBridge {
             event: 'info',
             message: `Claude model: requested=${this.model ?? '<default>'} resolved=${init.model ?? '<unknown>'}`,
           });
+          // Populate the subagent model catalog asynchronously off
+          // the query handle. Many agent definitions carry an
+          // explicit `model` override (a research agent pinned to
+          // Haiku, etc.); we pre-read the map so `subagent_started`
+          // can ship the planned model without waiting for the
+          // subagent's first assistant message. Fire-and-forget —
+          // `subagent_model_observed` is the authoritative signal
+          // later, so a late/failed resolution here just means the
+          // UI gets the value a moment later.
+          if (this.activeQuery) {
+            const q = this.activeQuery;
+            (async () => {
+              try {
+                const agents = await q.supportedAgents();
+                for (const a of agents) {
+                  if (a.model) this.agentModelByType.set(a.name, a.model);
+                }
+              } catch (err) {
+                console.error(
+                  `[bridge] supportedAgents() failed during init: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`,
+                );
+              }
+            })();
+          }
           // Emit the resolved model as a structured event too, so the
           // Rust adapter can upgrade `session.summary.model` to match
           // what the SDK actually runs. Without this the UI model
@@ -616,7 +668,7 @@ class ClaudeBridge {
       }
       case 'assistant': {
         const m = msg as unknown as {
-          message: { content: unknown };
+          message: { content: unknown; model?: string };
           parent_tool_use_id?: string | null;
         };
         const rawContent = m.message?.content;
@@ -632,6 +684,27 @@ class ClaudeBridge {
         // forward from this message so the frontend can group tool calls
         // by the agent that actually ran them.
         const parentToolUseId = m.parent_tool_use_id ?? undefined;
+        // Subagent model observation: the very first assistant
+        // message from a subagent carries the resolved model in
+        // `message.model`. That's the authoritative signal (beats
+        // the planned catalog value from supportedAgents() because
+        // the SDK may override or fail-over at runtime). Dedupe
+        // per-subagent so we only fire once per agent_id — later
+        // assistant messages carry the same model and would
+        // otherwise spam the event stream.
+        const observedModel = m.message?.model;
+        if (
+          parentToolUseId &&
+          observedModel &&
+          !this.observedSubagentIds.has(parentToolUseId)
+        ) {
+          this.observedSubagentIds.add(parentToolUseId);
+          writeStream({
+            event: 'subagent_model_observed',
+            agent_id: parentToolUseId,
+            model: observedModel,
+          });
+        }
         const blockTypes = rawContent
           .map((b) => (b as { type?: string }).type ?? '?')
           .join(',');
@@ -687,12 +760,22 @@ class ClaudeBridge {
 
             // Subagent dispatch
             if (name === 'Task' || name === 'Agent') {
+              const agentType =
+                (input.subagent_type as string) ?? 'general-purpose';
+              // Planned model: the static agent catalog value when
+              // the SDK exposed one. Falls back to the main-agent
+              // model on the Rust side for display. The live
+              // resolved value will overwrite via
+              // `subagent_model_observed` from the subagent's first
+              // assistant message.
+              const plannedModel = this.agentModelByType.get(agentType);
               writeStream({
                 event: 'subagent_started',
                 parent_call_id: callId,
                 agent_id: callId,
-                agent_type: (input.subagent_type as string) ?? 'general-purpose',
+                agent_type: agentType,
                 prompt: (input.prompt as string) ?? '',
+                ...(plannedModel ? { model: plannedModel } : {}),
               });
             }
 

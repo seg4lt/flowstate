@@ -1,6 +1,7 @@
 import * as React from "react";
 import type { AttachmentRef } from "@/lib/types";
 import { PersistedAttachmentChip } from "../attachment-chip";
+import { CopyButton } from "./copy-button";
 
 interface UserMessageProps {
   input: string;
@@ -11,7 +12,19 @@ interface UserMessageProps {
 function UserMessageInner({ input, attachments, onOpenAttachment }: UserMessageProps) {
   const hasAttachments = attachments && attachments.length > 0;
   return (
-    <div className="flex justify-end">
+    <div className="group flex items-start justify-end gap-1">
+      {/* Copy sits outside-left of the right-aligned bubble so long
+          messages don't crowd it and so it doesn't paint on top of
+          the bubble background. Hidden until hover/focus to keep the
+          chat surface visually quiet. */}
+      {input.length > 0 && (
+        <CopyButton
+          text={input}
+          title="Copy message"
+          label="Copied message"
+          className="mt-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+        />
+      )}
       <div className="max-w-[80%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
         {input.length > 0 && (
           <p className="whitespace-pre-wrap">{input}</p>

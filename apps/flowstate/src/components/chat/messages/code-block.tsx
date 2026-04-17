@@ -7,6 +7,7 @@ import type {
 import pierreDark from "@pierre/theme/pierre-dark";
 import pierreLight from "@pierre/theme/pierre-light";
 import { useTheme } from "@/hooks/use-theme";
+import { CopyButton } from "./copy-button";
 
 // Languages preloaded into the highlighter. Adding more is free at
 // runtime cost — shiki bundles the grammars statically. Trim if the
@@ -101,13 +102,29 @@ function CodeBlockInner({ code, language }: CodeBlockProps) {
     };
   }, [code, language, resolvedTheme]);
 
+  // Copy button floats in the top-right of the block. Background +
+  // backdrop-blur so it stays legible on both the muted fallback
+  // and shiki's theme-specific block colors without needing to
+  // branch on theme.
+  const copyButton = (
+    <CopyButton
+      text={code}
+      title="Copy code"
+      label="Copied code"
+      className="absolute right-1.5 top-1.5 z-10 bg-background/70 opacity-0 backdrop-blur transition-opacity group-hover:opacity-100 focus-visible:opacity-100"
+    />
+  );
+
   if (html === null) {
     // Plain fallback while shiki initializes (one-time, ~100-300ms cold)
     // or for unsupported languages. Matches the previous code block look.
     return (
-      <pre className="mb-3 overflow-x-auto rounded-md border border-border bg-muted p-3 font-mono text-xs last:mb-0">
-        <code className="font-mono">{code}</code>
-      </pre>
+      <div className="group relative mb-3 last:mb-0">
+        {copyButton}
+        <pre className="overflow-x-auto rounded-md border border-border bg-muted p-3 font-mono text-xs">
+          <code className="font-mono">{code}</code>
+        </pre>
+      </div>
     );
   }
 
@@ -115,10 +132,13 @@ function CodeBlockInner({ code, language }: CodeBlockProps) {
   // <code>...</code></pre>. Wrap in our own div for the rounded border
   // and overflow handling, force tighter padding via arbitrary variant.
   return (
-    <div
-      className="mb-3 overflow-x-auto rounded-md border border-border text-xs last:mb-0 [&>pre]:!p-3 [&>pre]:overflow-x-auto"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
+    <div className="group relative mb-3 overflow-hidden rounded-md border border-border text-xs last:mb-0">
+      {copyButton}
+      <div
+        className="overflow-x-auto [&>pre]:!p-3 [&>pre]:overflow-x-auto"
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    </div>
   );
 }
 

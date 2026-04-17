@@ -1451,26 +1451,38 @@ fn control_error(request_id: &str, error: &str) -> Value {
 }
 
 fn claude_cli_models() -> Vec<ProviderModel> {
+    // Matches the capability table in provider-claude-sdk — the CLI
+    // reaches the same Anthropic model family.
     vec![
         ProviderModel {
             value: "claude-sonnet-4-6".to_string(),
             label: "Claude Sonnet 4.6".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
         ProviderModel {
             value: "claude-opus-4-6".to_string(),
             label: "Claude Opus 4.6".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
         ProviderModel {
             value: "claude-opus-4-5".to_string(),
             label: "Claude Opus 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(32_000),
         },
         ProviderModel {
             value: "claude-haiku-4-5".to_string(),
             label: "Claude Haiku 4.5".to_string(),
+            context_window: Some(200_000),
+            max_output_tokens: Some(64_000),
         },
     ]
 }
