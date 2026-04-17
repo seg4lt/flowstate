@@ -78,6 +78,15 @@ export function MessageList({
 }: MessageListProps) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
+  // `suppressJump` hides the "Jump to latest" affordance while a user-
+  // initiated send is actively being scrolled to the bottom. Without
+  // this, Virtuoso's `atBottomStateChange` fires `false` the moment the
+  // optimistic pending row grows the list past the 80px threshold, and
+  // the button flashes for the duration of the smooth scroll animation.
+  const [suppressJump, setSuppressJump] = React.useState(false);
+  const suppressTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
   // chat-view maintains turn.blocks live during streaming, so a single
   // pass over turns[] is enough. The pending optimistic row covers the
@@ -130,15 +139,38 @@ export function MessageList({
   React.useEffect(() => {
     if (userSendTick === lastSendTickRef.current) return;
     lastSendTickRef.current = userSendTick;
+    // Hide the "Jump to latest" affordance briefly while we jump. 400ms
+    // is plenty for an instant scroll to settle and for Virtuoso's
+    // `atBottomStateChange(true)` to fire; after the timer clears,
+    // `atBottom` is trustworthy again.
+    setSuppressJump(true);
+    if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
+    suppressTimerRef.current = setTimeout(() => setSuppressJump(false), 400);
     const raf = requestAnimationFrame(() => {
+      // `behavior: "auto"` (instant) is required here. A smooth scroll
+      // across Virtuoso's virtualized list leaves the in-between items
+      // unrendered during the animation — the user sees a blank/black
+      // viewport until a re-render is triggered (e.g., by manual
+      // scroll). Instant scroll teleports to the new position and
+      // Virtuoso immediately renders the items in the destination
+      // window. This matches the thread-open effect above.
       virtuosoRef.current?.scrollToIndex({
         index: "LAST",
         align: "end",
-        behavior: "smooth",
+        behavior: "auto",
       });
     });
     return () => cancelAnimationFrame(raf);
   }, [userSendTick]);
+
+  // Clear any pending suppression timer on unmount so we don't
+  // setState on a torn-down component (e.g., if the user navigates
+  // away mid-send).
+  React.useEffect(() => {
+    return () => {
+      if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
+    };
+  }, []);
 
   // Cold-cache case: no turns in hand yet AND the daemon hasn't
   // replied. Render a small loader inline in the scroll region
@@ -193,7 +225,7 @@ export function MessageList({
         components={{ EmptyPlaceholder }}
       />
 
-      {!atBottom && displayItems.length > 0 && (
+      {!atBottom && !suppressJump && displayItems.length > 0 && (
         <button
           type="button"
           onClick={() => {
