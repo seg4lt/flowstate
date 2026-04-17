@@ -33,10 +33,6 @@ interface ChatInputProps {
   /** Active session's provider. Drives invocation formatting — Codex
    *  uses `$name`, everyone else uses `/name`. */
   provider?: ProviderKind;
-  /** Fires on the false→true edge of the popup opening. ChatView uses
-   *  this to trigger a debounced `refresh_session_commands` so disk
-   *  changes (e.g. a new SKILL.md) surface without a session reload. */
-  onPopupOpen?: () => void;
   /** Seed text to restore when the component remounts after a tab
    *  switch. The component is keyed by sessionId so it remounts on
    *  every thread change — this prop lets the parent supply the saved
@@ -122,7 +118,6 @@ export function ChatInput({
   toolbar,
   commands,
   provider,
-  onPopupOpen,
   initialValue = "",
   onDraftChange,
   initialQueue,
@@ -217,18 +212,6 @@ export function ChatInput({
   React.useEffect(() => {
     setPopupIndex(0);
   }, [matches.length, inputToken]);
-
-  // Rising-edge fire: every time the popup opens (false→true), ping
-  // the parent so it can trigger a debounced catalog refresh. Keeps
-  // disk changes (new SKILL.md) visible without a full session reload.
-  const prevShowPopupRef = React.useRef(false);
-  React.useEffect(() => {
-    const prev = prevShowPopupRef.current;
-    prevShowPopupRef.current = showPopup;
-    if (!prev && showPopup) {
-      onPopupOpen?.();
-    }
-  }, [showPopup, onPopupOpen]);
 
   // Track the last skill token we pre-filled into the composer from a
   // popup select. When the user hits Enter on that exact token (no

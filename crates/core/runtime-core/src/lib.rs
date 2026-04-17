@@ -674,11 +674,23 @@ impl RuntimeCore {
             ClientMessage::LoadSession { session_id, limit } => {
                 match self.live_session_detail_limited(&session_id, limit).await {
                     Some(mut session) => {
-                        // Populate cwd so the catalog refresh can scan
-                        // project-local skills. Fire-and-forget — the
-                        // SessionLoaded response doesn't wait for it.
+                        // Only spawn a catalog refresh the first time we see
+                        // a session id since daemon start. Switching back
+                        // and forth between threads would otherwise retrigger
+                        // the refresh on every navigation — on Claude SDK
+                        // that's a Node bridge spawn per click. The cached
+                        // catalog lives until the daemon restarts; the user
+                        // gets a fresh one by creating a new thread.
                         self.resolve_session_cwd(&mut session).await;
-                        self.spawn_catalog_refresh(session.clone());
+                        let already_cached = self
+                            .session_command_catalogs
+                            .read()
+                            .ok()
+                            .map(|map| map.contains_key(&session_id))
+                            .unwrap_or(false);
+                        if !already_cached {
+                            self.spawn_catalog_refresh(session.clone());
+                        }
                         Some(ServerMessage::SessionLoaded { session })
                     }
                     None => Some(ServerMessage::Error {
@@ -1675,17 +1687,6 @@ impl RuntimeCore {
             session: session.summary.clone(),
             turn: merged_turn,
         });
-
-        // Re-refresh the command catalog after every completed turn.
-        // Adapters with runtime-captured built-ins (Claude CLI parses
-        // `system/init` during the stream-json loop) only know the
-        // provider's full command list AFTER their first subprocess
-        // spawn, so this post-turn refresh is what surfaces built-ins
-        // and sub-agents in the popup. Cheap on cache-hit; the dedup
-        // guard on spawn_catalog_refresh collapses bursts.
-        if status == TurnStatus::Completed {
-            self.spawn_catalog_refresh(session);
-        }
 
         result
     }

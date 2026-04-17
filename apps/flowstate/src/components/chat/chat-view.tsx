@@ -633,29 +633,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, [session, isProviderEnabled]);
 
   // Per-session slash-command catalog. Populated by the daemon via
-  // `session_command_catalog_updated` on session start / load and on
-  // explicit refresh. Merged with core commands for the popup.
+  // `session_command_catalog_updated` on session start / load. The
+  // catalog is static for the session's lifetime — to pick up new
+  // disk SKILL.md files or a provider CLI upgrade, create a new
+  // thread. Nothing in the composer auto-refreshes the catalog.
   const commandCatalog = useSessionCommandCatalog(sessionId);
   const slashCommands = React.useMemo(
     () => mergeCommandsWithCatalog(commandCatalog),
     [commandCatalog],
   );
 
-  // Debounced catalog refresh triggered by the composer when the
-  // slash popup opens. Keeps disk changes (e.g. a new SKILL.md)
-  // visible without a full session reload while coalescing rapid
-  // re-opens (e.g. slash → delete → slash) into a single round-trip.
-  const REFRESH_SKILLS_DEBOUNCE_MS = 400;
-  const lastRefreshRef = React.useRef(0);
-  const handlePopupOpen = React.useCallback(() => {
-    const now = Date.now();
-    if (now - lastRefreshRef.current < REFRESH_SKILLS_DEBOUNCE_MS) return;
-    lastRefreshRef.current = now;
-    void sendMessage({
-      type: "refresh_session_commands",
-      session_id: sessionId,
-    });
-  }, [sessionId]);
   const projectPath = React.useMemo(() => {
     if (!session?.projectId) return null;
     return state.projects.find((p) => p.projectId === session.projectId)?.path ?? null;
@@ -1568,7 +1555,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             toolbar={toolbar}
             commands={slashCommands}
             provider={session?.provider}
-            onPopupOpen={handlePopupOpen}
             initialValue={sessionDrafts.get(sessionId) ?? ""}
             onDraftChange={handleDraftChange}
             initialQueue={sessionQueues.get(sessionId)}
