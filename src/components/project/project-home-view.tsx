@@ -464,6 +464,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
         <div className="ml-auto flex items-center gap-1">
           <ProviderDropdown
             projectId={projectId}
+            projectPath={gitRoot ?? projectPath}
             trigger={
               <button
                 type="button"
@@ -658,6 +659,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                         <Terminal className="h-3.5 w-3.5" />
                       </button>
                       <ProviderDropdown
+                        projectPath={wt.path}
                         onSelect={(provider, model) =>
                           void startThreadOnWorktree(wt, provider, model)
                         }
