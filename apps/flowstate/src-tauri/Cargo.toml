@@ -1,0 +1,71 @@
+[package]
+name = "flowstate"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "flowstate_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+# Auto-updater. Pulls signed manifests from the URL configured in
+# tauri.conf.json (`plugins.updater.endpoints`) and verifies them
+# against the embedded `pubkey`. The matching private key lives
+# only as the `TAURI_SIGNING_PRIVATE_KEY` GitHub secret used by
+# the release workflow — losing it means losing the ability to
+# ship updates to existing installs.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+dirs = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# ripgrep's gitignore-aware walker — used by the /code editor view
+# to list project files for the Cmd+P-style picker. Respects
+# .gitignore automatically so we don't walk into node_modules/
+# target/ etc.
+ignore = "0.4"
+# ripgrep's matcher + line searcher. Same lineage as `ignore`,
+# powers the editor view's content-search command. Pure library,
+# no `rg` binary or subprocess.
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+
+# Daemon core with opted-in features: every provider adapter, plus
+# the Tauri transport. flowstate ships with all providers compiled in
+# and lets users toggle them at runtime from Settings. transport-tauri
+# is re-exported by daemon-core as `zenui_daemon_core::transport_tauri`.
+zenui-daemon-core = { git = "https://github.com/seg4lt/rs-agent-sdk.git", branch = "main", features = ["all-providers", "transport-tauri"] }
+
+# Types used in Tauri commands
+zenui-provider-api = { git = "https://github.com/seg4lt/rs-agent-sdk.git", branch = "main" }
+zenui-runtime-core = { git = "https://github.com/seg4lt/rs-agent-sdk.git", branch = "main" }
+
+# Async
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Integrated terminal — PTY allocation and process spawn. Powers the
+# Cmd+J dock. Cross-platform (UNIX openpty, Windows ConPTY) via
+# wezterm's battle-tested abstraction.
+portable-pty = "0.9"
+
+# Flowstate-app-owned key/value store for user-tunable settings
+# (highlighter pool size, future tweaks). Lives in its own SQLite
+# file under Tauri's app_data_dir, intentionally separate from the
+# agent SDK's persistence — the SDK owns session/agent state, the
+# app owns app-level configuration. The rusqlite version matches
+# what the SDK uses transitively so libsqlite3-sys can be shared
+# across the dependency graph (Cargo refuses two crates linking to
+# the same native `sqlite3` library at different versions).
+rusqlite = { version = "0.37", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

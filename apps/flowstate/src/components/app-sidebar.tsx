@@ -1,0 +1,503 @@
+import * as React from "react";
+import { useLocation, useNavigate } from "@tanstack/react-router";
+import { open } from "@tauri-apps/plugin-dialog";
+import {
+  Archive,
+  ChevronRight,
+  EllipsisVertical,
+  FolderIcon,
+  FolderMinus,
+  Plus,
+  Settings,
+  MessageSquare,
+  Trash2,
+} from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupAction,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
+  SidebarRail,
+  useSidebar,
+} from "@/components/ui/sidebar";
+import { useApp } from "@/stores/app-store";
+import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
+import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
+import { ThreadItem } from "@/components/sidebar/thread-item";
+import type { SessionSummary } from "@/lib/types";
+
+export function AppSidebar() {
+  const { state, send, createProject } = useApp();
+  const navigate = useNavigate();
+  const location = useLocation();
+  // On a narrow window the sidebar renders as a full-screen Sheet
+  // overlay that covers the chat view. Without `closeIfMobile()` the
+  // sheet stays open after the user picks a thread and they have to
+  // hunt for the backdrop to dismiss it — "open close is broken" as
+  // far as the user is concerned. Desktop ignores it.
+  const { isMobile, setOpenMobile } = useSidebar();
+  const closeIfMobile = React.useCallback(() => {
+    if (isMobile) setOpenMobile(false);
+  }, [isMobile, setOpenMobile]);
+
+  // Look up display metadata (titles, names) from the app-side store.
+  // The SDK only knows ids + runtime state; anything the user sees as
+  // a label comes from `state.sessionDisplay` / `state.projectDisplay`.
+  const sessionTitle = (sessionId: string): string => {
+    return state.sessionDisplay.get(sessionId)?.title ?? "";
+  };
+  const projectName = (projectId: string): string => {
+    return state.projectDisplay.get(projectId)?.name ?? "Untitled project";
+  };
+
+  // Group sessions by project. Sessions whose projectId points at a
+  // project that no longer exists (deleted/tombstoned) are filtered
+  // out entirely instead of being dumped into the unassigned bucket
+  // — they're "hibernating" until the user re-adds the same folder
+  // as a project, at which point the persistence layer un-tombstones
+  // the original project_id and they reappear under it.
+  //
+  // Worktree projects are a special case: each git worktree gets its
+  // own SDK project so the agent runs with cwd = worktree folder,
+  // but visually the user sees ONE project in the sidebar. We pull
+  // the parent projectId out of `projectWorktrees` and use that as
+  // the grouping key so worktree threads land under the main repo's
+  // section, not as separate top-level entries.
+  const knownProjectIds = new Set(state.projects.map((p) => p.projectId));
+  const worktreeProjectIds = new Set(state.projectWorktrees.keys());
+  const effectiveProjectId = (rawProjectId: string | null): string | null => {
+    if (!rawProjectId) return null;
+    return (
+      state.projectWorktrees.get(rawProjectId)?.parentProjectId ?? rawProjectId
+    );
+  };
+  const sessionsByProject = new Map<string | null, SessionSummary[]>();
+  for (const session of state.sessions.values()) {
+    if (session.projectId && !knownProjectIds.has(session.projectId)) {
+      continue;
+    }
+    const key = effectiveProjectId(session.projectId ?? null);
+    const list = sessionsByProject.get(key) ?? [];
+    list.push(session);
+    sessionsByProject.set(key, list);
+  }
+  for (const list of sessionsByProject.values()) {
+    list.sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
+  }
+
+  // Group archived sessions by project
+  const projectNameMap = new Map<string, string>();
+  for (const p of state.projects) {
+    projectNameMap.set(p.projectId, projectName(p.projectId));
+  }
+
+  const archivedByProject = new Map<string | null, SessionSummary[]>();
+  for (const session of state.archivedSessions) {
+    // If projectId exists and is still a known project, group under
+    // the EFFECTIVE parent (rolling up worktree projects to their
+    // main repo); otherwise fall through to "General". This mirrors
+    // the active-session grouping above so archived worktree threads
+    // show under the same visual project they always did.
+    const rolledUp = effectiveProjectId(session.projectId ?? null);
+    const key = rolledUp && projectNameMap.has(rolledUp) ? rolledUp : null;
+    const list = archivedByProject.get(key) ?? [];
+    list.push(session);
+    archivedByProject.set(key, list);
+  }
+  for (const list of archivedByProject.values()) {
+    list.sort(
+      (a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
+  }
+
+  // Build sorted groups: named projects alphabetically, then "General" last
+  const archivedGroups: {
+    key: string;
+    name: string;
+    sessions: SessionSummary[];
+  }[] = [];
+  const namedGroups: typeof archivedGroups = [];
+  for (const [projectId, sessions] of archivedByProject) {
+    if (projectId) {
+      namedGroups.push({
+        key: projectId,
+        name: projectNameMap.get(projectId) ?? "Unknown",
+        sessions,
+      });
+    }
+  }
+  namedGroups.sort((a, b) => a.name.localeCompare(b.name));
+  archivedGroups.push(...namedGroups);
+  const generalSessions = archivedByProject.get(null);
+  if (generalSessions && generalSessions.length > 0) {
+    archivedGroups.push({
+      key: "__general__",
+      name: "General",
+      sessions: generalSessions,
+    });
+  }
+
+  async function handleAddFolder() {
+    const selected = await open({ directory: true, multiple: false });
+    if (!selected) return;
+    const path = typeof selected === "string" ? selected : selected[0];
+    if (!path) return;
+    const name = path.split("/").pop() ?? path;
+    await createProject(path, name);
+  }
+
+  async function handleRemoveProject(projectId: string) {
+    await send({ type: "delete_project", project_id: projectId });
+  }
+
+  function handleThreadClick(sessionId: string) {
+    navigate({ to: "/chat/$sessionId", params: { sessionId } });
+    closeIfMobile();
+  }
+
+  function handleProjectClick(projectId: string) {
+    navigate({ to: "/project/$projectId", params: { projectId } });
+    closeIfMobile();
+  }
+
+  // Pull worktree metadata for a given session's SDK project. If the
+  // session is tied to a project_worktree row we surface the branch
+  // label + the worktree folder path so ThreadItem can render the
+  // branch icon + tooltip. For main-project threads both are null.
+  function worktreeInfo(session: SessionSummary): {
+    branch: string | null;
+    path: string | null;
+  } {
+    if (!session.projectId) return { branch: null, path: null };
+    const link = state.projectWorktrees.get(session.projectId);
+    if (!link) return { branch: null, path: null };
+    const wtProject = state.projects.find(
+      (p) => p.projectId === session.projectId,
+    );
+    return { branch: link.branch ?? null, path: wtProject?.path ?? null };
+  }
+
+  const unassigned = sessionsByProject.get(null) ?? [];
+
+  return (
+    <Sidebar collapsible="offcanvas">
+      <SidebarHeader className="h-12 flex-row items-center justify-start border-b border-sidebar-border px-4 py-0">
+        <span className="text-sm font-semibold tracking-tight [[data-collapsible=icon]_&]:hidden">
+          flowstate
+        </span>
+      </SidebarHeader>
+
+      <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupLabel>Projects</SidebarGroupLabel>
+          <SidebarGroupAction title="Add folder" onClick={handleAddFolder}>
+            <Plus />
+            <span className="sr-only">Add folder</span>
+          </SidebarGroupAction>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {/* Folder-less threads */}
+              <Collapsible defaultOpen className="group/collapsible">
+                <SidebarMenuItem className="group/project">
+                  <CollapsibleTrigger asChild>
+                    <SidebarMenuButton tooltip="General">
+                      <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                      <MessageSquare />
+                      <span className="flex-1 truncate">General</span>
+                    </SidebarMenuButton>
+                  </CollapsibleTrigger>
+                  <div className="absolute right-1 top-1">
+                    <ProviderDropdown />
+                  </div>
+                  <CollapsibleContent>
+                    <SidebarMenuSub>
+                      {unassigned.map((session) => {
+                        const wt = worktreeInfo(session);
+                        return (
+                          <ThreadItem
+                            key={session.sessionId}
+                            sessionId={session.sessionId}
+                            title={sessionTitle(session.sessionId)}
+                            updatedAt={session.updatedAt}
+                            isActive={
+                              state.activeSessionId === session.sessionId
+                            }
+                            worktreeBranch={wt.branch}
+                            worktreePath={wt.path}
+                            running={session.status === "running"}
+                            awaitingInput={state.awaitingInputSessionIds.has(
+                              session.sessionId,
+                            )}
+                            pendingDone={state.doneSessionIds.has(
+                              session.sessionId,
+                            )}
+                            onClick={() =>
+                              handleThreadClick(session.sessionId)
+                            }
+                          />
+                        );
+                      })}
+                      {unassigned.length === 0 && (
+                        <SidebarMenuSubItem>
+                          <span className="px-2 py-1 text-xs text-muted-foreground">
+                            No threads yet
+                          </span>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </SidebarMenuItem>
+              </Collapsible>
+
+              {state.projects
+                .filter((project) => !worktreeProjectIds.has(project.projectId))
+                .map((project) => {
+                const threads =
+                  sessionsByProject.get(project.projectId) ?? [];
+                const isActive =
+                  location.pathname === `/project/${project.projectId}`;
+                return (
+                  <Collapsible
+                    key={project.projectId}
+                    defaultOpen
+                    className="group/collapsible"
+                  >
+                    <SidebarMenuItem className="group/project">
+                      <SidebarMenuButton
+                        tooltip={projectName(project.projectId)}
+                        isActive={isActive}
+                        onClick={() => handleProjectClick(project.projectId)}
+                        className="pl-7 pr-14"
+                      >
+                        <FolderIcon />
+                        <span className="flex-1 truncate">
+                          {projectName(project.projectId)}
+                        </span>
+                      </SidebarMenuButton>
+                      {/* The chevron is its own CollapsibleTrigger now so
+                          the rest of the row is free to navigate. Anchored
+                          to `top-1` (not `top-1/2`) because SidebarMenuItem
+                          is the li that also contains CollapsibleContent —
+                          "50%" of that expanded box is halfway down the
+                          thread list, not halfway down the header row.
+                          Same trick the right-side action cluster uses. */}
+                      <CollapsibleTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label={`Toggle ${projectName(project.projectId)} threads`}
+                          onClick={(e) => e.stopPropagation()}
+                          className="absolute left-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground outline-none hover:text-foreground"
+                        >
+                          <ChevronRight className="h-4 w-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                        </button>
+                      </CollapsibleTrigger>
+                      <div className="absolute right-1 top-1 flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          title="Remove project"
+                          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/project:opacity-100"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveProject(project.projectId);
+                          }}
+                        >
+                          <FolderMinus className="h-3.5 w-3.5" />
+                        </button>
+                        <WorktreeAwareNewThread projectId={project.projectId} projectPath={project.path} />
+                      </div>
+                      <CollapsibleContent>
+                        <SidebarMenuSub>
+                          {threads.map((session) => {
+                            const wt = worktreeInfo(session);
+                            return (
+                              <ThreadItem
+                                key={session.sessionId}
+                                sessionId={session.sessionId}
+                                title={sessionTitle(session.sessionId)}
+                                updatedAt={session.updatedAt}
+                                isActive={
+                                  state.activeSessionId === session.sessionId
+                                }
+                                worktreeBranch={wt.branch}
+                                worktreePath={wt.path}
+                                running={session.status === "running"}
+                                awaitingInput={state.awaitingInputSessionIds.has(
+                                  session.sessionId,
+                                )}
+                                pendingDone={state.doneSessionIds.has(
+                                  session.sessionId,
+                                )}
+                                onClick={() =>
+                                  handleThreadClick(session.sessionId)
+                                }
+                              />
+                            );
+                          })}
+                          {threads.length === 0 && (
+                            <SidebarMenuSubItem>
+                              <span className="px-2 py-1 text-xs text-muted-foreground">
+                                No threads yet
+                              </span>
+                            </SidebarMenuSubItem>
+                          )}
+                        </SidebarMenuSub>
+                      </CollapsibleContent>
+                    </SidebarMenuItem>
+                  </Collapsible>
+                );
+              })}
+              {/* Archived threads */}
+              <Collapsible
+                className="group/collapsible"
+                onOpenChange={(open) => {
+                  if (open) {
+                    send({ type: "list_archived_sessions" });
+                  }
+                }}
+              >
+                <SidebarMenuItem>
+                  <CollapsibleTrigger asChild>
+                    <SidebarMenuButton tooltip="Archived">
+                      <ChevronRight className="transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                      <Archive />
+                      <span className="flex-1 truncate">Archived</span>
+                    </SidebarMenuButton>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <SidebarMenuSub>
+                      {archivedGroups.map((group) => (
+                        <Collapsible
+                          key={group.key}
+                          className="group/archived-project"
+                        >
+                          <SidebarMenuSubItem>
+                            <CollapsibleTrigger asChild>
+                              <SidebarMenuSubButton className="h-7 w-full min-w-0">
+                                <ChevronRight className="h-3 w-3 shrink-0 transition-transform duration-200 group-data-[state=open]/archived-project:rotate-90" />
+                                <span className="flex-1 truncate text-xs font-medium">
+                                  {group.name}
+                                </span>
+                                <span className="text-[10px] tabular-nums text-muted-foreground">
+                                  {group.sessions.length}
+                                </span>
+                              </SidebarMenuSubButton>
+                            </CollapsibleTrigger>
+                            <CollapsibleContent>
+                              <SidebarMenuSub className="mx-2 px-1.5">
+                                {group.sessions.map((session) => (
+                                  <SidebarMenuSubItem
+                                    key={session.sessionId}
+                                    className="group/thread -mr-6"
+                                  >
+                                    <SidebarMenuSubButton
+                                      className="h-7 w-full min-w-0 cursor-pointer rounded-r-none pr-12"
+                                      onClick={() =>
+                                        handleThreadClick(session.sessionId)
+                                      }
+                                    >
+                                      <span className="flex-1 truncate text-xs">
+                                        {sessionTitle(session.sessionId) ||
+                                          "New thread"}
+                                      </span>
+                                    </SidebarMenuSubButton>
+                                    <div
+                                      className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
+                                      onClick={(e) => e.stopPropagation()}
+                                      onKeyDown={(e) => e.stopPropagation()}
+                                    >
+                                      <DropdownMenu>
+                                        <DropdownMenuTrigger asChild>
+                                          <button
+                                            type="button"
+                                            className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
+                                          >
+                                            <EllipsisVertical className="h-3 w-3" />
+                                          </button>
+                                        </DropdownMenuTrigger>
+                                        <DropdownMenuContent
+                                          align="start"
+                                          className="min-w-32"
+                                        >
+                                          <DropdownMenuItem
+                                            variant="destructive"
+                                            onClick={() =>
+                                              send({
+                                                type: "delete_session",
+                                                session_id: session.sessionId,
+                                              })
+                                            }
+                                          >
+                                            <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                            Delete
+                                          </DropdownMenuItem>
+                                        </DropdownMenuContent>
+                                      </DropdownMenu>
+                                    </div>
+                                  </SidebarMenuSubItem>
+                                ))}
+                              </SidebarMenuSub>
+                            </CollapsibleContent>
+                          </SidebarMenuSubItem>
+                        </Collapsible>
+                      ))}
+                      {state.archivedSessions.length === 0 && (
+                        <SidebarMenuSubItem>
+                          <span className="px-2 py-1 text-xs text-muted-foreground">
+                            No archived threads
+                          </span>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </SidebarMenuItem>
+              </Collapsible>
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+      </SidebarContent>
+
+      <SidebarFooter className="border-t border-sidebar-border">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Settings"
+              onClick={() => {
+                navigate({ to: "/settings" });
+                closeIfMobile();
+              }}
+            >
+              <Settings />
+              <span>Settings</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarFooter>
+      <SidebarRail />
+    </Sidebar>
+  );
+}

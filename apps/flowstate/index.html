@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>flowstate</title>
+    <style>
+      html, body { margin: 0; }
+      html.dark body { background-color: #252525; color: #fbfbfb; }
+      html:not(.dark) body { background-color: #ffffff; color: #1a1a1a; }
+      #root { min-height: 100vh; }
+      .splash {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 100vh;
+        color: inherit;
+        font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+        font-size: 2rem;
+        font-weight: 600;
+      }
+      .splash-text {
+        display: inline-block;
+        width: 10ch;
+        text-align: left;
+        white-space: nowrap;
+      }
+      .typewriter {
+        display: inline-block;
+        overflow: hidden;
+        vertical-align: bottom;
+        width: 0;
+        animation: type 0.7s steps(9, end) forwards;
+      }
+      .cursor {
+        display: inline-block;
+        vertical-align: bottom;
+        animation: blink 1s infinite;
+      }
+      @keyframes type {
+        to { width: 9ch; }
+      }
+      @keyframes blink {
+        0%, 49.99% { opacity: 1; }
+        50%, 100% { opacity: 0; }
+      }
+    </style>
+    <script>
+      // Synchronous theme bootstrap — runs before first paint to prevent
+      // flash-of-wrong-theme. Reads the persisted preference from
+      // localStorage and applies the .dark class on <html> immediately.
+      (function () {
+        var pref = localStorage.getItem("flowstate:theme") || "dark";
+        var dark =
+          pref === "dark" ||
+          (pref === "system" &&
+            window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("dark");
+      })();
+    </script>
+  </head>
+
+  <body>
+    <div id="root">
+      <div class="splash">
+        <div class="splash-text">
+          <span class="typewriter">flowstate</span><span class="cursor">_</span>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
