@@ -10,10 +10,11 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    FileOperation, PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind,
-    ProviderModel, ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail, TokenUsage,
-    TurnEventSink, UserInput, UserInputOption, UserInputQuestion,
+    CommandCatalog, CommandKind, FileOperation, McpServerInfo, PermissionDecision, PermissionMode,
+    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
+    ProviderTurnOutput, RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail, SkillSource,
+    TokenUsage, TurnEventSink, UserInput, UserInputOption, UserInputQuestion, skills_disk,
 };
 
 /// Maps Anthropic's rate-limit bucket ids to the human-readable
@@ -97,15 +98,45 @@ struct CliRateLimitInfo {
     is_using_overage: Option<bool>,
 }
 
+/// Shape of an `mcp_servers[]` entry inside the init payload — name +
+/// authentication status. `status` is a best-effort string ("connected",
+/// "needs-auth", "failed", …) we expose as the `enabled` flag.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct CliMcpServer {
+    name: String,
+    status: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum CliEvent {
     /// Initialisation and other system-level messages from the CLI.
+    ///
+    /// When `subtype == "init"`, the payload also carries
+    /// `slash_commands`, `agents`, `skills`, and `mcp_servers`. All are
+    /// optional and default to empty so `subtype != "init"` messages
+    /// (status updates, compacted events, …) continue to parse.
     System {
         #[serde(default)]
         subtype: Option<String>,
         #[serde(default)]
         session_id: Option<String>,
+        /// Every slash command the CLI exposes — a superset of
+        /// `skills`. Entries not in `skills` are provider-native
+        /// built-ins (e.g. `compact`, `context`, `cost`).
+        #[serde(default)]
+        slash_commands: Vec<String>,
+        /// Sub-agents the CLI was started with. Names only; the init
+        /// payload doesn't include descriptions.
+        #[serde(default)]
+        agents: Vec<String>,
+        /// Subset of `slash_commands` that are user-authored SKILL.md
+        /// entries. Used to tag them as UserSkill in the catalog.
+        #[serde(default)]
+        skills: Vec<String>,
+        #[serde(default)]
+        mcp_servers: Vec<CliMcpServer>,
     },
     /// Incremental stream events carrying individual content-block deltas
     /// (text tokens, thinking tokens). These arrive *before* the final
@@ -188,11 +219,27 @@ enum CliEvent {
 
 // ── adapter ──────────────────────────────────────────────────────────────────
 
+/// Snapshot of the init payload for a single session. Captured the
+/// first time the stream-json loop sees a `system/init` line and read
+/// back from `session_command_catalog` so the popup shows the CLI's
+/// full set of built-in commands and sub-agents.
+#[derive(Debug, Clone, Default)]
+struct InitSnapshot {
+    slash_commands: Vec<String>,
+    agents: Vec<String>,
+    skills: Vec<String>,
+    mcp_servers: Vec<(String, Option<String>)>,
+}
+
 #[derive(Clone)]
 pub struct ClaudeCliAdapter {
     working_directory: PathBuf,
     /// One active process per session (for interrupt support).
     active_processes: Arc<Mutex<HashMap<String, Arc<Mutex<ClaudeCliProcess>>>>>,
+    /// Per-session `system/init` payload cache. Populated inside
+    /// `run_turn`'s stream-json loop, read by `session_command_catalog`.
+    /// Sessions without a cached snapshot fall back to disk-only results.
+    init_cache: Arc<Mutex<HashMap<String, InitSnapshot>>>,
 }
 
 impl ClaudeCliAdapter {
@@ -200,6 +247,7 @@ impl ClaudeCliAdapter {
         Self {
             working_directory,
             active_processes: Arc::new(Mutex::new(HashMap::new())),
+            init_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -356,12 +404,41 @@ impl ClaudeCliAdapter {
             };
 
             match event {
-                CliEvent::System { subtype, session_id: sid } => {
+                CliEvent::System {
+                    subtype,
+                    session_id: sid,
+                    slash_commands,
+                    agents,
+                    skills,
+                    mcp_servers,
+                } => {
                     if let Some(sub) = &subtype {
                         debug!("claude CLI system: subtype={sub}");
                     }
                     if let Some(id) = sid {
                         cli_session_id = Some(id);
+                    }
+                    // The init payload arrives once per subprocess,
+                    // keyed under `subtype = "init"`. Cache it under
+                    // our session id so `session_command_catalog` can
+                    // merge built-ins with the disk scan without
+                    // spawning a dedicated probe.
+                    if subtype.as_deref() == Some("init")
+                        && (!slash_commands.is_empty()
+                            || !agents.is_empty()
+                            || !mcp_servers.is_empty())
+                    {
+                        let snapshot = InitSnapshot {
+                            slash_commands,
+                            agents,
+                            skills,
+                            mcp_servers: mcp_servers
+                                .into_iter()
+                                .map(|m| (m.name, m.status))
+                                .collect(),
+                        };
+                        let mut guard = self.init_cache.lock().await;
+                        guard.insert(session_id.clone(), snapshot);
                     }
                 }
 
@@ -981,7 +1058,120 @@ impl ProviderAdapter for ClaudeCliAdapter {
             let _ = proc.child.start_kill();
         }
 
+        // Drop the init snapshot alongside the process — session is
+        // gone, cache entry has no further consumers.
+        self.init_cache.lock().await.remove(session_id);
+
         Ok(())
+    }
+
+    /// Build the catalog by merging (a) this session's most recent
+    /// `system/init` snapshot, captured inside `run_turn` the first
+    /// time the CLI subprocess speaks, with (b) the disk scan shared
+    /// by every adapter's default impl.
+    ///
+    /// On cache miss (no turn has happened yet for this session) the
+    /// result is disk-only — the popup still shows user SKILL.md
+    /// entries, and the built-ins fill in after the user's first
+    /// message completes the round-trip (runtime-core re-triggers
+    /// spawn_catalog_refresh on TurnCompleted).
+    async fn session_command_catalog(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<CommandCatalog, String> {
+        let (home_dirs, project_dirs) = self.skill_scan_roots();
+        let cwd = session.cwd.as_deref().map(Path::new);
+        let roots = skills_disk::scan_roots_for(home_dirs, project_dirs, cwd);
+        let mut commands = skills_disk::scan(&roots, self.kind());
+
+        let snapshot = {
+            let guard = self.init_cache.lock().await;
+            guard.get(&session.summary.session_id).cloned()
+        };
+        let mut agents_out: Vec<ProviderAgent> = Vec::new();
+        let mut mcp_out: Vec<McpServerInfo> = Vec::new();
+
+        if let Some(snap) = snapshot {
+            // Fast name-lookup of disk-side skills so we don't
+            // double-list a user skill as a "built-in" just because
+            // Claude lists it in `slash_commands`.
+            let disk_names: std::collections::HashSet<String> =
+                commands.iter().map(|c| c.name.clone()).collect();
+            let skills_set: std::collections::HashSet<&str> =
+                snap.skills.iter().map(String::as_str).collect();
+
+            for name in &snap.slash_commands {
+                if disk_names.contains(name) {
+                    continue;
+                }
+                // The CLI flags skill-style entries via its `skills`
+                // array; treat everything else as a provider-native
+                // built-in. The init payload has no descriptions —
+                // show a generic label and let the command itself
+                // explain on invocation.
+                let is_skill = skills_set.contains(name.as_str());
+                let kind = if is_skill {
+                    CommandKind::UserSkill {
+                        // The CLI doesn't tell us where the skill
+                        // lives on disk; default to Global since
+                        // that's where unscoped CLI skills usually
+                        // live (`~/.claude/`). Project-rooted ones
+                        // are picked up by the disk scan above and
+                        // take precedence via `disk_names`.
+                        source: SkillSource::DiskGlobal,
+                    }
+                } else {
+                    CommandKind::Builtin
+                };
+                commands.push(ProviderCommand {
+                    id: format!("claude_cli:{}:{}", tag_for_kind(kind), name),
+                    name: name.clone(),
+                    description: match kind {
+                        CommandKind::Builtin => "Claude CLI built-in command.".to_string(),
+                        CommandKind::UserSkill { .. } => "User skill.".to_string(),
+                        CommandKind::TuiOnly => String::new(),
+                    },
+                    kind,
+                    user_invocable: true,
+                    arg_hint: None,
+                });
+            }
+
+            for name in &snap.agents {
+                agents_out.push(ProviderAgent {
+                    id: format!("claude_cli:agent:{name}"),
+                    name: name.clone(),
+                    description: "Claude CLI sub-agent.".to_string(),
+                });
+            }
+
+            for (name, status) in &snap.mcp_servers {
+                let enabled = matches!(status.as_deref(), Some("connected") | Some("ready"));
+                mcp_out.push(McpServerInfo {
+                    id: format!("claude_cli:mcp:{name}"),
+                    name: name.clone(),
+                    enabled,
+                });
+            }
+        }
+
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(CommandCatalog {
+            commands,
+            agents: agents_out,
+            mcp_servers: mcp_out,
+        })
+    }
+}
+
+/// Map a `CommandKind` variant to a short tag used in synthesised ids.
+/// Kept alongside the adapter since the init payload only gives us
+/// names — ids need a stable disambiguator.
+fn tag_for_kind(kind: CommandKind) -> &'static str {
+    match kind {
+        CommandKind::Builtin => "builtin",
+        CommandKind::UserSkill { .. } => "user_skill",
+        CommandKind::TuiOnly => "tui_only",
     }
 }
 

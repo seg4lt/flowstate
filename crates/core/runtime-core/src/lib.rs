@@ -1676,6 +1676,17 @@ impl RuntimeCore {
             turn: merged_turn,
         });
 
+        // Re-refresh the command catalog after every completed turn.
+        // Adapters with runtime-captured built-ins (Claude CLI parses
+        // `system/init` during the stream-json loop) only know the
+        // provider's full command list AFTER their first subprocess
+        // spawn, so this post-turn refresh is what surfaces built-ins
+        // and sub-agents in the popup. Cheap on cache-hit; the dedup
+        // guard on spawn_catalog_refresh collapses bursts.
+        if status == TurnStatus::Completed {
+            self.spawn_catalog_refresh(session);
+        }
+
         result
     }
 
