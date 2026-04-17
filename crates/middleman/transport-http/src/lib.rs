@@ -1,4 +1,4 @@
-//! HTTP + WebSocket transport for the ZenUI daemon.
+//! HTTP + WebSocket transport for the agent daemon.
 //!
 //! Implements `zenui_runtime_core::transport::Transport` via a two-stage
 //! `HttpTransport` → `HttpBound` → `HttpHandle` lifecycle. `bind()` runs on
@@ -8,9 +8,9 @@
 //! loop. `shutdown()` is async — it sends the oneshot, awaits the accept
 //! task, and drops the listener.
 //!
-//! The frontend is embedded into the binary at compile time via
-//! `rust-embed` (see `build.rs` + `FrontendAssets`), so the daemon has no
-//! runtime dependency on `apps/zenui/frontend/dist` existing on disk.
+//! This is a pure transport — it exposes the JSON API and WebSocket
+//! stream, and nothing else. Serving a UI bundle is the application's
+//! responsibility, not the transport's.
 
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
@@ -18,14 +18,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{ConnectInfo, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
-use rust_embed::Embed;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
@@ -35,14 +34,6 @@ use zenui_provider_api::{
 };
 use zenui_runtime_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
-
-/// Frontend bundle embedded into the binary at build time. The path is
-/// relative to this crate's `Cargo.toml`; `build.rs` runs
-/// `bun install && bun run build` before the embed happens, so the
-/// `dist/` directory is guaranteed to exist whenever this compiles.
-#[derive(Embed)]
-#[folder = "../../../apps/zenui/frontend/dist/"]
-struct FrontendAssets;
 
 /// HTTP + WebSocket transport. Construct this in your app's `main()`,
 /// add it to `run_blocking`'s transport list, and daemon-core handles
@@ -71,16 +62,6 @@ impl Transport for HttpTransport {
         let address = std_listener
             .local_addr()
             .context("failed to read local listener address")?;
-
-        // Verify the embedded frontend is present. This is a compile-time
-        // guarantee once rust-embed runs, but we check defensively so a
-        // mis-wired build.rs surfaces at daemon startup instead of at
-        // first request.
-        if FrontendAssets::get("index.html").is_none() {
-            anyhow::bail!(
-                "embedded frontend bundle is missing index.html; check transport-http build.rs"
-            );
-        }
 
         Ok(Box::new(HttpBound {
             std_listener: Some(std_listener),
@@ -132,15 +113,12 @@ impl Bound for HttpBound {
 
         let task = tokio::spawn(async move {
             let router = Router::new()
-                .route("/", get(index_handler))
-                .route("/index.html", get(index_handler))
                 .route("/api/health", get(health_handler))
                 .route("/api/bootstrap", get(bootstrap_handler))
                 .route("/api/snapshot", get(snapshot_handler))
                 .route("/api/status", get(status_handler))
                 .route("/api/shutdown", post(shutdown_handler))
                 .route("/ws", get(ws_handler))
-                .route("/{*path}", get(static_handler))
                 .with_state(state);
 
             let server = axum::serve(
@@ -228,50 +206,6 @@ struct ApiState {
     runtime: Arc<RuntimeCore>,
     ws_url: String,
     observer: Arc<dyn ConnectionObserver>,
-}
-
-async fn index_handler() -> Response {
-    serve_embedded("index.html")
-}
-
-/// Fallback route handler for everything that isn't an API/WS route.
-/// Serves the requested file from the embedded bundle; for paths that
-/// don't resolve to an embedded file, falls back to `index.html` so the
-/// React SPA router can take over.
-async fn static_handler(Path(path): Path<String>) -> Response {
-    // API and websocket routes have their own handlers and never reach
-    // here. The SPA fallback below covers client-side routes like
-    // `/projects/123` that don't correspond to embedded files.
-    if FrontendAssets::get(&path).is_some() {
-        serve_embedded(&path)
-    } else {
-        serve_embedded("index.html")
-    }
-}
-
-fn serve_embedded(path: &str) -> Response {
-    match FrontendAssets::get(path) {
-        Some(file) => {
-            let mime = mime_guess::from_path(path)
-                .first_or_octet_stream()
-                .as_ref()
-                .to_string();
-            let cache_control = if path == "index.html" {
-                "no-store, must-revalidate"
-            } else {
-                "public, max-age=3600"
-            };
-            (
-                [
-                    (header::CONTENT_TYPE, mime),
-                    (header::CACHE_CONTROL, cache_control.to_string()),
-                ],
-                file.data.into_owned(),
-            )
-                .into_response()
-        }
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 async fn health_handler() -> Json<HealthPayload> {

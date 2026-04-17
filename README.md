@@ -1,99 +1,23 @@
-# ZenUI
+# flowstate
 
-A multi-provider AI coding agent shell. ZenUI is a native desktop app that
-orchestrates conversations with Claude (SDK + CLI), Codex, and GitHub
-Copilot (SDK + CLI), backed by a background daemon so long-running agent
-turns survive closing the window.
-
----
-
-## Architecture
-
-```
-                          ┌─────────────────────────────────────────┐
-                          │              zenui-server               │
-                          │                  (daemon)               │
-                          │                                         │
-  ┌─────────────┐         │   ┌─────────────────────────────────┐   │
-  │  zenui      │◄───WS───┼──►│  http-api (axum, loopback only) │   │
-  │  (desktop   │         │   │  /api/bootstrap /api/snapshot   │   │
-  │  shell,     │         │   │  /api/status    /api/shutdown   │   │
-  │  tao+wry)   │◄──HTTP──┼──►│  /ws   (streams RuntimeEvents)  │   │
-  └─────────────┘         │   └────────────────┬────────────────┘   │
-         ▲                │                    │                    │
-         │                │                    ▼                    │
-         │                │   ┌─────────────────────────────────┐   │
-         │                │   │           RuntimeCore           │   │
-         │                │   │  • orchestration + sessions     │   │
-         │                │   │  • broadcast event bus          │   │
-         │                │   │  • ClientMessage/ServerMessage  │   │
-         │                │   └────────────────┬────────────────┘   │
-         │                │                    │                    │
-         │                │        ┌───────────┼───────────┐        │
-         │                │        ▼           ▼           ▼        │
-         │                │    ┌──────┐   ┌────────┐   ┌────────┐   │
-         │                │    │ SQL  │   │provider│   │provider│   │
-         │                │    │ite   │   │-claude │   │-codex  │   │
-         │                │    │(persist)│ │-sdk    │   │...     │   │
-         │                │    └──────┘   └───┬────┘   └───┬────┘   │
-         │                │                   │            │        │
-         │                └───────────────────┼────────────┼────────┘
-         │                                    ▼            ▼
-         │                              ┌──────────┐  ┌──────────┐
-         │                              │  claude  │  │  codex   │
-         │                              │  CLI /   │  │  CLI     │
-         │                              │  bridge  │  │          │
-         │                              └──────────┘  └──────────┘
-         │
-         │  Auto-spawn coordination via ready file at
-         │  $TMPDIR/zenui/daemon-{hash(project_root)}.json
-         │
-         ▼
-  [ user launches `zenui` ]
-       │
-       ▼
-  1. daemon-client reads the ready file
-  2. if healthy → attach
-  3. if absent  → fork-exec `zenui-server start`, wait for ready file
-  4. open webview pointed at http_base
-```
-
-### Lifecycle invariants
-
-- **Sessions survive closing the window.** In-flight provider turns run
-  inside the daemon's tokio runtime; closing `zenui` only decrements the
-  daemon's `connected_clients` counter.
-- **Idle auto-shutdown.** When both `connected_clients` and
-  `in_flight_turns` are zero, an idle timer (default 60s) starts. Any
-  new connection or turn cancels it.
-- **Per-project isolation.** The ready file is keyed by a hash of the
-  canonical project root, so two projects run independent daemons with
-  their own SQLite databases.
-- **Crash recovery.** `RuntimeCore::reconcile_startup` walks persisted
-  sessions on boot and marks any stuck `Running` sessions as
-  `Interrupted`, preventing the UI from spinning forever after a daemon
-  crash.
+A multi-provider AI coding agent desktop app. Flowstate orchestrates
+conversations with Claude (SDK + CLI), Codex, and GitHub Copilot (SDK +
+CLI) from a single native window, with the agent runtime embedded
+directly in-process.
 
 ---
 
-## Crate Layout
+## Repo layout
 
 ```
-zenui/
+flowstate/
 ├── apps/
-│   └── zenui/
-│       ├── crate/
-│       │   └── server/              zenui-server binary (daemon)
-│       │                            owns build.rs that compiles frontend/
-│       │
-│       ├── main-application/        zenui binary (desktop shell)
-│       │
-│       └── frontend/                React 19 + Vite + Tailwind 4 + shadcn
-│                                    (the UI the daemon serves and the
-│                                    main-application webview loads)
+│   └── flowstate/                  Tauri desktop app (Rust + React)
+│       ├── src/                    React 19 + Vite + Tailwind 4 + shadcn UI
+│       └── src-tauri/              Tauri shell + in-process agent runtime
 │
 ├── crates/
-│   ├── core/                        Shared domain — the product capability
+│   ├── core/                       Shared domain — the product capability
 │   │   ├── runtime-core              Event bus + orchestration dispatch
 │   │   ├── provider-api              Shared trait + ClientMessage/ServerMessage
 │   │   ├── orchestration             Session / turn state machine
@@ -108,13 +32,15 @@ zenui/
 │       ├── daemon-core               Transport trait + lifecycle state,
 │       │                             idle watchdog, ready file v2,
 │       │                             graceful shutdown
-│       ├── transport-http            axum HTTP+WS transport
-│       │                             (impl Transport for HttpTransport)
-│       └── daemon-client             Discovery + auto-spawn + health check
+│       ├── transport-tauri           In-process Tauri IPC transport
+│       │                             (used by apps/flowstate)
+│       ├── transport-http            axum HTTP+WS transport (pure transport;
+│       │                             available for out-of-process daemons)
+│       ├── daemon-client             Discovery + auto-spawn + health check
+│       └── embedded-node             Embedded Node.js runtime for CLI bridges
 │
-├── scripts/
-│   └── smoke-daemon.sh              End-to-end daemon lifecycle test
-└── README.md                        (this file)
+├── scripts/                        Build / release helpers
+└── .github/workflows/              CI: tag-triggered Tauri release build
 ```
 
 ### Dependency direction
@@ -129,15 +55,8 @@ zenui/
     crates/core/*
 ```
 
-Apps depend on middleman and (transitively) on core. Middleman depends on
-core. Core never depends on middleman or apps. There are no cycles.
-
-### Binaries
-
-| Binary         | Crate                               | Role                                    |
-| -------------- | ----------------------------------- | --------------------------------------- |
-| `zenui`        | `apps/zenui/main-application`       | Desktop shell (tao + wry webview)       |
-| `zenui-server` | `apps/zenui/crate/server`           | Daemon: owns runtime, providers, SQLite |
+Apps depend on middleman and (transitively) on core. Middleman depends
+on core. Core never depends on middleman or apps. There are no cycles.
 
 ---
 
@@ -146,89 +65,62 @@ core. Core never depends on middleman or apps. There are no cycles.
 ### Prerequisites
 
 - **Rust** — edition 2024 requires rustc 1.85+.
-- **Bun** — used by the frontend build at `apps/zenui/frontend/`. The
-  `apps/zenui/crate/server/build.rs` script invokes `bun install` and
-  `bun run build` from there, and embeds the compiled `dist/` path into
-  the `zenui-server` binary via a `cargo:rustc-env` directive so the
-  daemon can find its own static assets without depending on cwd.
-- **Node.js** is NOT required — some providers download their own Node at
-  build time for isolated TypeScript bridges.
+- **Bun** or **pnpm** — used by the flowstate frontend at
+  `apps/flowstate/src/`.
+- **Node.js** is NOT required at the repo level — some providers
+  download their own Node at build time for isolated TypeScript
+  bridges.
 
-### Build everything
+### Build the desktop app
+
+```bash
+# Frontend deps (from apps/flowstate/)
+pnpm install
+
+# Dev mode (Vite + Tauri with hot reload)
+pnpm tauri dev
+
+# Release build (native installer + updater artifacts)
+pnpm tauri build
+```
+
+### Build the workspace crates
 
 ```bash
 # From the repo root.
 cargo build --workspace
 ```
 
-This produces:
+---
 
-- `target/debug/zenui` — the desktop shell
-- `target/debug/zenui-server` — the daemon
-- `apps/zenui/frontend/dist/` — the built React app (served by the daemon)
+## Release
 
-To skip the frontend rebuild on subsequent compile iterations, set
-`ZENUI_SKIP_FRONTEND_BUILD=1`:
+Tag-triggered release via `.github/workflows/build.yml`:
 
 ```bash
-ZENUI_SKIP_FRONTEND_BUILD=1 cargo check --workspace
+git tag v0.x.y
+git push --tags
 ```
 
-### Run
-
-```bash
-# Launch the desktop shell. Auto-spawns zenui-server if not already running.
-./target/debug/zenui
-
-# Or run the daemon directly in the foreground, logging to stderr.
-./target/debug/zenui-server start --foreground
-
-# Check daemon status (prints ready file contents + live counters).
-./target/debug/zenui-server status
-
-# Ask the running daemon to shut down gracefully.
-./target/debug/zenui-server stop
-```
-
-The daemon discovers a per-project ready file at
-`$TMPDIR/zenui/daemon-<hash>.json` (macOS / Linux) or
-`%LOCALAPPDATA%\zenui\daemon-<hash>.json` (Windows). Run `zenui` or
-`zenui-server` from the project root you want the daemon scoped to, or
-pass `--project-root <PATH>` to the server commands.
-
-### Test
-
-```bash
-# Rust unit + integration tests.
-ZENUI_SKIP_FRONTEND_BUILD=1 cargo test --workspace
-
-# End-to-end daemon lifecycle smoke test.
-./scripts/smoke-daemon.sh
-```
-
-The smoke test starts `zenui-server`, confirms the ready file, probes
-`/api/health` and `/api/status` over HTTP, posts `/api/shutdown`, and
-asserts the daemon exits cleanly.
+The workflow builds macOS (arm64) and Windows (x64) installers,
+generates a Tauri updater manifest (`latest.json`), and publishes a
+GitHub release on this repo. Requires the `TAURI_SIGNING_PRIVATE_KEY`
+secret in GitHub Actions — everything else uses the default
+`GITHUB_TOKEN`.
 
 ---
 
-## Key Files
+## Key files
 
+- `apps/flowstate/src-tauri/src/main.rs` — Tauri entry point, wires the
+  in-process agent runtime into Tauri IPC.
 - `crates/core/runtime-core/src/lib.rs` — `RuntimeCore::send_turn`,
   `handle_client_message`, `reconcile_startup`, `shutdown_all_turns`,
   and the `TurnLifecycleObserver` trait.
 - `crates/core/provider-api/src/lib.rs` — `ClientMessage`,
   `ServerMessage`, `RuntimeEvent`, and the `ProviderAdapter` trait.
-- `crates/middleman/http-api/src/lib.rs` — axum router, `ws_handler`,
-  `ConnectionObserver` trait, and the `/api/shutdown` + `/api/status`
-  endpoints.
-- `crates/middleman/daemon-core/src/lifecycle.rs` — `DaemonLifecycle`
-  struct, atomic counters, and the `idle_watchdog` task.
 - `crates/middleman/daemon-core/src/lib.rs` — `bootstrap()` and
-  `run_blocking()` entry points.
-- `crates/middleman/daemon-client/src/lib.rs` — `connect_or_spawn()`,
-  `DaemonHandle`, and the fs4-based spawn lock.
-- `apps/zenui/main-application/src/main.rs` — tao + wry window code,
-  attaches to the daemon via `connect_or_spawn`.
-- `apps/zenui/crate/server/src/main.rs` — `zenui-server` clap entry
-  point with `start` / `stop` / `status` subcommands.
+  `run_blocking()` entry points, plus the `Transport` trait.
+- `crates/middleman/transport-tauri/` — the transport flowstate uses.
+- `crates/middleman/transport-http/` — pure HTTP+WS transport,
+  available for out-of-process daemon deployments.

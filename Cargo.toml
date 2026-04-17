@@ -1,6 +1,5 @@
 [workspace]
 members = [
-  "apps/zenui/main-application",
   "apps/flowstate/src-tauri",
   "crates/core/runtime-core",
   "crates/core/provider-api",

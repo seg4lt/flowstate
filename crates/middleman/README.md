@@ -16,10 +16,11 @@ behavior of its own.
   crate implements.
 - **[`transport-http/`](./transport-http/README.md)** — The
   `axum`-based HTTP + WebSocket transport. Implements
-  `daemon_core::Transport` for `HttpTransport`. Exposes the existing
-  REST surface (`/api/bootstrap`, `/api/snapshot`, `/api/health`,
+  `daemon_core::Transport` for `HttpTransport`. Exposes the REST
+  surface (`/api/bootstrap`, `/api/snapshot`, `/api/health`,
   `/api/status`, `/api/shutdown`) and streams `RuntimeEvent`s over
-  `/ws`. Serves the React frontend as static assets.
+  `/ws`. Pure transport — does not serve any UI; serving a frontend is
+  the application's responsibility.
 - **[`daemon-client/`](./daemon-client/README.md)** — Client-side
   daemon discovery. `connect_or_spawn()` reads the ready file (v1 and
   v2), filters by `preferred_transport`, health-checks a running

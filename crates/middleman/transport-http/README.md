@@ -1,17 +1,21 @@
 # transport-http
 
-HTTP + WebSocket transport for the ZenUI daemon. Implements the
+HTTP + WebSocket transport for the agent daemon. Implements the
 `Transport` trait from `zenui-daemon-core` via a two-stage
 `HttpTransport` → `HttpBound` → `HttpHandle` lifecycle. Built on
-`axum` + `tower-http`.
+`axum`.
+
+This is a **pure transport**: it exposes the JSON API and the
+WebSocket event stream, and nothing else. Serving a UI bundle is the
+application's responsibility — wrap `HttpTransport` in your own
+router, or embed it as a sub-router next to your static-file handler.
 
 ## Where it plugs in
 
 ```
-apps/zenui/crate/server/src/main.rs
- └─ vec![Box::new(HttpTransport::new(bind_addr, frontend_dist))]
-     │
-     ▼
+let transport = Box::new(HttpTransport::new(bind_addr));
+let transports: Vec<Box<dyn Transport>> = vec![transport];
+
 zenui_daemon_core::run_blocking(config, transports)
      │
      ├─► HttpTransport::bind()    (host thread, claims TCP socket)
@@ -29,7 +33,6 @@ is `transport-http → daemon-core` (for the trait) and
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET`  | `/` and fallback | Static React app from `frontend_dist`. |
 | `GET`  | `/api/health` | Liveness probe. |
 | `GET`  | `/api/bootstrap` | Full `BootstrapPayload` — snapshot + providers + models + `ws_url`. |
 | `GET`  | `/api/snapshot` | Just the session + project snapshot. |
@@ -40,21 +43,20 @@ is `transport-http → daemon-core` (for the trait) and
 ## `HttpTransport::new`
 
 ```rust
-pub fn new(bind_addr: SocketAddr, frontend_dist: PathBuf) -> Self
+pub fn new(bind_addr: SocketAddr) -> Self
 ```
 
-Holds only configuration. `bind()` synchronously claims the TCP socket
-on the host thread, verifies `frontend_dist/index.html` exists, and
-returns `Box<dyn Bound>`. `serve()` — called inside the tokio runtime —
-wraps the `StdTcpListener` in `TcpListener::from_std`, spawns the axum
-accept loop, and returns a `Box<dyn TransportHandle>`.
+Holds only the bind address. `bind()` synchronously claims the TCP
+socket on the host thread and returns `Box<dyn Bound>`. `serve()` —
+called inside the tokio runtime — wraps the `StdTcpListener` in
+`TcpListener::from_std`, spawns the axum accept loop, and returns a
+`Box<dyn TransportHandle>`.
 
 ## `ConnectionObserver` is non-optional
 
 `HttpBound::serve` takes `observer: Arc<dyn ConnectionObserver>` by
 value. Callers who don't want observation pass `Arc::new(NoopObserver)`
-from `zenui-runtime-core`. All the `Option::map` chains in the old
-handlers are gone.
+from `zenui-runtime-core`.
 
 ## WebSocket loop
 
@@ -89,4 +91,4 @@ at the call site.
   trait definitions and `TransportAddressInfo`.
 - `zenui-runtime-core` — for `RuntimeCore`, `ConnectionObserver`.
 - `zenui-provider-api` — for the wire types.
-- `axum` (with `ws`), `tower-http`, `tokio`, `futures`, `async-trait`.
+- `axum` (with `ws`), `tokio`, `futures`, `async-trait`, `chrono`.
