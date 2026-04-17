@@ -42,6 +42,8 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useApp } from "@/stores/app-store";
+import { useAttentionTone } from "@/hooks/use-attention-tone";
+import { cn } from "@/lib/utils";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
@@ -51,6 +53,12 @@ export function AppSidebar() {
   const { state, send, createProject } = useApp();
   const navigate = useNavigate();
   const location = useLocation();
+  // Aggregate "wants attention" tone across all non-active threads.
+  // Drives the dot rendered next to the "flowstate" wordmark below
+  // so a long thread list still has a persistent cue when the
+  // attention-wanting row is scrolled out of view. Collapsed sidebar
+  // relies on SidebarTrigger's dot instead (ui/sidebar.tsx).
+  const attentionTone = useAttentionTone();
   // On a narrow window the sidebar renders as a full-screen Sheet
   // overlay that covers the chat view. Without `closeIfMobile()` the
   // sheet stays open after the user picks a thread and they have to
@@ -210,6 +218,24 @@ export function AppSidebar() {
         <span className="text-sm font-semibold tracking-tight [[data-collapsible=icon]_&]:hidden">
           flowstate
         </span>
+        {attentionTone && (
+          <span
+            aria-label={
+              attentionTone === "awaiting"
+                ? "One or more threads need a response"
+                : "One or more threads finished"
+            }
+            title={
+              attentionTone === "awaiting"
+                ? "One or more threads need a response"
+                : "One or more threads finished"
+            }
+            className={cn(
+              "ml-2 inline-block size-1.5 rounded-full [[data-collapsible=icon]_&]:hidden",
+              attentionTone === "awaiting" ? "bg-blue-500" : "bg-green-500",
+            )}
+          />
+        )}
       </SidebarHeader>
 
       <SidebarContent>
