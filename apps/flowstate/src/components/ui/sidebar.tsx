@@ -23,6 +23,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { PanelLeftIcon } from "lucide-react"
+import { useApp } from "@/stores/app-store"
 
 const SIDEBAR_COOKIE_NAME = "sidebar_state"
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
@@ -269,7 +270,39 @@ function SidebarTrigger({
   onClick,
   ...props
 }: React.ComponentProps<typeof Button>) {
-  const { toggleSidebar } = useSidebar()
+  const { state, toggleSidebar } = useSidebar()
+  const { state: appState } = useApp()
+
+  // When the sidebar is collapsed the user loses the at-a-glance
+  // status badges on each thread row, so mirror the two most
+  // attention-worthy states onto the toggle button itself:
+  //   • any session awaiting user input (permission / question /
+  //     plan approval) — matches the blue "Need Response" badge
+  //   • any session that finished a turn while the user was
+  //     elsewhere — matches the green "Done" badge
+  // Active-session ids are excluded because the user is already
+  // looking at them. "Awaiting" takes priority over "done" because
+  // it's strictly more urgent. Only rendered when the sidebar is
+  // actually collapsed — expanded sidebar already shows per-row.
+  const activeId = appState.activeSessionId
+  const hasAwaiting = React.useMemo(() => {
+    for (const id of appState.awaitingInputSessionIds) {
+      if (id !== activeId) return true
+    }
+    return false
+  }, [appState.awaitingInputSessionIds, activeId])
+  const hasDone = React.useMemo(() => {
+    if (hasAwaiting) return false
+    for (const id of appState.doneSessionIds) {
+      if (id !== activeId) return true
+    }
+    return false
+  }, [appState.doneSessionIds, activeId, hasAwaiting])
+  const showDot = state === "collapsed" && (hasAwaiting || hasDone)
+  const dotClass = hasAwaiting ? "bg-blue-500" : "bg-green-500"
+  const dotTitle = hasAwaiting
+    ? "One or more threads need a response"
+    : "One or more threads finished"
 
   return (
     <Button
@@ -277,7 +310,7 @@ function SidebarTrigger({
       data-slot="sidebar-trigger"
       variant="ghost"
       size="icon-sm"
-      className={cn(className)}
+      className={cn("relative", className)}
       onClick={(event) => {
         onClick?.(event)
         toggleSidebar()
@@ -285,6 +318,16 @@ function SidebarTrigger({
       {...props}
     >
       <PanelLeftIcon />
+      {showDot && (
+        <span
+          aria-label={dotTitle}
+          title={dotTitle}
+          className={cn(
+            "pointer-events-none absolute right-1 top-1 size-1.5 rounded-full ring-2 ring-background",
+            dotClass,
+          )}
+        />
+      )}
       <span className="sr-only">Toggle Sidebar</span>
     </Button>
   )
