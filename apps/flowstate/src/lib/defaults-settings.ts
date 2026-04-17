@@ -18,6 +18,7 @@ const CONFIG_KEY_PERMISSION_MODE = "defaults.permission_mode";
 const CONFIG_KEY_MODEL_PREFIX = "defaults.model.";
 const CONFIG_KEY_PROVIDER_ENABLED_PREFIX = "provider.enabled.";
 const CONFIG_KEY_DEFAULT_PROVIDER = "defaults.provider";
+const CONFIG_KEY_STRICT_PLAN_MODE = "defaults.strict_plan_mode";
 
 // --- Provider-enabled defaults ---
 
@@ -183,6 +184,34 @@ export async function writeProviderEnabled(
       CONFIG_KEY_PROVIDER_ENABLED_PREFIX + provider,
       String(enabled),
     );
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+// --- Strict plan mode ---
+
+/**
+ * When `true`, the chat view auto-denies any permission request for
+ * a mutating tool (see `PLAN_MODE_MUTATING_TOOLS`) while the session
+ * is in plan mode, preventing the user from accidentally clicking
+ * Allow on an Edit/Write/Bash prompt that would exit plan mode
+ * early. Defaults to `false` — the SDK's own plan-mode gate is the
+ * baseline; this is an opt-in hardening.
+ */
+export async function readStrictPlanMode(): Promise<boolean> {
+  try {
+    const raw = await getUserConfig(CONFIG_KEY_STRICT_PLAN_MODE);
+    if (raw === "true") return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export async function writeStrictPlanMode(enabled: boolean): Promise<void> {
+  try {
+    await setUserConfig(CONFIG_KEY_STRICT_PLAN_MODE, String(enabled));
   } catch {
     /* storage may be unavailable */
   }

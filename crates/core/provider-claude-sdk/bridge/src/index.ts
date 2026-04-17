@@ -209,10 +209,29 @@ class ClaudeBridge {
    * The SDK exposes mid-turn control methods like `setPermissionMode` and
    * `interrupt` on this object — we hold onto it so the host can flip
    * the active permission mode (e.g. when the user approves an
-   * ExitPlanMode and picks "Auto-edit") without restarting the turn.
+   * ExitPlanMode and picks "Accept Edits") without restarting the turn.
    * Cleared in the finally block of `sendPrompt`.
    */
   private activeQuery?: Query;
+  /**
+   * Current effective permission mode for the in-flight turn. Seeded
+   * from the `permissionMode` parameter at the start of each
+   * `sendPrompt`, then kept in sync with every subsequent mode
+   * change — whether the host pushed an `update_permission_mode` RPC
+   * (`setPermissionMode` method below) or the user approved an
+   * ExitPlanMode with a new mode (`answerPermission` with a mode
+   * override, which rides the SDK's `updatedPermissions: [{setMode}]`
+   * mechanism).
+   *
+   * Read by `canUseTool` on every tool invocation to decide whether
+   * bypass mode should short-circuit the prompt. The previous
+   * implementation read the closure-captured `permissionMode`
+   * parameter, which froze at turn start and therefore failed the
+   * bypass check for tools AFTER an in-turn mode change — the
+   * user's "click Bypass Permissions in the plan-exit dialog but
+   * still get prompted for the next Bash" bug.
+   */
+  private livePermissionMode?: SdkPermissionMode;
 
   createSession(cwd: string, model?: string, resumeSessionId?: string): string {
     this.cwd = cwd;
@@ -253,6 +272,10 @@ class ClaudeBridge {
     }
     this.inFlight = true;
     this.abortController = new AbortController();
+    // Seed the live-mode tracker for this turn. Every subsequent
+    // mid-turn mode change updates this field so canUseTool reads
+    // the CURRENT mode, not the frozen turn-start one.
+    this.livePermissionMode = permissionMode;
 
     const canUseTool: CanUseTool = async (
       toolName: string,
@@ -274,6 +297,25 @@ class ClaudeBridge {
         return new Promise<PermissionResult>((resolve) => {
           pendingQuestions.set(requestId, { resolve, questions: rawQuestions });
         });
+      }
+
+      // Bypass mode: the user explicitly opted out of permission
+      // prompting. Resolve every non-question tool call as-is
+      // without round-tripping through the host. Without this the
+      // SDK would still call canUseTool for mutating tools
+      // (Bash/Write/Edit/...), we'd emit permission_request, and the
+      // UI would show a dialog the user explicitly said they didn't
+      // want. See also the runtime-core safety net which auto-answers
+      // any permission_request that slips through for a bypass turn
+      // — this short-circuit is the primary fix; the safety net
+      // covers other provider adapters.
+      //
+      // Reads `this.livePermissionMode`, not the closure-captured
+      // `permissionMode` parameter, so an in-turn mode change
+      // (ExitPlanMode → Bypass, toolbar toggle → update_permission_mode)
+      // takes effect for every tool call that follows.
+      if (this.livePermissionMode === 'bypassPermissions') {
+        return { behavior: 'allow', updatedInput: input };
       }
 
       const requestId = randomUUID();
@@ -435,6 +477,10 @@ class ClaudeBridge {
   async setPermissionMode(mode: SdkPermissionMode): Promise<void> {
     if (!this.activeQuery) return;
     await this.activeQuery.setPermissionMode(mode);
+    // Keep our canUseTool view in sync with the SDK's internal
+    // state — without this the bypass short-circuit would still
+    // read the stale turn-start mode for the rest of the turn.
+    this.livePermissionMode = mode;
   }
 
   /**
@@ -477,6 +523,16 @@ class ClaudeBridge {
             event: 'info',
             message: `Claude model: requested=${this.model ?? '<default>'} resolved=${init.model ?? '<unknown>'}`,
           });
+          // Emit the resolved model as a structured event too, so the
+          // Rust adapter can upgrade `session.summary.model` to match
+          // what the SDK actually runs. Without this the UI model
+          // selector fails to highlight the active entry whenever the
+          // stored value is an alias (`sonnet`) but the dropdown list
+          // carries pinned ids (`claude-sonnet-4-5-<date>`) returned
+          // by `supportedModels()`.
+          if (init.model) {
+            writeStream({ event: 'model_resolved', model: init.model });
+          }
         }
         return null;
       }
@@ -811,6 +867,15 @@ class ClaudeBridge {
         }).updatedPermissions = [
           { type: 'setMode', mode: permissionMode, destination: 'session' },
         ];
+        // Mirror the mode change into our canUseTool view. The SDK
+        // applies `updatedPermissions.setMode` internally at the
+        // moment this promise resolves, but it has no getter we can
+        // poll — without shadowing it here the next tool invocation
+        // would see the stale turn-start mode and fail the bypass
+        // short-circuit. This is the exact bug the user reported:
+        // ExitPlanMode → Bypass Permissions, then the next Bash
+        // still prompts.
+        this.livePermissionMode = permissionMode;
       }
       p.resolve(result);
     } else {

@@ -7,11 +7,16 @@ export const MODE_ORDER: PermissionMode[] = [
   "bypass",
 ];
 
+// Labels match the Claude Agent SDK's vocabulary so the UI
+// terminology doesn't drift from the underlying permission mode
+// names (`default` / `acceptEdits` / `plan` / `bypassPermissions`).
+// Enum values (`accept_edits`, `bypass`) stay unchanged — they're
+// the serde + sqlite persistence keys.
 export const MODE_LABELS: Record<PermissionMode, string> = {
   default: "Default",
-  accept_edits: "Auto-edit",
+  accept_edits: "Accept Edits",
   plan: "Plan",
-  bypass: "Full access",
+  bypass: "Bypass Permissions",
 };
 
 export function cycleMode(
