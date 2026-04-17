@@ -15,6 +15,8 @@ import {
   type ProjectWorktree,
   type SessionDisplay,
 } from "@/lib/api";
+import { useDockBadge } from "@/hooks/use-dock-badge";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
   ClientMessage,
   CommandCatalog,
@@ -98,6 +100,16 @@ interface AppState {
    *  matches the cached one, so the slash-popup memo stays stable
    *  across no-op refreshes. */
   sessionCommands: Map<string, CommandCatalog>;
+  /** Whether the OS thinks our window has focus. Distinct from
+   *  `activeSessionId` (which tracks the thread the user last
+   *  opened, even after they alt-tab to another app). Updated by a
+   *  Tauri `onFocusChanged` listener in AppProvider. Drives two
+   *  things: (a) turn_completed now marks the active thread as
+   *  "Done" when the window isn't focused — otherwise a thread that
+   *  finishes while the user is in another app would never badge;
+   *  (b) on refocus we clear the active thread from doneSessionIds
+   *  because the user is now watching it. */
+  isWindowFocused: boolean;
   ready: boolean;
 }
 
@@ -136,7 +148,12 @@ type AppAction =
       type: "set_project_worktree";
       projectId: string;
       record: ProjectWorktree | null;
-    };
+    }
+  /** OS-level window focus changed. Dispatched from AppProvider's
+   *  Tauri `onFocusChanged` subscription. Distinct from browser
+   *  `focus`/`blur` on the document, which don't track app-level
+   *  focus reliably across platforms. */
+  | { type: "window_focus_changed"; focused: boolean };
 
 /** Recompute whether a session still has any pending input after a
  *  consume action. If both the permissions queue and the question
@@ -171,6 +188,25 @@ function appReducer(state: AppState, action: AppAction): AppState {
         doneSessionIds.delete(action.sessionId);
       }
       return { ...state, activeSessionId: action.sessionId, doneSessionIds };
+    }
+    case "window_focus_changed": {
+      // Two jobs here: (1) stamp the new focus flag so the
+      // turn_completed handler knows whether the user is watching,
+      // and (2) if the window just regained focus and the active
+      // thread is currently in doneSessionIds, clear it — the user
+      // is now looking at it, so the badge should drop immediately
+      // rather than persist until they switch threads.
+      const isWindowFocused = action.focused;
+      let doneSessionIds = state.doneSessionIds;
+      if (
+        isWindowFocused &&
+        state.activeSessionId &&
+        doneSessionIds.has(state.activeSessionId)
+      ) {
+        doneSessionIds = new Set(doneSessionIds);
+        doneSessionIds.delete(state.activeSessionId);
+      }
+      return { ...state, isWindowFocused, doneSessionIds };
     }
     case "consume_pending_permission": {
       const list = state.pendingPermissionsBySession.get(action.sessionId);
@@ -401,10 +437,20 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       const sessions = new Map(state.sessions);
       sessions.set(event.session.sessionId, event.session);
       // Mark this session as "Done" iff the user isn't currently
-      // looking at it. Looking at it means there's nothing to
-      // notify about — the user already sees the new output.
+      // watching it. "Watching" now requires two conditions: the
+      // thread is active AND the app window has OS focus. Without
+      // the focus check, a thread that finishes while the user is
+      // in another app would never mark done (because it's still
+      // the active thread), so the dock badge and sidebar badge
+      // would both stay blank. See AppProvider's onFocusChanged
+      // subscription for the focus tracking, and the
+      // window_focus_changed reducer case for the complementary
+      // "clear done on refocus of the active thread" logic.
+      const viewingActive =
+        event.session.sessionId === state.activeSessionId &&
+        state.isWindowFocused;
       let doneSessionIds = state.doneSessionIds;
-      if (event.session.sessionId !== state.activeSessionId) {
+      if (!viewingActive) {
         if (!doneSessionIds.has(event.session.sessionId)) {
           doneSessionIds = new Set(doneSessionIds);
           doneSessionIds.add(event.session.sessionId);
@@ -675,6 +721,10 @@ const initialState: AppState = {
   pendingQuestionBySession: new Map(),
   rateLimits: {},
   sessionCommands: new Map(),
+  // Default to focused: the first focus event only fires on the NEXT
+  // focus change, so initialising false would incorrectly treat the
+  // first turn as "user isn't watching" until they alt-tabbed.
+  isWindowFocused: true,
   ready: false,
 };
 
@@ -722,6 +772,37 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // display maps without stale closures or useCallback dependency churn.
   const stateRef = React.useRef(state);
   stateRef.current = state;
+
+  // Subscribe to OS-level window focus so the turn_completed handler
+  // and the dock badge can tell the difference between "user is on
+  // thread A and looking at it" vs "user is on thread A but has
+  // alt-tabbed to another app". Tauri's onFocusChanged is
+  // authoritative across platforms; browser `focus`/`blur` on the
+  // document don't track app-level focus reliably.
+  React.useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        const win = getCurrentWindow();
+        // Seed with the current focus state on first mount so we
+        // don't start with a stale default if the window is already
+        // backgrounded when flowstate loads.
+        const focused = await win.isFocused();
+        if (cancelled) return;
+        dispatchRef.current({ type: "window_focus_changed", focused });
+        unlisten = await win.onFocusChanged(({ payload }) => {
+          dispatchRef.current({ type: "window_focus_changed", focused: payload });
+        });
+      } catch (err) {
+        console.warn("[app-store] window focus subscription failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   React.useEffect(() => {
     let active = true;
@@ -980,7 +1061,22 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     ],
   );
 
-  return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+  return (
+    <AppContext.Provider value={value}>
+      {/* Sync the OS dock/taskbar badge with the number of threads
+          awaiting user input or freshly finished. Rendered as a
+          sibling of `{children}` inside the provider so the hook can
+          read our context without any prop plumbing; returns null and
+          produces zero DOM. */}
+      <DockBadgeSync />
+      {children}
+    </AppContext.Provider>
+  );
+}
+
+function DockBadgeSync(): null {
+  useDockBadge();
+  return null;
 }
 
 export function useApp() {
