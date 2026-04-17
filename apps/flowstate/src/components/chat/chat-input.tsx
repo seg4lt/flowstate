@@ -198,12 +198,15 @@ export function ChatInput({
 
   // --- Slash command autocomplete ---
   // Show popup when the input starts with `/` (all providers) or `$`
-  // (Codex skill invocations) and the session isn't busy.
+  // (Codex skill invocations). We intentionally allow the popup while
+  // a turn is running: the user can still compose (messages queue),
+  // and skill invocations need to be selectable so they queue like any
+  // other text. Core app commands like `/flowstate-clear` fire
+  // immediately on select; ChatView.handleSend rejects those mid-run
+  // with a toast, so the popup staying visible doesn't break anything.
   const inputToken = value.trim().split(/\s/)[0] ?? "";
   const showPopup =
-    (inputToken.startsWith("/") || inputToken.startsWith("$")) &&
-    !isRunning &&
-    !disabled;
+    (inputToken.startsWith("/") || inputToken.startsWith("$")) && !disabled;
   const matches: SlashCommandItem[] = showPopup
     ? getCompletions(inputToken, commands)
     : [];
