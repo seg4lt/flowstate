@@ -181,7 +181,27 @@ function writeStream(payload: Record<string, unknown>): void {
 class ClaudeBridge {
   private cwd: string = process.cwd();
   private model?: string;
+  /**
+   * The SDK session id to `resume:` from on the NEXT query. Only updated
+   * from `result` messages — i.e. turns the SDK has committed to its
+   * on-disk session store. Persisted back to Rust as
+   * `provider_state.native_thread_id`.
+   *
+   * Crucially, we do NOT overwrite this from `system.init` mid-turn:
+   * the init id represents a session the SDK hasn't yet committed, and
+   * if the turn is interrupted that id is never finalised. Resuming
+   * from it would give Claude an empty or stale context — exactly the
+   * steering-mode context-loss bug this two-phase scheme prevents.
+   * See `pendingInitSessionId` below.
+   */
   private resumeSessionId?: string;
+  /**
+   * The init session id of the in-flight query, held aside until the
+   * matching `result` arrives. Promoted into `resumeSessionId` on
+   * successful completion; discarded on abort or any other unwind so
+   * we never ship a never-committed id back to the host.
+   */
+  private pendingInitSessionId?: string;
   private abortController?: AbortController;
   private inFlight = false;
   /**
@@ -385,12 +405,23 @@ class ClaudeBridge {
         // (the SDK's canUseTool callbacks) don't sit on a Promise that never
         // resolves. They'll see a deny / dismissal and unwind cleanly.
         drainPendingOnAbort();
+        // Discard the pending init id — the SDK never committed this
+        // session via `result`, so resuming from it on the next turn
+        // would give the model an empty/stale context. `resumeSessionId`
+        // remains pinned at the last COMPLETED turn's id, which is
+        // what steering-mode needs to preserve conversation history.
+        this.pendingInitSessionId = undefined;
         return '[interrupted]';
       }
       throw err;
     } finally {
       this.inFlight = false;
       this.activeQuery = undefined;
+      // Belt-and-suspenders: on any unwind path (abort handled above,
+      // unexpected throw re-raised, or normal completion where result
+      // already promoted the id), ensure we don't carry a stale
+      // pending id into the next turn.
+      this.pendingInitSessionId = undefined;
     }
     return finalText;
   }
@@ -430,7 +461,12 @@ class ClaudeBridge {
         if (sub === 'init') {
           const init = msg as { session_id?: string; model?: string };
           if (init.session_id) {
-            this.resumeSessionId = init.session_id;
+            // Stash as pending, not promoted. The SDK hasn't committed
+            // this session to its store yet — it will on `result`. If
+            // the turn is aborted mid-stream (steering), we must NOT
+            // ship this id back as the resume target because the SDK
+            // can't resume from a session it never finalised.
+            this.pendingInitSessionId = init.session_id;
             writeStream({ event: 'info', message: `Claude session ${init.session_id}` });
           }
           // Surface the model the SDK actually resolved. If the requested
@@ -692,7 +728,15 @@ class ClaudeBridge {
           total_cost_usd?: number;
           duration_ms?: number;
         };
-        if (r.session_id) this.resumeSessionId = r.session_id;
+        // The turn completed cleanly — the SDK committed this session
+        // to its store, so it's now safe to promote the id as the
+        // resume target for the next query. Clear the pending id so an
+        // abort later in this bridge's lifetime can't accidentally
+        // resurrect it.
+        if (r.session_id) {
+          this.resumeSessionId = r.session_id;
+          this.pendingInitSessionId = undefined;
+        }
         // Forward token usage before returning the output text so the
         // runtime-core drain loop sees a TurnUsage event before the
         // turn finalises. Maps Anthropic's SDK field names onto the

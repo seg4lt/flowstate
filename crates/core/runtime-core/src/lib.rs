@@ -1481,6 +1481,22 @@ impl RuntimeCore {
                 )
             }
             (true, Err(_)) => {
+                // Intentionally leave `session.provider_state` untouched.
+                // We reach here when the adapter surfaced an Err during
+                // an interrupt (e.g. bridge stdout closed, writer task
+                // died forwarding a permission answer). The adapter's
+                // Err path also invalidated its bridge cache, so the
+                // next turn spawns a fresh bridge and hydrates its
+                // `resumeSessionId` from whatever is still on disk in
+                // `provider_state.native_thread_id`.
+                //
+                // Invariant (maintained by the provider bridge's
+                // two-phase session-id scheme): the persisted
+                // `native_thread_id` always points at the last turn
+                // the SDK COMMITTED via its `result` message, never at
+                // an interrupted turn's uncommitted init id. So
+                // preserving it here is exactly what we want — don't
+                // "helpfully" clear it.
                 let canonical = if accumulated.trim().is_empty() {
                     "[interrupted]".to_string()
                 } else {
@@ -2462,6 +2478,15 @@ mod tests {
             "/tmp/zenui-test/threads".to_string(),
         ));
 
+        // Codex defaults to disabled since the "default only Claude and
+        // GitHub Copilot to enabled" change. `send_turn` rejects disabled
+        // providers before dispatching to the adapter, which would leave
+        // `mid_turn_tx` unfired and the test hanging on `mid_rx.await`.
+        // Flip it on for the test runtime so the adapter actually runs.
+        runtime
+            .set_provider_enabled(ProviderKind::Codex, true)
+            .await;
+
         let mut events = runtime.subscribe();
 
         runtime
@@ -2527,6 +2552,184 @@ mod tests {
         turn_completed_turn.expect("TurnCompleted must be published on interrupt")
     }
 
+    /// What the adapter returns from `execute_turn` after being released
+    /// mid-interrupt. Parallels `InterruptOutcome` but adds the
+    /// `OkWithState` variant so we can assert the `(true, Ok(output))`
+    /// branch's provider_state update semantics from a test.
+    enum InterruptStateOutcome {
+        Err,
+        OkNoState,
+        OkWithState(zenui_provider_api::ProviderSessionState),
+    }
+
+    /// Same shape as `InterruptingAdapter` but accepts an arbitrary
+    /// `InterruptStateOutcome`. Kept separate so adding the new variant
+    /// can't regress the existing interrupt tests.
+    struct InterruptStateAdapter {
+        mid_turn_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        resume_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        outcome: tokio::sync::Mutex<Option<InterruptStateOutcome>>,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for InterruptStateAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+                enabled: true,
+            }
+        }
+
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            _input: &UserInput,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            events
+                .send(ProviderTurnEvent::AssistantTextDelta {
+                    delta: "partial".to_string(),
+                })
+                .await;
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            if let Some(tx) = self.mid_turn_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = self.resume_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+
+            let outcome = self
+                .outcome
+                .lock()
+                .await
+                .take()
+                .expect("outcome must be configured");
+            match outcome {
+                InterruptStateOutcome::Err => Err("adapter stdout closed".to_string()),
+                InterruptStateOutcome::OkNoState => Ok(ProviderTurnOutput {
+                    output: "[interrupted]".to_string(),
+                    provider_state: None,
+                }),
+                InterruptStateOutcome::OkWithState(state) => Ok(ProviderTurnOutput {
+                    output: "[interrupted]".to_string(),
+                    provider_state: Some(state),
+                }),
+            }
+        }
+    }
+
+    /// Create a session, seed its `provider_state` via the persistence
+    /// service, then run one turn that gets interrupted mid-stream.
+    /// Returns the session as persisted AFTER the interrupted turn
+    /// finalises, so tests can assert on `provider_state` survival.
+    async fn run_interrupt_with_seeded_state(
+        seed: Option<zenui_provider_api::ProviderSessionState>,
+        outcome: InterruptStateOutcome,
+    ) -> SessionDetail {
+        let (mid_tx, mid_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(InterruptStateAdapter {
+            mid_turn_tx: tokio::sync::Mutex::new(Some(mid_tx)),
+            resume_rx: tokio::sync::Mutex::new(Some(resume_rx)),
+            outcome: tokio::sync::Mutex::new(Some(outcome)),
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+        ));
+
+        // Codex defaults to disabled since the "default only Claude and
+        // GitHub Copilot to enabled" change. `send_turn` rejects disabled
+        // providers before dispatching to the adapter, which would leave
+        // `mid_turn_tx` unfired and the test hanging on `mid_rx.await`.
+        // Flip it on for the test runtime so the adapter actually runs.
+        runtime
+            .set_provider_enabled(ProviderKind::Codex, true)
+            .await;
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let snapshot = runtime.snapshot().await;
+        let session_id = snapshot
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        // Seed provider_state directly through the persistence service,
+        // mimicking what a prior successfully-completed turn would have
+        // written. This is the precondition for the steering bug: the
+        // session enters the interrupted turn already carrying a
+        // committed native_thread_id.
+        if seed.is_some() {
+            let mut detail = runtime
+                .persistence
+                .get_session(&session_id)
+                .await
+                .expect("seed setup: session detail must exist");
+            detail.provider_state = seed;
+            runtime.persistence.upsert_session(detail).await;
+        }
+
+        let runtime_clone = runtime.clone();
+        let sid_clone = session_id.clone();
+        let turn_task = tokio::spawn(async move {
+            runtime_clone
+                .handle_client_message(ClientMessage::SendTurn {
+                    session_id: sid_clone,
+                    input: "go".to_string(),
+                    images: Vec::new(),
+                    permission_mode: None,
+                    reasoning_effort: None,
+                })
+                .await
+        });
+
+        mid_rx.await.expect("adapter should signal mid-turn");
+
+        runtime
+            .handle_client_message(ClientMessage::InterruptTurn {
+                session_id: session_id.clone(),
+            })
+            .await;
+
+        let _ = resume_tx.send(());
+        turn_task.await.expect("turn task should complete");
+
+        runtime
+            .persistence
+            .get_session(&session_id)
+            .await
+            .expect("session must persist after interrupted turn")
+    }
+
     /// User stops the turn; adapter surfaces it as `Err(...)` (the
     /// claude-cli / codex path). The final turn must keep every streamed
     /// block, land in `Interrupted` status, and NOT publish `Error`.
@@ -2559,6 +2762,92 @@ mod tests {
         assert_eq!(
             turn.output, "partial answer",
             "accumulated text must win over the adapter's [interrupted] stub"
+        );
+    }
+
+    /// Regression test for the steering-mode context-loss bug.
+    ///
+    /// If a session had a committed `provider_state` from a prior
+    /// successful turn, an interrupted turn that surfaces as `Err` must
+    /// NOT clobber or clear it. Downstream, the provider adapter will
+    /// use `provider_state.native_thread_id` to resume the SDK
+    /// conversation on the next (steered) turn — losing it here is
+    /// exactly the context-loss bug.
+    #[tokio::test]
+    async fn interrupt_err_preserves_seeded_provider_state() {
+        use zenui_provider_api::ProviderSessionState;
+        let seeded = ProviderSessionState {
+            native_thread_id: Some("sdk-session-ABC".to_string()),
+            metadata: None,
+        };
+        let persisted = run_interrupt_with_seeded_state(
+            Some(seeded.clone()),
+            InterruptStateOutcome::Err,
+        )
+        .await;
+        let got = persisted
+            .provider_state
+            .expect("seeded provider_state must survive Err interrupt");
+        assert_eq!(
+            got.native_thread_id,
+            seeded.native_thread_id,
+            "interrupt-Err path must not clobber committed native_thread_id"
+        );
+    }
+
+    /// Same invariant for the `Ok(provider_state=None)` interrupt path
+    /// (claude-sdk surfaces interrupts as `Ok("[interrupted]")` with
+    /// no new provider_state). The seeded id must survive because the
+    /// runtime only overwrites on `Some(_)`.
+    #[tokio::test]
+    async fn interrupt_ok_without_new_state_preserves_seeded_provider_state() {
+        use zenui_provider_api::ProviderSessionState;
+        let seeded = ProviderSessionState {
+            native_thread_id: Some("sdk-session-DEF".to_string()),
+            metadata: None,
+        };
+        let persisted = run_interrupt_with_seeded_state(
+            Some(seeded.clone()),
+            InterruptStateOutcome::OkNoState,
+        )
+        .await;
+        let got = persisted
+            .provider_state
+            .expect("seeded provider_state must survive Ok-no-state interrupt");
+        assert_eq!(
+            got.native_thread_id,
+            seeded.native_thread_id,
+            "interrupt-Ok-no-state path must not clobber committed native_thread_id"
+        );
+    }
+
+    /// Forward-path semantics: when the adapter explicitly provides a
+    /// fresh `provider_state` on an Ok-interrupt (e.g. the bridge's
+    /// two-phase scheme promoted a COMPLETED turn's id before the
+    /// abort landed), the runtime replaces the prior value. Documents
+    /// the non-regression side of the invariant.
+    #[tokio::test]
+    async fn interrupt_ok_with_new_state_replaces_seeded_provider_state() {
+        use zenui_provider_api::ProviderSessionState;
+        let seeded = ProviderSessionState {
+            native_thread_id: Some("sdk-session-OLD".to_string()),
+            metadata: None,
+        };
+        let refreshed = ProviderSessionState {
+            native_thread_id: Some("sdk-session-NEW".to_string()),
+            metadata: None,
+        };
+        let persisted = run_interrupt_with_seeded_state(
+            Some(seeded),
+            InterruptStateOutcome::OkWithState(refreshed.clone()),
+        )
+        .await;
+        let got = persisted
+            .provider_state
+            .expect("provider_state must be present after Ok-with-state");
+        assert_eq!(
+            got.native_thread_id, refreshed.native_thread_id,
+            "Ok-with-state must update native_thread_id to the adapter-supplied value"
         );
     }
 
@@ -2641,6 +2930,14 @@ mod tests {
             None,
             "/tmp/zenui-test/threads".to_string(),
         ));
+
+        // Codex defaults to disabled since the "default only Claude and
+        // GitHub Copilot to enabled" change; `send_turn` would reject
+        // the turn before producing a TurnRecord, making the later
+        // `turns.last()` assertion fail. Enable it for the test runtime.
+        runtime
+            .set_provider_enabled(ProviderKind::Codex, true)
+            .await;
 
         runtime
             .handle_client_message(ClientMessage::StartSession {
