@@ -32,7 +32,7 @@ export function ModeSelector({ value, onChange }: ModeSelectorProps) {
           <ChevronDown className="h-3 w-3 text-muted-foreground" />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-36">
+      <DropdownMenuContent align="start" className="min-w-44">
         <DropdownMenuLabel>Mode</DropdownMenuLabel>
         {MODE_OPTIONS.map((option) => (
           <DropdownMenuItem
