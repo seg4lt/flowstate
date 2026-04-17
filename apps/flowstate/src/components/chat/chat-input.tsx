@@ -1,12 +1,18 @@
 import * as React from "react";
 import { Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
-import type { AttachedImage, ProviderKind, SessionStatus } from "@/lib/types";
+import type {
+  AttachedImage,
+  PermissionMode,
+  ProviderKind,
+  SessionStatus,
+} from "@/lib/types";
 import {
   formatSkillInvocation,
   getCompletions,
   isCoreCommand,
   type SlashCommandItem,
 } from "@/lib/slash-commands";
+import { cn } from "@/lib/utils";
 import { toast } from "@/hooks/use-toast";
 import { SlashCommandPopup } from "./slash-command-popup";
 import { InFluxAttachmentChip } from "./attachment-chip";
@@ -47,6 +53,11 @@ interface ChatInputProps {
   /** Fires whenever the queue changes so the parent can persist it
    *  outside this component's lifecycle. */
   onQueueChange?: (queue: QueuedMessage[]) => void;
+  /** Current permission mode — drives the composer tint so the user
+   *  can see at rest which mode the next send will use. Plan mode
+   *  tints blue, bypass tints orange; default / accept_edits keep
+   *  the neutral styling. */
+  permissionMode?: PermissionMode;
 }
 
 export interface QueuedMessage {
@@ -122,6 +133,7 @@ export function ChatInput({
   onDraftChange,
   initialQueue,
   onQueueChange,
+  permissionMode,
 }: ChatInputProps) {
   const [value, setValueRaw] = React.useState(initialValue);
   // Notify the parent of every draft change so it can persist the text
@@ -692,7 +704,20 @@ export function ChatInput({
               }
               disabled={disabled || providerDisabled || archived}
               rows={1}
-              className="flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              className={cn(
+                "flex-1 resize-none rounded-lg border px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                // Mode tint. Plan + bypass are the modes where the
+                // next send behaves *differently* from the defaults,
+                // so they get a coloured border and a subtle L→R
+                // fade matching the WorkingIndicator's spinner tone.
+                // Default / accept_edits keep the neutral look so
+                // the tint only draws the eye when it matters.
+                permissionMode === "plan"
+                  ? "border-blue-500/60 bg-gradient-to-r from-blue-500/10 to-transparent focus-visible:ring-blue-500/60"
+                  : permissionMode === "bypass"
+                    ? "border-orange-500/60 bg-gradient-to-r from-orange-500/10 to-transparent focus-visible:ring-orange-500/60"
+                    : "border-input bg-background focus-visible:ring-ring",
+              )}
             />
 
             {showStop ? (

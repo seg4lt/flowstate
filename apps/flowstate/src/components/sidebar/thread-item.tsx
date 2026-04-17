@@ -25,6 +25,7 @@ import { useApp } from "@/stores/app-store";
 import { prefetchSession, sessionQueryKey, type SessionPage } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 import { BrailleSpinner, type SpinnerTone } from "../chat/braille-spinner";
+import { toneForMode } from "@/lib/mode-tone";
 
 function formatTimeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -86,18 +87,18 @@ export function ThreadItem({
   const inputRef = React.useRef<HTMLInputElement>(null);
 
   // Peek at the cached session page (non-reactively) to colour the
-  // spinner by the running turn's permission mode. Blue for plan
-  // mode, green otherwise. Falls back to green when the session
-  // hasn't been opened yet and therefore has no cached turns — the
-  // moment the user opens the thread and a turn starts, subsequent
-  // renders pick up the right tone.
+  // spinner by the running turn's permission mode. Blue for plan,
+  // orange for bypass, green otherwise. Falls back to green when the
+  // session hasn't been opened yet and therefore has no cached turns
+  // — the moment the user opens the thread and a turn starts,
+  // subsequent renders pick up the right tone.
   const spinnerTone = React.useMemo<SpinnerTone>(() => {
     if (!running) return "green";
     const page = queryClient.getQueryData<SessionPage>(
       sessionQueryKey(sessionId),
     );
     const runningTurn = page?.detail.turns.find((t) => t.status === "running");
-    return runningTurn?.permissionMode === "plan" ? "blue" : "green";
+    return toneForMode(runningTurn?.permissionMode);
     // queryClient is stable; re-evaluate whenever the running flag
     // flips, which is the same cadence chat-view updates the cache
     // on turn_started/turn_completed. We deliberately don't depend

@@ -28,6 +28,7 @@ import {
 } from "@/lib/queries";
 import { useStreamedGitDiffSummary } from "@/lib/git-diff-stream";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
+import { toneForMode } from "@/lib/mode-tone";
 import {
   readDefaultEffort,
   readDefaultPermissionMode,
@@ -1629,7 +1630,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             <WorkingIndicator
               turnStartedAt={new Date(runningTurn.createdAt).getTime()}
               lastEventAt={lastEventAt}
-              tone={permissionMode === "plan" ? "blue" : "green"}
+              tone={toneForMode(permissionMode)}
               onInterrupt={handleInterrupt}
             />
           )}
@@ -1713,6 +1714,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             onDraftChange={handleDraftChange}
             initialQueue={sessionQueues.get(sessionId)}
             onQueueChange={handleQueueChange}
+            permissionMode={permissionMode}
           />
         </div>
 

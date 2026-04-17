@@ -19,12 +19,13 @@ const BRAILLE_FRAMES = [
 ];
 const FRAME_MS = 80;
 
-export type SpinnerTone = "blue" | "green";
+export type SpinnerTone = "blue" | "green" | "orange";
 
 interface BrailleSpinnerProps {
-  /** Colour signal. "blue" for plan mode, "green" for default /
-   *  accept-edits / bypass. Callers map their own mode state onto
-   *  one of these so the spinner stays mode-agnostic. */
+  /** Colour signal. "blue" for plan mode, "orange" for bypass
+   *  permissions, "green" for default / accept-edits. Callers map
+   *  their own mode state onto one of these so the spinner stays
+   *  mode-agnostic. */
   tone: SpinnerTone;
   className?: string;
   /** Accessible label — announced by screen readers in place of the
@@ -56,10 +57,11 @@ function BrailleSpinnerInner({
     return () => window.clearInterval(id);
   }, []);
 
-  const toneClass =
-    tone === "blue"
-      ? "text-blue-500 dark:text-blue-400"
-      : "text-green-500 dark:text-green-400";
+  const toneClass = {
+    blue: "text-blue-500 dark:text-blue-400",
+    green: "text-green-500 dark:text-green-400",
+    orange: "text-orange-500 dark:text-orange-400",
+  }[tone];
 
   return (
     <span
