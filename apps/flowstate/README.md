@@ -34,19 +34,23 @@ Build explicitly for Apple Silicon (`aarch64-apple-darwin`):
 pnpm tauri build --target aarch64-apple-darwin
 ```
 
-Build artifacts land under:
+Build artifacts land in the workspace `target/` at the repo root:
 
-- macOS arm: `src-tauri/target/aarch64-apple-darwin/release/bundle/`
+- macOS arm: `<repo-root>/target/aarch64-apple-darwin/release/bundle/`
   (`.app` under `macos/`, `.dmg` under `dmg/`)
-- Default target: `src-tauri/target/release/bundle/`
+- Default target: `<repo-root>/target/release/bundle/`
   (`.deb` / `.AppImage` on Linux, `.msi` / `.exe` on Windows)
 
 ## Releases
 
-`.github/workflows/build.yml` runs the same build via a platform matrix when
-you push a tag matching `v*` (e.g. `v0.2.0`). Only the macOS arm target is
-enabled today; the Windows and Linux entries are commented out and ready to
-re-enable.
+The root `.github/workflows/build.yml` runs the same build via a
+platform matrix when you push a tag matching `v*` (e.g. `v0.2.0`).
+macOS arm and Windows x64 are enabled today; the Linux entry is
+commented out and ready to re-enable. Release assets and the Tauri
+updater manifest (`latest.json`) are published to this repo via the
+default `GITHUB_TOKEN`; the workflow requires a
+`TAURI_SIGNING_PRIVATE_KEY` secret in Actions to sign updater
+artifacts.
 
 ```sh
 git tag v0.2.0

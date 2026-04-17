@@ -1,8 +1,8 @@
 # provider-api
 
-The shared protocol crate. Every other crate in ZenUI speaks these
+The shared protocol crate. Every other crate in the SDK speaks these
 types when a message crosses a boundary — into or out of the runtime,
-over the wire to the frontend, across the daemon IPC transport, or
+over the wire to the frontend, across a daemon IPC transport, or
 between a provider adapter and its external process.
 
 ## The wire protocol

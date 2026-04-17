@@ -15,19 +15,71 @@ network stack.
 
 ## Entry points
 
-### `bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore>`
+Three entry points, differing only in **who owns the tokio runtime**.
+Pick by that axis first; the rest of the daemon-core lifecycle
+(counters, ready file, graceful shutdown) is identical either way.
 
-Pure headless bootstrap. Builds the tokio runtime, wires every provider
-adapter, opens SQLite, constructs `RuntimeCore` with the
-`DaemonLifecycle` as its `TurnLifecycleObserver`, and reconciles any
-stuck sessions. Does not start any transport. Returns a
-`BootstrappedCore { tokio_runtime, runtime_core, lifecycle }` for
-embedded callers that want to drive the runtime in-process without
-the full daemon loop.
+### Runtime ownership: app vs. daemon
+
+| Scenario | Runtime | Entry point | Returns |
+|---|---|---|---|
+| Host app already has a tokio runtime (Tauri, axum, your own `#[tokio::main]`, a test harness) | **App owns it.** daemon-core borrows it. | `bootstrap_core_async` | `InProcessCore { runtime_core, lifecycle }` |
+| Plain sync `main()` with no runtime yet (standalone daemon binary) | **daemon-core owns it.** Builds a multi-thread tokio runtime internally. | `bootstrap_core` | `BootstrappedCore { tokio_runtime, runtime_core, lifecycle }` |
+| Full out-of-process daemon with transports, ready file, SIGINT, idle watchdog | daemon-core owns it (via `bootstrap_core`) | `run_blocking` | `Result<()>` (blocks until shutdown) |
+
+**Rule of thumb:** if you already have a tokio runtime, use
+`bootstrap_core_async`. Only reach for `bootstrap_core` when you
+genuinely need the SDK to own a dedicated runtime.
+
+### `bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore>` — preferred for embedders
+
+Async, **runtime-agnostic** bootstrap. Does NOT build a tokio runtime.
+Call from inside an existing `#[tokio::main]`, a `tokio::test`, or a
+spawned task. Every subsequent `RuntimeCore` call and every task it
+spawns runs on the caller's runtime — no second runtime in the
+process, no cross-runtime `block_on` hazards.
+
+This is what flowstate does. The Tauri webview already drives a
+multi-thread tokio runtime; flowstate hands that runtime to daemon-core
+via `bootstrap_core_async` and holds the returned `InProcessCore` as
+an application-wide state.
+
+```rust
+// Inside a Tauri setup handler, or any existing tokio context.
+let core = zenui_daemon_core::bootstrap_core_async(&config)
+    .await
+    .context("failed to bootstrap agent runtime")?;
+let runtime: Arc<RuntimeCore> = core.runtime_core;
+// ... use runtime directly; spawn your own transport glue as needed.
+```
+
+Wires every enabled provider adapter, opens SQLite, constructs
+`RuntimeCore` with `DaemonLifecycle` as its `TurnLifecycleObserver`,
+reclaims sessions stuck at `Running` from a prior crash, and seeds the
+provider-enablement map from persistence. Does NOT start any
+transport — embedders call `RuntimeCore` methods directly (or wire
+their own transport).
+
+### `bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore>` — sync wrapper
+
+Thin sync wrapper over `bootstrap_core_async`. Builds its own
+multi-thread tokio runtime (`thread_name = "zenui-runtime"`),
+`block_on`s the async path, and returns a `BootstrappedCore` that
+**owns** the runtime. Drop it to shut everything down.
+
+Use from a plain sync `main()` that does **not** already have a
+runtime — typically a standalone daemon binary.
+
+> ⚠️ **Do not call this from inside an existing tokio runtime.** The
+> internal `block_on` will panic with `Cannot start a runtime from
+> within a runtime`. Reach for `bootstrap_core_async` instead.
 
 ### `run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -> Result<()>`
 
-The zenui-server binary entry point. Sequence:
+Full daemon-binary entry point. Calls `bootstrap_core` (so it owns
+its own runtime), binds and serves every transport, writes the ready
+file, runs the idle watchdog + SIGINT handler, and coordinates
+graceful shutdown. Sequence:
 
 1. `bootstrap_core(&config)`.
 2. For each transport, call `bind()` on the host thread. Errors abort
@@ -43,6 +95,10 @@ The zenui-server binary entry point. Sequence:
    `graceful_shutdown` (which runs `shutdown_all_turns`), then drain
    every transport handle via `shutdown().await` in reverse order of
    start, delete the ready file, drop the runtime.
+
+Library embedders typically do NOT call `run_blocking` — it's for the
+standalone-daemon shape. Embedders stop at `bootstrap_core_async` and
+wire their own application loop around the returned `RuntimeCore`.
 
 ## The `Transport` trait
 
@@ -87,8 +143,8 @@ pub enum TransportAddressInfo {
 a transport can claim OS resources (`StdTcpListener::bind`,
 `UnixListener::bind`, `CreateNamedPipe`, ...). `bind()` must NOT call
 any tokio API — tokio isn't running yet. Preserving this property is
-what lets `zenui-server start` fail fast with a clear error when the
-port is in use.
+what lets a daemon's `start` subcommand fail fast with a clear error
+when the port is in use.
 
 **`serve()` is synchronous but called inside tokio.** `tokio::spawn` is
 a sync API, so marking `serve()` async would be misleading. The
@@ -119,9 +175,17 @@ Tokio task spawned from `run_blocking`. Waits for both
 On timeout: fires the shutdown oneshot. On activity: re-enters the
 wait loop.
 
+**Only `run_blocking` spawns the watchdog.** `bootstrap_core_async`
+and `bootstrap_core` do not — embedders own their own application
+lifetime (e.g. flowstate lives as long as the Tauri window does, and
+explicitly calls `DaemonLifecycle::request_shutdown` on app exit).
+If an embedder *wants* the watchdog, they can call `idle_watchdog`
+from their own task after `bootstrap_core_async` returns.
+
 `DaemonConfig::zero_transport(project_root)` sets `idle_timeout:
 Duration::MAX` for embedded daemons — they'll never fire the idle
-timer by themselves and rely on explicit `DaemonLifecycle::request_shutdown`.
+timer by themselves and rely on explicit
+`DaemonLifecycle::request_shutdown`.
 
 ## `ReadyFile`
 

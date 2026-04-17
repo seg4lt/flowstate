@@ -1,9 +1,9 @@
 # core — shared domain
 
-Transport-agnostic logic that defines what ZenUI is, independent of how
-it's wired up. Any frontend, transport adapter, or test harness depends
-on these; none of these depend on any frontend, transport, or daemon
-crate.
+Transport-agnostic logic that defines what the agent SDK does,
+independent of how it's wired up. Any frontend, transport adapter, or
+test harness depends on these; none of these depend on any frontend,
+transport, or daemon crate.
 
 ## What lives here
 
@@ -31,6 +31,6 @@ crate.
 ## Why providers live in `core` and not `middleman`
 
 Providers implement `ProviderAdapter` and are the concrete capability
-that makes ZenUI useful. They aren't transport glue — transport glue
+that makes the SDK useful. They aren't transport glue — transport glue
 moves bytes; providers produce the bytes in the first place. Without
 them, `RuntimeCore` has nothing to dispatch to.

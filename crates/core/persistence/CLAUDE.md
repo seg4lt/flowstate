@@ -16,9 +16,8 @@ or any new persisted type, ask:
 
 - **Yes** → it's a runtime concern, persist it here.
 - **No** → it's a display concern. Put it in the consuming app's own
-  store (for flowstate, that's `session_display` / `project_display`
-  tables in `flowstate/src-tauri/src/user_config.rs`; for the zenui
-  reference frontend, it's an in-memory map in `appStore.ts`).
+  store (for flowstate, that's the `session_display` / `project_display`
+  tables in `flowstate/src-tauri/src/user_config.rs`).
 
 "It's convenient for the UI to read it here" is not the runtime
 reading it. Convenience is a bridge between storage and UI that the
@@ -41,9 +40,9 @@ app owns, not the SDK.
 
 | Field | Lives in | Why |
 |---|---|---|
-| Session title | App store (flowstate: `session_display.title`; zenui: in-memory `sessionDisplay`) | Never read by the runtime. Apps derive titles client-side (e.g. first 6 words of input) or let the user set one. |
+| Session title | App store (flowstate: `session_display.title`) | Never read by the runtime. Apps derive titles client-side (e.g. first 6 words of input) or let the user set one. |
 | Session last-turn preview | App store (same tables) | Display affordance for session lists. Apps can derive it from the last turn's `output` — no need for a persisted column. |
-| Project name | App store (flowstate: `project_display.name`; zenui: in-memory `projectDisplay`) | User-visible label. Runtime only needs `project_id` and `path`. |
+| Project name | App store (flowstate: `project_display.name`) | User-visible label. Runtime only needs `project_id` and `path`. |
 | Project sort order | App store | Arbitrary UI ordering preference. Different apps sort differently (alphabetically, by recency, etc.). |
 
 ## Wire protocol implications

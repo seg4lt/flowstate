@@ -1,6 +1,6 @@
 # runtime-core
 
-Central runtime for ZenUI. Owns session state, dispatches client
+Central agent runtime. Owns session state, dispatches client
 messages to provider adapters, drains streaming turn events, and
 broadcasts `RuntimeEvent`s to attached subscribers.
 
