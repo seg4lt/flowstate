@@ -194,6 +194,11 @@ export function mergeCommandsWithCatalog(
     });
   }
 
+  // Collect agents first, then push them at the end so they cluster
+  // visually. Sort alphabetically so the ordering is stable across
+  // refreshes — the reducer's id-equality short-circuit depends on a
+  // deterministic list.
+  const agents: SlashCommandItem[] = [];
   for (const agent of catalog.agents) {
     // Namespace agent names away from slash-commands so a collision
     // (e.g. a skill named "general-purpose") doesn't silently replace
@@ -201,15 +206,16 @@ export function mergeCommandsWithCatalog(
     const key = `agent:${agent.name}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push({
+    agents.push({
       id: agent.id,
       name: agent.name,
       description: agent.description,
       kind: "agent",
     });
   }
+  agents.sort((a, b) => a.name.localeCompare(b.name));
 
-  return out;
+  return [...out, ...agents];
 }
 
 /** True when `name` matches a core app command. Used by chat-input

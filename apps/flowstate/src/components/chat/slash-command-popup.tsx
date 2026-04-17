@@ -41,7 +41,7 @@ export function SlashCommandPopup({
     <div
       ref={listRef}
       role="listbox"
-      className="absolute bottom-full left-0 z-50 mb-1 max-h-72 w-72 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-md"
+      className="absolute bottom-full left-0 z-50 mb-1 max-h-80 w-80 overflow-y-auto rounded-lg border border-border bg-popover p-1 shadow-md"
     >
       {matches.map((cmd, i) => {
         const badge = badgeFor(cmd);
@@ -64,12 +64,12 @@ export function SlashCommandPopup({
             }`}
           >
             <div className="flex items-baseline gap-1.5">
-              <span className="font-medium">
+              <span className="truncate font-medium">
                 {prefix}
                 {cmd.name}
               </span>
               {cmd.argHint && (
-                <span className="text-xs text-muted-foreground/70">
+                <span className="truncate text-xs text-muted-foreground/70">
                   {cmd.argHint}
                 </span>
               )}
