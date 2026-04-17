@@ -22,7 +22,7 @@ export interface SlashCommandContext {
 }
 
 export interface SlashCommand {
-  /** Command name without the leading slash, e.g. "clear" */
+  /** Command name without the leading slash, e.g. "flowstate-clear" */
   name: string;
   /** One-liner shown in the autocomplete popup */
   description: string;
@@ -35,7 +35,7 @@ export interface SlashCommand {
 // ---------------------------------------------------------------------------
 
 const clearCommand: SlashCommand = {
-  name: "clear",
+  name: "flowstate-clear",
   description: "Clear session — archives current thread and opens a fresh one",
   async execute(ctx) {
     const { session, sessionId, send, navigate, toast } = ctx;
@@ -80,7 +80,7 @@ const clearCommand: SlashCommand = {
 };
 
 const newCommand: SlashCommand = {
-  name: "new",
+  name: "flowstate-new",
   description: "New thread — same provider, model & project",
   async execute(ctx) {
     const { session, send, navigate, toast } = ctx;
@@ -155,6 +155,6 @@ export function getCompletions(
 ): { name: string; description: string }[] {
   const lower = partial.toLowerCase();
   // Match against "/name" so the user can type "/" and see everything,
-  // or "/cl" and narrow down to "/clear".
+  // or "/flow" and narrow down to "/flowstate-clear".
   return COMMAND_META.filter((c) => `/${c.name}`.startsWith(lower));
 }
