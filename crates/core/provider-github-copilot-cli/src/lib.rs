@@ -12,10 +12,11 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zenui_provider_api::{
-    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
+    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
+    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion,
+    UserInputQuestion, skills_disk,
 };
 
 const TURN_TIMEOUT_SECS: u64 = 600;
@@ -304,14 +305,20 @@ struct CachedProcess {
     last_activity: Arc<AtomicU64>,
     /// Number of turns currently running on this process.
     in_flight: Arc<AtomicU32>,
+    /// Copilot CLI sessionId for this cached process — persisted here
+    /// (not just in `create_params`) so `session_command_catalog`
+    /// can route `session.skills.list` / `.agent.list` / `.mcp.list`
+    /// without re-resolving from `provider_state`.
+    native_session_id: String,
 }
 
 impl CachedProcess {
-    fn new(process: CopilotCliProcess) -> Self {
+    fn new(process: CopilotCliProcess, native_session_id: String) -> Self {
         Self {
             process: Arc::new(Mutex::new(process)),
             last_activity: Arc::new(AtomicU64::new(unix_now())),
             in_flight: Arc::new(AtomicU32::new(0)),
+            native_session_id,
         }
     }
 
@@ -584,7 +591,7 @@ impl GitHubCopilotCliAdapter {
 
         info!("copilot CLI: session ready ({})", native_session_id);
 
-        let cached = CachedProcess::new(process);
+        let cached = CachedProcess::new(process, native_session_id);
         let mut sessions = self.active_processes.lock().await;
         Ok(sessions
             .entry(session.summary.session_id.clone())
@@ -1303,6 +1310,180 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
 
         Ok(())
     }
+
+    /// Same scan convention as the Copilot SDK adapter: broad support
+    /// for the different skill directory layouts that Copilot-flavoured
+    /// repos use in the wild.
+    fn skill_scan_roots(&self) -> (&'static [&'static str], &'static [&'static str]) {
+        (
+            &[".copilot", ".claude"],
+            &[
+                ".copilot/skills",
+                ".claude/skills",
+                ".agents/skills",
+                ".github/skills",
+            ],
+        )
+    }
+
+    /// Merge the disk SKILL.md scan with Copilot CLI's live
+    /// `session.skills.list` / `.agent.list` / `.mcp.list` results. The
+    /// CLI wraps the same SDK as the Copilot bridge, so the wire shapes
+    /// match — skills carry `userInvocable`, which we pass through for
+    /// the frontend filter. Requires a live CLI session; on any RPC
+    /// error we fall back to disk-only.
+    async fn session_command_catalog(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<CommandCatalog, String> {
+        let (home_dirs, project_dirs) = self.skill_scan_roots();
+        let cwd_path = session.cwd.as_deref().map(Path::new);
+        let roots = skills_disk::scan_roots_for(home_dirs, project_dirs, cwd_path);
+        let mut commands = skills_disk::scan(&roots, self.kind());
+
+        let capabilities = self.fetch_capabilities(session).await;
+        let (sdk_skills, sdk_agents, sdk_mcp) = match capabilities {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("copilot-cli session_command_catalog: falling back to disk-only ({err})");
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        };
+
+        let disk_names: std::collections::HashSet<String> =
+            commands.iter().map(|c| c.name.clone()).collect();
+        for skill in sdk_skills {
+            if disk_names.contains(&skill.name) {
+                continue;
+            }
+            commands.push(ProviderCommand {
+                id: format!("github_copilot_cli:builtin:{}", skill.name),
+                name: skill.name,
+                description: skill.description,
+                kind: CommandKind::Builtin,
+                user_invocable: skill.user_invocable,
+                arg_hint: None,
+            });
+        }
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let agents = sdk_agents
+            .into_iter()
+            .map(|a| ProviderAgent {
+                id: format!("github_copilot_cli:agent:{}", a.name),
+                name: a.name,
+                description: a.description,
+            })
+            .collect();
+
+        let mcp_servers = sdk_mcp
+            .into_iter()
+            .map(|m| McpServerInfo {
+                enabled: matches!(
+                    m.status.as_deref(),
+                    Some("connected") | Some("pending")
+                ),
+                id: format!("github_copilot_cli:mcp:{}", m.name),
+                name: m.name,
+            })
+            .collect();
+
+        Ok(CommandCatalog {
+            commands,
+            agents,
+            mcp_servers,
+        })
+    }
+}
+
+impl GitHubCopilotCliAdapter {
+    /// Call Copilot CLI's `session.skills.list` / `.agent.list` /
+    /// `.mcp.list` JSON-RPC methods in parallel via the cached process.
+    /// Booting a process if necessary via `ensure_session_process`.
+    async fn fetch_capabilities(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<
+        (Vec<CliSkill>, Vec<CliAgent>, Vec<CliMcpServer>),
+        String,
+    > {
+        let cached = self.ensure_session_process(session).await?;
+        let _guard = cached.activity_guard();
+        let native = cached.native_session_id.clone();
+        let process = cached.process.lock().await;
+
+        let (skills, agents, mcp) = tokio::try_join!(
+            process.call(
+                "session.skills.list",
+                serde_json::json!({ "sessionId": native.clone() }),
+            ),
+            process.call(
+                "session.agent.list",
+                serde_json::json!({ "sessionId": native.clone() }),
+            ),
+            process.call(
+                "session.mcp.list",
+                serde_json::json!({ "sessionId": native }),
+            ),
+        )?;
+
+        let parsed_skills: SkillsList = serde_json::from_value(skills)
+            .map_err(|e| format!("parse skills.list: {e}"))?;
+        let parsed_agents: AgentsList = serde_json::from_value(agents)
+            .map_err(|e| format!("parse agent.list: {e}"))?;
+        let parsed_mcp: McpList = serde_json::from_value(mcp)
+            .map_err(|e| format!("parse mcp.list: {e}"))?;
+
+        Ok((parsed_skills.skills, parsed_agents.agents, parsed_mcp.servers))
+    }
+}
+
+/// Inner `skills` array inside the JSON-RPC response to
+/// `session.skills.list`. Mirrors `SessionSkillsListResult.skills[]`
+/// on the SDK side; deserde dropouts for `path` / `source` are
+/// intentional — those aren't surfaced in the popup.
+#[derive(Debug, serde::Deserialize)]
+struct SkillsList {
+    #[serde(default)]
+    skills: Vec<CliSkill>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliSkill {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    user_invocable: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentsList {
+    #[serde(default)]
+    agents: Vec<CliAgent>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliAgent {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct McpList {
+    #[serde(default)]
+    servers: Vec<CliMcpServer>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CliMcpServer {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
