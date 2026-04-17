@@ -737,12 +737,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       // Prevent default Tab behavior (focus navigation)
       event.preventDefault();
 
-      // Cycle to next mode. Local state only — the new mode rides out on
-      // the next `send_turn`. Pushing `update_permission_mode` to the
-      // daemon mid-stream flips the live SDK Query and drops the running
-      // turn from view, which is exactly what we're avoiding here.
+      // Cycle to next mode. Always update local state so the toolbar
+      // reflects the choice and the next `send_turn` sends it. If a
+      // turn is in flight, also push `update_permission_mode` so the
+      // in-flight adapter picks up the change immediately — without
+      // this, toggling bypass mid-turn would still prompt for every
+      // subsequent tool call until the turn ends.
       const newMode = cycleMode(permissionMode, "forward");
       setPermissionMode(newMode);
+      if (session?.status === "running") {
+        void sendMessage({
+          type: "update_permission_mode",
+          session_id: sessionId,
+          permission_mode: newMode,
+        });
+      }
 
       toast({
         description: `Mode: ${MODE_LABELS[newMode]}`,
@@ -1371,15 +1380,27 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
   }
 
-  // Mode changes are local-only: the new mode rides out on the next
-  // `send_turn`, so the running turn stays untouched. Plan-exit mode
-  // switches go through `handlePermissionDecision` /
-  // `permission_mode_override`, which is the sanctioned atomic path.
+  // Mode changes update local state (picked up by next `send_turn`)
+  // AND push `update_permission_mode` when a turn is running so the
+  // in-flight adapter honors the new mode for tools still to be
+  // called in the current turn. Plan-exit mode switches go through
+  // `handlePermissionDecision` / `permission_mode_override` — that
+  // path bundles the mode change atomically with a tool approval via
+  // the SDK's `updatedPermissions: [{setMode}]` mechanism, which is
+  // cheaper than a separate RPC but only applies when there's a
+  // pending permission to approve.
   const handlePermissionModeChange = React.useCallback(
     (mode: PermissionMode) => {
       setPermissionMode(mode);
+      if (session?.status === "running") {
+        void sendMessage({
+          type: "update_permission_mode",
+          session_id: sessionId,
+          permission_mode: mode,
+        });
+      }
     },
-    [],
+    [session?.status, sessionId],
   );
 
   const toolbar = session ? (

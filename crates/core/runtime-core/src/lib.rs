@@ -114,6 +114,17 @@ pub struct RuntimeCore {
     /// `spawn_health_check`, and `handle_send_turn` to gate downstream
     /// behavior.
     provider_enablement: Arc<RwLock<HashMap<ProviderKind, bool>>>,
+    /// Per-session live permission mode during an in-flight turn.
+    /// Seeded at `send_turn` entry from the turn-start mode and
+    /// updated when `answer_permission` carries a mode override or
+    /// `UpdatePermissionMode` client message lands mid-stream. Read
+    /// by the drain loop's Bypass safety net so a mid-turn mode
+    /// change (e.g. ExitPlanMode → Bypass Permissions) takes effect
+    /// for every tool call later in the same turn — the earlier
+    /// implementation only read the turn-start mode via the local
+    /// `permission_mode` parameter, which went stale after the
+    /// override.
+    in_flight_permission_mode: Arc<RwLock<HashMap<String, PermissionMode>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
@@ -142,6 +153,24 @@ impl Drop for TurnCounterGuard {
     fn drop(&mut self) {
         if let Some(obs) = &self.observer {
             obs.on_turn_end(&self.session_id);
+        }
+    }
+}
+
+/// RAII guard that removes the session's entry from
+/// `in_flight_permission_mode` on every exit path of `send_turn`.
+/// Mirrors `TurnCounterGuard`'s shape — a plain `remove()` at the
+/// bottom of the function would leak the entry whenever an early
+/// `?` return unwinds the task.
+struct InFlightPermissionModeGuard {
+    map: Arc<RwLock<HashMap<String, PermissionMode>>>,
+    session_id: String,
+}
+
+impl Drop for InFlightPermissionModeGuard {
+    fn drop(&mut self) {
+        if let Ok(mut live) = self.map.write() {
+            live.remove(&self.session_id);
         }
     }
 }
@@ -184,6 +213,7 @@ impl RuntimeCore {
             in_flight_turns: Arc::new(RwLock::new(HashMap::new())),
             interrupted_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_enablement: Arc::new(RwLock::new(HashMap::new())),
+            in_flight_permission_mode: Arc::new(RwLock::new(HashMap::new())),
             turn_observer,
         }
     }
@@ -849,6 +879,19 @@ impl RuntimeCore {
         decision: PermissionDecision,
         mode_override: Option<PermissionMode>,
     ) {
+        // Update the live-mode tracker BEFORE we forward to the sink.
+        // The sink wakes the adapter's pending canUseTool promise,
+        // which may resolve quickly enough for the SDK to issue a
+        // subsequent tool call that re-enters the drain loop — if
+        // the safety net is still reading the stale turn-start mode,
+        // that tool call would get prompted instead of auto-allowed.
+        // Updating first makes the mode change visible to the drain
+        // loop by the time it matters.
+        if let Some(mode) = mode_override {
+            if let Ok(mut live) = self.in_flight_permission_mode.write() {
+                live.insert(session_id.to_string(), mode);
+            }
+        }
         let sink = self.active_sinks.lock().await.get(session_id).cloned();
         if let Some(sink) = sink {
             tracing::info!(
@@ -1022,6 +1065,19 @@ impl RuntimeCore {
         // drain loop could leave a set flag behind; without this clear,
         // the next turn's exit path would wrongly finalise as Interrupted.
         self.interrupted_sessions.lock().await.remove(&session_id);
+        // Seed the live-mode tracker. Any mid-turn override via
+        // `answer_permission` or `UpdatePermissionMode` mutates this
+        // entry so the drain loop's bypass safety net reads the
+        // current effective mode, not the frozen turn-start one.
+        // The RAII guard below removes the entry on every exit path
+        // (normal return, early `?`, panic) so it can't leak.
+        if let Ok(mut live) = self.in_flight_permission_mode.write() {
+            live.insert(session_id.clone(), permission_mode);
+        }
+        let _in_flight_mode_guard = InFlightPermissionModeGuard {
+            map: self.in_flight_permission_mode.clone(),
+            session_id: session_id.clone(),
+        };
         // Runtime enablement gate. Reject before we touch orchestration
         // so a disabled provider can't start a turn mid-stream. Previous
         // turns on this session stay visible (read-only) — that's the
@@ -1281,21 +1337,35 @@ impl RuntimeCore {
                     suggested_decision,
                 } => {
                     // Bypass-mode safety net. The user explicitly
-                    // opted out of permission prompting for this turn
-                    // by selecting Bypass Permissions. Primary fix
-                    // lives at each adapter's emission site (e.g. the
-                    // Claude SDK bridge short-circuits inside
-                    // canUseTool before ever emitting), but this
-                    // cross-provider net catches any permission
-                    // request that still slips through — CLI-backed
-                    // adapters whose upstream binary forwards prompts
-                    // in danger-mode, future adapters that don't know
-                    // about bypass yet, or a stale bridge build on
+                    // opted out of permission prompting by selecting
+                    // Bypass Permissions. Primary fix lives at each
+                    // adapter's emission site (e.g. the Claude SDK
+                    // bridge short-circuits inside canUseTool before
+                    // ever emitting), but this cross-provider net
+                    // catches any permission request that still
+                    // slips through — CLI-backed adapters whose
+                    // upstream binary forwards prompts in danger-
+                    // mode, future adapters that don't know about
+                    // bypass yet, or a stale bridge build on
                     // someone's disk. Auto-answer Allow on the sink
                     // and skip the publish so no dialog reaches the
-                    // UI. The adapter's canUseTool promise resolves
-                    // with approved and the tool runs.
-                    if permission_mode == PermissionMode::Bypass {
+                    // UI.
+                    //
+                    // Read the LIVE mode, not the turn-start
+                    // parameter. If the user just approved an
+                    // ExitPlanMode → Bypass, `answer_permission`
+                    // already flipped the live-mode entry; the
+                    // local `permission_mode` captured at
+                    // `send_turn` entry is stale and would fall
+                    // through to the publish path, re-prompting
+                    // for the first post-plan tool call.
+                    let effective_mode = self
+                        .in_flight_permission_mode
+                        .read()
+                        .ok()
+                        .and_then(|live| live.get(&sid).copied())
+                        .unwrap_or(permission_mode);
+                    if effective_mode == PermissionMode::Bypass {
                         let sink =
                             self.active_sinks.lock().await.get(&sid).cloned();
                         if let Some(sink) = sink {
@@ -1627,6 +1697,15 @@ impl RuntimeCore {
                 )
             })?
             .clone();
+        // Keep the bypass safety net's view of the current mode in
+        // sync with any mid-turn toolbar toggle. Only affects the
+        // current turn's drain loop — cleared by the RAII guard in
+        // `send_turn` once the turn ends.
+        if let Ok(mut live) = self.in_flight_permission_mode.write() {
+            if live.contains_key(&session_id) {
+                live.insert(session_id.clone(), mode);
+            }
+        }
         adapter.update_permission_mode(&session, mode).await
     }
 
