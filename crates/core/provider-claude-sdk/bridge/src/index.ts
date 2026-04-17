@@ -900,6 +900,70 @@ class ClaudeBridge {
       }
     }
   }
+
+  /**
+   * Enumerate the slash commands, sub-agents, and MCP servers the
+   * Claude Agent SDK reports for a given cwd. Same ephemeral-query
+   * trick as `listModels`: spawn with a noop prompt so init fires,
+   * read the cached `supportedCommands` / `supportedAgents` /
+   * `mcpServerStatus`, then abort. The aborted query doesn't round-trip
+   * to the Claude API, so this is cheap enough to call on popup open.
+   *
+   * `cwd` is explicit (not `this.cwd`) so the caller can probe any
+   * session's working directory without first calling `create_session`.
+   */
+  async listCapabilities(
+    cwd: string,
+    model?: string,
+  ): Promise<{
+    commands: Array<{ name: string; description: string; argumentHint?: string }>;
+    agents: Array<{ name: string; description: string; model?: string }>;
+    mcpServers: Array<{ name: string; status: string; scope?: string; error?: string }>;
+  }> {
+    const abortController = new AbortController();
+    const q = query({
+      prompt: 'noop',
+      options: {
+        cwd,
+        abortController,
+        ...(model ? { model } : {}),
+        ...(RESOLVED_LOCAL_CLAUDE_PATH
+          ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
+          : {}),
+      },
+    });
+    try {
+      const [commands, agents, mcpServers] = await Promise.all([
+        q.supportedCommands(),
+        q.supportedAgents(),
+        q.mcpServerStatus(),
+      ]);
+      return {
+        commands: commands.map((c) => ({
+          name: c.name,
+          description: c.description,
+          argumentHint: c.argumentHint,
+        })),
+        agents: agents.map((a) => ({
+          name: a.name,
+          description: a.description,
+          model: a.model,
+        })),
+        mcpServers: mcpServers.map((m) => ({
+          name: m.name,
+          status: m.status,
+          scope: m.scope,
+          error: m.error,
+        })),
+      };
+    } finally {
+      try {
+        abortController.abort();
+      } catch {
+        // ignore
+      }
+    }
+  }
 }
 
 function parsePlanSteps(raw: string): Array<{ title: string; detail?: string }> {
@@ -1068,6 +1132,32 @@ async function main(): Promise<void> {
             writeJson({
               type: 'error',
               error: `list_models failed: ${(err as Error).message}`,
+            });
+          }
+        })();
+        break;
+      }
+
+      case 'list_capabilities': {
+        // Enumerate slash commands / sub-agents / MCP servers for a
+        // given cwd. Called from the Rust adapter's
+        // session_command_catalog override. Independent of any active
+        // session — we spawn an ephemeral query, read init, abort.
+        const cwd = (msg.cwd as string) ?? process.cwd();
+        const model = msg.model as string | undefined;
+        (async () => {
+          try {
+            const caps = await bridge.listCapabilities(cwd, model);
+            writeJson({
+              type: 'capabilities',
+              commands: caps.commands,
+              agents: caps.agents,
+              mcp_servers: caps.mcpServers,
+            });
+          } catch (err) {
+            writeJson({
+              type: 'error',
+              error: `list_capabilities failed: ${(err as Error).message}`,
             });
           }
         })();

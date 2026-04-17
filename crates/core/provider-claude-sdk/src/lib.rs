@@ -15,10 +15,11 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    PermissionDecision, PermissionMode, ProviderAdapter, ProviderKind, ProviderModel,
+    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
+    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputAnswer,
-    UserInputOption, UserInputQuestion,
+    UserInputOption, UserInputQuestion, skills_disk,
 };
 
 fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
@@ -115,6 +116,49 @@ struct BridgeImageAttachment {
     data_base64: String,
 }
 
+/// Shape of a single slash command in a `capabilities` response.
+/// Mirrors the Claude Agent SDK's `SlashCommand` type (camelCase on
+/// the wire).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeCommand {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    argument_hint: Option<String>,
+}
+
+/// Shape of a sub-agent in a `capabilities` response. Mirrors the SDK's
+/// `AgentInfo`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeAgent {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+}
+
+/// Shape of an MCP server in a `capabilities` response. Subset of the
+/// SDK's `McpServerStatus` — we only need name + connection state for
+/// the `McpServerInfo` wire type.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeMcpServer {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    scope: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 enum BridgeRequest {
@@ -165,6 +209,19 @@ enum BridgeRequest {
     CancelQuestion { request_id: String },
     #[serde(rename = "list_models")]
     ListModels,
+    /// Enumerate the slash commands, sub-agents, and MCP servers the
+    /// SDK exposes for `cwd`. Bridge spawns a throwaway `query()` with
+    /// a noop prompt, reads the cached init response, and aborts —
+    /// no actual API call. Fired from
+    /// [`ProviderAdapter::session_command_catalog`] and safe to call
+    /// on every popup open.
+    #[serde(rename = "list_capabilities")]
+    ListCapabilities {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
     #[serde(rename = "interrupt")]
     Interrupt,
     /// Mid-turn permission-mode switch. Bridge calls
@@ -190,6 +247,19 @@ enum BridgeResponse {
     SessionCreated { session_id: String },
     #[serde(rename = "models")]
     Models { models: Vec<ProviderModel> },
+    /// Response to `BridgeRequest::ListCapabilities`. Carries the
+    /// SDK-reported slash commands, sub-agents, and MCP servers for
+    /// a given cwd. Descriptions come straight from the SDK so the
+    /// popup renders them as-is; the adapter only adds stable ids.
+    #[serde(rename = "capabilities")]
+    Capabilities {
+        #[serde(default)]
+        commands: Vec<BridgeCommand>,
+        #[serde(default)]
+        agents: Vec<BridgeAgent>,
+        #[serde(default)]
+        mcp_servers: Vec<BridgeMcpServer>,
+    },
     #[serde(rename = "response")]
     Response {
         output: String,
@@ -1076,6 +1146,134 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             BridgeResponse::Error { error } => Err(format!("Claude list_models error: {error}")),
             other => Err(format!(
                 "Unexpected bridge response for list_models: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Ask the Claude Agent SDK what slash commands, sub-agents, and
+    /// MCP servers are available for this session, and merge the
+    /// result with the shared on-disk skill scan.
+    ///
+    /// The bridge path is the same throwaway `query({ prompt: 'noop' })`
+    /// trick as `fetch_models`: no API call is made, init runs
+    /// locally, we read the cached capability lists, abort. On any
+    /// failure we fall through to a disk-only catalog so the popup
+    /// still shows user SKILL.md entries.
+    async fn session_command_catalog(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<CommandCatalog, String> {
+        let (home_dirs, project_dirs) = self.skill_scan_roots();
+        let cwd_path = session.cwd.as_deref().map(Path::new);
+        let roots = skills_disk::scan_roots_for(home_dirs, project_dirs, cwd_path);
+        let mut commands = skills_disk::scan(&roots, self.kind());
+
+        // Ask the bridge for the SDK's live capability snapshot. If
+        // anything goes wrong (bridge spawn, timeout, malformed
+        // response) fall back to disk-only — the popup is a UX
+        // affordance, not something a failure should propagate.
+        let capabilities = self
+            .fetch_capabilities(
+                session.cwd.clone(),
+                session.summary.model.clone(),
+            )
+            .await;
+        let (sdk_commands, sdk_agents, sdk_mcp) = match capabilities {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("session_command_catalog: falling back to disk-only ({err})");
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        };
+
+        let disk_names: std::collections::HashSet<String> =
+            commands.iter().map(|c| c.name.clone()).collect();
+        for sdk in sdk_commands {
+            if disk_names.contains(&sdk.name) {
+                // The on-disk SKILL.md carries richer metadata
+                // (source, real description) — let it win the slot.
+                continue;
+            }
+            commands.push(ProviderCommand {
+                id: format!("claude:builtin:{}", sdk.name),
+                name: sdk.name,
+                description: sdk.description,
+                kind: CommandKind::Builtin,
+                user_invocable: true,
+                arg_hint: sdk.argument_hint,
+            });
+        }
+        commands.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let agents = sdk_agents
+            .into_iter()
+            .map(|a| ProviderAgent {
+                id: format!("claude:agent:{}", a.name),
+                name: a.name,
+                description: a.description,
+            })
+            .collect();
+
+        let mcp_servers = sdk_mcp
+            .into_iter()
+            .map(|m| McpServerInfo {
+                enabled: matches!(
+                    m.status.as_deref(),
+                    Some("connected") | Some("pending")
+                ),
+                id: format!("claude:mcp:{}", m.name),
+                name: m.name,
+            })
+            .collect();
+
+        Ok(CommandCatalog {
+            commands,
+            agents,
+            mcp_servers,
+        })
+    }
+}
+
+impl ClaudeSdkAdapter {
+    /// Spawn an ephemeral bridge, send `list_capabilities`, tear down
+    /// the bridge, and surface the parsed lists. Separated from the
+    /// trait method so errors are centralised and the trait body stays
+    /// focused on the mapping step.
+    async fn fetch_capabilities(
+        &self,
+        cwd: Option<String>,
+        model: Option<String>,
+    ) -> Result<
+        (Vec<BridgeCommand>, Vec<BridgeAgent>, Vec<BridgeMcpServer>),
+        String,
+    > {
+        let mut bridge = self.spawn_bridge().await?;
+        write_request(
+            &bridge.stdin,
+            &BridgeRequest::ListCapabilities { cwd, model },
+        )
+        .await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            bridge.read_response(),
+        )
+        .await
+        .map_err(|_| "Timeout listing Claude capabilities".to_string())?
+        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let _ = bridge.child.start_kill();
+
+        match response {
+            BridgeResponse::Capabilities {
+                commands,
+                agents,
+                mcp_servers,
+            } => Ok((commands, agents, mcp_servers)),
+            BridgeResponse::Error { error } => {
+                Err(format!("Claude list_capabilities error: {error}"))
+            }
+            other => Err(format!(
+                "Unexpected bridge response for list_capabilities: {:?}",
                 other
             )),
         }
