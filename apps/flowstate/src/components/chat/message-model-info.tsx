@@ -5,7 +5,6 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { Button } from "@/components/ui/button";
 import type { ProviderKind } from "@/lib/types";
 import { resolveModelDisplay } from "@/lib/model-lookup";
 import { useApp } from "@/stores/app-store";
@@ -56,19 +55,21 @@ export function MessageModelInfo({
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button
+        {/* Plain <button> (not our custom Button component) because
+            Radix's asChild slot needs the child to forward refs, which
+            the cva-wrapped Button doesn't do. Matches the pattern in
+            context-display.tsx which works. */}
+        <button
           type="button"
-          variant="ghost"
-          size="icon-xs"
           title="Model used for this reply"
           aria-label="Model used for this reply"
           className={cn(
-            "text-muted-foreground opacity-60 hover:opacity-100 focus-visible:opacity-100",
+            "inline-flex size-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:bg-muted focus-visible:outline-none",
             className,
           )}
         >
           <Info className="h-3 w-3" />
-        </Button>
+        </button>
       </PopoverTrigger>
       <PopoverContent side="top" align="start" className="w-72 p-3">
         <div className="mb-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
