@@ -4,7 +4,6 @@ import {
   Archive,
   EllipsisVertical,
   GitBranch,
-  Loader2,
   Trash2,
 } from "lucide-react";
 import {
@@ -23,8 +22,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useApp } from "@/stores/app-store";
-import { prefetchSession } from "@/lib/queries";
+import { prefetchSession, sessionQueryKey, type SessionPage } from "@/lib/queries";
 import { cn } from "@/lib/utils";
+import { BrailleSpinner, type SpinnerTone } from "../chat/braille-spinner";
 
 function formatTimeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -84,6 +84,29 @@ export function ThreadItem({
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(title);
   const inputRef = React.useRef<HTMLInputElement>(null);
+
+  // Peek at the cached session page (non-reactively) to colour the
+  // spinner by the running turn's permission mode. Blue for plan
+  // mode, green otherwise. Falls back to green when the session
+  // hasn't been opened yet and therefore has no cached turns — the
+  // moment the user opens the thread and a turn starts, subsequent
+  // renders pick up the right tone.
+  const spinnerTone = React.useMemo<SpinnerTone>(() => {
+    if (!running) return "green";
+    const page = queryClient.getQueryData<SessionPage>(
+      sessionQueryKey(sessionId),
+    );
+    const runningTurn = page?.detail.turns.find((t) => t.status === "running");
+    return runningTurn?.permissionMode === "plan" ? "blue" : "green";
+    // queryClient is stable; re-evaluate whenever the running flag
+    // flips, which is the same cadence chat-view updates the cache
+    // on turn_started/turn_completed. We deliberately don't depend
+    // on the cached turn directly — React Query's cache mutations
+    // already re-render subscribed components, and the sidebar row
+    // re-renders via the store on session changes, which is frequent
+    // enough for a mode change to land within a second.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running, sessionId, queryClient]);
   // Hover prefetch: warm the session cache the moment the pointer
   // enters this row so the click itself only has to consume cached
   // data. A few hundred ms of hover — normal human targeting time —
@@ -154,7 +177,11 @@ export function ThreadItem({
           }}
         >
           {running && (
-            <Loader2 className="h-3 w-3 shrink-0 animate-spin text-muted-foreground" />
+            <BrailleSpinner
+              tone={spinnerTone}
+              label="Running"
+              className="shrink-0 text-sm"
+            />
           )}
           {worktreePath && (
             <Tooltip>

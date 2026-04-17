@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Loader2 } from "lucide-react";
+import { BrailleSpinner, type SpinnerTone } from "./braille-spinner";
 
 interface WorkingIndicatorProps {
   /**
@@ -20,6 +20,14 @@ interface WorkingIndicatorProps {
    * resetting the counter to 0 every event.
    */
   lastEventAt: number;
+  /**
+   * Colour signal for the spinner. Blue when the turn is running in
+   * plan mode (no writes yet, just thinking), green otherwise —
+   * matches the visual language users already read from the mode
+   * dropdown. Decoupled from `permissionMode` directly so this
+   * component stays oblivious to how tones map to modes.
+   */
+  tone: SpinnerTone;
   onInterrupt: () => void;
 }
 
@@ -34,6 +42,7 @@ function formatElapsed(elapsedMs: number): string {
 function WorkingIndicatorInner({
   turnStartedAt,
   lastEventAt,
+  tone,
   onInterrupt,
 }: WorkingIndicatorProps) {
   // Re-render every second so both counters tick. We deliberately
@@ -52,7 +61,7 @@ function WorkingIndicatorInner({
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-t border-border/60 bg-muted/30 px-4 py-1.5 text-xs text-muted-foreground">
-      <Loader2 className="h-3 w-3 animate-spin" />
+      <BrailleSpinner tone={tone} className="text-sm" label="Working" />
       <span>
         Working<span className="animate-pulse">…</span>{" "}
         <span className="font-mono tabular-nums">{totalLabel}</span>

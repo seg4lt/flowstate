@@ -1629,6 +1629,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             <WorkingIndicator
               turnStartedAt={new Date(runningTurn.createdAt).getTime()}
               lastEventAt={lastEventAt}
+              tone={permissionMode === "plan" ? "blue" : "green"}
               onInterrupt={handleInterrupt}
             />
           )}
