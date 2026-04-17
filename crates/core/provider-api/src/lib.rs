@@ -660,6 +660,18 @@ pub enum ProviderTurnEvent {
     TurnUsage {
         usage: TokenUsage,
     },
+    /// The provider has told us which model it actually resolved to
+    /// for this turn. The string the user picked in the dropdown
+    /// (or read from Settings defaults) can be an alias — e.g. the
+    /// Claude SDK accepts `"sonnet"` and internally resolves it to
+    /// a specific pinned version like
+    /// `"claude-sonnet-4-5-20250929"`. Runtime-core uses this to
+    /// upgrade `session.summary.model` so the UI's model-selector
+    /// dropdown highlights the correct entry (its list contains the
+    /// pinned version, not the alias).
+    ModelResolved {
+        model: String,
+    },
     /// Rate-limit / plan-usage snapshot for a single bucket. Can fire
     /// multiple times per turn if the provider updates several
     /// buckets at once. Conceptually account-wide — runtime-core

@@ -270,6 +270,12 @@ enum BridgeResponse {
         usage: Option<Value>,
         #[serde(default)]
         rate_limit_info: Option<Value>,
+        /// Populated on `model_resolved` events. Carries the pinned
+        /// model id the SDK settled on for the current turn (e.g.
+        /// `claude-sonnet-4-5-20250929`), which may differ from the
+        /// alias the adapter originally asked for (`sonnet`).
+        #[serde(default)]
+        model: Option<String>,
     },
 }
 
@@ -714,6 +720,7 @@ impl ClaudeSdkAdapter {
                     nested_event,
                     usage,
                     rate_limit_info,
+                    model,
                 } => {
                     // Log every non-delta stream event so "stuck"
                     // bugs are diagnosable from the log alone: if the
@@ -792,6 +799,22 @@ impl ClaudeSdkAdapter {
                             events
                                 .send(ProviderTurnEvent::RateLimitUpdated { info })
                                 .await;
+                        }
+                    }
+                    "model_resolved" => {
+                        // The bridge surfaces the SDK's resolved model
+                        // from `system.init`. Forward to runtime-core so
+                        // `session.summary.model` can be upgraded from an
+                        // alias (e.g. `sonnet`) to the pinned id the SDK
+                        // actually ran with — the model-selector dropdown
+                        // matches on the pinned value and otherwise fails
+                        // to highlight the active entry.
+                        if let Some(m) = model {
+                            if !m.is_empty() {
+                                events
+                                    .send(ProviderTurnEvent::ModelResolved { model: m })
+                                    .await;
+                            }
                         }
                     }
                     other_event => {

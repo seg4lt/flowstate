@@ -1494,6 +1494,31 @@ impl RuntimeCore {
                     // stream without touching any turn-local state.
                     self.publish(RuntimeEvent::RateLimitUpdated { info });
                 }
+                ProviderTurnEvent::ModelResolved { model: resolved } => {
+                    // The provider told us which model it actually ran
+                    // this turn on. If that differs from what's stored
+                    // on the session (typically because the user or the
+                    // default-settings picked an alias like `sonnet`
+                    // and the SDK resolved it to a pinned
+                    // `claude-sonnet-4-5-<date>` id), upgrade
+                    // `session.summary.model` and persist. The model-
+                    // selector dropdown matches against the pinned id
+                    // from the provider's `models` list, so without
+                    // this the dropdown never highlights the active
+                    // entry for alias-backed sessions.
+                    //
+                    // Guarded so a turn running on an already-pinned
+                    // model doesn't write the same value back and
+                    // churn persistence.
+                    if session.summary.model.as_deref() != Some(resolved.as_str()) {
+                        session.summary.model = Some(resolved.clone());
+                        self.persistence.upsert_session(session.clone()).await;
+                        self.publish(RuntimeEvent::SessionModelUpdated {
+                            session_id: sid.clone(),
+                            model: resolved,
+                        });
+                    }
+                }
                 ProviderTurnEvent::PlanProposed {
                     plan_id,
                     title,

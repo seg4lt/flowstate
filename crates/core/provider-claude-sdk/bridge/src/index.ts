@@ -523,6 +523,16 @@ class ClaudeBridge {
             event: 'info',
             message: `Claude model: requested=${this.model ?? '<default>'} resolved=${init.model ?? '<unknown>'}`,
           });
+          // Emit the resolved model as a structured event too, so the
+          // Rust adapter can upgrade `session.summary.model` to match
+          // what the SDK actually runs. Without this the UI model
+          // selector fails to highlight the active entry whenever the
+          // stored value is an alias (`sonnet`) but the dropdown list
+          // carries pinned ids (`claude-sonnet-4-5-<date>`) returned
+          // by `supportedModels()`.
+          if (init.model) {
+            writeStream({ event: 'model_resolved', model: init.model });
+          }
         }
         return null;
       }
