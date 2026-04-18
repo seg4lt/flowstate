@@ -502,6 +502,7 @@ export type RuntimeEvent =
   | { type: "turn_status_changed"; session_id: string; turn_id: string; phase: TurnPhase }
   | { type: "turn_retrying"; session_id: string; turn_id: string; attempt: number; max_retries: number; retry_delay_ms: number; error_status?: number; error: string }
   | { type: "prompt_suggested"; session_id: string; turn_id: string; suggestion: string }
+  | { type: "turn_usage_updated"; session_id: string; turn_id: string; usage: TokenUsage }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }

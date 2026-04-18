@@ -1666,7 +1666,21 @@ impl RuntimeCore {
                     });
                 }
                 ProviderTurnEvent::TurnUsage { usage: u } => {
-                    usage = Some(u);
+                    // Stash on the per-turn local so the final TurnRecord
+                    // merges it on completion (see merge site below where
+                    // `t.usage = usage;` is assigned before TurnCompleted).
+                    usage = Some(u.clone());
+                    // Broadcast incremental usage so clients rendering a
+                    // live context indicator can update mid-turn rather
+                    // than waiting for TurnCompleted. The provider bridge
+                    // emits `turn_usage` per API call — for a long tool
+                    // loop that's the difference between a frozen
+                    // numerator and one that updates as the SDK works.
+                    self.publish(RuntimeEvent::TurnUsageUpdated {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        usage: u,
+                    });
                 }
                 ProviderTurnEvent::RateLimitUpdated { info } => {
                     // Rate limits are account-wide, not per-turn, so

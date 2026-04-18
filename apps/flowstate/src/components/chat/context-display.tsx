@@ -232,12 +232,16 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
     (r) => r.status === "allowed_warning" || r.status === "rejected",
   );
 
-  // Real KV-cache occupancy for this turn = fresh input + fresh
-  // output + cache reads + cache creation. The raw input_tokens
-  // field from Anthropic excludes cached content, so on a heavily
-  // cached turn it reads artificially low (104 etc.) — adding the
-  // cache counters brings the numerator in line with what Claude
-  // Code's own context indicator reports.
+  // Current context-window occupancy. The provider bridge is
+  // responsible for ensuring inputTokens / cacheReadTokens /
+  // cacheWriteTokens are the LATEST API call's values (not summed
+  // across every call in the turn's tool loop), so this formula
+  // reads "current prompt size + running output". Summing cache
+  // reads across a long loop would re-count the same cached prompt
+  // once per iteration and push the numerator past the window —
+  // the "51M / 1M" bug. See provider-claude-sdk bridge, where
+  // `assistant` messages emit `turn_usage` per call with per-call
+  // input/cache fields and an accumulated output total.
   const used = usage
     ? usage.inputTokens +
       usage.outputTokens +

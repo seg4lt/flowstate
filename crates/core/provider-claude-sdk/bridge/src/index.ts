@@ -252,6 +252,41 @@ class ClaudeBridge {
    * want to forward it once.
    */
   private observedSubagentIds: Set<string> = new Set();
+  /**
+   * Running sum of output tokens across every top-level assistant
+   * message in the current turn. Each per-call `message.usage`
+   * only reports its own slice of output, so we accumulate — unlike
+   * cache_read / cache_creation / input_tokens, which are reported
+   * per-call and should be displayed as the LATEST call's values
+   * to represent current prompt size (not summed, which would
+   * inflate past the context window on long tool loops).
+   * Reset at the start of every `sendPrompt`.
+   */
+  private outputTokensTotal = 0;
+  /**
+   * The last observed per-call `input_tokens` / cache / model state
+   * from a top-level assistant message. Forwarded verbatim in the
+   * final `turn_usage` emitted from the `result` handler so the
+   * closing event carries the same numerator basis as the mid-turn
+   * stream (rather than the aggregated `result.usage`, which sums
+   * cache reads across every API call and is what caused the
+   * "51M / 1M" display).
+   */
+  private lastAssistantUsage?: {
+    inputTokens: number;
+    cacheWriteTokens: number | null;
+    cacheReadTokens: number | null;
+    model?: string;
+  };
+  /**
+   * Last `contextWindow` observed from the SDK's `result.modelUsage`.
+   * Cached across turns so mid-turn `turn_usage` events on the next
+   * turn can carry the window without waiting for that turn's own
+   * `result`. When unset (first turn of a fresh bridge), the client
+   * falls back to the provider-declared window from
+   * `ProviderModel.contextWindow`.
+   */
+  private lastContextWindow: number | null = null;
 
   createSession(cwd: string, model?: string, resumeSessionId?: string): string {
     this.cwd = cwd;
@@ -302,6 +337,13 @@ class ClaudeBridge {
     // subagent_model_observed event on every assistant chunk.
     this.agentModelByType.clear();
     this.observedSubagentIds.clear();
+    // Per-turn usage accumulator reset. `lastContextWindow`
+    // deliberately persists across turns — the SDK only reports
+    // it inside `result.modelUsage`, so holding the previous
+    // turn's value lets us populate mid-turn `turn_usage` events
+    // on the next turn without waiting for that turn's `result`.
+    this.outputTokensTotal = 0;
+    this.lastAssistantUsage = undefined;
 
     const canUseTool: CanUseTool = async (
       toolName: string,
@@ -877,7 +919,16 @@ class ClaudeBridge {
       }
       case 'assistant': {
         const m = msg as unknown as {
-          message: { content: unknown; model?: string };
+          message: {
+            content: unknown;
+            model?: string;
+            usage?: {
+              input_tokens?: number;
+              output_tokens?: number;
+              cache_creation_input_tokens?: number | null;
+              cache_read_input_tokens?: number | null;
+            };
+          };
           parent_tool_use_id?: string | null;
         };
         const rawContent = m.message?.content;
@@ -893,6 +944,52 @@ class ClaudeBridge {
         // forward from this message so the frontend can group tool calls
         // by the agent that actually ran them.
         const parentToolUseId = m.parent_tool_use_id ?? undefined;
+        // Per-call token usage for the main-agent context-window
+        // indicator. Only top-level assistant messages count toward the
+        // main turn's numerator — subagent calls have their own context
+        // window (tracked separately by the SDK via modelUsage) and
+        // lumping them in inflates the display on Task-heavy turns.
+        //
+        // Fields below use per-call semantics: input/cache/creation are
+        // from THIS API call (the "current prompt size"), output_tokens
+        // accumulates across the turn because each call only reports
+        // its own slice. The SDK's `result.usage` sums all four across
+        // every call — using its cache_read would re-count the same
+        // cached prompt once per iteration of the tool loop, which is
+        // how the "51M / 1M" bug used to reach 50×.
+        const msgUsage = m.message?.usage;
+        if (!parentToolUseId && msgUsage && typeof msgUsage === 'object') {
+          const inputTokens = msgUsage.input_tokens ?? 0;
+          const outputDelta = msgUsage.output_tokens ?? 0;
+          const cacheWrite = msgUsage.cache_creation_input_tokens ?? null;
+          const cacheRead = msgUsage.cache_read_input_tokens ?? null;
+          const observedMainModel = m.message?.model;
+          this.outputTokensTotal += outputDelta;
+          this.lastAssistantUsage = {
+            inputTokens,
+            cacheWriteTokens: cacheWrite,
+            cacheReadTokens: cacheRead,
+            model: observedMainModel,
+          };
+          writeStream({
+            event: 'turn_usage',
+            usage: {
+              inputTokens,
+              outputTokens: this.outputTokensTotal,
+              cacheWriteTokens: cacheWrite,
+              cacheReadTokens: cacheRead,
+              // contextWindow only surfaces in `result.modelUsage`;
+              // reuse the last seen value on subsequent turns.
+              // First-turn mid-stream emits carry null and the
+              // client falls back to the provider-declared window.
+              contextWindow: this.lastContextWindow,
+              // Cost and duration are only authoritative at turn end.
+              totalCostUsd: null,
+              durationMs: null,
+              model: observedMainModel ?? null,
+            },
+          });
+        }
         // Subagent model observation: the very first assistant
         // message from a subagent carries the resolved model in
         // `message.model`. That's the authoritative signal (beats
@@ -1087,26 +1184,52 @@ class ClaudeBridge {
         }
         // Forward token usage before returning the output text so the
         // runtime-core drain loop sees a TurnUsage event before the
-        // turn finalises. Maps Anthropic's SDK field names onto the
-        // provider-agnostic TokenUsage shape. Picks the first key
-        // in modelUsage as the source of truth for contextWindow —
-        // a single Flowstate turn only runs on one model at a time.
-        if (r.usage) {
-          const modelKey = r.modelUsage
-            ? Object.keys(r.modelUsage)[0]
-            : undefined;
-          const mu = modelKey ? r.modelUsage![modelKey] : undefined;
+        // turn finalises. Picks the first key in modelUsage as the
+        // source of truth for contextWindow — a single Flowstate turn
+        // only runs on one model at a time.
+        //
+        // Numerator basis: the LAST assistant message's per-call
+        // usage (captured into `lastAssistantUsage` as each API call
+        // landed), NOT `r.usage`. The SDK's result.usage sums every
+        // API call in the turn — on a long tool loop that makes
+        // cache_read_input_tokens add up to many multiples of the
+        // context window (each call re-reads the same cached prompt).
+        // Displaying that sum produced the "51M / 1M" bug.
+        //
+        // Cost and duration, by contrast, ARE naturally cumulative
+        // across the turn and only land on `r`, so those keep coming
+        // from the result payload as before.
+        const modelKey = r.modelUsage
+          ? Object.keys(r.modelUsage)[0]
+          : undefined;
+        const mu = modelKey ? r.modelUsage![modelKey] : undefined;
+        const resolvedContextWindow = mu?.contextWindow ?? this.lastContextWindow;
+        if (mu?.contextWindow != null) {
+          this.lastContextWindow = mu.contextWindow;
+        }
+        if (this.lastAssistantUsage || r.usage) {
+          const last = this.lastAssistantUsage;
+          // outputTokensTotal is authoritative whenever we saw at least
+          // one top-level assistant message (which also populates
+          // `last`). Only fall back to r.usage.output_tokens on the
+          // exotic path where the turn produced no assistant message
+          // but the SDK still emitted a `result.usage`.
+          const outputTokens = last
+            ? this.outputTokensTotal
+            : (r.usage?.output_tokens ?? 0);
           writeStream({
             event: 'turn_usage',
             usage: {
-              inputTokens: r.usage.input_tokens,
-              outputTokens: r.usage.output_tokens,
-              cacheWriteTokens: r.usage.cache_creation_input_tokens ?? null,
-              cacheReadTokens: r.usage.cache_read_input_tokens ?? null,
-              contextWindow: mu?.contextWindow ?? null,
+              inputTokens: last?.inputTokens ?? r.usage?.input_tokens ?? 0,
+              outputTokens,
+              cacheWriteTokens:
+                last?.cacheWriteTokens ?? r.usage?.cache_creation_input_tokens ?? null,
+              cacheReadTokens:
+                last?.cacheReadTokens ?? r.usage?.cache_read_input_tokens ?? null,
+              contextWindow: resolvedContextWindow,
               totalCostUsd: r.total_cost_usd ?? null,
               durationMs: r.duration_ms ?? null,
-              model: modelKey ?? null,
+              model: last?.model ?? modelKey ?? null,
             },
           });
         }
