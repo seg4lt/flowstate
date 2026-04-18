@@ -12,6 +12,8 @@ import { ToolCallCard } from "../tool-call-card";
 import { ToolOutputContent } from "../tool-renderers";
 import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
+import { CompactBlock } from "./compact-block";
+import { MemoryRecallBlock } from "./memory-recall-block";
 
 const GROUP_DEFAULT_VISIBLE = 5;
 
@@ -27,6 +29,21 @@ type RenderBlock =
       kind: "tool_call_group";
       callIds: string[];
       parentCallId: string | undefined;
+      key: string;
+    }
+  | {
+      kind: "compact";
+      trigger: "auto" | "manual";
+      preTokens?: number;
+      postTokens?: number;
+      durationMs?: number;
+      summary?: string;
+      key: string;
+    }
+  | {
+      kind: "memory_recall";
+      mode: "select" | "synthesize";
+      memories: import("@/lib/types").MemoryRecallItem[];
       key: string;
     };
 
@@ -153,10 +170,10 @@ function groupBlocks(
       return;
     }
 
-    // Any non-tool block (text, reasoning) breaks the main-agent
-    // streak. Sub-agent boxes are unaffected — they keep collecting
-    // across these interruptions because their identity is the
-    // parentCallId, not stream contiguity.
+    // Any non-tool block (text, reasoning, compact, memory_recall)
+    // breaks the main-agent streak. Sub-agent boxes are unaffected
+    // — they keep collecting across these interruptions because
+    // their identity is the parentCallId, not stream contiguity.
     currentMainGroup = null;
     if (block.kind === "text") {
       result.push({ kind: "text", text: block.text, key: `text-${idx}` });
@@ -165,6 +182,23 @@ function groupBlocks(
         kind: "reasoning",
         text: block.text,
         key: `reasoning-${idx}`,
+      });
+    } else if (block.kind === "compact") {
+      result.push({
+        kind: "compact",
+        trigger: block.trigger,
+        preTokens: block.preTokens,
+        postTokens: block.postTokens,
+        durationMs: block.durationMs,
+        summary: block.summary,
+        key: `compact-${idx}`,
+      });
+    } else if (block.kind === "memory_recall") {
+      result.push({
+        kind: "memory_recall",
+        mode: block.mode,
+        memories: block.memories,
+        key: `memrecall-${idx}`,
       });
     }
   });
@@ -481,6 +515,25 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
                 parentCallId={block.parentCallId}
                 callsById={callsById}
                 subagentsByParent={subagentsByParent}
+              />
+            );
+          case "compact":
+            return (
+              <CompactBlock
+                key={block.key}
+                trigger={block.trigger}
+                preTokens={block.preTokens}
+                postTokens={block.postTokens}
+                durationMs={block.durationMs}
+                summary={block.summary}
+              />
+            );
+          case "memory_recall":
+            return (
+              <MemoryRecallBlock
+                key={block.key}
+                mode={block.mode}
+                memories={block.memories}
               />
             );
         }

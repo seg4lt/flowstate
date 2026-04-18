@@ -1679,6 +1679,116 @@ impl RuntimeCore {
                         raw,
                     });
                 }
+                ProviderTurnEvent::CompactBoundary {
+                    trigger,
+                    pre_tokens,
+                    post_tokens,
+                    duration_ms,
+                } => {
+                    // Merge into the last Compact block if it's still
+                    // waiting on metrics (summary arrived first);
+                    // otherwise append a new one. Don't re-use a
+                    // completed Compact block — two compactions in
+                    // one turn (rare but possible on very long turns)
+                    // must show as two separate blocks.
+                    let merged_into_existing = match blocks.last_mut() {
+                        Some(ContentBlock::Compact {
+                            trigger: t,
+                            pre_tokens: pt,
+                            post_tokens: po,
+                            duration_ms: dm,
+                            summary: _,
+                        }) if pt.is_none() && po.is_none() && dm.is_none() => {
+                            *t = trigger;
+                            *pt = pre_tokens;
+                            *po = post_tokens;
+                            *dm = duration_ms;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !merged_into_existing {
+                        blocks.push(ContentBlock::Compact {
+                            trigger,
+                            pre_tokens,
+                            post_tokens,
+                            duration_ms,
+                            summary: None,
+                        });
+                    }
+                    // Pull the merged state back out so the live event
+                    // carries whatever the block now holds (summary
+                    // may already be present if it arrived first).
+                    let (summary_now, trigger_now) = match blocks.last() {
+                        Some(ContentBlock::Compact {
+                            summary, trigger, ..
+                        }) => (summary.clone(), *trigger),
+                        _ => (None, trigger),
+                    };
+                    self.publish(RuntimeEvent::CompactUpdated {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        trigger: trigger_now,
+                        pre_tokens,
+                        post_tokens,
+                        duration_ms,
+                        summary: summary_now,
+                    });
+                }
+                ProviderTurnEvent::CompactSummary { trigger, summary } => {
+                    let merged_into_existing = match blocks.last_mut() {
+                        Some(ContentBlock::Compact {
+                            summary: s,
+                            trigger: t,
+                            ..
+                        }) if s.is_none() => {
+                            *s = Some(summary.clone());
+                            *t = trigger;
+                            true
+                        }
+                        _ => false,
+                    };
+                    if !merged_into_existing {
+                        blocks.push(ContentBlock::Compact {
+                            trigger,
+                            pre_tokens: None,
+                            post_tokens: None,
+                            duration_ms: None,
+                            summary: Some(summary.clone()),
+                        });
+                    }
+                    let (pt, po, dm, tr) = match blocks.last() {
+                        Some(ContentBlock::Compact {
+                            pre_tokens,
+                            post_tokens,
+                            duration_ms,
+                            trigger,
+                            ..
+                        }) => (*pre_tokens, *post_tokens, *duration_ms, *trigger),
+                        _ => (None, None, None, trigger),
+                    };
+                    self.publish(RuntimeEvent::CompactUpdated {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        trigger: tr,
+                        pre_tokens: pt,
+                        post_tokens: po,
+                        duration_ms: dm,
+                        summary: Some(summary),
+                    });
+                }
+                ProviderTurnEvent::MemoryRecall { mode, memories } => {
+                    blocks.push(ContentBlock::MemoryRecall {
+                        mode,
+                        memories: memories.clone(),
+                    });
+                    self.publish(RuntimeEvent::MemoryRecalled {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        mode,
+                        memories,
+                    });
+                }
             }
             // Refresh the live in-flight snapshot after every event so a
             // client recovering from broadcast lag gets the authoritative

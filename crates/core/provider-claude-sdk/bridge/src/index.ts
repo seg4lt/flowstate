@@ -406,6 +406,32 @@ class ClaudeBridge {
       canUseTool,
       abortController: this.abortController,
       includePartialMessages: true,
+      // PostCompact fires after the SDK finishes compressing older
+      // turns into a summary. That summary is the ONLY place the
+      // recap text shows up — the paired `compact_boundary` system
+      // message carries the boundary + token metrics but no text.
+      // Without this hook we get metrics-only and the user never
+      // sees what was summarised.
+      hooks: {
+        PostCompact: [
+          {
+            hooks: [
+              async (input) => {
+                const pc = input as {
+                  trigger?: 'manual' | 'auto';
+                  compact_summary?: string;
+                };
+                writeStream({
+                  event: 'compact_summary',
+                  trigger: pc.trigger ?? 'auto',
+                  summary: pc.compact_summary ?? '',
+                });
+                return {};
+              },
+            ],
+          },
+        ],
+      },
       ...(permissionMode === 'plan'
         ? { allowedTools: planModeAllowedTools }
         : {}),
@@ -585,6 +611,54 @@ class ClaudeBridge {
           if (init.model) {
             writeStream({ event: 'model_resolved', model: init.model });
           }
+        }
+        // The SDK inserts a `compact_boundary` system message at the
+        // point in the stream where older turns were compressed into
+        // a summary. The accompanying text lives on the PostCompact
+        // hook (registered above); this message only carries metrics
+        // + the trigger, which we pair up on the app side.
+        if (sub === 'compact_boundary') {
+          const cb = msg as {
+            compact_metadata?: {
+              trigger?: 'manual' | 'auto';
+              pre_tokens?: number;
+              post_tokens?: number;
+              duration_ms?: number;
+            };
+          };
+          const m = cb.compact_metadata ?? {};
+          writeStream({
+            event: 'compact_boundary',
+            trigger: m.trigger ?? 'auto',
+            pre_tokens: m.pre_tokens ?? null,
+            post_tokens: m.post_tokens ?? null,
+            duration_ms: m.duration_ms ?? null,
+          });
+        }
+        // The SDK's memory-recall supervisor surfaces relevant
+        // memory files into the turn. `select` mode yields full file
+        // bodies (renderers lazy-load from `path`); `synthesize`
+        // mode yields a Sonnet-authored paragraph in `content`. We
+        // forward whatever shape we receive and let the UI decide
+        // how to render each mode.
+        if (sub === 'memory_recall') {
+          const mr = msg as {
+            mode?: 'select' | 'synthesize';
+            memories?: Array<{
+              path?: string;
+              scope?: 'personal' | 'team';
+              content?: string;
+            }>;
+          };
+          writeStream({
+            event: 'memory_recall',
+            mode: mr.mode ?? 'select',
+            memories: (mr.memories ?? []).map((x) => ({
+              path: x.path ?? '',
+              scope: x.scope ?? 'personal',
+              content: x.content ?? null,
+            })),
+          });
         }
         return null;
       }

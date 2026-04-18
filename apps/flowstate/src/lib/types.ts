@@ -140,7 +140,35 @@ export interface ToolCall {
 export type ContentBlock =
   | { kind: "text"; text: string }
   | { kind: "reasoning"; text: string }
-  | { kind: "tool_call"; callId: string };
+  | { kind: "tool_call"; callId: string }
+  // Conversation-recap marker — the Claude Agent SDK compressed
+  // older turns into a summary. `summary` is absent between receipt
+  // of the compact_boundary system message (which has metrics only)
+  // and the PostCompact hook firing (which carries the text);
+  // runtime-core merges them before emitting.
+  | {
+      kind: "compact";
+      trigger: "auto" | "manual";
+      preTokens?: number;
+      postTokens?: number;
+      durationMs?: number;
+      summary?: string;
+    }
+  // "Recalled from memory" marker — the SDK's memory-recall
+  // supervisor attached memory files to the turn's context.
+  | {
+      kind: "memory_recall";
+      mode: "select" | "synthesize";
+      memories: MemoryRecallItem[];
+    };
+
+export interface MemoryRecallItem {
+  path: string;
+  scope: "personal" | "team";
+  /** Present in 'synthesize' mode; absent in 'select' mode where
+   *  renderers lazy-load the file body from `path` on demand. */
+  content?: string;
+}
 
 export interface FileChangeRecord {
   callId: string;
@@ -385,6 +413,8 @@ export type RuntimeEvent =
   | { type: "subagent_completed"; session_id: string; turn_id: string; agent_id: string; output: string; error?: string }
   | { type: "subagent_model_observed"; session_id: string; turn_id: string; agent_id: string; model: string }
   | { type: "plan_proposed"; session_id: string; turn_id: string; plan_id: string; title: string; steps: PlanStep[]; raw: string }
+  | { type: "compact_updated"; session_id: string; turn_id: string; trigger: "auto" | "manual"; pre_tokens?: number; post_tokens?: number; duration_ms?: number; summary?: string }
+  | { type: "memory_recalled"; session_id: string; turn_id: string; mode: "select" | "synthesize"; memories: MemoryRecallItem[] }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }

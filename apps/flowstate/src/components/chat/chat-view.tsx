@@ -142,6 +142,50 @@ function appendReasoningDelta(
   return [...list, { kind: "reasoning", text: delta }];
 }
 
+// Merge-or-append for compaction blocks. Runtime-core already pairs
+// up `compact_boundary` + `compact_summary` into one block, but the
+// frontend receives incremental updates as either event arrives. If
+// the last block is a Compact whose payload is compatible (same
+// trigger, no newer-than-stream regressions) we fold the fresh
+// fields in; otherwise we append a new block. Two compactions in
+// one turn (rare, but possible on very long turns) show as two
+// separate blocks.
+function applyCompactUpdate(
+  blocks: ContentBlock[] | undefined,
+  update: {
+    trigger: "auto" | "manual";
+    preTokens?: number;
+    postTokens?: number;
+    durationMs?: number;
+    summary?: string;
+  },
+): ContentBlock[] {
+  const list = blocks ?? [];
+  const last = list[list.length - 1];
+  if (last && last.kind === "compact") {
+    const merged: ContentBlock = {
+      kind: "compact",
+      trigger: update.trigger,
+      preTokens: update.preTokens ?? last.preTokens,
+      postTokens: update.postTokens ?? last.postTokens,
+      durationMs: update.durationMs ?? last.durationMs,
+      summary: update.summary ?? last.summary,
+    };
+    return [...list.slice(0, -1), merged];
+  }
+  return [
+    ...list,
+    {
+      kind: "compact",
+      trigger: update.trigger,
+      preTokens: update.preTokens,
+      postTokens: update.postTokens,
+      durationMs: update.durationMs,
+      summary: update.summary,
+    },
+  ];
+}
+
 // Apply a single runtime event to a turns array and return the
 // next-state turns. Used by the stream handler to update the
 // query cache entry for the event's session — because this is a
@@ -183,6 +227,37 @@ function applyEventToTurns(
               ...t,
               reasoning: (t.reasoning ?? "") + event.delta,
               blocks: appendReasoningDelta(t.blocks, event.delta),
+            }
+          : t,
+      );
+    case "compact_updated":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              blocks: applyCompactUpdate(t.blocks, {
+                trigger: event.trigger,
+                preTokens: event.pre_tokens,
+                postTokens: event.post_tokens,
+                durationMs: event.duration_ms,
+                summary: event.summary,
+              }),
+            }
+          : t,
+      );
+    case "memory_recalled":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              blocks: [
+                ...(t.blocks ?? []),
+                {
+                  kind: "memory_recall",
+                  mode: event.mode,
+                  memories: event.memories,
+                },
+              ],
             }
           : t,
       );

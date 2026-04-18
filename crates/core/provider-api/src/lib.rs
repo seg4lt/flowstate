@@ -288,6 +288,67 @@ pub enum ContentBlock {
         #[serde(rename = "callId")]
         call_id: String,
     },
+    /// Conversation-recap marker emitted by the Claude Agent SDK when
+    /// it compresses older turns into a summary to free up context.
+    /// `summary` is `None` between receiving the `compact_boundary`
+    /// system message (which has the metrics) and the `PostCompact`
+    /// hook firing (which carries the text). The runtime merges the
+    /// two into a single block.
+    Compact {
+        trigger: CompactTrigger,
+        #[serde(rename = "preTokens", default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+        #[serde(rename = "postTokens", default, skip_serializing_if = "Option::is_none")]
+        post_tokens: Option<u64>,
+        #[serde(rename = "durationMs", default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    /// "Recalled from memory" marker — the SDK's memory-recall
+    /// supervisor attached one or more memory files (or a synthesis
+    /// paragraph) to the turn's context. Rendered as a subtle chip
+    /// that expands into the referenced paths or synthesis body.
+    MemoryRecall {
+        mode: MemoryRecallMode,
+        memories: Vec<MemoryRecallItem>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactTrigger {
+    Auto,
+    Manual,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRecallMode {
+    /// Full file bodies surfaced by the parallel selector. `content`
+    /// on each `MemoryRecallItem` is absent; renderers lazy-load from
+    /// `path`.
+    Select,
+    /// Sonnet-authored paragraph distilled from many tiny memories.
+    /// `content` holds the paragraph; `path` is a synthesis sentinel
+    /// of the form `<synthesis:DIR>`.
+    Synthesize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRecallScope {
+    Personal,
+    Team,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRecallItem {
+    pub path: String,
+    pub scope: MemoryRecallScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -815,6 +876,32 @@ pub enum ProviderTurnEvent {
     RateLimitUpdated {
         info: RateLimitInfo,
     },
+    /// The SDK inserted a compaction boundary in the stream — older
+    /// turns are being compressed into a summary. Arrives paired
+    /// with `CompactSummary` (hook-sourced, may land before or after
+    /// this event). Runtime-core merges the pair into one
+    /// `ContentBlock::Compact` on the current turn.
+    CompactBoundary {
+        trigger: CompactTrigger,
+        pre_tokens: Option<u64>,
+        post_tokens: Option<u64>,
+        duration_ms: Option<u64>,
+    },
+    /// Summary text produced by compaction. Pairs with
+    /// `CompactBoundary`; whichever lands first creates the block,
+    /// the second fills the gap.
+    CompactSummary {
+        trigger: CompactTrigger,
+        summary: String,
+    },
+    /// The SDK's memory-recall supervisor surfaced relevant memory
+    /// files (or a synthesis paragraph) into the turn's context.
+    /// Runtime-core appends one `ContentBlock::MemoryRecall` per
+    /// occurrence to the turn's blocks.
+    MemoryRecall {
+        mode: MemoryRecallMode,
+        memories: Vec<MemoryRecallItem>,
+    },
 }
 
 /// Per-session "always allow / always deny" memory keyed by tool name.
@@ -1208,6 +1295,31 @@ pub enum RuntimeEvent {
         title: String,
         steps: Vec<PlanStep>,
         raw: String,
+    },
+    /// Compaction started / finished in the provider. Carries the
+    /// full merged block state each time an input event lands, so
+    /// clients can re-render a single "Conversation recap" divider
+    /// without tracking the boundary / summary pair themselves.
+    CompactUpdated {
+        session_id: String,
+        turn_id: String,
+        trigger: CompactTrigger,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
+    /// The SDK's memory-recall supervisor attached memories to the
+    /// current turn.
+    MemoryRecalled {
+        session_id: String,
+        turn_id: String,
+        mode: MemoryRecallMode,
+        memories: Vec<MemoryRecallItem>,
     },
     Error {
         message: String,

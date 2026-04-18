@@ -346,6 +346,27 @@ enum BridgeResponse {
         /// alias the adapter originally asked for (`sonnet`).
         #[serde(default)]
         model: Option<String>,
+        /// Populated on `compact_boundary` / `compact_summary`.
+        /// Kept as free-form Value so the adapter can parse the
+        /// structured payload (trigger, token counts, summary text)
+        /// without bloating this struct with six more flat fields.
+        #[serde(default)]
+        trigger: Option<String>,
+        #[serde(default)]
+        pre_tokens: Option<u64>,
+        #[serde(default)]
+        post_tokens: Option<u64>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        #[serde(default)]
+        summary: Option<String>,
+        /// Populated on `memory_recall`. `mode` is `'select' |
+        /// 'synthesize'`; `memories` is the raw array the SDK
+        /// surfaced (path / scope / optional content per entry).
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        memories: Option<Value>,
     },
 }
 
@@ -775,6 +796,13 @@ impl ClaudeSdkAdapter {
                     suggested,
                     question: _question,
                     questions,
+                    trigger,
+                    pre_tokens,
+                    post_tokens,
+                    duration_ms,
+                    summary,
+                    mode,
+                    memories,
                     path,
                     operation,
                     before,
@@ -886,6 +914,78 @@ impl ClaudeSdkAdapter {
                                     .await;
                             }
                         }
+                    }
+                    "compact_boundary" => {
+                        // SDK is compressing older turns. Metrics
+                        // arrive here; the paired summary text lands
+                        // separately via the PostCompact hook
+                        // (`compact_summary` event). Runtime-core
+                        // merges the pair into one ContentBlock.
+                        let trig = parse_compact_trigger(trigger.as_deref());
+                        events
+                            .send(ProviderTurnEvent::CompactBoundary {
+                                trigger: trig,
+                                pre_tokens,
+                                post_tokens,
+                                duration_ms,
+                            })
+                            .await;
+                    }
+                    "compact_summary" => {
+                        let trig = parse_compact_trigger(trigger.as_deref());
+                        let text = summary.unwrap_or_default();
+                        events
+                            .send(ProviderTurnEvent::CompactSummary {
+                                trigger: trig,
+                                summary: text,
+                            })
+                            .await;
+                    }
+                    "memory_recall" => {
+                        use zenui_provider_api::{
+                            MemoryRecallItem, MemoryRecallMode, MemoryRecallScope,
+                        };
+                        let parsed_mode = match mode.as_deref() {
+                            Some("synthesize") => MemoryRecallMode::Synthesize,
+                            _ => MemoryRecallMode::Select,
+                        };
+                        let items: Vec<MemoryRecallItem> = memories
+                            .as_ref()
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|v| {
+                                        let path = v
+                                            .get("path")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let scope = match v
+                                            .get("scope")
+                                            .and_then(Value::as_str)
+                                        {
+                                            Some("team") => MemoryRecallScope::Team,
+                                            _ => MemoryRecallScope::Personal,
+                                        };
+                                        let content = v
+                                            .get("content")
+                                            .and_then(Value::as_str)
+                                            .map(str::to_string);
+                                        MemoryRecallItem {
+                                            path,
+                                            scope,
+                                            content,
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        events
+                            .send(ProviderTurnEvent::MemoryRecall {
+                                mode: parsed_mode,
+                                memories: items,
+                            })
+                            .await;
                     }
                     other_event => {
                         forward_stream(
@@ -1400,6 +1500,13 @@ fn parse_decision(value: &str) -> PermissionDecision {
         "deny" => PermissionDecision::Deny,
         "deny_always" => PermissionDecision::DenyAlways,
         _ => PermissionDecision::Allow,
+    }
+}
+
+fn parse_compact_trigger(value: Option<&str>) -> zenui_provider_api::CompactTrigger {
+    match value {
+        Some("manual") => zenui_provider_api::CompactTrigger::Manual,
+        _ => zenui_provider_api::CompactTrigger::Auto,
     }
 }
 
