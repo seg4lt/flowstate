@@ -1,7 +1,13 @@
 pub mod session_ops;
 pub mod transport;
+mod internals;
 
 pub use session_ops::OrchestrationService;
+
+use internals::{
+    InFlightPermissionModeGuard, RewindOutcome, TurnCounterGuard, is_cache_stale,
+    spawn_model_refresh_detached, write_in_flight_snapshot,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -26,17 +32,6 @@ const MODEL_CACHE_TTL_HOURS: i64 = 24;
 pub trait TurnLifecycleObserver: Send + Sync {
     fn on_turn_start(&self, session_id: &str);
     fn on_turn_end(&self, session_id: &str);
-}
-
-/// Internal result of `RuntimeCore::rewind_files`. Not exported to
-/// transports or the wire — `handle_client_message` decomposes it
-/// into a `RuntimeEvent::FilesRewound` broadcast plus an Ack. Kept
-/// as a struct rather than a tuple so the call site reads
-/// self-documentingly when the lists grow more entries (e.g. paths
-/// we *intended* to touch but couldn't).
-struct RewindOutcome {
-    paths_restored: Vec<String>,
-    paths_deleted: Vec<String>,
 }
 
 /// Hooks a transport calls whenever a client connects or disconnects, plus
@@ -151,53 +146,6 @@ pub struct RuntimeCore {
     /// override.
     in_flight_permission_mode: Arc<RwLock<HashMap<String, PermissionMode>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
-}
-
-/// RAII guard that ticks the `TurnLifecycleObserver` counter around the
-/// lifetime of `send_turn`. Drop runs on every exit path (normal return,
-/// early `?` return, panic), so the daemon-side counter cannot leak even if
-/// an adapter panics or a `.await?` unwinds the task.
-struct TurnCounterGuard {
-    observer: Option<Arc<dyn TurnLifecycleObserver>>,
-    session_id: String,
-}
-
-impl TurnCounterGuard {
-    fn new(observer: Option<Arc<dyn TurnLifecycleObserver>>, session_id: String) -> Self {
-        if let Some(obs) = &observer {
-            obs.on_turn_start(&session_id);
-        }
-        Self {
-            observer,
-            session_id,
-        }
-    }
-}
-
-impl Drop for TurnCounterGuard {
-    fn drop(&mut self) {
-        if let Some(obs) = &self.observer {
-            obs.on_turn_end(&self.session_id);
-        }
-    }
-}
-
-/// RAII guard that removes the session's entry from
-/// `in_flight_permission_mode` on every exit path of `send_turn`.
-/// Mirrors `TurnCounterGuard`'s shape — a plain `remove()` at the
-/// bottom of the function would leak the entry whenever an early
-/// `?` return unwinds the task.
-struct InFlightPermissionModeGuard {
-    map: Arc<RwLock<HashMap<String, PermissionMode>>>,
-    session_id: String,
-}
-
-impl Drop for InFlightPermissionModeGuard {
-    fn drop(&mut self) {
-        if let Ok(mut live) = self.map.write() {
-            live.remove(&self.session_id);
-        }
-    }
 }
 
 impl RuntimeCore {
@@ -2395,114 +2343,6 @@ impl RuntimeCore {
     }
 }
 
-/// Standalone model-refresh spawner, usable from both `RuntimeCore::spawn_model_refresh`
-/// and from within already-spawned tasks (like `spawn_health_check`) that don't have `&self`.
-fn spawn_model_refresh_detached(
-    kind: ProviderKind,
-    adapter: Arc<dyn ProviderAdapter>,
-    persistence: Arc<PersistenceService>,
-    event_tx: broadcast::Sender<RuntimeEvent>,
-    in_flight: Arc<Mutex<HashSet<ProviderKind>>>,
-) {
-    tokio::spawn(async move {
-        // Dedupe: skip if another refresh for this provider is already running.
-        {
-            let mut guard = in_flight.lock().await;
-            if guard.contains(&kind) {
-                tracing::debug!(?kind, "skipping duplicate model refresh");
-                return;
-            }
-            guard.insert(kind);
-        }
-
-        let result = adapter.fetch_models().await;
-
-        // Always release the in-flight slot, regardless of outcome.
-        {
-            let mut guard = in_flight.lock().await;
-            guard.remove(&kind);
-        }
-
-        match result {
-            Ok(models) if !models.is_empty() => {
-                tracing::info!(
-                    ?kind,
-                    count = models.len(),
-                    "fetched provider models, persisting and broadcasting"
-                );
-                persistence.set_cached_models(kind, &models).await;
-                // Keep provider_health_cache.status_json in sync with
-                // the fresh model list. The bootstrap path now prefers
-                // provider_model_cache, but any other reader that
-                // touches only the health cache (or a future one) must
-                // not observe a stale list.
-                if let Some((_, mut status)) = persistence.get_cached_health(kind).await {
-                    status.models = models.clone();
-                    persistence.set_cached_health(kind, &status).await;
-                }
-                let _ = event_tx.send(RuntimeEvent::ProviderModelsUpdated {
-                    provider: kind,
-                    models,
-                });
-            }
-            Ok(_) => {
-                tracing::debug!(?kind, "fetch_models returned empty list");
-            }
-            Err(e) => {
-                tracing::warn!(?kind, "fetch_models failed: {e}");
-            }
-        }
-    });
-}
-
-/// Build a `TurnRecord` snapshot from the accumulator's local state and
-/// stash it under `session_id` in the live in-flight map. Called after
-/// every event in the drain loop, so the map always reflects the
-/// latest known state of the running turn — that's what `live_session_detail`
-/// hands back to a client recovering from broadcast lag.
-#[allow(clippy::too_many_arguments)]
-fn write_in_flight_snapshot(
-    in_flight_turns: &Arc<RwLock<HashMap<String, TurnRecord>>>,
-    session_id: &str,
-    base: &TurnRecord,
-    accumulated: &str,
-    reasoning_text: &str,
-    tool_calls: &[ToolCall],
-    file_changes: &[FileChangeRecord],
-    subagents: &[SubagentRecord],
-    plan: &Option<PlanRecord>,
-    blocks: &[ContentBlock],
-    usage: &Option<TokenUsage>,
-) {
-    let mut snap = base.clone();
-    snap.output = accumulated.to_string();
-    snap.reasoning = if reasoning_text.is_empty() {
-        None
-    } else {
-        Some(reasoning_text.to_string())
-    };
-    snap.tool_calls = tool_calls.to_vec();
-    snap.file_changes = file_changes.to_vec();
-    snap.subagents = subagents.to_vec();
-    snap.plan = plan.clone();
-    snap.blocks = blocks.to_vec();
-    snap.usage = usage.clone();
-    if let Ok(mut map) = in_flight_turns.write() {
-        map.insert(session_id.to_string(), snap);
-    }
-}
-
-/// Returns true if the ISO-8601 `fetched_at` timestamp is older than the model
-/// cache TTL. Unparseable timestamps are treated as stale so we'll re-fetch.
-fn is_cache_stale(fetched_at: &str) -> bool {
-    match chrono::DateTime::parse_from_rfc3339(fetched_at) {
-        Ok(parsed) => {
-            let age = Utc::now().signed_duration_since(parsed.with_timezone(&Utc));
-            age > chrono::Duration::hours(MODEL_CACHE_TTL_HOURS)
-        }
-        Err(_) => true,
-    }
-}
 
 #[cfg(test)]
 mod tests {
