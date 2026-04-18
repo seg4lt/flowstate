@@ -51,7 +51,6 @@ import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { SessionSettingsDialog } from "./session-settings-dialog";
 import { RevertFilesDialog } from "./messages/revert-files-dialog";
-import { useProviderFeatures } from "@/hooks/use-provider-features";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
 import { ApiRetryBanner } from "./api-retry-banner";

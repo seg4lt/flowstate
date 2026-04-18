@@ -8,3 +8,7 @@
 
 # ZenUI specific
 .zenui/
+
+# Local-only Tauri config overlay (e.g. disables updater artifacts so
+# builds don't require TAURI_SIGNING_PRIVATE_KEY). Do not commit.
+tauri.local.conf.json

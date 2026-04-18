@@ -27,6 +27,22 @@ Prereqs: Rust (stable), pnpm ≥ 10, bun, and the
 [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for
 your platform.
 
+## Build locally
+
+The committed `tauri.conf.json` enables updater artifacts, which
+require `TAURI_SIGNING_PRIVATE_KEY` (used by CI for signed releases).
+To produce a runnable `.app` / `.dmg` locally without the key, disable
+updater artifacts via an inline config override:
+
+```sh
+cd apps/flowstate
+pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+```
+
+Outputs land in `target/release/bundle/` (`macos/flowstate.app` and
+`dmg/flowstate_<version>_aarch64.dmg`). No `.tar.gz` / `.sig` pair is
+produced, so no signing key is needed.
+
 ## Repo layout
 
 - `apps/flowstate/` — the Tauri desktop app (Rust + React)
