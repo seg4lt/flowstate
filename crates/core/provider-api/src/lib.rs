@@ -279,13 +279,22 @@ pub struct ToolCall {
     /// Wall-clock timestamp (RFC 3339 / ISO 8601) of when the tool
     /// call started. Set by runtime-core on `ToolCallStarted`; the
     /// frontend reads this to render a live "Bash · 12s" elapsed
-    /// counter while the call is still pending. Optional for two
-    /// reasons: (1) cleanly deserializes older persisted turns, and
-    /// (2) providers whose adapter hasn't opted into
-    /// `ProviderFeatures.tool_progress` will simply have this
-    /// field absent and the UI falls through to no timer.
+    /// counter while the call is still pending. Optional so older
+    /// persisted turns deserialize cleanly; runtime-core stamps this
+    /// on every fresh ToolCallStarted regardless of provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    /// Wall-clock timestamp of the most recent SDK heartbeat for
+    /// this tool call (the provider's `tool_progress` event). Drives
+    /// the per-tool stalled-tool pip on the frontend: when this
+    /// timestamp grows older than the threshold (≈30s) while the
+    /// tool is still pending, the UI shows "no progress · Ns" next
+    /// to the elapsed counter and the session-wide stuck banner
+    /// stays out of the way. `None` when the provider doesn't emit
+    /// heartbeats — the UI then falls back to the session-wide
+    /// stuck detector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_progress_at: Option<String>,
 }
 
 /// One element of an assistant turn's ordered content stream.
@@ -1082,6 +1091,28 @@ pub enum ProviderTurnEvent {
     PromptSuggestion {
         suggestion: String,
     },
+    /// Heartbeat for an in-flight tool call. Emitted periodically
+    /// by providers that opt in (`ProviderFeatures.tool_progress`).
+    /// Runtime-core stamps `ToolCall::last_progress_at` on receipt
+    /// so the frontend can distinguish "still ticking" from "stuck"
+    /// per-tool, instead of falling back to the session-wide
+    /// silence detector.
+    ToolProgress {
+        call_id: String,
+        /// Tool name from the provider (e.g. "Bash"). Carried for
+        /// log clarity and for the stuck-banner copy when this
+        /// heartbeat is the one that's gone stale.
+        tool_name: String,
+        /// Parent Task/Agent call_id when the tool runs inside a
+        /// sub-agent; mirrors the field on `ToolCallStarted`.
+        parent_call_id: Option<String>,
+        /// ISO 8601 timestamp stamped at the bridge when the SDK's
+        /// heartbeat arrived. We propagate this verbatim rather
+        /// than restamping inside runtime-core so the freshness
+        /// clock measures wall time at the source, not arrival
+        /// time at our end of the bridge channel.
+        occurred_at: String,
+    },
 }
 
 /// Phase of a turn between streams. Deliberately coarse — only
@@ -1425,6 +1456,35 @@ pub enum RuntimeEvent {
         output: String,
         error: Option<String>,
     },
+    /// Heartbeat for an in-flight tool call. Mirrors
+    /// `ProviderTurnEvent::ToolProgress`. Frontend uses
+    /// `occurred_at` to refresh the per-tool stalled-tool pip; the
+    /// matching `ToolCall::last_progress_at` field is also updated
+    /// in the persisted `TurnRecord` so a reload mid-turn keeps the
+    /// pip behavior consistent.
+    ToolProgress {
+        session_id: String,
+        turn_id: String,
+        call_id: String,
+        tool_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_call_id: Option<String>,
+        occurred_at: String,
+    },
+    /// File rewind completed. Carries the lists of paths the
+    /// runtime restored (had captured `before` snapshots) and
+    /// deleted (created in the rewound span). Diff panel keys off
+    /// this to refresh; toasts can read the totals to surface a
+    /// "Reverted N files" message.
+    FilesRewound {
+        session_id: String,
+        /// `turn_id` of the turn the user rewound to (the anchor
+        /// they clicked). Frontend uses this to scroll / focus the
+        /// originating user message.
+        turn_id: String,
+        paths_restored: Vec<String>,
+        paths_deleted: Vec<String>,
+    },
     TurnCompleted {
         session_id: String,
         session: SessionSummary,
@@ -1695,6 +1755,43 @@ pub enum ClientMessage {
     UpdatePermissionMode {
         session_id: String,
         permission_mode: PermissionMode,
+    },
+    /// Update per-session settings persisted in
+    /// `sessions.provider_state_json.metadata`. Designed as a sparse
+    /// envelope — only fields the user actually changed are present;
+    /// `None` means "leave existing value untouched". Today the only
+    /// field is `compact_custom_instructions`, but the envelope shape
+    /// keeps this command stable as future per-session settings land.
+    /// Settings take effect on the NEXT turn (the Claude SDK doesn't
+    /// expose a mid-turn handle for system-prompt edits); runtime-core
+    /// reads the metadata when constructing the next `send_prompt`
+    /// call, so a user can edit and immediately fire a turn without
+    /// any reload step.
+    UpdateSessionSettings {
+        session_id: String,
+        /// `None` here means "no change to this field". To clear the
+        /// value, pass `Some("".to_string())` — the empty string is
+        /// the canonical "no instructions, use the default
+        /// compaction prompt" signal.
+        #[serde(default)]
+        compact_custom_instructions: Option<String>,
+    },
+    /// Revert all on-disk file changes made by the chosen turn and
+    /// every subsequent turn back to their pre-turn state. Uses the
+    /// snapshots persistence already captures in
+    /// `FileChangeRecord.before` — no SDK round-trip required, so
+    /// the action works between turns and after a daemon restart.
+    /// On success the runtime broadcasts a `FilesRewound` event;
+    /// the diff panel listens for it and refreshes.
+    RewindFiles {
+        session_id: String,
+        /// `turn_id` of the turn the user wants to "rewind to".
+        /// Every file change recorded by THIS turn and any later
+        /// turn is undone; the file's earliest captured `before`
+        /// across that span wins. Files whose first record in the
+        /// span has `before = None` (newly created in the span) are
+        /// deleted instead of restored.
+        turn_id: String,
     },
     DeleteSession {
         session_id: String,

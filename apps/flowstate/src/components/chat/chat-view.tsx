@@ -49,6 +49,9 @@ import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
+import { SessionSettingsDialog } from "./session-settings-dialog";
+import { RevertFilesDialog } from "./messages/revert-files-dialog";
+import { useProviderFeatures } from "@/hooks/use-provider-features";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
 import { ApiRetryBanner } from "./api-retry-banner";
@@ -300,6 +303,27 @@ function applyEventToTurns(
                     ? ("failed" as const)
                     : ("completed" as const),
                 }
+              : tc,
+          ),
+        };
+      });
+    // Per-tool heartbeat from a provider that opted into
+    // ProviderFeatures.toolProgress (Claude SDK today). We just
+    // stamp lastProgressAt on the matching tool call; the
+    // tool-call card watches that field against wall time and
+    // shows a "no progress · Ns" pip when it goes stale, while
+    // the stuck banner stays out of the way for tools that are
+    // still ticking. Unknown call_ids are silently ignored —
+    // usually means the heartbeat raced ahead of
+    // tool_call_started by a frame.
+    case "tool_progress":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.toolCalls) return t;
+        return {
+          ...t,
+          toolCalls: t.toolCalls.map((tc) =>
+            tc.callId === event.call_id
+              ? { ...tc, lastProgressAt: event.occurred_at }
               : tc,
           ),
         };
@@ -660,6 +684,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [promptSuggestion, setPromptSuggestion] = React.useState<string | null>(
     null,
   );
+  // Open-state for the per-session settings dialog (gear icon in
+  // header). Local to chat-view because dialog content reads from
+  // the React Query cache that lives here.
+  const [sessionSettingsOpen, setSessionSettingsOpen] =
+    React.useState(false);
+  // Anchor turn for the per-user-message revert dialog. `null`
+  // means closed; setting to a turn id opens the dialog with that
+  // turn as the rewind target.
+  const [revertAnchorTurnId, setRevertAnchorTurnId] = React.useState<
+    string | null
+  >(null);
 
   // The diff view is sourced directly from `git diff HEAD` against
   // the project's working tree (plus untracked files). It refreshes
@@ -1233,6 +1268,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           refreshDiffs();
           break;
 
+        case "files_rewound":
+          // Native rewind just changed files on disk outside the
+          // turn loop. Force the diff subscription open and refresh
+          // so the badge updates to the post-rewind state. Toast
+          // the totals so the user has feedback even if the diff
+          // panel isn't visible. Cap the path-list preview in the
+          // toast so a 200-file rewind doesn't blow it up.
+          activateDiffSubscription();
+          refreshDiffs({ force: true });
+          {
+            const restored = event.paths_restored.length;
+            const deleted = event.paths_deleted.length;
+            toast({
+              description: `Reverted ${restored} restored, ${deleted} deleted.`,
+              duration: 4000,
+            });
+          }
+          break;
+
         case "content_delta":
           // First token of the turn clears any in-flight retry
           // banner — if the provider was retrying and the model
@@ -1594,6 +1648,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return (runningTurn.toolCalls ?? []).some((tc) => tc.status === "pending");
   }, [runningTurn]);
 
+  // Per-session settings affordance gate. Reads the current
+  // provider's feature flags; the gear button (and dialog) only
+  // surface when at least one settable field is supported. As
+  // future per-session fields land they should OR-in here.
+  const sessionFeatures = useProviderFeatures(
+    sessionQuery.data?.detail.summary.provider,
+  );
+  const hasSessionSettings = !!sessionFeatures.compactCustomInstructions;
+  // Per-user-message revert affordance — gated on the same
+  // ProviderFeatures lookup; only surfaces a click handler when
+  // the provider opted in. Undefined here propagates through
+  // MessageList → TurnView → UserMessage and the button stays
+  // hidden.
+  const handleRevertFiles = React.useMemo(() => {
+    if (!sessionFeatures.fileCheckpoints) return undefined;
+    return (turnId: string) => setRevertAnchorTurnId(turnId);
+  }, [sessionFeatures.fileCheckpoints]);
+
   // Arm the stuck-watchdog. We only trip it when the session is
   // running *and* at least one tool call is pending, so idle
   // pre-tool "Thinking…" periods don't falsely flag as stuck. The
@@ -1731,6 +1803,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             contextOpen={contextOpen}
             todoProgress={todoProgress}
             onToggleContext={handleToggleContext}
+            // Only show the gear when the current provider has at
+            // least one per-session-settable feature. Today that's
+            // gated on `compact_custom_instructions`; as more
+            // session-scoped fields land, OR them in here.
+            onOpenSessionSettings={
+              hasSessionSettings
+                ? () => setSessionSettingsOpen(true)
+                : undefined
+            }
             onToggleDiff={() => {
               setDiffOpen((v) => {
                 if (!v) {
@@ -1792,6 +1873,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             onOpenAttachment={handleOpenPersistedAttachment}
             providerKind={sessionQuery.data?.detail.summary.provider}
             sessionModel={sessionQuery.data?.detail.summary.model}
+            onRevertFiles={handleRevertFiles}
           />
 
           {isRunning && session && runningTurn && (
@@ -1965,6 +2047,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <ImageLightbox
           source={{ kind: "persisted", ref: persistedLightboxRef }}
           onClose={() => setPersistedLightboxRef(null)}
+        />
+      )}
+      {hasSessionSettings && sessionQuery.data?.detail.summary.provider && (
+        <SessionSettingsDialog
+          open={sessionSettingsOpen}
+          onOpenChange={setSessionSettingsOpen}
+          sessionId={sessionId}
+          provider={sessionQuery.data.detail.summary.provider}
+          session={sessionQuery.data?.detail}
+        />
+      )}
+      {sessionFeatures.fileCheckpoints && (
+        <RevertFilesDialog
+          open={revertAnchorTurnId !== null}
+          onOpenChange={(next) => {
+            if (!next) setRevertAnchorTurnId(null);
+          }}
+          sessionId={sessionId}
+          anchorTurnId={revertAnchorTurnId}
+          turns={turns}
         />
       )}
     </div>

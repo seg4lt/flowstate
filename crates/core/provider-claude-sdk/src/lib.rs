@@ -223,6 +223,16 @@ enum BridgeRequest {
         /// text + base64 image blocks.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<BridgeImageAttachment>,
+        /// Per-session steering text the user wrote in
+        /// "Session settings → Compaction priorities". When present the
+        /// bridge builds the SDK Options' system prompt as
+        /// `{ type: 'preset', preset: 'claude_code', append: <wrapped text> }`
+        /// so the model honors it whenever it summarises older turns
+        /// during compaction. Cleared by an empty string at the
+        /// runtime-core layer; absent here means "use the default
+        /// preset, no append".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_custom_instructions: Option<String>,
     },
     #[serde(rename = "answer_permission")]
     AnswerPermission {
@@ -448,6 +458,19 @@ enum BridgeResponse {
         /// predicted next user prompt.
         #[serde(default)]
         suggestion: Option<String>,
+        /// Populated on `tool_progress` events. Seconds since the
+        /// SDK started the tool call; mirrored for display only —
+        /// the frontend's stalled-tool detector relies on
+        /// `occurred_at` for freshness, not this field.
+        #[serde(default)]
+        elapsed_time_seconds: Option<f64>,
+        /// Populated on `tool_progress` events. ISO 8601 timestamp
+        /// stamped by the bridge at the moment the SDK's heartbeat
+        /// arrived. The runtime stores this as
+        /// `ToolCall::last_progress_at` so the stalled-tool pip
+        /// can compare against wall time.
+        #[serde(default)]
+        occurred_at: Option<String>,
     },
 }
 
@@ -884,6 +907,7 @@ impl ClaudeSdkAdapter {
         input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        compact_custom_instructions: Option<String>,
         events: TurnEventSink,
     ) -> Result<(String, Option<String>), String> {
         // Held for the entire turn. Drops after `process` is released,
@@ -906,6 +930,7 @@ impl ClaudeSdkAdapter {
             permission_mode: mode_str.to_string(),
             reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
             images: bridge_images,
+            compact_custom_instructions,
         };
         write_request(&process.stdin, &request).await?;
 
@@ -1057,6 +1082,8 @@ impl ClaudeSdkAdapter {
                     usage,
                     rate_limit_info,
                     model,
+                    elapsed_time_seconds: _elapsed_time_seconds,
+                    occurred_at,
                 } => {
                     // Log every non-delta stream event so "stuck"
                     // bugs are diagnosable from the log alone: if the
@@ -1262,6 +1289,35 @@ impl ClaudeSdkAdapter {
                             }
                         }
                     }
+                    "tool_progress" => {
+                        // Per-tool heartbeat from the SDK. Drives the
+                        // stalled-tool pip on the frontend (a per-tool
+                        // affordance that's strictly more useful than
+                        // the existing 45s session-wide stuck banner).
+                        // We require call_id since it's the join key
+                        // against the live ToolCall; missing call_id
+                        // means we can't attach the heartbeat to a
+                        // tool, so drop the event.
+                        if let Some(cid) = call_id {
+                            // The bridge always stamps `occurred_at`
+                            // before emitting (see the
+                            // `tool_progress` case in
+                            // bridge/src/index.ts), so the
+                            // `unwrap_or_default()` is just a JSON-
+                            // safety net — runtime-core treats an
+                            // empty string the same as no heartbeat
+                            // (the staleness check is `!is_empty()`
+                            // first, then a parse).
+                            events
+                                .send(ProviderTurnEvent::ToolProgress {
+                                    call_id: cid,
+                                    tool_name: tool_name.unwrap_or_default(),
+                                    parent_call_id,
+                                    occurred_at: occurred_at.unwrap_or_default(),
+                                })
+                                .await;
+                        }
+                    }
                     other_event => {
                         forward_stream(
                             &events,
@@ -1445,12 +1501,21 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         let cached = self.ensure_session_process(session).await?;
+        // Pull per-session compaction steering text out of
+        // `provider_state.metadata`. Empty / whitespace-only values
+        // collapse to None so the bridge falls back to the SDK's
+        // default Claude Code preset (no `append`). The metadata key
+        // is camelCase to match `ProviderSessionState`'s serde shape.
+        let compact_custom_instructions = read_compact_custom_instructions(
+            session.provider_state.as_ref(),
+        );
         let result = self
             .run_turn(
                 cached,
                 input,
                 permission_mode,
                 reasoning_effort,
+                compact_custom_instructions,
                 events,
             )
             .await;
@@ -1461,10 +1526,19 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 // resume after restart works. Fall back to whatever was already
                 // persisted if the bridge didn't return one (e.g. init failed
                 // to carry a session_id in this SDK version).
+                //
+                // CAREFUL: when we mint a new ProviderSessionState here we
+                // intentionally preserve any existing `metadata` blob (the
+                // user's compact_custom_instructions live there) — without
+                // this, every successful turn would silently wipe per-
+                // session settings.
                 let provider_state = session_id
                     .map(|id| ProviderSessionState {
                         native_thread_id: Some(id),
-                        metadata: None,
+                        metadata: session
+                            .provider_state
+                            .as_ref()
+                            .and_then(|s| s.metadata.clone()),
                     })
                     .or_else(|| session.provider_state.clone());
                 Ok(ProviderTurnOutput {
@@ -2148,6 +2222,31 @@ async fn forward_stream(
     }
 }
 
+/// Pull `compactCustomInstructions` out of a session's
+/// `provider_state.metadata` blob. Returns `None` for absent /
+/// non-string / empty / whitespace-only values — those should all
+/// collapse to "no append, use the default preset" rather than
+/// "append an empty string", so the SDK gets a clean Options shape.
+///
+/// Key name is camelCase because `ProviderSessionState` serializes
+/// with `#[serde(rename_all = "camelCase")]`; the metadata blob
+/// inside is opaque JSON but we follow the same convention so the
+/// flowstate user_config readers (TS) and writers (Rust) agree.
+fn read_compact_custom_instructions(
+    state: Option<&ProviderSessionState>,
+) -> Option<String> {
+    let metadata = state.and_then(|s| s.metadata.as_ref())?;
+    let text = metadata
+        .get("compactCustomInstructions")
+        .and_then(Value::as_str)?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Feature flags the Claude Agent SDK bridge supports today. Keep in
 /// lockstep with the `ProviderFeatures` fields wired by this adapter;
 /// each flag flips to `true` only when both halves of the pipeline
@@ -2161,13 +2260,13 @@ fn claude_sdk_features() -> zenui_provider_api::ProviderFeatures {
 
         // Commit 2: turn-phase labels + API-retry banner. The
         // basic tool-elapsed counter is driven by the cross-
-        // provider `ToolCall::started_at` field and doesn't need
-        // a feature flag, so `tool_progress` stays off here — it
-        // reserves for a later commit wiring the SDK's
-        // `tool_progress` heartbeat messages (stuck-tool
-        // detection).
+        // provider `ToolCall::started_at` field and ships
+        // unconditionally; `tool_progress` is the SDK's per-tool
+        // heartbeat that drives the *stalled-tool* pip (and
+        // demotes the session-wide stuck banner to a fallback).
         status_labels: true,
         api_retries: true,
+        tool_progress: true,
 
         // Commit 3: ghost-text prompt suggestions via the SDK's
         // `promptSuggestions: true` option + `prompt_suggestion`
@@ -2196,29 +2295,28 @@ fn claude_sdk_features() -> zenui_provider_api::ProviderFeatures {
         // bridge/src/index.ts::sendPrompt.
         supports_auto_permission_mode: true,
 
-        // Deferred:
-        //   tool_progress           — wires the SDK's
-        //                             `tool_progress` heartbeat
-        //                             messages for stuck-tool
-        //                             detection.
-        //   file_checkpoints        — same infrastructure (mid-
-        //                             turn RPC) unlocks it, but
-        //                             rewind naturally wants to
-        //                             fire *between* turns; since
-        //                             `rewindFiles` is a Query
-        //                             method we'd need a silent
-        //                             no-op turn to host the
-        //                             call, a persistent idle
-        //                             query, or a flowstate-
-        //                             native snapshot mechanism.
-        //   compact_custom_instr… — the SDK's PreCompact hook is
-        //                             read-only (no output path for
-        //                             `custom_instructions` in the
-        //                             typed API of 0.2.112). Needs
-        //                             either a different injection
-        //                             mechanism (settings file,
-        //                             applyFlagSettings) or a future
-        //                             SDK surface.
+        // Per-session "Compaction priorities" textarea. Stored in
+        // `provider_state.metadata.compactCustomInstructions`,
+        // wrapped at the bridge into the SDK's
+        // `systemPrompt: { preset: 'claude_code', append: ... }`
+        // shape so the model honors it during compaction. SDK
+        // 0.2.112's PreCompact hook is read-only, so this is the
+        // supported steering surface — see the bridge's Options
+        // construction for the exact wrapping.
+        compact_custom_instructions: true,
+
+        // Per-user-message "Revert file changes since here" action.
+        // Implemented natively in runtime-core by walking the
+        // persisted `FileChangeRecord.before` snapshots — no SDK
+        // round-trip required, so the action works between turns
+        // and after a daemon restart. (The SDK's own
+        // `Query.rewindFiles()` is also available behind
+        // `enableFileCheckpointing: true`, but adding that path
+        // would force every session to pay the SDK's checkpoint
+        // disk overhead just to enable the same UX we already get
+        // for free.)
+        file_checkpoints: true,
+
         ..zenui_provider_api::ProviderFeatures::default()
     }
 }

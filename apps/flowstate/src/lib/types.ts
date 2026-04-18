@@ -224,10 +224,18 @@ export interface ToolCall {
   /** ISO 8601 timestamp of when the tool call was issued. Populated
    *  by runtime-core on `ToolCallStarted` for every provider; the UI
    *  renders a live elapsed counter ("Bash · 12s") from this while
-   *  the call is still `pending`. Providers whose adapter doesn't
-   *  opt into `ProviderFeatures.toolProgress` have the timer hidden
-   *  at the UI level even though the field is populated. */
+   *  the call is still `pending`. The counter ships
+   *  cross-provider — `ProviderFeatures.toolProgress` controls the
+   *  *stalled-tool pip* (next field), not this base counter. */
   startedAt?: string;
+  /** ISO 8601 timestamp of the most recent SDK heartbeat for this
+   *  tool call. Populated only by providers that opt into
+   *  `ProviderFeatures.toolProgress` (e.g. the Claude Agent SDK). The
+   *  tool-call card compares this against wall time while the call
+   *  is `pending` and renders an amber "no progress · Ns" pip when
+   *  freshness exceeds ≈30s. Absent on cross-provider calls — the
+   *  UI then falls back to the session-wide stuck banner. */
+  lastProgressAt?: string;
 }
 
 // Mirrors `zenui_provider_api::ContentBlock` — the canonical ordered
@@ -426,9 +434,24 @@ export interface SessionSummary {
   projectId?: string;
 }
 
+/** Per-session metadata persisted alongside `nativeThreadId`. The
+ *  Rust shape is `serde_json::Value` (any JSON), but the keys we
+ *  read on the frontend are stable and listed here so the
+ *  session-settings dialog has a typed handle on them. Unknown
+ *  fields are tolerated — anything we don't list is preserved
+ *  round-trip by the runtime's metadata merge.
+ *
+ *  - `compactCustomInstructions`: per-session text appended to the
+ *    Claude SDK system prompt to steer compaction summaries. Empty
+ *    string means "clear the setting"; absent means "never set". */
+export interface SessionMetadata {
+  compactCustomInstructions?: string;
+  [key: string]: unknown;
+}
+
 export interface ProviderSessionState {
   nativeThreadId?: string;
-  metadata?: unknown;
+  metadata?: SessionMetadata;
 }
 
 export interface SessionDetail {
@@ -484,6 +507,8 @@ export type ClientMessage =
   | { type: "get_attachment"; attachment_id: string }
   | { type: "interrupt_turn"; session_id: string }
   | { type: "update_permission_mode"; session_id: string; permission_mode: PermissionMode }
+  | { type: "update_session_settings"; session_id: string; compact_custom_instructions?: string }
+  | { type: "rewind_files"; session_id: string; turn_id: string }
   | { type: "delete_session"; session_id: string }
   | { type: "answer_permission"; session_id: string; request_id: string; decision: PermissionDecision; permission_mode_override?: PermissionMode }
   | { type: "answer_question"; session_id: string; request_id: string; answers: UserInputAnswer[] }
@@ -524,6 +549,8 @@ export type RuntimeEvent =
   | { type: "reasoning_delta"; session_id: string; turn_id: string; delta: string }
   | { type: "tool_call_started"; session_id: string; turn_id: string; call_id: string; name: string; args: unknown; parent_call_id?: string }
   | { type: "tool_call_completed"; session_id: string; turn_id: string; call_id: string; output: string; error?: string }
+  | { type: "tool_progress"; session_id: string; turn_id: string; call_id: string; tool_name: string; parent_call_id?: string; occurred_at: string }
+  | { type: "files_rewound"; session_id: string; turn_id: string; paths_restored: string[]; paths_deleted: string[] }
   | { type: "turn_completed"; session_id: string; session: SessionSummary; turn: TurnRecord }
   | { type: "session_interrupted"; session: SessionSummary; message: string }
   | { type: "session_deleted"; session_id: string }

@@ -334,6 +334,7 @@ class ClaudeBridge {
     permissionMode: SdkPermissionMode,
     reasoningEffort?: ReasoningEffortWire,
     images: Array<{ media_type: string; data_base64: string }> = [],
+    compactCustomInstructions?: string,
   ): Promise<string> {
     if (this.inFlight) {
       throw new Error('Another turn is already in flight');
@@ -480,6 +481,27 @@ class ClaudeBridge {
       'Agent',
     ];
 
+    // Per-session compaction steering. SDK 0.2.112's PreCompact hook
+    // is read-only (no output path for custom_instructions in its
+    // typed API), so we instead append the user's text to the system
+    // prompt via the supported `{ type: 'preset', preset:
+    // 'claude_code', append: ... }` shape on `Options.systemPrompt`.
+    // The model sees this on every prompt — not strictly compaction-
+    // only — but the wording explicitly scopes the guidance to the
+    // summarization step, so non-compaction turns just see an
+    // additional instruction the model can satisfy implicitly. Empty
+    // strings collapse at the runtime-core layer; if the field ever
+    // arrives empty here we still skip it as a defence-in-depth.
+    const trimmedCompactInstructions = compactCustomInstructions?.trim();
+    const compactSystemPrompt: Options['systemPrompt'] | undefined =
+      trimmedCompactInstructions
+        ? {
+            type: 'preset',
+            preset: 'claude_code',
+            append: `When summarizing prior conversation during compaction, prioritize the following user-supplied guidance: ${trimmedCompactInstructions}`,
+          }
+        : undefined;
+
     const options: Options = {
       cwd: this.cwd,
       permissionMode,
@@ -567,6 +589,7 @@ class ClaudeBridge {
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
       ...(effortLevel ? { effort: effortLevel } : {}),
+      ...(compactSystemPrompt ? { systemPrompt: compactSystemPrompt } : {}),
       // Optional: prefer the user's local Claude Code install over
       // the SDK's bundled binary when one is on PATH. Spread is
       // empty (no key set) when no local install was found, so the
@@ -864,6 +887,39 @@ class ClaudeBridge {
           writeStream({
             event: 'prompt_suggestion',
             suggestion: ps.suggestion,
+          });
+        }
+        return null;
+      }
+      case 'tool_progress': {
+        // Heartbeat for an in-flight tool call. The SDK emits these
+        // periodically while a tool is running (Bash watching stdout,
+        // Task subagent ticking, etc.) so the UI can distinguish
+        // "still working" from "actually stuck" — without a heartbeat
+        // we can only fall back to session-wide silence detection.
+        // SDKToolProgressMessage shape (sdk.d.ts:3048):
+        //   { type, tool_use_id, tool_name, parent_tool_use_id,
+        //     elapsed_time_seconds, task_id?, uuid, session_id }
+        // We forward a minimal shape: the call_id (the SDK calls it
+        // `tool_use_id`) is the join key against ToolCall in the
+        // runtime; tool_name + elapsed are display fluff. Stamp
+        // `occurred_at` here in the bridge so the freshness clock
+        // ticks against wall time, not event-arrival time at the
+        // frontend (which can lag under load).
+        const tp = msg as {
+          tool_use_id?: string;
+          tool_name?: string;
+          parent_tool_use_id?: string | null;
+          elapsed_time_seconds?: number;
+        };
+        if (typeof tp.tool_use_id === 'string' && tp.tool_use_id.length > 0) {
+          writeStream({
+            event: 'tool_progress',
+            call_id: tp.tool_use_id,
+            tool_name: tp.tool_name ?? '',
+            parent_call_id: tp.parent_tool_use_id ?? null,
+            elapsed_time_seconds: tp.elapsed_time_seconds ?? 0,
+            occurred_at: new Date().toISOString(),
           });
         }
         return null;
@@ -1564,9 +1620,23 @@ async function main(): Promise<void> {
         const images = (msg.images as
           | Array<{ media_type: string; data_base64: string }>
           | undefined) ?? [];
+        // Optional per-session compaction steering text. Wraps into
+        // `Options.systemPrompt = { type: 'preset', preset:
+        // 'claude_code', append: ... }` inside sendPrompt. Absent /
+        // empty here means "use the default Claude Code preset, no
+        // append".
+        const compactCustomInstructions = msg.compact_custom_instructions as
+          | string
+          | undefined;
         promptInFlight = (async () => {
           try {
-            const output = await bridge.sendPrompt(prompt, mode, effort, images);
+            const output = await bridge.sendPrompt(
+              prompt,
+              mode,
+              effort,
+              images,
+              compactCustomInstructions,
+            );
             writeJson({
               type: 'response',
               output,

@@ -49,6 +49,53 @@ export async function getContextUsage(
   throw new Error("unexpected response to get_context_usage");
 }
 
+/**
+ * Persist per-session settings (compaction priorities, future
+ * fields) into the runtime's `provider_state.metadata`. Sparse —
+ * only fields the caller passes are merged on the Rust side; absent
+ * fields keep their prior value. Pass an empty string to clear a
+ * field. Throws on `ServerMessage::Error`. Resolves once the
+ * runtime has flushed to disk, so the very next turn picks up the
+ * new value.
+ */
+export async function updateSessionSettings(
+  sessionId: string,
+  settings: { compactCustomInstructions?: string },
+): Promise<void> {
+  const resp = await sendMessage({
+    type: "update_session_settings",
+    session_id: sessionId,
+    compact_custom_instructions: settings.compactCustomInstructions,
+  });
+  if (resp?.type === "ack") return;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to update_session_settings");
+}
+
+/**
+ * Revert all on-disk file changes made by `turnId` and every later
+ * turn back to their pre-turn state. Best-effort and partial — a
+ * single bad path errors the whole call; previously-touched paths
+ * are NOT rolled back (no transactional FS). Throws on
+ * `ServerMessage::Error`. The runtime broadcasts a
+ * `RuntimeEvent::FilesRewound` after success which carries the
+ * detailed lists; this call's resolved Ack is just a "request
+ * accepted" signal.
+ */
+export async function rewindFiles(
+  sessionId: string,
+  turnId: string,
+): Promise<void> {
+  const resp = await sendMessage({
+    type: "rewind_files",
+    session_id: sessionId,
+    turn_id: turnId,
+  });
+  if (resp?.type === "ack") return;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to rewind_files");
+}
+
 export function connectStream(
   onMessage: (message: ServerMessage) => void,
 ): Promise<void> {

@@ -90,6 +90,46 @@ function ToolElapsed({ startedAt }: { startedAt: string }) {
   );
 }
 
+// Threshold (ms) past which a per-tool heartbeat counts as stale.
+// Picked to be longer than the SDK's nominal heartbeat cadence so
+// momentary scheduling jitter doesn't flip the pip on every other
+// frame. Shorter than the session-wide 45s stuck banner so a
+// stalled tool surfaces here first.
+const TOOL_STALL_THRESHOLD_MS = 30_000;
+
+// Per-tool stalled-tool indicator. Renders only when the provider
+// is actually heartbeating this tool (`lastProgressAt` populated)
+// AND the most recent heartbeat is older than the threshold AND
+// the call is still pending. Absence of `lastProgressAt` means
+// the provider doesn't emit `tool_progress` for this tool — the
+// session-wide stuck banner handles that case as a fallback. The
+// pip stays out of the way for fast tools (Read/Glob) that finish
+// before any heartbeat arrives.
+function ToolStalled({ lastProgressAt }: { lastProgressAt: string }) {
+  const now = useTicker(1000);
+  const lastMs = React.useMemo(() => {
+    const t = Date.parse(lastProgressAt);
+    return Number.isNaN(t) ? null : t;
+  }, [lastProgressAt]);
+  if (lastMs == null) return null;
+  const sinceMs = now - lastMs;
+  if (sinceMs < TOOL_STALL_THRESHOLD_MS) return null;
+  const sinceSec = Math.floor(sinceMs / 1000);
+  const label =
+    sinceSec < 60
+      ? `${sinceSec}s`
+      : `${Math.floor(sinceSec / 60)}m ${sinceSec % 60}s`;
+  return (
+    <span
+      className="ml-2 shrink-0 rounded-sm bg-amber-500/10 px-1.5 py-0.5 font-mono text-[10px] tabular-nums text-amber-700 dark:text-amber-400"
+      aria-label={`No progress for ${label}`}
+      title="The SDK hasn't reported progress for this tool recently. It may be stuck."
+    >
+      no progress · {label}
+    </span>
+  );
+}
+
 export function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const [open, setOpen] = React.useState(false);
 
@@ -101,8 +141,17 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
         : "text-muted-foreground";
 
   const preview = toolPreview(toolCall.name, toolCall.args);
+  const isPending = toolCall.status === "pending";
   const showElapsed =
-    toolCall.status === "pending" && typeof toolCall.startedAt === "string";
+    isPending && typeof toolCall.startedAt === "string";
+  // Stalled-tool pip is gated naturally by the presence of
+  // `lastProgressAt` — only providers that emit `tool_progress`
+  // populate it. Pending check guards against a stale heartbeat
+  // lingering after completion (the field isn't cleared on
+  // tool_call_completed since the call is done; the pip just
+  // disappears because `isPending` is false).
+  const showStalled =
+    isPending && typeof toolCall.lastProgressAt === "string";
 
   return (
     <div className="text-xs">
@@ -123,6 +172,9 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
         </span>
         {showElapsed && toolCall.startedAt && (
           <ToolElapsed startedAt={toolCall.startedAt} />
+        )}
+        {showStalled && toolCall.lastProgressAt && (
+          <ToolStalled lastProgressAt={toolCall.lastProgressAt} />
         )}
         <span className={`ml-2 shrink-0 text-[10px] ${statusColor}`}>
           {toolCall.status}

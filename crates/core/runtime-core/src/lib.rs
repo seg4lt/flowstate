@@ -1,6 +1,6 @@
 pub mod transport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -10,9 +10,10 @@ use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
     ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter,
-    ProviderKind, ProviderStatus, ProviderTurnEvent, ReasoningEffort, RuntimeEvent, ServerMessage,
-    SessionDetail, SessionStatus, SubagentRecord, SubagentStatus, TokenUsage, ToolCall,
-    ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
+    ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent, ReasoningEffort,
+    RuntimeEvent, ServerMessage, SessionDetail, SessionStatus, SubagentRecord, SubagentStatus,
+    TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput,
+    UserInputAnswer,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -23,6 +24,17 @@ const MODEL_CACHE_TTL_HOURS: i64 = 24;
 pub trait TurnLifecycleObserver: Send + Sync {
     fn on_turn_start(&self, session_id: &str);
     fn on_turn_end(&self, session_id: &str);
+}
+
+/// Internal result of `RuntimeCore::rewind_files`. Not exported to
+/// transports or the wire — `handle_client_message` decomposes it
+/// into a `RuntimeEvent::FilesRewound` broadcast plus an Ack. Kept
+/// as a struct rather than a tuple so the call site reads
+/// self-documentingly when the lists grow more entries (e.g. paths
+/// we *intended* to touch but couldn't).
+struct RewindOutcome {
+    paths_restored: Vec<String>,
+    paths_deleted: Vec<String>,
 }
 
 /// Status snapshot returned by `ConnectionObserver::status` and serialized
@@ -786,6 +798,46 @@ impl RuntimeCore {
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
+            ClientMessage::UpdateSessionSettings {
+                session_id,
+                compact_custom_instructions,
+            } => {
+                match self
+                    .update_session_settings(session_id, compact_custom_instructions)
+                    .await
+                {
+                    Ok(()) => Some(ServerMessage::Ack {
+                        message: "Session settings updated.".to_string(),
+                    }),
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
+            ClientMessage::RewindFiles { session_id, turn_id } => {
+                match self.rewind_files(&session_id, &turn_id).await {
+                    Ok(outcome) => {
+                        let restored = outcome.paths_restored.len();
+                        let deleted = outcome.paths_deleted.len();
+                        // Broadcast so the diff panel and any
+                        // listening surface refresh against the new
+                        // on-disk state. Errors here are recorded
+                        // but don't change the Ack — the rewind has
+                        // already happened on disk by the time we
+                        // get here.
+                        self.publish(RuntimeEvent::FilesRewound {
+                            session_id: session_id.clone(),
+                            turn_id: turn_id.clone(),
+                            paths_restored: outcome.paths_restored,
+                            paths_deleted: outcome.paths_deleted,
+                        });
+                        Some(ServerMessage::Ack {
+                            message: format!(
+                                "Rewound {restored} restored, {deleted} deleted."
+                            ),
+                        })
+                    }
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
             ClientMessage::DeleteSession { session_id } => {
                 match self.delete_session(session_id).await {
                     Ok(message) => Some(ServerMessage::Ack { message }),
@@ -1459,6 +1511,14 @@ impl RuntimeCore {
                         // feature flag get a reasonable "Bash ·
                         // 12s" if the UI ever unhides the timer.
                         started_at: Some(chrono::Utc::now().to_rfc3339()),
+                        // Heartbeat tracker. None on creation; gets
+                        // stamped by ProviderTurnEvent::ToolProgress
+                        // events for providers that opt into
+                        // `ProviderFeatures.tool_progress`. The
+                        // frontend's stalled-tool pip compares this
+                        // against wall time (≈30s threshold) while
+                        // the call is still pending.
+                        last_progress_at: None,
                     });
                     blocks.push(ContentBlock::ToolCall {
                         call_id: call_id.clone(),
@@ -1488,6 +1548,33 @@ impl RuntimeCore {
                         call_id,
                         output,
                         error,
+                    });
+                }
+                ProviderTurnEvent::ToolProgress {
+                    call_id,
+                    tool_name,
+                    parent_call_id,
+                    occurred_at,
+                } => {
+                    // Stamp `last_progress_at` on the matching live
+                    // ToolCall so a mid-turn persistence write (or a
+                    // session reload) preserves the heartbeat the
+                    // frontend's stalled-tool pip is comparing
+                    // against. Silently ignore heartbeats whose
+                    // call_id we don't recognise — it usually means
+                    // the heartbeat raced ahead of ToolCallStarted
+                    // by a few ms; the next heartbeat will land on a
+                    // resolved ToolCall and the pip catches up.
+                    if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.call_id == call_id) {
+                        tc.last_progress_at = Some(occurred_at.clone());
+                    }
+                    self.publish(RuntimeEvent::ToolProgress {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        call_id,
+                        tool_name,
+                        parent_call_id,
+                        occurred_at,
                     });
                 }
                 ProviderTurnEvent::Info { message } => {
@@ -2043,6 +2130,162 @@ impl RuntimeCore {
         });
 
         result
+    }
+
+    /// Walk this session's turns from `turn_id` forward, restore
+    /// each touched file's earliest `before` snapshot back to disk,
+    /// and delete files that were created in the rewound span.
+    /// Native — does not depend on the provider's SDK lifecycle, so
+    /// it works between turns and after a restart.
+    ///
+    /// Returns the lists of paths actually written and deleted so
+    /// the handler can include them in the `FilesRewound` broadcast
+    /// (the diff panel and toasts read both). Errors surface as
+    /// strings, mirroring the rest of this module's `Result<_, String>`
+    /// discipline.
+    async fn rewind_files(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Result<RewindOutcome, String> {
+        let session = self
+            .live_session_detail(session_id)
+            .await
+            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+
+        // Locate the anchor turn. We match on turn_id rather than
+        // index because the user-facing UI knows turn_ids and the
+        // session's turns vector may be paginated in the future.
+        let anchor_index = session
+            .turns
+            .iter()
+            .position(|t| t.turn_id == turn_id)
+            .ok_or_else(|| {
+                format!(
+                    "Turn `{turn_id}` not found in session `{session_id}`."
+                )
+            })?;
+        let span = &session.turns[anchor_index..];
+
+        // Walk in chronological order. The FIRST FileChangeRecord we
+        // see for a path holds the canonical pre-rewind state — its
+        // `before` is the value to restore (or None if the file was
+        // created in this span and should therefore be deleted).
+        // Later records on the same path are intermediate states the
+        // user wants undone, so they're ignored.
+        let mut earliest_before: BTreeMap<String, Option<String>> =
+            BTreeMap::new();
+        for turn in span {
+            for change in &turn.file_changes {
+                earliest_before
+                    .entry(change.path.clone())
+                    .or_insert_with(|| change.before.clone());
+            }
+        }
+
+        // Apply. Best-effort per path: a partial failure surfaces as
+        // an error toast but doesn't roll back the paths we already
+        // touched (that would require a transactional FS, which we
+        // don't have). Order is sorted alphabetically purely for
+        // deterministic event/log output.
+        let mut paths_restored = Vec::new();
+        let mut paths_deleted = Vec::new();
+        for (path, before) in earliest_before {
+            match before {
+                Some(content) => {
+                    if let Err(e) = tokio::fs::write(&path, content).await {
+                        return Err(format!(
+                            "Failed to restore `{path}`: {e}"
+                        ));
+                    }
+                    paths_restored.push(path);
+                }
+                None => {
+                    // File was created during the rewound span. If
+                    // it's already gone (user / another tool deleted
+                    // it), treat that as success — the desired
+                    // post-condition is "the file does not exist".
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => paths_deleted.push(path),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            paths_deleted.push(path);
+                        }
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to delete `{path}`: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(RewindOutcome {
+            paths_restored,
+            paths_deleted,
+        })
+    }
+
+    /// Persist per-session settings into
+    /// `provider_state.metadata`. Sparse — only fields the caller
+    /// explicitly passed are merged; absent fields keep their prior
+    /// value. Settings take effect on the NEXT turn (reading happens
+    /// inside the adapter's `execute_turn`); this call returns once
+    /// persistence has flushed so a follow-up SendTurn always sees
+    /// the new value.
+    async fn update_session_settings(
+        &self,
+        session_id: String,
+        compact_custom_instructions: Option<String>,
+    ) -> Result<(), String> {
+        let mut session = self
+            .live_session_detail(&session_id)
+            .await
+            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+
+        // Bump updated_at so list views that sort on it surface the
+        // change. We treat session settings as a session-touch event
+        // even though no turn was issued.
+        session.summary.updated_at = chrono::Utc::now().to_rfc3339();
+
+        // Merge into the existing provider_state, preserving
+        // native_thread_id and any other metadata fields. If no
+        // provider_state exists yet (settings change before the first
+        // turn), seed an empty one so the metadata write has a home.
+        let mut state = session
+            .provider_state
+            .clone()
+            .unwrap_or(ProviderSessionState {
+                native_thread_id: None,
+                metadata: None,
+            });
+        let mut metadata_obj = state
+            .metadata
+            .as_ref()
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(text) = compact_custom_instructions {
+            // Trim here so persistence carries the canonical form;
+            // reading code already collapses empty / whitespace
+            // values to `None`. Storing `""` (empty string) is
+            // intentional — it's the user's signal to clear the
+            // setting and it round-trips cleanly through the JSON
+            // blob.
+            let trimmed = text.trim();
+            metadata_obj.insert(
+                "compactCustomInstructions".to_string(),
+                serde_json::Value::String(trimmed.to_string()),
+            );
+        }
+        state.metadata = if metadata_obj.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(metadata_obj))
+        };
+        session.provider_state = Some(state);
+
+        self.persistence.upsert_session(session).await;
+        Ok(())
     }
 
     async fn update_permission_mode(
