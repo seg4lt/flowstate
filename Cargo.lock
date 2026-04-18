@@ -6705,7 +6705,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zenui-orchestration",
  "zenui-persistence",
  "zenui-provider-api",
  "zenui-runtime-core",
@@ -6727,15 +6726,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zenui-orchestration"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "uuid",
- "zenui-provider-api",
-]
-
-[[package]]
 name = "zenui-persistence"
 version = "0.1.0"
 dependencies = [
@@ -6743,6 +6733,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "parking_lot",
  "rusqlite",
  "serde_json",
  "tokio",
@@ -6846,7 +6837,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "zenui-orchestration",
  "zenui-persistence",
  "zenui-provider-api",
 ]

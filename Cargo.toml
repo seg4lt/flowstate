@@ -3,7 +3,6 @@ members = [
   "apps/flowstate/src-tauri",
   "crates/core/runtime-core",
   "crates/core/provider-api",
-  "crates/core/orchestration",
   "crates/core/persistence",
   "crates/core/embedded-node",
   "crates/core/provider-claude-sdk",

@@ -1,3 +1,10 @@
+//! Session / turn lifecycle primitives. Pure functions on `SessionDetail`
+//! that create a session row, start a turn, finalise a turn, or mark a
+//! session interrupted. Previously lived in the `zenui-orchestration`
+//! crate, which turned out to host exactly these four helpers and
+//! nothing else — a crate boundary paying for no isolation. Folded in
+//! here so runtime-core reaches its own session primitives directly.
+
 use chrono::Utc;
 use uuid::Uuid;
 use zenui_provider_api::{
