@@ -352,7 +352,18 @@ class CopilotBridge {
   async sendPrompt(
     prompt: string,
     permissionMode: ZenUiPermissionMode,
-    reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high',
+    // Mirrors `zenui_provider_api::ReasoningEffort`. Copilot itself
+    // doesn't differentiate `xhigh` / `max` today (its own capability
+    // model is coarser), but the type must match the Rust wire
+    // format so a direct RPC caller keeps type safety — and the
+    // Claude-SDK bridge uses the same 6-level shape.
+    reasoningEffort?:
+      | 'minimal'
+      | 'low'
+      | 'medium'
+      | 'high'
+      | 'xhigh'
+      | 'max',
   ): Promise<string> {
     if (!this.session) {
       throw new Error('No active session');
@@ -787,6 +798,8 @@ async function main(): Promise<void> {
               | 'low'
               | 'medium'
               | 'high'
+              | 'xhigh'
+              | 'max'
               | undefined;
             promptInFlight = (async () => {
               try {

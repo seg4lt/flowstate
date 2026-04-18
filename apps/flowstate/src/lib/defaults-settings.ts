@@ -39,6 +39,8 @@ export const ALL_PROVIDER_KINDS: readonly ProviderKind[] = [
 // --- Validation helpers ---
 
 const VALID_EFFORTS: ReadonlySet<string> = new Set<ReasoningEffort>([
+  "max",
+  "xhigh",
   "high",
   "medium",
   "low",
@@ -50,6 +52,7 @@ const VALID_PERMISSION_MODES: ReadonlySet<string> = new Set<PermissionMode>([
   "accept_edits",
   "plan",
   "bypass",
+  "auto",
 ]);
 
 const VALID_PROVIDER_KINDS: ReadonlySet<string> = new Set<ProviderKind>(

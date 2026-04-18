@@ -898,6 +898,10 @@ async fn handle_callback(
             // Decide permission based on mode. The Copilot CLI adapter
             // doesn't consume a mid-answer permission-mode switch, so the
             // `_mode_override` half of the tuple is dropped.
+            //
+            // `Auto` is not exposed for Copilot-CLI (the adapter doesn't
+            // set `supports_auto_permission_mode`), but the arm is
+            // defensive and mirrors `Default`: always ask.
             let decision = match permission_mode {
                 PermissionMode::Bypass => PermissionDecision::Allow,
                 PermissionMode::AcceptEdits | PermissionMode::Plan => {
@@ -914,7 +918,7 @@ async fn handle_callback(
                         d
                     }
                 }
-                PermissionMode::Default => {
+                PermissionMode::Default | PermissionMode::Auto => {
                     let (d, _mode_override) = events
                         .request_permission(
                             kind.to_string(),
@@ -1210,6 +1214,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     label,
                     context_window,
                     max_output_tokens,
+                    ..ProviderModel::default()
                 })
             })
             .collect();
@@ -1529,48 +1534,56 @@ fn copilot_cli_models() -> Vec<ProviderModel> {
             label: "GPT-4o".to_string(),
             context_window: Some(128_000),
             max_output_tokens: Some(16_384),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "gpt-4.1".to_string(),
             label: "GPT-4.1".to_string(),
             context_window: Some(1_047_576),
             max_output_tokens: Some(32_768),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "gpt-5".to_string(),
             label: "GPT-5".to_string(),
             context_window: Some(400_000),
             max_output_tokens: Some(128_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-sonnet-4-6".to_string(),
             label: "Claude Sonnet 4.6".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "o3".to_string(),
             label: "o3".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(100_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "o4-mini".to_string(),
             label: "o4-mini".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(100_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "gemini-2.5-pro".to_string(),
             label: "Gemini 2.5 Pro".to_string(),
             context_window: Some(1_048_576),
             max_output_tokens: Some(65_536),
+            ..ProviderModel::default()
         },
     ]
 }

@@ -129,6 +129,13 @@ pub enum PermissionMode {
     AcceptEdits,
     Plan,
     Bypass,
+    /// Model-classifier approvals — the provider routes each tool call
+    /// through an internal classifier that auto-approves low-risk calls
+    /// and only falls through to `canUseTool` for tools it isn't
+    /// confident about. Today only the Claude Agent SDK implements this
+    /// (it maps to the SDK's `"auto"` `PermissionMode`); other adapters
+    /// gate on `ProviderFeatures::supports_auto_permission_mode`.
+    Auto,
 }
 
 impl Default for PermissionMode {
@@ -144,6 +151,14 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    /// Claude Agent SDK's `EffortLevel::Xhigh` — deeper than `high`,
+    /// currently only honoured by Opus 4.7+. The UI should gate this
+    /// on `ProviderModel::supported_effort_levels` so older models
+    /// don't expose an option they'll reject.
+    Xhigh,
+    /// Claude Agent SDK's `EffortLevel::Max` — maximum effort,
+    /// limited to Opus 4.6/4.7+. Gated the same way as `Xhigh`.
+    Max,
 }
 
 impl Default for ReasoningEffort {
@@ -159,6 +174,8 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
     }
 }
@@ -410,6 +427,32 @@ pub struct ProviderModel {
     /// never enforce this locally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u64>,
+    /// Whether this model honours the SDK-native `effort` parameter
+    /// (`low` / `medium` / `high` / `xhigh` / `max`). Mirrors the
+    /// Claude Agent SDK's `ModelInfo.supportsEffort`. When false, the
+    /// UI effort selector should be hidden (or downgraded to "default")
+    /// for this model.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_effort: bool,
+    /// The effort levels this model accepts. Populated from the Claude
+    /// Agent SDK's `ModelInfo.supportedEffortLevels`. Empty means
+    /// "unknown — assume all levels" (back-compat when the adapter
+    /// hasn't forwarded the list yet).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_effort_levels: Vec<String>,
+    /// Whether Claude decides its own thinking budget on this model
+    /// (`thinking: { type: 'adaptive' }`). Mirrors the Claude Agent
+    /// SDK's `ModelInfo.supportsAdaptiveThinking`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_adaptive_thinking: bool,
+    /// Whether this model supports the model-classifier `auto`
+    /// permission mode. Mirrors the Claude Agent SDK's
+    /// `ModelInfo.supportsAutoMode`. Complements the provider-level
+    /// `ProviderFeatures::supports_auto_permission_mode` — the UI can
+    /// gate on both (provider opts in, then the active model must also
+    /// support it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_auto_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -496,6 +539,12 @@ pub struct ProviderFeatures {
     /// Emits session lifecycle diagnostics (start / end). Surfaced as
     /// `Info` events in the daemon log; purely observational today.
     pub session_lifecycle_events: bool,
+    /// Honours `PermissionMode::Auto` — the provider has an internal
+    /// classifier that decides when to auto-approve vs escalate to the
+    /// `canUseTool` callback. The UI shows the "Auto" option in the
+    /// mode selector only when true, so providers that would silently
+    /// treat it as `Default` don't expose a non-functional choice.
+    pub supports_auto_permission_mode: bool,
 }
 
 /// Where a user-authored `SKILL.md` came from. Drives the "project" /

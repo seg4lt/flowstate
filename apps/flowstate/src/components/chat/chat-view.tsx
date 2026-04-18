@@ -42,6 +42,7 @@ import {
 import { PLAN_MODE_MUTATING_TOOLS } from "@/lib/tool-policy";
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
+import { useProviderFeatures } from "@/hooks/use-provider-features";
 import { MessageList } from "./messages/message-list";
 import { ChatInput, type QueuedMessage } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
@@ -824,6 +825,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const session =
     state.sessions.get(sessionId) ??
     state.archivedSessions.find((s) => s.sessionId === sessionId);
+
+  // Provider feature flags — drives capability-gated UI (mode
+  // selector, effort selector, etc.). Used locally to exclude `auto`
+  // from the Shift+Tab cycle when the provider doesn't support a
+  // model-classifier permission mode.
+  const providerFeatures = useProviderFeatures(session?.provider);
+  const excludedModes = React.useMemo<PermissionMode[]>(
+    () =>
+      providerFeatures.supportsAutoPermissionMode === true ? [] : ["auto"],
+    [providerFeatures.supportsAutoPermissionMode],
+  );
   const isArchived = React.useMemo(
     () => state.archivedSessions.some((s) => s.sessionId === sessionId),
     [state.archivedSessions, sessionId],
@@ -943,7 +955,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       // in-flight adapter picks up the change immediately — without
       // this, toggling bypass mid-turn would still prompt for every
       // subsequent tool call until the turn ends.
-      const newMode = cycleMode(permissionMode, "forward");
+      const newMode = cycleMode(permissionMode, "forward", excludedModes);
       setPermissionMode(newMode);
       if (session?.status === "running") {
         void sendMessage({
@@ -961,7 +973,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [session, permissionMode]);
+  }, [session, permissionMode, excludedModes]);
 
   // Escape interrupts the in-flight turn — but requires a *double* press
   // within 2s to actually fire. A single Esc only "arms" the gesture and

@@ -1869,6 +1869,11 @@ fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
         PermissionMode::AcceptEdits => "acceptEdits",
         PermissionMode::Plan => "plan",
         PermissionMode::Bypass => "bypassPermissions",
+        // The Claude Agent SDK exposes `'auto'` as a sixth
+        // PermissionMode where a built-in model classifier decides
+        // which tool calls to auto-approve vs escalate to
+        // `canUseTool`. See sdk.d.ts PermissionMode union, v0.2.112+.
+        PermissionMode::Auto => "auto",
     }
 }
 
@@ -2182,6 +2187,15 @@ fn claude_sdk_features() -> zenui_provider_api::ProviderFeatures {
         // `isRunning` alongside this flag.
         context_breakdown: true,
 
+        // The SDK's `'auto'` permission mode routes each tool call
+        // through its own model classifier before falling back to
+        // our `canUseTool` callback. The bridge forwards
+        // `PermissionMode::Auto` straight through to the SDK and
+        // leaves `canUseTool` untouched for classifier-escalated
+        // calls — see the `permissionMode === 'auto'` note in
+        // bridge/src/index.ts::sendPrompt.
+        supports_auto_permission_mode: true,
+
         // Deferred:
         //   tool_progress           — wires the SDK's
         //                             `tool_progress` heartbeat
@@ -2215,36 +2229,47 @@ fn claude_models() -> Vec<ProviderModel> {
     // vary by tier). The 1M beta context for Sonnet 4.5 is not
     // surfaced here because it requires an explicit opt-in header —
     // reporting 1M universally would be misleading.
+    // Capability booleans (`supports_effort`, `supports_adaptive_thinking`,
+    // `supports_auto_mode`) deliberately left at their struct defaults
+    // (false / empty) in this static table — the SDK's own `supportedModels()`
+    // response in `fetch_models` carries authoritative per-model flags and
+    // overlays them via `..m`. This table is only a context-window fallback
+    // for when the bridge path is unavailable.
     vec![
         ProviderModel {
             value: "claude-opus-4-6".to_string(),
             label: "Claude Opus 4.6".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(32_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-sonnet-4-6".to_string(),
             label: "Claude Sonnet 4.6".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-haiku-4-5".to_string(),
             label: "Claude Haiku 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-opus-4-5".to_string(),
             label: "Claude Opus 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(32_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
     ]
 }

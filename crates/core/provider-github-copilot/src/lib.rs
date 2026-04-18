@@ -1221,6 +1221,10 @@ fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
         PermissionMode::AcceptEdits => "accept_edits",
         PermissionMode::Plan => "plan",
         PermissionMode::Bypass => "bypass",
+        // Copilot has no model-classifier permission mode; the UI
+        // gates the "Auto" option on `supports_auto_permission_mode`
+        // so this arm is defensive. Fall back to the neutral default.
+        PermissionMode::Auto => "default",
     }
 }
 
@@ -1255,24 +1259,28 @@ fn copilot_models() -> Vec<ProviderModel> {
             label: "GPT-4.1".to_string(),
             context_window: Some(1_047_576),
             max_output_tokens: Some(32_768),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "gpt-4o".to_string(),
             label: "GPT-4o".to_string(),
             context_window: Some(128_000),
             max_output_tokens: Some(16_384),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "gpt-5".to_string(),
             label: "GPT-5".to_string(),
             context_window: Some(400_000),
             max_output_tokens: Some(128_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
     ]
 }

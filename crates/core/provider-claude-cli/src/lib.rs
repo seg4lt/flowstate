@@ -270,6 +270,11 @@ impl ClaudeCliAdapter {
             PermissionMode::AcceptEdits => "acceptEdits",
             PermissionMode::Plan => "plan",
             PermissionMode::Bypass => "bypassPermissions",
+            // Claude CLI hasn't opted in to
+            // `supports_auto_permission_mode`, so the UI won't let
+            // a user pick this; the arm exists for exhaustiveness.
+            // Neutral fallback preserves historical behaviour.
+            PermissionMode::Auto => "default",
         }
     }
 
@@ -1464,30 +1469,35 @@ fn claude_cli_models() -> Vec<ProviderModel> {
             label: "Claude Sonnet 4.6".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-opus-4-6".to_string(),
             label: "Claude Opus 4.6".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(32_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-sonnet-4-5".to_string(),
             label: "Claude Sonnet 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-opus-4-5".to_string(),
             label: "Claude Opus 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(32_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "claude-haiku-4-5".to_string(),
             label: "Claude Haiku 4.5".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(64_000),
+            ..ProviderModel::default()
         },
     ]
 }

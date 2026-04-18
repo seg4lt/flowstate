@@ -856,6 +856,7 @@ fn extract_model_entry(entry: &Value) -> Option<ProviderModel> {
         label,
         context_window,
         max_output_tokens,
+        ..ProviderModel::default()
     })
 }
 
@@ -938,6 +939,10 @@ fn map_permission_mode(mode: PermissionMode) -> (&'static str, &'static str) {
         // happens per turn via `collaborationMode.mode = "plan"` in turn/start.
         PermissionMode::Plan => ("on-request", "workspace-write"),
         PermissionMode::Bypass => ("never", "danger-full-access"),
+        // Codex has no model-classifier permission mode. The UI gates
+        // the "Auto" option on `supports_auto_permission_mode`, which
+        // this adapter never sets to true, so this arm is defensive.
+        PermissionMode::Auto => ("untrusted", "read-only"),
     }
 }
 
@@ -963,18 +968,21 @@ fn codex_models() -> Vec<ProviderModel> {
             label: "GPT-5 (Codex)".to_string(),
             context_window: Some(400_000),
             max_output_tokens: Some(128_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "o3".to_string(),
             label: "o3".to_string(),
             context_window: Some(200_000),
             max_output_tokens: Some(100_000),
+            ..ProviderModel::default()
         },
         ProviderModel {
             value: "gpt-4o".to_string(),
             label: "GPT-4o".to_string(),
             context_window: Some(128_000),
             max_output_tokens: Some(16_384),
+            ..ProviderModel::default()
         },
     ]
 }

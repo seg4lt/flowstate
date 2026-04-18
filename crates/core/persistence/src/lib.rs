@@ -1288,6 +1288,7 @@ fn permission_mode_to_str(mode: PermissionMode) -> String {
         PermissionMode::AcceptEdits => "accept_edits",
         PermissionMode::Plan => "plan",
         PermissionMode::Bypass => "bypass",
+        PermissionMode::Auto => "auto",
     }
     .to_string()
 }
@@ -1297,6 +1298,7 @@ fn permission_mode_from_str(value: &str) -> PermissionMode {
         "default" => PermissionMode::Default,
         "plan" => PermissionMode::Plan,
         "bypass" => PermissionMode::Bypass,
+        "auto" => PermissionMode::Auto,
         _ => PermissionMode::AcceptEdits,
     }
 }
@@ -1337,6 +1339,8 @@ fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffort> {
         "low" => Some(ReasoningEffort::Low),
         "medium" => Some(ReasoningEffort::Medium),
         "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::Xhigh),
+        "max" => Some(ReasoningEffort::Max),
         _ => None,
     }
 }

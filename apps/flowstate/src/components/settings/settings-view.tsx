@@ -40,7 +40,8 @@ import {
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
-import { EFFORT_OPTIONS } from "@/components/chat/effort-selector";
+import { visibleEffortOptions } from "@/components/chat/effort-selector";
+import { resolveModelDisplay } from "@/lib/model-lookup";
 import { MODE_ORDER, MODE_LABELS } from "@/lib/mode-cycling";
 import type {
   PermissionMode,
@@ -184,17 +185,50 @@ function DefaultProviderRow() {
 }
 
 function DefaultEffortRow() {
+  const { state } = useApp();
   const [value, setValue] = React.useState<ReasoningEffort>("high");
+  // Track the saved default provider + its default model so we can
+  // gate the dropdown to levels that provider/model actually accepts.
+  // `xhigh` / `max` are Opus-4.7-only today, so users on a Sonnet
+  // default shouldn't see them in the global picker.
+  const [defaultProvider, setDefaultProvider] =
+    React.useState<ProviderKind>(DEFAULT_PROVIDER);
+  const [defaultModel, setDefaultModel] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     let cancelled = false;
     readDefaultEffort().then((saved) => {
       if (!cancelled && saved) setValue(saved);
     });
+    readDefaultProvider().then((saved) => {
+      if (!cancelled) setDefaultProvider(saved ?? DEFAULT_PROVIDER);
+    });
     return () => {
       cancelled = true;
     };
   }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultModel(defaultProvider).then((m) => {
+      if (!cancelled) setDefaultModel(m);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [defaultProvider]);
+
+  // Resolve the saved default model against the live provider
+  // catalog so we can read its `supportedEffortLevels`. Falls through
+  // to an empty list when no default model is saved yet or the
+  // provider catalog hasn't hydrated — `visibleEffortOptions`
+  // interprets that as "hide `xhigh` / `max`", which is the safe
+  // baseline.
+  const supportedEffortLevels = defaultModel
+    ? (resolveModelDisplay(defaultModel, defaultProvider, state.providers).entry
+        ?.supportedEffortLevels ?? [])
+    : [];
+  const options = visibleEffortOptions(supportedEffortLevels);
 
   function handleChange(next: ReasoningEffort) {
     setValue(next);
@@ -215,7 +249,7 @@ function DefaultEffortRow() {
         className="h-8 rounded-md border border-input bg-background px-2 text-sm"
         aria-label="Default effort"
       >
-        {EFFORT_OPTIONS.map((opt) => (
+        {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
             {opt.label}
           </option>

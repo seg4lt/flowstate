@@ -14,6 +14,7 @@ import {
   type CanUseTool,
   type Query,
   type PermissionMode as SdkPermissionMode,
+  type EffortLevel,
 } from '@anthropic-ai/claude-agent-sdk';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
@@ -27,6 +28,18 @@ type ZenUiMessage = {
 };
 
 type DecisionString = 'allow' | 'allow_always' | 'deny' | 'deny_always';
+
+// Mirrors `zenui_provider_api::ReasoningEffort`. The first four levels
+// are flowstate-native; `xhigh` / `max` are straight pass-throughs to
+// the SDK's `EffortLevel` enum (gated per-model via
+// `ModelInfo.supportedEffortLevels`).
+type ReasoningEffortWire =
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max';
 
 interface PendingPermission {
   resolve: (decision: PermissionResult) => void;
@@ -318,8 +331,8 @@ class ClaudeBridge {
 
   async sendPrompt(
     prompt: string,
-    permissionMode: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions',
-    reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high',
+    permissionMode: SdkPermissionMode,
+    reasoningEffort?: ReasoningEffortWire,
     images: Array<{ media_type: string; data_base64: string }> = [],
   ): Promise<string> {
     if (this.inFlight) {
@@ -386,6 +399,13 @@ class ClaudeBridge {
         return { behavior: 'allow', updatedInput: input };
       }
 
+      // Auto mode (SDK `PermissionMode` === 'auto') runs its own
+      // model-classifier upstream. The SDK only invokes canUseTool
+      // for tool calls the classifier *isn't* confident about, so we
+      // deliberately don't short-circuit here — the remaining calls
+      // are exactly the ones the user should be asked about. Treat
+      // them like Default / AcceptEdits and emit a permission_request.
+
       const requestId = randomUUID();
       writeStream({
         event: 'permission_request',
@@ -399,33 +419,41 @@ class ClaudeBridge {
       });
     };
 
-    // The SDK exposes two parallel knobs for extended thinking:
-    //   - `maxThinkingTokens: number` (deprecated in 0.2.x)
-    //   - `thinking: ThinkingConfig` (the replacement)
+    // The SDK exposes two composable knobs for extended thinking:
+    //   - `thinking: ThinkingConfig` — on/off + adaptive: accepts
+    //     `{ type: 'disabled' }`, `{ type: 'adaptive' }` (Claude picks
+    //     the budget based on task complexity), or the legacy
+    //     `{ type: 'enabled', budgetTokens: N }` for older models.
+    //   - `effort: EffortLevel` — user-intent dial: `'low' | 'medium'
+    //     | 'high' | 'xhigh' | 'max'`. Guides how hard Claude tries,
+    //     working alongside `adaptive` to shape the actual budget.
     //
-    // `thinking` accepts `{ type: 'disabled' }`, `{ type: 'adaptive' }`
-    // (SDK auto-tunes based on task complexity), or `{ type: 'enabled',
-    // budgetTokens: N }` (explicit budget). Map flowstate's four-level
-    // ReasoningEffort onto that surface:
-    //   - `minimal` → disabled entirely
-    //   - `low`     → explicit small budget (2048 tokens)
-    //   - `medium`  → adaptive (let the SDK decide)
-    //   - `high`    → explicit large budget (32000 tokens)
-    //   - null / unknown → leave unset, SDK uses its own default
+    // Passing `effort` directly (instead of mapping to hardcoded
+    // `budgetTokens`) means Anthropic's defaults track model
+    // capability automatically — new models with different optimal
+    // ranges (Opus 4.7's `xhigh`, future tiers) don't require a code
+    // change here. See sdk.d.ts lines 1190-1214, v0.2.112+.
+    //
+    // Flowstate's `ReasoningEffort` maps onto that surface:
+    //   - `minimal` → thinking disabled, no `effort`
+    //   - `low`/`medium`/`high`/`xhigh`/`max` → adaptive thinking +
+    //     pass the level straight to the SDK's `effort` param
+    //   - undefined → leave both unset (SDK defaults apply)
+    //
+    // `xhigh` / `max` are gated per-model on the frontend via
+    // `ModelInfo.supportedEffortLevels`; if an unsupported level
+    // reaches us here the SDK ignores it on unsupported models.
     const thinkingConfig = (() => {
-      switch (reasoningEffort) {
-        case 'minimal':
-          return { type: 'disabled' as const };
-        case 'low':
-          return { type: 'enabled' as const, budgetTokens: 2048 };
-        case 'medium':
-          return { type: 'adaptive' as const };
-        case 'high':
-          return { type: 'enabled' as const, budgetTokens: 32000 };
-        default:
-          return undefined;
+      if (reasoningEffort === undefined) return undefined;
+      if (reasoningEffort === 'minimal') {
+        return { type: 'disabled' as const };
       }
+      return { type: 'adaptive' as const };
     })();
+    const effortLevel: EffortLevel | undefined =
+      reasoningEffort && reasoningEffort !== 'minimal'
+        ? reasoningEffort
+        : undefined;
 
     // In plan mode the model is investigating, not changing anything.
     // Prompting for every Read / Grep / Glob / WebSearch / TodoWrite is
@@ -538,6 +566,7 @@ class ClaudeBridge {
       ...(this.model ? { model: this.model } : {}),
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
+      ...(effortLevel ? { effort: effortLevel } : {}),
       // Optional: prefer the user's local Claude Code install over
       // the SDK's bundled binary when one is on PATH. Spread is
       // empty (no key set) when no local install was found, so the
@@ -1350,8 +1379,22 @@ class ClaudeBridge {
    * List the models the Claude Agent SDK reports as supported. Cheapest path:
    * call query() with a noop prompt, abort immediately, then read
    * supportedModels() — internally that just returns the cached init response.
+   *
+   * Forwards every capability flag the SDK's `ModelInfo` exposes
+   * (`supportsEffort`, `supportedEffortLevels`, `supportsAdaptiveThinking`,
+   * `supportsAutoMode`) so the UI can gate per-model affordances without
+   * hardcoding model names on the frontend.
    */
-  async listModels(): Promise<Array<{ value: string; label: string }>> {
+  async listModels(): Promise<
+    Array<{
+      value: string;
+      label: string;
+      supportsEffort: boolean;
+      supportedEffortLevels: string[];
+      supportsAdaptiveThinking: boolean;
+      supportsAutoMode: boolean;
+    }>
+  > {
     const abortController = new AbortController();
     const q = query({
       prompt: 'noop',
@@ -1371,6 +1414,10 @@ class ClaudeBridge {
       return models.map((m) => ({
         value: m.value,
         label: m.displayName ?? m.value,
+        supportsEffort: m.supportsEffort ?? false,
+        supportedEffortLevels: m.supportedEffortLevels ?? [],
+        supportsAdaptiveThinking: m.supportsAdaptiveThinking ?? false,
+        supportsAutoMode: m.supportsAutoMode ?? false,
       }));
     } finally {
       try {
@@ -1508,16 +1555,11 @@ async function main(): Promise<void> {
 
       case 'send_prompt': {
         const prompt = msg.prompt as string;
-        const mode = (msg.permission_mode as
-          | 'default'
-          | 'acceptEdits'
-          | 'plan'
-          | 'bypassPermissions') ?? 'acceptEdits';
+        const mode =
+          (msg.permission_mode as SdkPermissionMode | undefined) ??
+          'acceptEdits';
         const effort = msg.reasoning_effort as
-          | 'minimal'
-          | 'low'
-          | 'medium'
-          | 'high'
+          | ReasoningEffortWire
           | undefined;
         const images = (msg.images as
           | Array<{ media_type: string; data_base64: string }>
@@ -1575,11 +1617,7 @@ async function main(): Promise<void> {
         // Mid-turn permission switch. The Rust runtime sends this when
         // the user picks "Approve & Auto-edit" (etc.) on an ExitPlanMode
         // approval. Map our wire mode names to the SDK's enum.
-        const mode = msg.permission_mode as
-          | 'default'
-          | 'acceptEdits'
-          | 'plan'
-          | 'bypassPermissions';
+        const mode = msg.permission_mode as SdkPermissionMode;
         (async () => {
           try {
             await bridge.setPermissionMode(mode);

@@ -20,7 +20,18 @@ export type SessionStatus = "ready" | "running" | "interrupted";
 export type TurnStatus = "running" | "completed" | "interrupted" | "failed";
 export type ToolCallStatus = "pending" | "completed" | "failed";
 export type PermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
-export type PermissionMode = "default" | "accept_edits" | "plan" | "bypass";
+export type PermissionMode =
+  | "default"
+  | "accept_edits"
+  | "plan"
+  | "bypass"
+  /** Model-classifier approvals. The provider's own classifier
+   *  auto-approves low-risk tool calls and only escalates to the host
+   *  for ones it isn't confident about. Gated on
+   *  `ProviderFeatures.supportsAutoPermissionMode` — providers that
+   *  don't implement a classifier hide this option rather than
+   *  silently falling back to Default. */
+  | "auto";
 
 /** Coarse turn-phase signal emitted by providers that support the
  *  capability (`ProviderFeatures.statusLabels`). Drives the working-
@@ -49,7 +60,17 @@ export interface RetryState {
    *  can render `retryDelayMs - (now - startedAt)`. */
   startedAt: number;
 }
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
+export type ReasoningEffort =
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  /** SDK `EffortLevel::Xhigh` — Opus 4.7+ only. UI gates on the
+   *  active model's `supportedEffortLevels` list. */
+  | "xhigh"
+  /** SDK `EffortLevel::Max` — Opus 4.6/4.7+ only. Gated the
+   *  same way as `xhigh`. */
+  | "max";
 export type FileOperation = "write" | "edit" | "delete";
 export type SubagentStatus = "running" | "completed" | "failed";
 export type PlanStatus = "proposed" | "accepted" | "rejected";
@@ -67,6 +88,20 @@ export interface ProviderModel {
   contextWindow?: number;
   /** Authoritative max output tokens for this model, when known. */
   maxOutputTokens?: number;
+  /** Whether this model accepts the SDK-native `effort` parameter
+   *  (`low` / `medium` / `high` / `xhigh` / `max`). Mirrors the
+   *  Claude Agent SDK's `ModelInfo.supportsEffort`. */
+  supportsEffort?: boolean;
+  /** The effort levels this model accepts. Empty means "unknown —
+   *  assume all levels" (adapters that don't forward a list yet). */
+  supportedEffortLevels?: string[];
+  /** Whether this model lets Claude pick its own thinking budget
+   *  (`thinking: { type: 'adaptive' }`). */
+  supportsAdaptiveThinking?: boolean;
+  /** Whether this model supports the classifier-based `auto`
+   *  permission mode. The mode selector AND-gates this against the
+   *  provider-level `ProviderFeatures.supportsAutoPermissionMode`. */
+  supportsAutoMode?: boolean;
 }
 
 /** Where a user-authored SKILL.md came from on disk. Drives the
@@ -157,6 +192,9 @@ export interface ProviderFeatures {
   fileCheckpoints?: boolean;
   compactCustomInstructions?: boolean;
   sessionLifecycleEvents?: boolean;
+  /** Honours `PermissionMode.auto` via an internal model classifier.
+   *  The mode selector hides the "Auto" option when this is false. */
+  supportsAutoPermissionMode?: boolean;
 }
 
 export interface PlanStep {
