@@ -234,7 +234,7 @@ impl ProviderAdapter for CodexAdapter {
             &["--version"],
             &["login", "status"],
             codex_models(),
-            codex_features(),
+            zenui_provider_api::features_for_kind(ProviderKind::Codex),
         )
         .await
     }
@@ -943,18 +943,6 @@ fn map_permission_mode(mode: PermissionMode) -> (&'static str, &'static str) {
         // the "Auto" option on `supports_auto_permission_mode`, which
         // this adapter never sets to true, so this arm is defensive.
         PermissionMode::Auto => ("untrusted", "read-only"),
-    }
-}
-
-/// Feature flags the Codex CLI adapter exposes. Codex has native
-/// `reasoning_effort` support on its turn API; none of the other
-/// cross-provider features (compact summaries, memory recall, tool
-/// elapsed time, etc.) map to anything the Codex protocol surfaces
-/// today, so they stay off.
-fn codex_features() -> zenui_provider_api::ProviderFeatures {
-    zenui_provider_api::ProviderFeatures {
-        thinking_effort: true,
-        ..zenui_provider_api::ProviderFeatures::default()
     }
 }
 

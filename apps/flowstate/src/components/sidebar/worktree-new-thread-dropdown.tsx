@@ -16,7 +16,11 @@ import {
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind } from "@/lib/types";
 import type { GitWorktree } from "@/lib/api";
-import { readDefaultModel } from "@/lib/defaults-settings";
+import {
+  DEFAULT_PROVIDER,
+  readDefaultModel,
+  readDefaultProvider,
+} from "@/lib/defaults-settings";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import {
   gitWorktreeListQueryOptions,
@@ -131,6 +135,39 @@ function WorktreeDropdownInner({
       cancelled = true;
     };
   }, [state.providers, isProviderEnabled]);
+
+  // User's configured default provider (Settings → Defaults → Default
+  // provider). Used when starting a thread on a freshly-created
+  // worktree where we have no ambient session/provider to inherit.
+  // Falls back to the first ready enabled provider, then to
+  // `DEFAULT_PROVIDER` — same chain as project-home-view.
+  const [savedProvider, setSavedProvider] = React.useState<ProviderKind | null>(
+    null,
+  );
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultProvider().then((saved) => {
+      if (!cancelled) setSavedProvider(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const defaultProvider: ProviderKind = React.useMemo(() => {
+    // Prefer the user's saved choice if it's enabled and ready.
+    if (savedProvider && isProviderEnabled(savedProvider)) {
+      const info = state.providers.find((p) => p.kind === savedProvider);
+      if (info?.status === "ready") return savedProvider;
+    }
+    // Fall back to the first ready enabled provider.
+    const ready = state.providers.find(
+      (p) => isProviderEnabled(p.kind) && p.status === "ready",
+    );
+    if (ready) return ready.kind;
+    // Nothing ready — return the saved choice or the hardcoded default.
+    return savedProvider ?? DEFAULT_PROVIDER;
+  }, [state.providers, isProviderEnabled, savedProvider]);
 
   // ── Thread creation (mirrors project-home-view startThreadOnWorktree) ──
 
@@ -389,14 +426,11 @@ function WorktreeDropdownInner({
         projectPath={projectPath}
         currentBranch={currentBranch}
         onCreated={(wt) => {
-          // After creating a worktree, start a thread on it with the
-          // first ready enabled provider (same fallback logic as
-          // project-home-view).
-          const readyProvider = state.providers.find(
-            (p) => isProviderEnabled(p.kind) && p.status === "ready",
-          );
-          const provider: ProviderKind = readyProvider?.kind ?? "claude";
-          void startThreadOnWorktree(wt, provider);
+          // Respect the user's configured default provider (with
+          // ready/enabled fallbacks handled by the `defaultProvider`
+          // memo above).
+          const model = defaultModels.get(defaultProvider);
+          void startThreadOnWorktree(wt, defaultProvider, model);
         }}
       />
     </>

@@ -1294,19 +1294,28 @@ class ClaudeBridge {
         // forward from this message so the frontend can group tool calls
         // by the agent that actually ran them.
         const parentToolUseId = m.parent_tool_use_id ?? undefined;
-        // Per-call token usage for the main-agent context-window
-        // indicator. Only top-level assistant messages count toward the
-        // main turn's numerator — subagent calls have their own context
-        // window (tracked separately by the SDK via modelUsage) and
-        // lumping them in inflates the display on Task-heavy turns.
+        // Per-call token usage for the MAIN-AGENT context-window
+        // indicator only. Only top-level assistant messages count
+        // toward the main turn's numerator — subagent calls have
+        // their own context window (tracked separately by the SDK
+        // via modelUsage) and lumping them in inflates the display
+        // on Task-heavy turns.
         //
-        // Fields below use per-call semantics: input/cache/creation are
-        // from THIS API call (the "current prompt size"), output_tokens
-        // accumulates across the turn because each call only reports
-        // its own slice. The SDK's `result.usage` sums all four across
-        // every call — using its cache_read would re-count the same
-        // cached prompt once per iteration of the tool loop, which is
-        // how the "51M / 1M" bug used to reach 50×.
+        // Fields below use per-call semantics: input/cache/creation
+        // are from THIS API call (the "current prompt size"),
+        // output_tokens accumulates across the turn because each
+        // call only reports its own slice. The SDK's `result.usage`
+        // sums all four across every call — using its cache_read
+        // would re-count the same cached prompt once per iteration
+        // of the tool loop, which is how the "51M / 1M" bug used
+        // to reach 50×.
+        //
+        // These values do NOT land in the usage dashboard. The
+        // FINAL `turn_usage` event emitted from the `result` handler
+        // below overrides these with SDK-aggregate totals (including
+        // subagents) before `TurnRecord.usage` is persisted, so the
+        // dashboard's tokens and cost share a scope. See the comment
+        // block at the `result` handler for details.
         const msgUsage = m.message?.usage;
         if (!parentToolUseId && msgUsage && typeof msgUsage === 'object') {
           const inputTokens = msgUsage.input_tokens ?? 0;
@@ -1538,17 +1547,30 @@ class ClaudeBridge {
         // source of truth for contextWindow — a single Flowstate turn
         // only runs on one model at a time.
         //
-        // Numerator basis: the LAST assistant message's per-call
-        // usage (captured into `lastAssistantUsage` as each API call
-        // landed), NOT `r.usage`. The SDK's result.usage sums every
-        // API call in the turn — on a long tool loop that makes
-        // cache_read_input_tokens add up to many multiples of the
-        // context window (each call re-reads the same cached prompt).
-        // Displaying that sum produced the "51M / 1M" bug.
+        // Scope: this is the FINAL `turn_usage` of the turn and the
+        // one that lands in `TurnRecord.usage` (last-writer-wins in
+        // runtime-core), so it also feeds the usage dashboard
+        // (`usage.sqlite` / per-turn cost + token analytics).
         //
-        // Cost and duration, by contrast, ARE naturally cumulative
-        // across the turn and only land on `r`, so those keep coming
-        // from the result payload as before.
+        // Critically, token fields here use `r.usage.*` — the SDK's
+        // aggregate across the whole turn, including every subagent
+        // Task call. This matches the scope of `r.total_cost_usd`
+        // (the SDK sums subagent cost into the result) so the
+        // dashboard's cost ÷ tokens ratio is self-consistent. An
+        // older version of this code sourced tokens from
+        // `lastAssistantUsage` (parent-only, per-call) while cost
+        // came from `r.total_cost_usd` (parent + subagents), which
+        // under-counted tokens on Task-heavy turns and made
+        // $/token analytics look spuriously expensive.
+        //
+        // The parent-only per-call values are still the right signal
+        // for the live context-window indicator — that's emitted
+        // separately by the per-assistant-message handler above (it
+        // explicitly skips subagent messages via `parentToolUseId`
+        // and avoids the `r.usage.cache_read_*` aggregation that
+        // caused the "51M / 1M" inflation bug on long tool loops).
+        // We only fall back to those fields here if the SDK didn't
+        // supply an aggregate (exotic result-only path).
         const modelKey = r.modelUsage
           ? Object.keys(r.modelUsage)[0]
           : undefined;
@@ -1559,26 +1581,25 @@ class ClaudeBridge {
         }
         if (this.lastAssistantUsage || r.usage) {
           const last = this.lastAssistantUsage;
-          // outputTokensTotal is authoritative whenever we saw at least
-          // one top-level assistant message (which also populates
-          // `last`). Only fall back to r.usage.output_tokens on the
-          // exotic path where the turn produced no assistant message
-          // but the SDK still emitted a `result.usage`.
-          const outputTokens = last
-            ? this.outputTokensTotal
-            : (r.usage?.output_tokens ?? 0);
           writeStream({
             event: 'turn_usage',
             usage: {
-              inputTokens: last?.inputTokens ?? r.usage?.input_tokens ?? 0,
-              outputTokens,
+              inputTokens: r.usage?.input_tokens ?? last?.inputTokens ?? 0,
+              outputTokens: r.usage?.output_tokens ?? this.outputTokensTotal,
               cacheWriteTokens:
-                last?.cacheWriteTokens ?? r.usage?.cache_creation_input_tokens ?? null,
+                r.usage?.cache_creation_input_tokens ?? last?.cacheWriteTokens ?? null,
               cacheReadTokens:
-                last?.cacheReadTokens ?? r.usage?.cache_read_input_tokens ?? null,
+                r.usage?.cache_read_input_tokens ?? last?.cacheReadTokens ?? null,
               contextWindow: resolvedContextWindow,
               totalCostUsd: r.total_cost_usd ?? null,
               durationMs: r.duration_ms ?? null,
+              // Parent model. On Task-heavy turns subagents may have
+              // run different models; we only store one label here
+              // because the per-turn usage row is keyed by the
+              // primary (parent) model for dashboard aggregation.
+              // Per-subagent cost attribution would require a schema
+              // split (TokenUsage.subagents[]) — deliberately out of
+              // scope for this fix.
               model: last?.model ?? modelKey ?? null,
             },
           });
