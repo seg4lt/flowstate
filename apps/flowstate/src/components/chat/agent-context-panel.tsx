@@ -12,6 +12,7 @@ import type { ToolCall, TurnRecord } from "@/lib/types";
 import { findLatestMainTodoWrite, parseTodoProgress } from "@/lib/todo-extract";
 import { TodoList } from "./tool-renderers";
 import { MarkdownContent } from "./messages/markdown-content";
+import { CopyButton } from "./messages/copy-button";
 
 interface AgentContextPanelProps {
   turns: TurnRecord[];
@@ -116,6 +117,14 @@ export const AgentContextPanel = React.memo(function AgentContextPanel({
           <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             Plan
           </span>
+          {latestPlan && (
+            <CopyButton
+              text={latestPlan}
+              label="Plan copied"
+              title="Copy plan"
+              className="ml-auto"
+            />
+          )}
         </div>
         {latestPlan ? (
           <div className="text-sm leading-relaxed">
