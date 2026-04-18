@@ -9,6 +9,7 @@
 import {
   query,
   type SDKMessage,
+  type SDKUserMessage,
   type Options,
   type PermissionResult,
   type CanUseTool,
@@ -191,41 +192,153 @@ function writeStream(payload: Record<string, unknown>): void {
   writeJson({ type: 'stream', ...payload });
 }
 
+/**
+ * Unbounded async iterable that external code can push into at any
+ * time. Backbone of streaming-input mode: the SDK's `query()`
+ * consumes from this, and `sendPrompt` / `interrupt` push into it
+ * across multiple turns on a single persistent Query.
+ *
+ * Pushed values are delivered in FIFO order. If a consumer is already
+ * awaiting `next()` when a value lands, it's handed directly to that
+ * waiter with zero buffering; otherwise it's enqueued until the next
+ * `next()` call. Calling `close()` drains any outstanding waiters
+ * with `{done: true}` and causes all future `next()` calls to do the
+ * same, which terminates the SDK Query gracefully.
+ *
+ * Not thread-safe — single-threaded Node event loop only.
+ */
+class PushableAsyncIterable<T> implements AsyncIterable<T> {
+  private queue: T[] = [];
+  private waiters: Array<(result: IteratorResult<T>) => void> = [];
+  private closed = false;
+
+  push(value: T): void {
+    if (this.closed) return;
+    const waiter = this.waiters.shift();
+    if (waiter) {
+      waiter({ value, done: false });
+    } else {
+      this.queue.push(value);
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    const waiters = this.waiters.slice();
+    this.waiters.length = 0;
+    for (const w of waiters) {
+      w({ value: undefined as unknown as T, done: true });
+    }
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: (): Promise<IteratorResult<T>> => {
+        if (this.queue.length > 0) {
+          return Promise.resolve({ value: this.queue.shift()!, done: false });
+        }
+        if (this.closed) {
+          return Promise.resolve({
+            value: undefined as unknown as T,
+            done: true,
+          });
+        }
+        return new Promise((resolve) => {
+          this.waiters.push(resolve);
+        });
+      },
+      return: (): Promise<IteratorResult<T>> => {
+        this.close();
+        return Promise.resolve({
+          value: undefined as unknown as T,
+          done: true,
+        });
+      },
+    };
+  }
+}
+
 class ClaudeBridge {
   private cwd: string = process.cwd();
   private model?: string;
   /**
-   * The SDK session id to `resume:` from on the NEXT query. Only updated
-   * from `result` messages — i.e. turns the SDK has committed to its
-   * on-disk session store. Persisted back to Rust as
-   * `provider_state.native_thread_id`.
+   * The SDK session id to `resume:` from when we next need to (re)open
+   * a Query — typically only on bridge cold-start / respawn. Persisted
+   * back to Rust as `provider_state.native_thread_id`.
    *
-   * Crucially, we do NOT overwrite this from `system.init` mid-turn:
-   * the init id represents a session the SDK hasn't yet committed, and
-   * if the turn is interrupted that id is never finalised. Resuming
-   * from it would give Claude an empty or stale context — exactly the
-   * steering-mode context-loss bug this two-phase scheme prevents.
-   * See `pendingInitSessionId` below.
+   * Updated from every `result` message the SDK commits. In streaming-
+   * input mode the Query is persistent across turns, so we no longer
+   * need the two-phase pending/committed split that used to protect
+   * against interrupted-turn context loss: the Query handles interrupt
+   * internally (committing partial tool_use/tool_result pairs), and
+   * every `result` we see is a genuine commit boundary.
    */
   private resumeSessionId?: string;
   /**
-   * The init session id of the in-flight query, held aside until the
-   * matching `result` arrives. Promoted into `resumeSessionId` on
-   * successful completion; discarded on abort or any other unwind so
-   * we never ship a never-committed id back to the host.
-   */
-  private pendingInitSessionId?: string;
-  private abortController?: AbortController;
-  private inFlight = false;
-  /**
-   * Live handle to the SDK Query object for the in-flight turn, if any.
-   * The SDK exposes mid-turn control methods like `setPermissionMode` and
-   * `interrupt` on this object — we hold onto it so the host can flip
-   * the active permission mode (e.g. when the user approves an
-   * ExitPlanMode and picks "Accept Edits") without restarting the turn.
-   * Cleared in the finally block of `sendPrompt`.
+   * The persistent SDK Query for this session. Lives for the lifetime
+   * of the bridge process (one per session). All user messages —
+   * first turn, follow-ups, steered messages after an interrupt —
+   * flow through `inputQueue` into this single Query, preserving
+   * conversation context across interrupts. Created lazily on first
+   * `sendPrompt`; torn down in `endSession`.
    */
   private activeQuery?: Query;
+  /**
+   * Streaming input feeding `activeQuery`. Every `sendPrompt` pushes
+   * one `SDKUserMessage` onto this queue; the SDK consumes it as the
+   * next user turn. Closing this queue terminates the Query.
+   */
+  private inputQueue?: PushableAsyncIterable<SDKUserMessage>;
+  /**
+   * Background pump draining SDK messages out of `activeQuery`. Runs
+   * once per session lifetime. Each `result` it observes resolves
+   * `pendingTurn`; the pump then keeps looping for the next turn.
+   * On pump-level errors (Query unrecoverable) we reject `pendingTurn`
+   * and tear down so the next `sendPrompt` re-opens a fresh Query
+   * via `resume: resumeSessionId`.
+   */
+  private pumpPromise?: Promise<void>;
+  /**
+   * Resolver for the currently-awaited `sendPrompt`. Set before the
+   * user message is pushed onto `inputQueue`; cleared by the pump
+   * when the matching `result` arrives (or by `interrupt` on the
+   * interrupt path). At most one pending turn at a time — Rust
+   * serializes turns per session.
+   */
+  private pendingTurn?: {
+    resolve: (text: string) => void;
+    reject: (err: unknown) => void;
+  };
+  /**
+   * True from the moment a user message is pushed onto `inputQueue`
+   * until the matching `result` is observed (or an interrupt
+   * short-circuits it). Guards against concurrent `sendPrompt` calls
+   * on the same bridge.
+   */
+  private turnInProgress = false;
+  /**
+   * Cached canUseTool closure for the persistent Query. Created at
+   * Query-open time and never re-created — mid-turn permission
+   * changes flow through `setPermissionMode` + `livePermissionMode`
+   * (read inside this closure), not via recreating the callback.
+   */
+  private canUseToolCached?: CanUseTool;
+  /**
+   * The `effort` / compact-instructions config the live `activeQuery`
+   * was opened with. Compared against each incoming `sendPrompt`
+   * request: if either knob changed, we close-and-reopen the Query
+   * with the new options, passing `resume: resumeSessionId` so
+   * conversation history is fully preserved. The SDK has no
+   * mid-session setter for `effort` / `thinking` / `systemPrompt`,
+   * so reopen is the only path to honour a per-turn change.
+   * Cleared whenever `activeQuery` is unset.
+   */
+  private queryConfig?: {
+    reasoningEffort?: ReasoningEffortWire;
+    // Trimmed; undefined and empty-string are equivalent (no steering).
+    compactInstructions?: string;
+  };
   /**
    * Current effective permission mode for the in-flight turn. Seeded
    * from the `permissionMode` parameter at the start of each
@@ -329,6 +442,26 @@ class ClaudeBridge {
     return this.resumeSessionId;
   }
 
+  /**
+   * Send one user message through the session's persistent SDK Query.
+   *
+   * On first call this opens the Query (with `resume:` if we have a
+   * hydrated session id), wires up the streaming-input pump, and pushes
+   * the user message onto the input queue. On every subsequent call
+   * the same Query and same pump are reused — the message is simply
+   * pushed onto the existing queue, preserving full conversation
+   * context including any partial tool_use/tool_result pairs from a
+   * previously interrupted turn.
+   *
+   * Returns the assistant's final text for this turn (or
+   * `'[interrupted]'` if the user steered before completion).
+   *
+   * IMPORTANT: `reasoningEffort` and `compactCustomInstructions` take
+   * effect at Query-open time only. Per-turn changes are currently
+   * ignored by the active Query — switching them requires ending the
+   * session. `permissionMode` IS switchable mid-session via the SDK's
+   * `setPermissionMode` control.
+   */
   async sendPrompt(
     prompt: string,
     permissionMode: SdkPermissionMode,
@@ -336,29 +469,135 @@ class ClaudeBridge {
     images: Array<{ media_type: string; data_base64: string }> = [],
     compactCustomInstructions?: string,
   ): Promise<string> {
-    if (this.inFlight) {
+    if (this.turnInProgress) {
       throw new Error('Another turn is already in flight');
     }
-    this.inFlight = true;
-    this.abortController = new AbortController();
-    // Seed the live-mode tracker for this turn. Every subsequent
-    // mid-turn mode change updates this field so canUseTool reads
-    // the CURRENT mode, not the frozen turn-start one.
-    this.livePermissionMode = permissionMode;
-    // Per-turn subagent caches. Recomputed each turn from the
-    // SDK's own supportedAgents() snapshot on `system.init`; the
-    // observed-ids set prevents re-emitting the same
-    // subagent_model_observed event on every assistant chunk.
+
+    // Per-turn accumulator resets. `lastContextWindow` deliberately
+    // persists across turns — the SDK only reports it inside
+    // `result.modelUsage`, so holding the previous turn's value lets
+    // us populate mid-turn `turn_usage` events on the next turn
+    // without waiting for that turn's `result`.
     this.agentModelByType.clear();
     this.observedSubagentIds.clear();
-    // Per-turn usage accumulator reset. `lastContextWindow`
-    // deliberately persists across turns — the SDK only reports
-    // it inside `result.modelUsage`, so holding the previous
-    // turn's value lets us populate mid-turn `turn_usage` events
-    // on the next turn without waiting for that turn's `result`.
     this.outputTokensTotal = 0;
     this.lastAssistantUsage = undefined;
 
+    // Lazy-open the persistent Query on first sendPrompt, or re-open
+    // it if a previous pump error tore it down.
+    if (!this.activeQuery) {
+      this.openPersistentQuery(
+        permissionMode,
+        reasoningEffort,
+        compactCustomInstructions,
+      );
+    } else {
+      // Query already live. Two per-turn knobs may have changed:
+      //
+      //   1. `reasoningEffort` or `compactCustomInstructions` — the
+      //      SDK has no mid-session setter for these, so a change
+      //      forces a close-and-reopen with `resume: resumeSessionId`.
+      //      Full conversation history is preserved; only the SDK-
+      //      side Query object is recycled.
+      //   2. `permissionMode` — has a live SDK setter, apply in
+      //      place so we don't pay the reopen cost for the common
+      //      case of the user flipping permission mode between turns.
+      //
+      // If both changed, (1) happens first: the reopen opens the
+      // new Query already configured with the requested permission
+      // mode, so (2) is skipped.
+      const desiredCompact =
+        compactCustomInstructions?.trim() || undefined;
+      const effortChanged =
+        this.queryConfig?.reasoningEffort !== reasoningEffort;
+      const compactChanged =
+        this.queryConfig?.compactInstructions !== desiredCompact;
+      if (effortChanged || compactChanged) {
+        await this.reopenQueryForConfigChange(
+          permissionMode,
+          reasoningEffort,
+          compactCustomInstructions,
+        );
+      } else if (this.livePermissionMode !== permissionMode) {
+        // Subsequent turn with a different permission mode. Push the
+        // change into the live Query; `setPermissionMode` below also
+        // updates `this.livePermissionMode` so canUseTool reads the
+        // fresh mode for the upcoming turn.
+        try {
+          await this.setPermissionMode(permissionMode);
+        } catch (err) {
+          console.error(
+            '[bridge] setPermissionMode before sendPrompt failed (continuing):',
+            err,
+          );
+          this.livePermissionMode = permissionMode;
+        }
+      }
+    }
+
+    // Compose the SDKUserMessage (text + optional images) to push
+    // onto the input stream.
+    type SdkImageMediaType =
+      | 'image/jpeg'
+      | 'image/png'
+      | 'image/gif'
+      | 'image/webp';
+    const userMessage: SDKUserMessage = {
+      type: 'user' as const,
+      message: {
+        role: 'user' as const,
+        content:
+          images.length === 0
+            ? prompt
+            : [
+                { type: 'text' as const, text: prompt },
+                ...images.map((img) => ({
+                  type: 'image' as const,
+                  source: {
+                    type: 'base64' as const,
+                    media_type: img.media_type as SdkImageMediaType,
+                    data: img.data_base64,
+                  },
+                })),
+              ],
+      },
+      parent_tool_use_id: null,
+      session_id: '',
+    };
+
+    // Arm the turn-boundary resolver BEFORE pushing so the pump loop
+    // can never see a `result` race ahead of us. Only one turn is in
+    // flight at a time (guarded above).
+    const turnResult = new Promise<string>((resolve, reject) => {
+      this.pendingTurn = { resolve, reject };
+    });
+    this.turnInProgress = true;
+    try {
+      this.inputQueue!.push(userMessage);
+      return await turnResult;
+    } finally {
+      this.turnInProgress = false;
+      this.pendingTurn = undefined;
+    }
+  }
+
+  /**
+   * Open the long-lived SDK Query for this session and start the pump
+   * loop that turns SDK messages into stream events + turn-boundary
+   * resolutions. Called from `sendPrompt` when `activeQuery` is unset
+   * (first turn of the session, or recovery after a pump error).
+   */
+  private openPersistentQuery(
+    initialPermissionMode: SdkPermissionMode,
+    reasoningEffort?: ReasoningEffortWire,
+    compactCustomInstructions?: string,
+  ): void {
+    this.livePermissionMode = initialPermissionMode;
+
+    // Persistent canUseTool closure. Reads `this.livePermissionMode`
+    // on every invocation so mid-session mode changes (toolbar toggle
+    // or ExitPlanMode approval) take effect immediately without
+    // reopening the Query.
     const canUseTool: CanUseTool = async (
       toolName: string,
       input: Record<string, unknown>,
@@ -369,7 +608,8 @@ class ClaudeBridge {
       // where `answers` is keyed by the question text. See
       // https://code.claude.com/docs/en/agent-sdk/user-input#handle-clarifying-questions
       if (toolName === 'AskUserQuestion') {
-        const rawQuestions = (input?.questions as AskUserSdkQuestion[] | undefined) ?? [];
+        const rawQuestions =
+          (input?.questions as AskUserSdkQuestion[] | undefined) ?? [];
         const requestId = randomUUID();
         writeStream({
           event: 'user_question',
@@ -377,36 +617,27 @@ class ClaudeBridge {
           questions: rawQuestions,
         });
         return new Promise<PermissionResult>((resolve) => {
-          pendingQuestions.set(requestId, { resolve, questions: rawQuestions });
+          pendingQuestions.set(requestId, {
+            resolve,
+            questions: rawQuestions,
+          });
         });
       }
 
       // Bypass mode: the user explicitly opted out of permission
-      // prompting. Resolve every non-question tool call as-is
-      // without round-tripping through the host. Without this the
-      // SDK would still call canUseTool for mutating tools
-      // (Bash/Write/Edit/...), we'd emit permission_request, and the
-      // UI would show a dialog the user explicitly said they didn't
-      // want. See also the runtime-core safety net which auto-answers
-      // any permission_request that slips through for a bypass turn
-      // — this short-circuit is the primary fix; the safety net
-      // covers other provider adapters.
-      //
-      // Reads `this.livePermissionMode`, not the closure-captured
-      // `permissionMode` parameter, so an in-turn mode change
-      // (ExitPlanMode → Bypass, toolbar toggle → update_permission_mode)
-      // takes effect for every tool call that follows.
+      // prompting. Resolve every non-question tool call as-is without
+      // round-tripping through the host. See the runtime-core safety
+      // net which auto-answers any permission_request that slips
+      // through for a bypass turn — this short-circuit is the primary
+      // fix; the safety net covers other provider adapters.
       if (this.livePermissionMode === 'bypassPermissions') {
         return { behavior: 'allow', updatedInput: input };
       }
 
-      // Auto mode (SDK `PermissionMode` === 'auto') runs its own
-      // model-classifier upstream. The SDK only invokes canUseTool
-      // for tool calls the classifier *isn't* confident about, so we
-      // deliberately don't short-circuit here — the remaining calls
-      // are exactly the ones the user should be asked about. Treat
-      // them like Default / AcceptEdits and emit a permission_request.
-
+      // Auto mode runs its own model-classifier upstream. The SDK
+      // only invokes canUseTool for tool calls the classifier isn't
+      // confident about — treat them like Default / AcceptEdits and
+      // emit a permission_request.
       const requestId = randomUUID();
       writeStream({
         event: 'permission_request',
@@ -419,31 +650,12 @@ class ClaudeBridge {
         pendingPermissions.set(requestId, { resolve, input });
       });
     };
+    this.canUseToolCached = canUseTool;
 
-    // The SDK exposes two composable knobs for extended thinking:
-    //   - `thinking: ThinkingConfig` — on/off + adaptive: accepts
-    //     `{ type: 'disabled' }`, `{ type: 'adaptive' }` (Claude picks
-    //     the budget based on task complexity), or the legacy
-    //     `{ type: 'enabled', budgetTokens: N }` for older models.
-    //   - `effort: EffortLevel` — user-intent dial: `'low' | 'medium'
-    //     | 'high' | 'xhigh' | 'max'`. Guides how hard Claude tries,
-    //     working alongside `adaptive` to shape the actual budget.
-    //
-    // Passing `effort` directly (instead of mapping to hardcoded
-    // `budgetTokens`) means Anthropic's defaults track model
-    // capability automatically — new models with different optimal
-    // ranges (Opus 4.7's `xhigh`, future tiers) don't require a code
-    // change here. See sdk.d.ts lines 1190-1214, v0.2.112+.
-    //
-    // Flowstate's `ReasoningEffort` maps onto that surface:
-    //   - `minimal` → thinking disabled, no `effort`
-    //   - `low`/`medium`/`high`/`xhigh`/`max` → adaptive thinking +
-    //     pass the level straight to the SDK's `effort` param
-    //   - undefined → leave both unset (SDK defaults apply)
-    //
-    // `xhigh` / `max` are gated per-model on the frontend via
-    // `ModelInfo.supportedEffortLevels`; if an unsupported level
-    // reaches us here the SDK ignores it on unsupported models.
+    // Extended-thinking / effort dial — see the long-form comment in
+    // the previous version of sendPrompt for the mapping rationale.
+    // In streaming-input mode these are fixed at Query open time; a
+    // change requires closing the Query and starting a new session.
     const thinkingConfig = (() => {
       if (reasoningEffort === undefined) return undefined;
       if (reasoningEffort === 'minimal') {
@@ -456,20 +668,9 @@ class ClaudeBridge {
         ? reasoningEffort
         : undefined;
 
-    // In plan mode the model is investigating, not changing anything.
-    // Prompting for every Read / Grep / Glob / WebSearch / TodoWrite is
-    // pure friction -- those calls can't damage anything and the user
-    // already opted into "let the model look around" by entering plan
-    // mode. Pass them via the SDK's built-in allowedTools so canUseTool
-    // is never even invoked for them. ExitPlanMode is intentionally
-    // NOT in the list -- that's THE prompt that matters in plan mode
-    // (the plan approval). Bash, Write, Edit, NotebookEdit, and any
-    // unknown tool keep going through canUseTool because they can
-    // mutate state (Bash can run rm/git push/etc., the rest are
-    // explicitly modifying). Task/Agent dispatches a sub-agent which
-    // inherits the same plan-mode constraints, so we auto-allow it
-    // too -- otherwise the user would get prompted just to let the
-    // model spawn an investigator.
+    // Plan-mode allowlist: let the model investigate without per-tool
+    // prompting. See previous version's comment block for the
+    // rationale behind which tools are whitelisted.
     const planModeAllowedTools = [
       'Read',
       'Grep',
@@ -481,17 +682,9 @@ class ClaudeBridge {
       'Agent',
     ];
 
-    // Per-session compaction steering. SDK 0.2.112's PreCompact hook
-    // is read-only (no output path for custom_instructions in its
-    // typed API), so we instead append the user's text to the system
-    // prompt via the supported `{ type: 'preset', preset:
-    // 'claude_code', append: ... }` shape on `Options.systemPrompt`.
-    // The model sees this on every prompt — not strictly compaction-
-    // only — but the wording explicitly scopes the guidance to the
-    // summarization step, so non-compaction turns just see an
-    // additional instruction the model can satisfy implicitly. Empty
-    // strings collapse at the runtime-core layer; if the field ever
-    // arrives empty here we still skip it as a defence-in-depth.
+    // Per-session compaction steering. Baked into the Query's
+    // systemPrompt at open time — switching mid-session requires a
+    // new session.
     const trimmedCompactInstructions = compactCustomInstructions?.trim();
     const compactSystemPrompt: Options['systemPrompt'] | undefined =
       trimmedCompactInstructions
@@ -504,22 +697,10 @@ class ClaudeBridge {
 
     const options: Options = {
       cwd: this.cwd,
-      permissionMode,
+      permissionMode: initialPermissionMode,
       canUseTool,
-      abortController: this.abortController,
       includePartialMessages: true,
-      // Ask the SDK to emit `prompt_suggestion` messages predicting
-      // the user's likely next input. Drives the ghost-text
-      // affordance in the composer. Cheap to enable — the SDK only
-      // emits when it has high-confidence predictions, and the UI
-      // renders nothing when no suggestion is in state.
       promptSuggestions: true,
-      // PostCompact fires after the SDK finishes compressing older
-      // turns into a summary. That summary is the ONLY place the
-      // recap text shows up — the paired `compact_boundary` system
-      // message carries the boundary + token metrics but no text.
-      // Without this hook we get metrics-only and the user never
-      // sees what was summarised.
       hooks: {
         PostCompact: [
           {
@@ -539,13 +720,6 @@ class ClaudeBridge {
             ],
           },
         ],
-        // Lifecycle hooks — purely diagnostic today. Forward both
-        // as `info` events so the daemon log carries a trace of
-        // when the SDK thinks each session starts / ends and what
-        // caused it. The data is useful for debugging session
-        // resume + compact flows end-to-end. No UI surface today;
-        // if we ever want one, the Info events are already routed
-        // through the standard toast path.
         SessionStart: [
           {
             hooks: [
@@ -582,7 +756,7 @@ class ClaudeBridge {
           },
         ],
       },
-      ...(permissionMode === 'plan'
+      ...(initialPermissionMode === 'plan'
         ? { allowedTools: planModeAllowedTools }
         : {}),
       ...(this.model ? { model: this.model } : {}),
@@ -590,84 +764,69 @@ class ClaudeBridge {
       ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
       ...(effortLevel ? { effort: effortLevel } : {}),
       ...(compactSystemPrompt ? { systemPrompt: compactSystemPrompt } : {}),
-      // Optional: prefer the user's local Claude Code install over
-      // the SDK's bundled binary when one is on PATH. Spread is
-      // empty (no key set) when no local install was found, so the
-      // SDK transparently uses its own embedded executable.
       ...(RESOLVED_LOCAL_CLAUDE_PATH
         ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
         : {}),
     };
 
-    let finalText = '';
-    // When the user pasted one or more images we have to use the
-    // `query({ prompt: AsyncIterable<SDKUserMessage>, … })` form instead
-    // of the plain string path — Claude Agent SDK only accepts
-    // multimodal `content` arrays via that channel. The async iterator
-    // yields exactly one user message whose `content` is text + image
-    // blocks, then closes; the SDK pumps it like any other turn.
-    type SdkPromptInput = Parameters<typeof query>[0]['prompt'];
-    type SdkImageMediaType =
-      | 'image/jpeg'
-      | 'image/png'
-      | 'image/gif'
-      | 'image/webp';
-    const promptInput: SdkPromptInput = images.length === 0
-      ? prompt
-      : (async function* userMessages() {
-          yield {
-            type: 'user' as const,
-            message: {
-              role: 'user' as const,
-              content: [
-                { type: 'text' as const, text: prompt },
-                ...images.map((img) => ({
-                  type: 'image' as const,
-                  source: {
-                    type: 'base64' as const,
-                    media_type: img.media_type as SdkImageMediaType,
-                    data: img.data_base64,
-                  },
-                })),
-              ],
-            },
-            parent_tool_use_id: null,
-            session_id: '',
-          };
-        })();
-    const q = query({ prompt: promptInput, options });
+    const inputQueue = new PushableAsyncIterable<SDKUserMessage>();
+    this.inputQueue = inputQueue;
+    const q = query({ prompt: inputQueue, options });
     this.activeQuery = q;
-    try {
-      for await (const message of q) {
-        const text = this.handleSdkMessage(message);
-        if (text != null) finalText = text;
-      }
-    } catch (err) {
-      const e = err as Error;
-      if (e.name === 'AbortError') {
-        // Drain any in-flight permission/question prompts so their callers
-        // (the SDK's canUseTool callbacks) don't sit on a Promise that never
-        // resolves. They'll see a deny / dismissal and unwind cleanly.
+    // Remember what this Query was opened with so the next
+    // `sendPrompt` can detect a per-turn config change and trigger a
+    // reopen. `trimmedCompactInstructions` is already trimmed/empty-
+    // collapsed above, so the stored value compares cleanly.
+    this.queryConfig = {
+      reasoningEffort,
+      compactInstructions: trimmedCompactInstructions || undefined,
+    };
+
+    // Background pump: drain SDK messages forever. Every `result`
+    // resolves the current turn's `pendingTurn`; the pump then keeps
+    // looping for the next turn's messages. A thrown error here tears
+    // the Query down; the next sendPrompt re-opens a fresh Query with
+    // `resume: resumeSessionId` so context is still preserved.
+    this.pumpPromise = (async () => {
+      try {
+        for await (const message of q) {
+          const text = this.handleSdkMessage(message);
+          if (text != null) {
+            // Turn boundary (result event). Drain any permission /
+            // question prompts left dangling by an interrupt — their
+            // callers need a terminal answer, and the tool the model
+            // had asked about is no longer running.
+            drainPendingOnAbort();
+            const pending = this.pendingTurn;
+            this.pendingTurn = undefined;
+            pending?.resolve(text);
+          }
+        }
+        // Iterator ended cleanly (Query closed externally).
+        const pending = this.pendingTurn;
+        this.pendingTurn = undefined;
+        this.activeQuery = undefined;
+        this.inputQueue = undefined;
+        this.canUseToolCached = undefined;
+        this.queryConfig = undefined;
         drainPendingOnAbort();
-        // Discard the pending init id — the SDK never committed this
-        // session via `result`, so resuming from it on the next turn
-        // would give the model an empty/stale context. `resumeSessionId`
-        // remains pinned at the last COMPLETED turn's id, which is
-        // what steering-mode needs to preserve conversation history.
-        this.pendingInitSessionId = undefined;
-        return '[interrupted]';
+        pending?.resolve('[interrupted]');
+      } catch (err) {
+        // Pump-level failure. Tear the Query down and fail the
+        // in-flight turn (if any). Next sendPrompt will re-open a
+        // fresh Query using the most recent resumeSessionId, so
+        // conversation history is preserved across the recovery.
+        const pending = this.pendingTurn;
+        this.pendingTurn = undefined;
+        this.activeQuery = undefined;
+        this.inputQueue = undefined;
+        this.canUseToolCached = undefined;
+        this.queryConfig = undefined;
+        drainPendingOnAbort();
+        console.error('[bridge] SDK pump error:', err);
+        pending?.reject(err);
       }
-      throw err;
-    } finally {
-      this.inFlight = false;
-      this.activeQuery = undefined;
-      // Belt-and-suspenders: on any unwind path (abort handled above,
-      // unexpected throw re-raised, or normal completion where result
-      // already promoted the id), ensure we don't carry a stale
-      // pending id into the next turn.
-      this.pendingInitSessionId = undefined;
-    }
-    return finalText;
+    })();
   }
 
   /**
@@ -700,6 +859,107 @@ class ClaudeBridge {
   }
 
   /**
+   * Gracefully close the persistent Query and the streaming input
+   * queue. Used on shutdown / SIGTERM paths. Safe to call when no
+   * Query is open (no-op). After close, the next `sendPrompt` will
+   * open a fresh Query with `resume: resumeSessionId` — so even a
+   * graceful close preserves conversation history.
+   */
+  async closeSession(): Promise<void> {
+    const q = this.activeQuery;
+    const queue = this.inputQueue;
+    this.activeQuery = undefined;
+    this.inputQueue = undefined;
+    this.canUseToolCached = undefined;
+    this.queryConfig = undefined;
+    // Reject any turn pending at close time so the caller doesn't hang.
+    const pending = this.pendingTurn;
+    this.pendingTurn = undefined;
+    pending?.reject(new Error('Session closed'));
+    drainPendingOnAbort();
+    if (queue) queue.close();
+    if (q) {
+      try {
+        q.close();
+      } catch (err) {
+        console.error('[bridge] Query.close() during closeSession:', err);
+      }
+    }
+    // Wait for the pump to unwind so we don't race process exit.
+    const pump = this.pumpPromise;
+    this.pumpPromise = undefined;
+    if (pump) {
+      try {
+        await pump;
+      } catch {
+        // pump errors are already logged inside the pump.
+      }
+    }
+  }
+
+  /**
+   * Close the current persistent Query and reopen a fresh one under
+   * new `reasoningEffort` / `compactCustomInstructions`. Conversation
+   * history is preserved via `resume: this.resumeSessionId` — from
+   * the model's POV nothing happened, only the SDK-side Query object
+   * was recycled.
+   *
+   * Called from `sendPrompt` when the requested config differs from
+   * `this.queryConfig`. Serialised inside sendPrompt's single-turn
+   * guard (`turnInProgress`), so the pump cannot race the reopen and
+   * there is never a `pendingTurn` when we get here.
+   */
+  private async reopenQueryForConfigChange(
+    permissionMode: SdkPermissionMode,
+    reasoningEffort: ReasoningEffortWire | undefined,
+    compactCustomInstructions: string | undefined,
+  ): Promise<void> {
+    const pump = this.pumpPromise;
+    const q = this.activeQuery;
+    const queue = this.inputQueue;
+    // Drop all references before closing so the pump's own teardown
+    // branch (which also clears these) is a harmless second write.
+    this.activeQuery = undefined;
+    this.inputQueue = undefined;
+    this.canUseToolCached = undefined;
+    this.queryConfig = undefined;
+    this.pumpPromise = undefined;
+    // Defensive: we should never have a pendingTurn here (sendPrompt
+    // arms it only AFTER the reopen completes). If one somehow
+    // exists, reject it rather than leak the promise.
+    if (this.pendingTurn) {
+      const pending = this.pendingTurn;
+      this.pendingTurn = undefined;
+      pending.reject(new Error('Query reopened before turn completed'));
+    }
+    drainPendingOnAbort();
+    if (queue) queue.close();
+    if (q) {
+      try {
+        q.close();
+      } catch (err) {
+        console.error('[bridge] Query.close() during reopen:', err);
+      }
+    }
+    if (pump) {
+      try {
+        await pump;
+      } catch {
+        // pump errors already logged inside the pump.
+      }
+    }
+    // Reopen. `resumeSessionId` is the latest committed id (updated
+    // by every `result` event + promoted eagerly on `init` since the
+    // streaming-input fix), so the new Query rehydrates the full
+    // conversation.
+    this.openPersistentQuery(
+      permissionMode,
+      reasoningEffort,
+      compactCustomInstructions,
+    );
+  }
+
+  /**
    * Translate one SDKMessage into stream events. Returns the final assistant text
    * if this message is a `result` (so the caller can capture canonical output).
    */
@@ -723,12 +983,17 @@ class ClaudeBridge {
         if (sub === 'init') {
           const init = msg as { session_id?: string; model?: string };
           if (init.session_id) {
-            // Stash as pending, not promoted. The SDK hasn't committed
-            // this session to its store yet — it will on `result`. If
-            // the turn is aborted mid-stream (steering), we must NOT
-            // ship this id back as the resume target because the SDK
-            // can't resume from a session it never finalised.
-            this.pendingInitSessionId = init.session_id;
+            // Under streaming-input mode the Query is persistent: one
+            // init fires when the Query opens, and every subsequent
+            // turn commits back to the same SDK session. We can safely
+            // promote the init session_id to the resume target right
+            // away — if the bridge dies before any turn completes, the
+            // worst case on next restart is `resume:<never-used-id>`,
+            // which is no worse than a cold start (both yield an empty
+            // conversation). See the previous two-phase pending/
+            // committed split (pendingInitSessionId) — no longer
+            // needed now that interrupt doesn't tear the session down.
+            this.resumeSessionId = init.session_id;
             writeStream({ event: 'info', message: `Claude session ${init.session_id}` });
           }
           // Surface the model the SDK actually resolved. If the requested
@@ -1258,14 +1523,14 @@ class ClaudeBridge {
           total_cost_usd?: number;
           duration_ms?: number;
         };
-        // The turn completed cleanly — the SDK committed this session
-        // to its store, so it's now safe to promote the id as the
-        // resume target for the next query. Clear the pending id so an
-        // abort later in this bridge's lifetime can't accidentally
-        // resurrect it.
+        // Each turn's result carries the current committed session id.
+        // Overwrite resumeSessionId unconditionally — even if the turn
+        // was interrupted, the SDK's session store reflects whatever
+        // tool_use/tool_result pairs completed before the interrupt.
+        // Resuming from this id on a future bridge restart replays
+        // exactly that state.
         if (r.session_id) {
           this.resumeSessionId = r.session_id;
-          this.pendingInitSessionId = undefined;
         }
         // Forward token usage before returning the output text so the
         // runtime-core drain loop sees a TurnUsage event before the
@@ -1421,14 +1686,38 @@ class ClaudeBridge {
     });
   }
 
+  /**
+   * Stop the currently-running assistant turn without closing the
+   * session. The SDK's `Query.interrupt()` unwinds the in-flight turn
+   * cooperatively — tool_use/tool_result pairs that already completed
+   * stay committed to the session, a `result` event is emitted (which
+   * the pump treats as the turn boundary and resolves `pendingTurn`),
+   * and the Query stays alive waiting for the next user message.
+   *
+   * This is THE fix for the steering context-loss bug: the old
+   * implementation called `abortController.abort()`, which tore the
+   * whole Query down and discarded the uncommitted SDK session —
+   * meaning the next turn resumed from before the interrupted turn's
+   * tools ran. With `Query.interrupt()`, everything the assistant did
+   * up to the interrupt point remains visible to the model on the
+   * next turn.
+   */
   interrupt(): void {
-    if (this.abortController) {
-      try {
-        this.abortController.abort();
-      } catch {
-        // ignore
-      }
+    // Always drain pending permission / question prompts so their
+    // resolvers unwind even if the SDK takes a while to emit the
+    // result event. The UI dismisses the dialog immediately either
+    // way.
+    drainPendingOnAbort();
+    if (!this.activeQuery || !this.turnInProgress) {
+      return;
     }
+    // Fire-and-forget — we don't await because `interrupt()` resolves
+    // asynchronously after the SDK flushes state, and the pump loop
+    // is already awaiting the next message. Any error surfaces via
+    // the pump's catch.
+    this.activeQuery.interrupt().catch((err) => {
+      console.error('[bridge] Query.interrupt() failed:', err);
+    });
   }
 
   /**
