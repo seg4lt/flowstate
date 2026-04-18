@@ -920,6 +920,10 @@ impl ProviderAdapter for ClaudeCliAdapter {
         ProviderKind::ClaudeCli
     }
 
+    fn default_enabled(&self) -> bool {
+        false
+    }
+
     async fn health(&self) -> ProviderStatus {
         let binary = Self::find_claude_binary();
         let label = ProviderKind::ClaudeCli.label();
@@ -1139,7 +1143,6 @@ impl ProviderAdapter for ClaudeCliAdapter {
                     description: match kind {
                         CommandKind::Builtin => "Claude CLI built-in command.".to_string(),
                         CommandKind::UserSkill { .. } => "User skill.".to_string(),
-                        CommandKind::TuiOnly => String::new(),
                     },
                     kind,
                     user_invocable: true,
@@ -1181,7 +1184,6 @@ fn tag_for_kind(kind: CommandKind) -> &'static str {
     match kind {
         CommandKind::Builtin => "builtin",
         CommandKind::UserSkill { .. } => "user_skill",
-        CommandKind::TuiOnly => "tui_only",
     }
 }
 

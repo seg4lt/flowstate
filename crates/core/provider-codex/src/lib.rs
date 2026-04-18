@@ -227,6 +227,10 @@ impl ProviderAdapter for CodexAdapter {
         ProviderKind::Codex
     }
 
+    fn default_enabled(&self) -> bool {
+        false
+    }
+
     async fn health(&self) -> ProviderStatus {
         probe_cli(
             &self.binary_path,

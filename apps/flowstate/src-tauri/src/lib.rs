@@ -30,7 +30,12 @@ use usage::{
     TopSessionRow, UsageBucket, UsageEvent, UsageGroupBy, UsageRange, UsageStore,
     UsageSummaryPayload, UsageTimeseriesPayload,
 };
-use zenui_provider_api::RuntimeEvent;
+use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
+use zenui_provider_claude_cli::ClaudeCliAdapter;
+use zenui_provider_claude_sdk::ClaudeSdkAdapter;
+use zenui_provider_codex::CodexAdapter;
+use zenui_provider_github_copilot::GitHubCopilotAdapter;
+use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
 use tokio::sync::broadcast::error::RecvError;
 
 use std::collections::HashMap;
@@ -2038,8 +2043,26 @@ pub fn run() {
             // runtime"; bootstrap_core_async removes that need by
             // letting us share the host runtime.
             tauri::async_runtime::spawn(async move {
-                let mut config = DaemonConfig::with_project_root(flowstate_root);
+                let mut config = DaemonConfig::with_project_root(flowstate_root.clone());
                 config.idle_timeout = Duration::MAX;
+                // Advertised to every connected client via the
+                // Bootstrap wire payload. Keeping it here means
+                // `runtime-core` never knows its host app's name.
+                config.app_name = "Flowstate".to_string();
+
+                // Construct the provider adapters the app wants to
+                // expose. Adding or removing providers now lives in a
+                // single call site here — `daemon-core` stays
+                // provider-agnostic. Per-provider `default_enabled()`
+                // decides which are on out of the box.
+                config.adapters = vec![
+                    Arc::new(ClaudeSdkAdapter::new(flowstate_root.clone()))
+                        as Arc<dyn ProviderAdapter>,
+                    Arc::new(ClaudeCliAdapter::new(flowstate_root.clone())),
+                    Arc::new(CodexAdapter::new(flowstate_root.clone())),
+                    Arc::new(GitHubCopilotAdapter::new(flowstate_root.clone())),
+                    Arc::new(GitHubCopilotCliAdapter::new(flowstate_root.clone())),
+                ];
 
                 let core = bootstrap_core_async(&config)
                     .await

@@ -334,7 +334,7 @@ impl UsageStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let day = day_from_rfc3339(&event.occurred_at);
-        let provider_str = provider_kind_to_str(event.provider);
+        let provider_str = event.provider.as_tag();
         let status_str = turn_status_to_str(event.status);
         let model_for_pk = event.model.clone().unwrap_or_default();
         let now = Utc::now().to_rfc3339();
@@ -542,7 +542,7 @@ impl UsageStore {
         let rows = stmt
             .query_map(params![from, to, capped], |row| {
                 let provider: String = row.get(1)?;
-                let label = provider_kind_from_str(&provider).label().to_string();
+                let label = provider_label_from_tag(&provider);
                 Ok(TopSessionRow {
                     session_id: row.get(0)?,
                     provider,
@@ -564,23 +564,14 @@ impl UsageStore {
     }
 }
 
-fn provider_kind_to_str(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Codex => "codex",
-        ProviderKind::Claude => "claude",
-        ProviderKind::GitHubCopilot => "github_copilot",
-        ProviderKind::ClaudeCli => "claude_cli",
-        ProviderKind::GitHubCopilotCli => "github_copilot_cli",
-    }
-}
-
-fn provider_kind_from_str(value: &str) -> ProviderKind {
-    match value {
-        "claude" => ProviderKind::Claude,
-        "github_copilot" => ProviderKind::GitHubCopilot,
-        "claude_cli" => ProviderKind::ClaudeCli,
-        "github_copilot_cli" => ProviderKind::GitHubCopilotCli,
-        _ => ProviderKind::Codex,
+/// Display-only label lookup for a provider tag stored in the usage
+/// database. Unknown tags are surfaced verbatim rather than silently
+/// coerced to `Codex` — if the rollup ever produces an unexpected
+/// string we'd rather see it in the UI than hide the drift.
+fn provider_label_from_tag(tag: &str) -> String {
+    match ProviderKind::from_tag(tag) {
+        Some(kind) => kind.label().to_string(),
+        None => tag.to_string(),
     }
 }
 
@@ -723,9 +714,7 @@ fn read_group(
             let key: String = row.get(0)?;
             let raw_label: String = row.get(1)?;
             let label = match group_by {
-                UsageGroupBy::ByProvider => {
-                    provider_kind_from_str(&raw_label).label().to_string()
-                }
+                UsageGroupBy::ByProvider => provider_label_from_tag(&raw_label),
                 UsageGroupBy::ByModel => {
                     if raw_label.is_empty() {
                         "(unknown model)".to_string()
@@ -893,7 +882,7 @@ fn read_daily_series(
     let mut out = Vec::new();
     for key in key_order {
         let label = match split_by {
-            UsageGroupBy::ByProvider => provider_kind_from_str(&key).label().to_string(),
+            UsageGroupBy::ByProvider => provider_label_from_tag(&key),
             UsageGroupBy::ByModel => {
                 if key.is_empty() {
                     "(unknown model)".to_string()

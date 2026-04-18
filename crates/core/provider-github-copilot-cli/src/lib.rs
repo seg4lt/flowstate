@@ -1021,6 +1021,10 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         ProviderKind::GitHubCopilotCli
     }
 
+    fn default_enabled(&self) -> bool {
+        false
+    }
+
     async fn health(&self) -> ProviderStatus {
         let kind = ProviderKind::GitHubCopilotCli;
         let label = kind.label();

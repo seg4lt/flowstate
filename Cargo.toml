@@ -5,6 +5,7 @@ members = [
   "crates/core/provider-api",
   "crates/core/orchestration",
   "crates/core/persistence",
+  "crates/core/embedded-node",
   "crates/core/provider-claude-sdk",
   "crates/core/provider-claude-cli",
   "crates/core/provider-codex",
@@ -13,7 +14,6 @@ members = [
   "crates/middleman/transport-http",
   "crates/middleman/daemon-core",
   "crates/middleman/daemon-client",
-  "crates/middleman/embedded-node",
   "crates/middleman/transport-tauri",
 ]
 resolver = "2"
