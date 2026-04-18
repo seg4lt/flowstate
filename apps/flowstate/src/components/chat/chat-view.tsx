@@ -600,7 +600,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   React.useEffect(() => {
     sessionStorage.setItem(permissionStorageKey, permissionMode);
-  }, [permissionStorageKey, permissionMode]);
+    // Mirror to the app-store so the sidebar thread spinner can tint
+    // by the live composer mode (not the running turn's starting
+    // mode). Reducer short-circuits when unchanged, so firing on
+    // every sessionStorage write is cheap.
+    dispatch({
+      type: "set_session_permission_mode",
+      sessionId,
+      mode: permissionMode,
+    });
+  }, [dispatch, permissionStorageKey, permissionMode, sessionId]);
 
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
   // Monotonically-increasing tick bumped each time the user dispatches a

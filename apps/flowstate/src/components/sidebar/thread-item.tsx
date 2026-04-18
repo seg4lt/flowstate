@@ -22,9 +22,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { useApp } from "@/stores/app-store";
-import { prefetchSession, sessionQueryKey, type SessionPage } from "@/lib/queries";
+import { prefetchSession } from "@/lib/queries";
 import { cn } from "@/lib/utils";
-import { BrailleSpinner, type SpinnerTone } from "../chat/braille-spinner";
+import { BrailleSpinner } from "../chat/braille-spinner";
 import { toneForMode } from "@/lib/mode-tone";
 
 function formatTimeAgo(iso: string): string {
@@ -80,34 +80,20 @@ export function ThreadItem({
   pendingDone,
   onClick,
 }: ThreadItemProps) {
-  const { send, renameSession } = useApp();
+  const { state, send, renameSession } = useApp();
   const queryClient = useQueryClient();
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(title);
   const inputRef = React.useRef<HTMLInputElement>(null);
 
-  // Peek at the cached session page (non-reactively) to colour the
-  // spinner by the running turn's permission mode. Blue for plan,
-  // orange for bypass, green otherwise. Falls back to green when the
-  // session hasn't been opened yet and therefore has no cached turns
-  // — the moment the user opens the thread and a turn starts,
-  // subsequent renders pick up the right tone.
-  const spinnerTone = React.useMemo<SpinnerTone>(() => {
-    if (!running) return "green";
-    const page = queryClient.getQueryData<SessionPage>(
-      sessionQueryKey(sessionId),
-    );
-    const runningTurn = page?.detail.turns.find((t) => t.status === "running");
-    return toneForMode(runningTurn?.permissionMode);
-    // queryClient is stable; re-evaluate whenever the running flag
-    // flips, which is the same cadence chat-view updates the cache
-    // on turn_started/turn_completed. We deliberately don't depend
-    // on the cached turn directly — React Query's cache mutations
-    // already re-render subscribed components, and the sidebar row
-    // re-renders via the store on session changes, which is frequent
-    // enough for a mode change to land within a second.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [running, sessionId, queryClient]);
+  // Tint the running-spinner by the session's *live* composer mode —
+  // same source chat-view's WorkingIndicator uses — so a mid-turn
+  // plan↔bypass↔accept flip recolours the sidebar immediately. The
+  // map is populated by chat-view on mount and on every toggle; for
+  // sessions the user hasn't opened yet the entry is absent and
+  // `toneForMode(undefined)` falls back to "green" (the accept-edits
+  // baseline), which matches what the WorkingIndicator would show.
+  const spinnerTone = toneForMode(state.permissionModeBySession.get(sessionId));
   // Hover prefetch: warm the session cache the moment the pointer
   // enters this row so the click itself only has to consume cached
   // data. A few hundred ms of hover — normal human targeting time —

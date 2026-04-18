@@ -21,6 +21,7 @@ import type {
   ClientMessage,
   CommandCatalog,
   PermissionDecision,
+  PermissionMode,
   ProviderStatus,
   ProjectRecord,
   RateLimitInfo,
@@ -88,6 +89,14 @@ interface AppState {
    *  as pendingPermissionsBySession — global so cross-thread events
    *  aren't dropped on the floor. */
   pendingQuestionBySession: Map<string, PendingQuestion>;
+  /** Latest composer permission mode chosen by the user, per session.
+   *  Mirrors the local state chat-view persists to sessionStorage so
+   *  the sidebar thread spinner can tint by the *currently* selected
+   *  mode rather than the mode the running turn was started with.
+   *  Without this the spinner "sticks" on the turn's opening mode and
+   *  doesn't follow a plan↔bypass↔accept flip mid-turn. Populated by
+   *  chat-view on mount/change; cleared on session_deleted. */
+  permissionModeBySession: Map<string, PermissionMode>;
   /** Latest rate-limit / plan-usage snapshot per bucket, keyed by
    *  the provider-defined bucket id. Account-wide, not scoped to
    *  any session — providers report these whenever they update.
@@ -153,7 +162,18 @@ type AppAction =
    *  Tauri `onFocusChanged` subscription. Distinct from browser
    *  `focus`/`blur` on the document, which don't track app-level
    *  focus reliably across platforms. */
-  | { type: "window_focus_changed"; focused: boolean };
+  | { type: "window_focus_changed"; focused: boolean }
+  /** Per-session composer permission mode — dispatched by chat-view
+   *  whenever its local `permissionMode` state changes (on mount from
+   *  sessionStorage / Settings defaults, and on every user toggle).
+   *  Read by the sidebar thread spinner so it tints by the live mode
+   *  rather than the turn's starting mode. No-ops if the stored value
+   *  already matches so unrelated subscribers don't re-render. */
+  | {
+      type: "set_session_permission_mode";
+      sessionId: string;
+      mode: PermissionMode;
+    };
 
 /** Recompute whether a session still has any pending input after a
  *  consume action. If both the permissions queue and the question
@@ -207,6 +227,17 @@ function appReducer(state: AppState, action: AppAction): AppState {
         doneSessionIds.delete(state.activeSessionId);
       }
       return { ...state, isWindowFocused, doneSessionIds };
+    }
+    case "set_session_permission_mode": {
+      // Short-circuit when the mode hasn't actually changed so
+      // unrelated subscribers (every ThreadItem) don't re-render on
+      // a no-op dispatch from chat-view's persist-to-sessionStorage
+      // effect.
+      const current = state.permissionModeBySession.get(action.sessionId);
+      if (current === action.mode) return state;
+      const permissionModeBySession = new Map(state.permissionModeBySession);
+      permissionModeBySession.set(action.sessionId, action.mode);
+      return { ...state, permissionModeBySession };
     }
     case "consume_pending_permission": {
       const list = state.pendingPermissionsBySession.get(action.sessionId);
@@ -368,6 +399,11 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
         pendingQuestionBySession = new Map(pendingQuestionBySession);
         pendingQuestionBySession.delete(event.session_id);
       }
+      let permissionModeBySession = state.permissionModeBySession;
+      if (permissionModeBySession.has(event.session_id)) {
+        permissionModeBySession = new Map(permissionModeBySession);
+        permissionModeBySession.delete(event.session_id);
+      }
       return {
         ...state,
         sessions,
@@ -382,6 +418,7 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
         awaitingInputSessionIds,
         pendingPermissionsBySession,
         pendingQuestionBySession,
+        permissionModeBySession,
       };
     }
 
@@ -719,6 +756,7 @@ const initialState: AppState = {
   awaitingInputSessionIds: new Set(),
   pendingPermissionsBySession: new Map(),
   pendingQuestionBySession: new Map(),
+  permissionModeBySession: new Map(),
   rateLimits: {},
   sessionCommands: new Map(),
   // Default to focused: the first focus event only fires on the NEXT
