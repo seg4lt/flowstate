@@ -107,7 +107,17 @@ function DefaultPrompt({
         >
           {showArgs ? "hide" : "show"} args
         </button>
-        {showArgs && <div className="mt-2">{renderToolArgs(toolName, input)}</div>}
+        {showArgs && (
+          // Cap at ~60vh so a huge tool payload (big Write, long
+          // Bash, multi-hunk Edit) can't push Allow / Deny and the
+          // composer off-screen. The buttons sit in the row above
+          // this container so they always stay visible; the args
+          // scroll internally. 60vh + prompt chrome lands the total
+          // at ~2/3 of the viewport.
+          <div className="mt-2 max-h-[60vh] overflow-y-auto">
+            {renderToolArgs(toolName, input)}
+          </div>
+        )}
       </div>
     </>
   );
