@@ -469,6 +469,15 @@ export function ChatInput({
     // either the queue or onSend, so the chip row clears immediately.
     const imagesToSend = attachedImages;
     setAttachedImages([]);
+    // Images-only sends need a non-empty text block: the Claude Agent
+    // SDK bridge unconditionally emits `{ type: 'text', text: prompt }`
+    // alongside the image blocks, and the Messages API rejects empty
+    // text blocks ("text content blocks must be non-empty"). Supply a
+    // neutral default so the user's "just analyze this screenshot"
+    // intent goes through. Normalize here (before the queue/direct
+    // branch) so drained messages get the same treatment.
+    const textToSend =
+      !trimmed && imagesToSend.length > 0 ? "Analyze image" : trimmed;
     // While a turn is running OR earlier messages are still queued,
     // append this one to the queue. Clearing the textarea immediately
     // mirrors what the user just did ("send"), and the queued chip
@@ -483,12 +492,12 @@ export function ChatInput({
     // whatever was already queued once the new turn completes, which
     // is how the user's "send one more to drain" workflow above works.
     if (isRunning || (queued.length > 0 && sessionStatus !== "interrupted")) {
-      enqueue(trimmed, imagesToSend);
+      enqueue(textToSend, imagesToSend);
       setValue("");
       resetHeight();
       return;
     }
-    onSend(trimmed, imagesToSend);
+    onSend(textToSend, imagesToSend);
     // Object URLs revoked AFTER onSend so the renderer can still
     // paint the (now removed) chip's thumbnail this frame, then they
     // get freed.
@@ -743,9 +752,11 @@ export function ChatInput({
                     ? "Archived thread — read-only"
                     : providerDisabled
                       ? "Provider disabled — re-enable it in Settings to send"
-                      : queued.length > 0
-                        ? "Compose another message…"
-                        : "Send a message..."
+                      : promptSuggestion && value.length === 0 && !disabled
+                        ? ""
+                        : queued.length > 0
+                          ? "Compose another message…"
+                          : "Send a message..."
                 }
                 disabled={disabled || providerDisabled || archived}
                 rows={1}
