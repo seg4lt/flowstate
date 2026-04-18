@@ -23,6 +23,18 @@ use rust_embed::Embed;
 #[folder = "$OUT_DIR/bridge-assets/"]
 struct BridgeAssets;
 
+/// Fingerprint of `bridge/dist/index.js` written by `build.rs`. The
+/// `include_str!` is load-bearing: rustc tracks it in dep-info, so when
+/// `build.rs` rewrites this file (content hash of dist changed),
+/// rustc recompiles this module and the `#[derive(Embed)]` proc macro
+/// above re-scans `$OUT_DIR/bridge-assets/` with the fresh bytes.
+/// Without this reference, the previous build's bridge stays embedded
+/// in the binary even after a fresh `bun run build` updates the on-disk
+/// assets, and the daemon ends up spawning a stale bridge at runtime.
+#[allow(dead_code)]
+const BRIDGE_ASSETS_FINGERPRINT: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/bridge-assets-fingerprint.txt"));
+
 /// Resolved paths to an extracted Claude SDK bridge on disk.
 #[derive(Debug, Clone)]
 pub struct BridgeRuntime {

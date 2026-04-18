@@ -102,6 +102,48 @@ fn main() {
         copy_dir_all(&node_modules, &dest_nm).expect("failed to copy node_modules");
         touch_stamp(&node_modules_stamp);
     }
+
+    // Content fingerprint of the bridge script. rust-embed's proc macro
+    // only re-scans `$OUT_DIR/bridge-assets/` when its containing crate
+    // recompiles, which normally only happens when a `.rs` file changes.
+    // That meant a fresh `bridge/dist/index.js` could be staged into
+    // bridge-assets but the binary would still embed the previous build's
+    // bytes (baked in at the last macro expansion). To force a recompile
+    // when the bridge content changes, we write a stable hex hash of the
+    // dist to `bridge-assets-fingerprint.txt` and have `bridge_runtime.rs`
+    // `include_str!` it — rustc tracks include_str! inputs in dep-info,
+    // so a fingerprint change invalidates the crate and re-expands
+    // `#[derive(Embed)]` with fresh bytes.
+    //
+    // CRITICAL: we only rewrite the fingerprint file when the value
+    // actually changes. tsc updates `dist/index.js`'s mtime on every
+    // build even when content is identical; blindly touching the
+    // fingerprint here would force an unconditional crate recompile on
+    // every cargo invocation.
+    let dist_bytes = fs::read(&bridge_src).expect("read bridge dist for fingerprint");
+    let fingerprint = fnv1a_hex(&dist_bytes);
+    let fingerprint_path = out_dir.join("bridge-assets-fingerprint.txt");
+    let existing = fs::read_to_string(&fingerprint_path).ok();
+    if existing.as_deref() != Some(fingerprint.as_str()) {
+        fs::write(&fingerprint_path, &fingerprint)
+            .expect("write bridge-assets-fingerprint.txt");
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        fingerprint_path.display()
+    );
+}
+
+/// Inline FNV-1a over a byte slice — same family as `assets_fingerprint`
+/// in `bridge_runtime.rs` but over content, not file-name/size tuples.
+/// No dep, deterministic, adequate for a "did this file change?" signal.
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Returns `true` if `stamp` exists and is newer than every path in `sources`.
