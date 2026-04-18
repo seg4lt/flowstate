@@ -1,6 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+// `parking_lot::Mutex` has no poisoning semantics, so a panic inside a
+// query callback no longer wedges every subsequent `.lock()` call on
+// the sqlite connection. Previously a single bad row or a malformed
+// JSON blob in one record could take the whole daemon down via the
+// cascade of `.expect("sqlite mutex poisoned")` calls that used to
+// line this file.
+use parking_lot::Mutex;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -115,7 +122,7 @@ impl PersistenceService {
     }
 
     pub async fn upsert_session(&self, session: SessionDetail) {
-        let mut connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut connection = self.connection.lock();
         let transaction = match connection.transaction() {
             Ok(transaction) => transaction,
             Err(_) => return,
@@ -230,7 +237,7 @@ impl PersistenceService {
     }
 
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         load_session(&connection, session_id, None).ok().flatten()
     }
 
@@ -245,12 +252,12 @@ impl PersistenceService {
         session_id: &str,
         limit: Option<usize>,
     ) -> Option<SessionDetail> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         load_session(&connection, session_id, limit).ok().flatten()
     }
 
     pub async fn list_sessions(&self) -> Vec<SessionDetail> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let session_ids = match list_session_ids(&connection) {
             Ok(session_ids) => session_ids,
             Err(_) => return Vec::new(),
@@ -268,7 +275,7 @@ impl PersistenceService {
     /// turn list for a session is loaded lazily via `get_session` when the
     /// user actually opens it.
     pub async fn list_session_summaries(&self) -> Vec<SessionSummary> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let mut statement = match connection.prepare(
             "SELECT session_id, provider, status, created_at, updated_at,
                     turn_count, model, project_id
@@ -303,7 +310,7 @@ impl PersistenceService {
         // sqlite below; attachment files don't have a FK so we delete
         // them here explicitly.
         self.delete_attachments_for_session_blocking(session_id);
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         connection
             .execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])
             .map(|affected| affected > 0)
@@ -313,7 +320,7 @@ impl PersistenceService {
     pub fn delete_archived_session(&self, session_id: &str) -> bool {
         // Best-effort attachment cleanup before the row delete.
         self.delete_attachments_for_session_blocking(session_id);
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let tx = match connection.unchecked_transaction() {
             Ok(tx) => tx,
             Err(_) => return false,
@@ -372,7 +379,7 @@ impl PersistenceService {
         let now = Utc::now().to_rfc3339();
         let size_bytes = bytes.len() as i64;
         {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             if let Err(e) = connection.execute(
                 "INSERT INTO turn_attachments
                     (id, turn_id, session_id, media_type, name, size_bytes, created_at)
@@ -397,7 +404,7 @@ impl PersistenceService {
     /// Called only on user click — never on session load.
     pub async fn read_attachment(&self, attachment_id: &str) -> Result<AttachmentData, String> {
         let (media_type, name) = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             connection
                 .query_row(
                     "SELECT media_type, name FROM turn_attachments WHERE id = ?1",
@@ -430,7 +437,7 @@ impl PersistenceService {
     /// first. Used by the session-load path to hydrate
     /// `TurnRecord.input_attachments` without reading any file bytes.
     pub fn list_attachments_for_turn(&self, turn_id: &str) -> Vec<AttachmentRef> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let mut stmt = match connection.prepare(
             "SELECT id, media_type, name, size_bytes
              FROM turn_attachments WHERE turn_id = ?1 ORDER BY created_at ASC",
@@ -459,7 +466,7 @@ impl PersistenceService {
     /// disk is preferable to a half-deleted session.
     fn delete_attachments_for_session_blocking(&self, session_id: &str) {
         let rows: Vec<(String, String)> = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             let mut stmt = match connection.prepare(
                 "SELECT id, media_type FROM turn_attachments WHERE session_id = ?1",
             ) {
@@ -486,7 +493,7 @@ impl PersistenceService {
                 );
             }
         }
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let _ = connection.execute(
             "DELETE FROM turn_attachments WHERE session_id = ?1",
             params![session_id],
@@ -499,7 +506,7 @@ impl PersistenceService {
         &self,
         kind: ProviderKind,
     ) -> Option<(String, Vec<ProviderModel>)> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT fetched_at, models_json FROM provider_model_cache WHERE provider = ?1",
@@ -539,7 +546,7 @@ impl PersistenceService {
             Ok(s) => s,
             Err(_) => return,
         };
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let _ = connection.execute(
             "INSERT INTO provider_model_cache (provider, fetched_at, models_json)
              VALUES (?1, ?2, ?3)
@@ -560,7 +567,7 @@ impl PersistenceService {
         &self,
         kind: ProviderKind,
     ) -> Option<(String, ProviderStatus)> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT checked_at, status_json FROM provider_health_cache WHERE provider = ?1",
@@ -595,7 +602,7 @@ impl PersistenceService {
     /// `provider_enablement`; providers whose kind has no row are treated
     /// as enabled by the caller (runtime-core defaults to `true` on miss).
     pub async fn get_provider_enablement(&self) -> HashMap<ProviderKind, bool> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let mut statement = match connection
             .prepare("SELECT provider, enabled FROM provider_enablement")
         {
@@ -620,7 +627,7 @@ impl PersistenceService {
     /// `SetProviderEnabled` handler.
     pub async fn set_provider_enabled(&self, kind: ProviderKind, enabled: bool) {
         let now = chrono::Utc::now().to_rfc3339();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let _ = connection.execute(
             "INSERT INTO provider_enablement (provider, enabled, updated_at)
              VALUES (?1, ?2, ?3)
@@ -648,7 +655,7 @@ impl PersistenceService {
             Err(_) => return,
         };
         let now = chrono::Utc::now().to_rfc3339();
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let _ = connection.execute(
             "INSERT INTO provider_health_cache (provider, checked_at, status_json)
              VALUES (?1, ?2, ?3)
@@ -660,7 +667,7 @@ impl PersistenceService {
     }
 
     pub async fn list_projects(&self) -> Vec<ProjectRecord> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let mut statement = match connection.prepare(
             "SELECT project_id, path, created_at, updated_at
              FROM projects
@@ -685,7 +692,7 @@ impl PersistenceService {
     }
 
     pub async fn get_project(&self, project_id: &str) -> Option<ProjectRecord> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         connection
             .query_row(
                 "SELECT project_id, path, created_at, updated_at
@@ -706,7 +713,7 @@ impl PersistenceService {
     }
 
     pub async fn create_project(&self, path: Option<String>) -> Option<ProjectRecord> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let now = Utc::now().to_rfc3339();
 
         // Resurrection path. If we have a path AND there's an existing
@@ -787,7 +794,7 @@ impl PersistenceService {
     /// expected `reassigned_session_ids`) or `None` if no live row
     /// matched the id.
     pub async fn delete_project(&self, project_id: &str) -> Option<Vec<String>> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let now = Utc::now().to_rfc3339();
         let updated = connection
             .execute(
@@ -807,7 +814,7 @@ impl PersistenceService {
         session_id: &str,
         project_id: Option<&str>,
     ) -> bool {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         connection
             .execute(
                 "UPDATE sessions SET project_id = ?1 WHERE session_id = ?2",
@@ -818,7 +825,7 @@ impl PersistenceService {
     }
 
     fn migrate(&self) -> Result<()> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         connection
             .execute_batch(
                 "
@@ -961,7 +968,7 @@ impl PersistenceService {
     }
 
     pub async fn archive_session(&self, session_id: &str) -> bool {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let now = Utc::now().to_rfc3339();
         let tx = match connection.unchecked_transaction() {
             Ok(tx) => tx,
@@ -1003,7 +1010,7 @@ impl PersistenceService {
 
     pub async fn unarchive_session(&self, session_id: &str) -> Option<SessionDetail> {
         let success = {
-            let connection = self.connection.lock().expect("sqlite mutex poisoned");
+            let connection = self.connection.lock();
             let tx = match connection.unchecked_transaction() {
                 Ok(tx) => tx,
                 Err(_) => return None,
@@ -1049,7 +1056,7 @@ impl PersistenceService {
     }
 
     pub async fn list_archived_session_summaries(&self) -> Vec<SessionSummary> {
-        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let connection = self.connection.lock();
         let mut stmt = match connection.prepare(
             "SELECT session_id, provider, status, created_at, updated_at,
                     turn_count, model, project_id
@@ -1424,7 +1431,7 @@ mod tests {
             "features":{}
         }"#;
         {
-            let connection = service.connection.lock().unwrap();
+            let connection = service.connection.lock();
             connection
                 .execute(
                     "INSERT INTO provider_health_cache (provider, checked_at, status_json)
@@ -1486,7 +1493,7 @@ mod tests {
         // (stripped on write), proving the on-disk row never
         // becomes the source of truth.
         let raw_json: String = {
-            let connection = service.connection.lock().unwrap();
+            let connection = service.connection.lock();
             connection
                 .query_row(
                     "SELECT status_json FROM provider_health_cache WHERE provider = 'claude'",

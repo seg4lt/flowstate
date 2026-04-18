@@ -1,11 +1,13 @@
+pub mod session_ops;
 pub mod transport;
+
+pub use session_ops::OrchestrationService;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use tokio::sync::{Mutex, broadcast};
-use zenui_orchestration::OrchestrationService;
 use zenui_persistence::{FileCheckpointStore, PersistenceService};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
@@ -2507,7 +2509,7 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use zenui_orchestration::OrchestrationService;
+    use crate::session_ops::OrchestrationService;
     use zenui_persistence::PersistenceService;
     use zenui_provider_api::{
         ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind,
