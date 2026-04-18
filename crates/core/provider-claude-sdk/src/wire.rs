@@ -1,0 +1,433 @@
+//! TS-bridge wire protocol: request/response envelopes plus parser
+//! helpers for the Claude SDK's JSON shapes (permission decisions,
+//! compact triggers, user-question tool inputs).
+//!
+//! Extracted from `lib.rs` in the phase 3 god-file split. Process
+//! handling lives in `process.rs`; RPC types in `rpc.rs`; streaming
+//! event translation in `stream.rs`.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use zenui_provider_api::{
+    PermissionDecision, PermissionMode, ProviderModel, UserInputAnswer, UserInputQuestion,
+};
+
+use crate::rpc::BridgeRpcKind;
+
+/// Result of asking the user a question: either they answered or dismissed.
+/// Carried over the writer-task channel so the bridge can be told which
+/// BridgeRequest to emit.
+pub(crate) enum QuestionOutcome {
+    Answered(Vec<UserInputAnswer>),
+    Cancelled,
+}
+
+/// Wire-shape image attachment passed through to the TS bridge. Mirrors
+/// `zenui_provider_api::ImageAttachment` minus the optional display
+/// `name` (the bridge doesn't need it).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BridgeImageAttachment {
+    pub(crate) media_type: String,
+    pub(crate) data_base64: String,
+}
+
+/// Shape of a single slash command in a `capabilities` response.
+/// Mirrors the Claude Agent SDK's `SlashCommand` type (camelCase on
+/// the wire).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BridgeCommand {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: String,
+    #[serde(default)]
+    pub(crate) argument_hint: Option<String>,
+}
+
+/// Shape of a sub-agent in a `capabilities` response. Mirrors the SDK's
+/// `AgentInfo`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BridgeAgent {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) model: Option<String>,
+}
+
+/// Shape of an MCP server in a `capabilities` response. Subset of the
+/// SDK's `McpServerStatus` — we only need name + connection state for
+/// the `McpServerInfo` wire type.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BridgeMcpServer {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) scope: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub(crate) enum BridgeRequest {
+    #[serde(rename = "create_session")]
+    CreateSession {
+        cwd: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Persisted Claude SDK session id from a prior turn. When present the
+        /// bridge hydrates `resumeSessionId` before the next send_prompt, so a
+        /// zenui restart or bridge crash recovers the conversation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resume_session_id: Option<String>,
+    },
+    #[serde(rename = "send_prompt")]
+    SendPrompt {
+        prompt: String,
+        permission_mode: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        /// Multimodal image attachments. When non-empty the TS bridge
+        /// switches to the `query({ prompt: AsyncIterable, … })` form
+        /// and builds a user message whose `content` array carries
+        /// text + base64 image blocks.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<BridgeImageAttachment>,
+        /// Per-session steering text the user wrote in
+        /// "Session settings → Compaction priorities". When present the
+        /// bridge builds the SDK Options' system prompt as
+        /// `{ type: 'preset', preset: 'claude_code', append: <wrapped text> }`
+        /// so the model honors it whenever it summarises older turns
+        /// during compaction. Cleared by an empty string at the
+        /// runtime-core layer; absent here means "use the default
+        /// preset, no append".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compact_custom_instructions: Option<String>,
+    },
+    #[serde(rename = "answer_permission")]
+    AnswerPermission {
+        request_id: String,
+        decision: String,
+        /// Optional mode change to bundle with the approval. The bridge
+        /// includes this in the SDK `PermissionResult`'s
+        /// `updatedPermissions` so the SDK applies the mode AS PART OF
+        /// accepting the tool call. This is the only path that makes
+        /// the model continue executing in the new mode within the
+        /// same turn — `set_permission_mode` alone is not enough when
+        /// the active turn is `ExitPlanMode`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+    },
+    #[serde(rename = "answer_question")]
+    AnswerQuestion {
+        request_id: String,
+        answers: Vec<UserInputAnswer>,
+    },
+    #[serde(rename = "cancel_question")]
+    CancelQuestion { request_id: String },
+    #[serde(rename = "list_models")]
+    ListModels,
+    /// Enumerate the slash commands, sub-agents, and MCP servers the
+    /// SDK exposes for `cwd`. Bridge spawns a throwaway `query()` with
+    /// a noop prompt, reads the cached init response, and aborts —
+    /// no actual API call. Fired from
+    /// [`ProviderAdapter::session_command_catalog`] and safe to call
+    /// on every popup open.
+    #[serde(rename = "list_capabilities")]
+    ListCapabilities {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    #[serde(rename = "interrupt")]
+    Interrupt,
+    /// Mid-turn permission-mode switch. Bridge calls
+    /// `query.setPermissionMode(...)` on the in-flight SDK Query, which
+    /// applies to the rest of the current turn (and subsequent turns
+    /// until changed again).
+    #[serde(rename = "set_permission_mode")]
+    SetPermissionMode { permission_mode: String },
+    /// Mid-session model switch. Updates `this.model` on the TS bridge
+    /// so that the next `query()` call uses the new model. No-op if no
+    /// bridge exists yet — the runtime will pick up the new model from
+    /// the session summary on the next `ensure_session_process`.
+    #[serde(rename = "set_model")]
+    SetModel { model: String },
+    /// Request a per-category context breakdown from the live SDK
+    /// Query. The bridge calls `query.getContextUsage()` and
+    /// replies with `BridgeResponse::RpcResponse { request_id,
+    /// kind: 'context_usage', payload | error }`. `request_id` is
+    /// client-generated (UUID) so the caller can route the
+    /// response through the pending-RPC map even when multiple
+    /// RPCs are interleaved with the turn's stream events.
+    #[serde(rename = "get_context_usage")]
+    GetContextUsage { request_id: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+pub(crate) enum BridgeResponse {
+    #[serde(rename = "ready")]
+    Ready,
+    #[serde(rename = "session_created")]
+    SessionCreated { session_id: String },
+    #[serde(rename = "models")]
+    Models { models: Vec<ProviderModel> },
+    /// Response to `BridgeRequest::ListCapabilities`. Carries the
+    /// SDK-reported slash commands, sub-agents, and MCP servers for
+    /// a given cwd. Descriptions come straight from the SDK so the
+    /// popup renders them as-is; the adapter only adds stable ids.
+    #[serde(rename = "capabilities")]
+    Capabilities {
+        #[serde(default)]
+        commands: Vec<BridgeCommand>,
+        #[serde(default)]
+        agents: Vec<BridgeAgent>,
+        #[serde(default)]
+        mcp_servers: Vec<BridgeMcpServer>,
+    },
+    #[serde(rename = "response")]
+    Response {
+        output: String,
+        /// Claude SDK session id captured from the init/result messages in the
+        /// bridge. Round-tripped back to the Rust side so we can persist it on
+        /// `session.provider_state.native_thread_id` and resume on the next turn.
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    #[serde(rename = "interrupted")]
+    #[allow(dead_code)]
+    Interrupted,
+    /// Ack emitted by the bridge after `query.setPermissionMode(...)` resolves.
+    /// Fire-and-forget on the Rust side: nothing awaits this, we just need a
+    /// variant so serde doesn't fail the whole turn on an unknown `type`.
+    #[serde(rename = "permission_mode_set")]
+    #[allow(dead_code)]
+    PermissionModeSet { mode: String },
+    /// Response to a mid-turn RPC request. `request_id` is echoed
+    /// from the originating `BridgeRequest`, `kind` names which RPC
+    /// this is the response to, and exactly one of `payload` /
+    /// `error` is populated. Drain-loop looks up `request_id` in the
+    /// session's `pending_rpcs` map and forwards the response
+    /// through the registered oneshot.
+    #[serde(rename = "rpc_response")]
+    RpcResponse {
+        request_id: String,
+        kind: BridgeRpcKind,
+        #[serde(default)]
+        payload: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    #[serde(rename = "error")]
+    Error { error: String },
+    /// Streaming event emitted during send_prompt.
+    #[serde(rename = "stream")]
+    Stream {
+        event: String,
+        #[serde(default)]
+        delta: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        args: Option<Value>,
+        #[serde(default)]
+        output: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        tool_name: Option<String>,
+        #[serde(default)]
+        input: Option<Value>,
+        #[serde(default)]
+        suggested: Option<String>,
+        #[serde(default)]
+        question: Option<String>,
+        #[serde(default)]
+        questions: Option<Value>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        operation: Option<String>,
+        #[serde(default)]
+        before: Option<String>,
+        #[serde(default)]
+        after: Option<String>,
+        #[serde(default)]
+        parent_call_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default)]
+        agent_type: Option<String>,
+        #[serde(default)]
+        prompt: Option<String>,
+        #[serde(default)]
+        plan_id: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        steps: Option<Value>,
+        #[serde(default)]
+        raw: Option<String>,
+        #[serde(default)]
+        nested_event: Option<Value>,
+        #[serde(default)]
+        usage: Option<Value>,
+        #[serde(default)]
+        rate_limit_info: Option<Value>,
+        /// Populated on `model_resolved` events. Carries the pinned
+        /// model id the SDK settled on for the current turn (e.g.
+        /// `claude-sonnet-4-5-20250929`), which may differ from the
+        /// alias the adapter originally asked for (`sonnet`).
+        #[serde(default)]
+        model: Option<String>,
+        /// Populated on `compact_boundary` / `compact_summary`.
+        /// Kept as free-form Value so the adapter can parse the
+        /// structured payload (trigger, token counts, summary text)
+        /// without bloating this struct with six more flat fields.
+        #[serde(default)]
+        trigger: Option<String>,
+        #[serde(default)]
+        pre_tokens: Option<u64>,
+        #[serde(default)]
+        post_tokens: Option<u64>,
+        #[serde(default)]
+        duration_ms: Option<u64>,
+        #[serde(default)]
+        summary: Option<String>,
+        /// Populated on `memory_recall`. `mode` is `'select' |
+        /// 'synthesize'`; `memories` is the raw array the SDK
+        /// surfaced (path / scope / optional content per entry).
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default)]
+        memories: Option<Value>,
+        /// Populated on `turn_status`. Bridge maps the SDK's
+        /// `status: compacting | requesting | null` to our coarse
+        /// phase strings (`idle | requesting | streaming |
+        /// compacting | awaiting_input`).
+        #[serde(default)]
+        phase: Option<String>,
+        /// Populated on `api_retry` events.
+        #[serde(default)]
+        attempt: Option<u32>,
+        #[serde(default)]
+        max_retries: Option<u32>,
+        #[serde(default)]
+        retry_delay_ms: Option<u64>,
+        #[serde(default)]
+        error_status: Option<u16>,
+        /// Populated on `prompt_suggestion` events — the SDK's
+        /// predicted next user prompt.
+        #[serde(default)]
+        suggestion: Option<String>,
+        /// Populated on `tool_progress` events. Seconds since the
+        /// SDK started the tool call; mirrored for display only —
+        /// the frontend's stalled-tool detector relies on
+        /// `occurred_at` for freshness, not this field.
+        #[serde(default)]
+        elapsed_time_seconds: Option<f64>,
+        /// Populated on `tool_progress` events. ISO 8601 timestamp
+        /// stamped by the bridge at the moment the SDK's heartbeat
+        /// arrived. The runtime stores this as
+        /// `ToolCall::last_progress_at` so the stalled-tool pip
+        /// can compare against wall time.
+        #[serde(default)]
+        occurred_at: Option<String>,
+    },
+}
+
+pub(crate) fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::Bypass => "bypassPermissions",
+        // The Claude Agent SDK exposes `'auto'` as a sixth
+        // PermissionMode where a built-in model classifier decides
+        // which tool calls to auto-approve vs escalate to
+        // `canUseTool`. See sdk.d.ts PermissionMode union, v0.2.112+.
+        PermissionMode::Auto => "auto",
+    }
+}
+
+pub(crate) fn permission_decision_to_str(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "allow",
+        PermissionDecision::AllowAlways => "allow_always",
+        PermissionDecision::Deny => "deny",
+        PermissionDecision::DenyAlways => "deny_always",
+    }
+}
+
+pub(crate) fn parse_decision(value: &str) -> PermissionDecision {
+    match value {
+        "allow_always" => PermissionDecision::AllowAlways,
+        "deny" => PermissionDecision::Deny,
+        "deny_always" => PermissionDecision::DenyAlways,
+        _ => PermissionDecision::Allow,
+    }
+}
+
+pub(crate) fn parse_compact_trigger(value: Option<&str>) -> zenui_provider_api::CompactTrigger {
+    match value {
+        Some("manual") => zenui_provider_api::CompactTrigger::Manual,
+        _ => zenui_provider_api::CompactTrigger::Auto,
+    }
+}
+
+/// Parse Claude SDK's `AskUserQuestion` tool input into zenui's cross-provider
+/// question list. Claude's shape is
+/// `{ questions: [{ question, header, options: [{label, description}], multiSelect }] }`,
+/// per https://code.claude.com/docs/en/agent-sdk/user-input. Question ids are
+/// synthesized as `q{i}` (matching the Claude-CLI adapter) and option ids are
+/// `q{i}_opt{j}` via the shared `parse_options_from_value` helper. The bridge's
+/// `answerQuestion` strips the `q` prefix to recover the original question
+/// index and look up the text Claude expects as the `updatedInput.answers`
+/// map key.
+pub(crate) fn parse_claude_questions(raw: Option<&Value>) -> Vec<UserInputQuestion> {
+    let Some(array) = raw.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    array
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            let id = format!("q{i}");
+            let options = zenui_provider_api::parse_options_from_value(q.get("options"), &id);
+            UserInputQuestion {
+                id,
+                text: q
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                header: q.get("header").and_then(Value::as_str).map(str::to_string),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                // Claude docs: no explicit allowFreeform flag; the client may always
+                // accept a free-form answer by passing the user's typed text as the value.
+                allow_freeform: true,
+                is_secret: false,
+            }
+        })
+        .collect()
+}

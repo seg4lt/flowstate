@@ -1,14 +1,16 @@
 mod bridge_runtime;
+mod config;
+mod process;
+mod wire;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
@@ -19,219 +21,16 @@ use zenui_provider_api::{
     UserInputQuestion, session_cwd, skills_disk,
 };
 
-const BRIDGE_TIMEOUT_MS: u64 = 120_000;
+use crate::config::copilot_models;
+use crate::process::{
+    BRIDGE_IDLE_TIMEOUT_SECS, BRIDGE_WATCHDOG_INTERVAL_SECS, BRIDGE_TIMEOUT_MS, CachedBridge,
+    CopilotBridgeProcess, write_request,
+};
+use crate::wire::{
+    BridgeCopilotAgent, BridgeCopilotMcp, BridgeRequest, BridgeResponse, BridgeSkill,
+    UserInputOutcome, parse_decision, permission_decision_to_str, permission_mode_to_str,
+};
 
-/// Result of asking the user a question: either they picked / typed, or
-/// dismissed the dialog. Carried over the writer-task channel so the bridge
-/// knows whether to send AnswerUserInput or CancelUserInput.
-enum UserInputOutcome {
-    Answered { answer: String, was_freeform: bool },
-    Cancelled,
-}
-
-/// Bridge process wrapper for GitHub Copilot SDK
-#[derive(Debug)]
-struct CopilotBridgeProcess {
-    child: Child,
-    // Wrapped in Arc<Mutex> so a background writer task can forward
-    // permission/user-input answers back to the bridge concurrently with the
-    // main read loop. Mirrors the pattern in provider-claude-sdk/src/lib.rs.
-    stdin: Arc<Mutex<ChildStdin>>,
-    stdout: Lines<BufReader<ChildStdout>>,
-    bridge_session_id: String,
-}
-
-/// Idle timeout: a cached bridge with no in-flight turn is killed after
-/// this many seconds of inactivity.
-const BRIDGE_IDLE_TIMEOUT_SECS: u64 = 120;
-/// Watchdog tick interval. Determines the worst-case delay between a
-/// bridge crossing the idle threshold and actually being killed.
-const BRIDGE_WATCHDOG_INTERVAL_SECS: u64 = 30;
-
-/// Alias for the shared `ProcessCache` entry type. Each cached entry
-/// wraps a long-lived Copilot bridge child along with the atomics the
-/// idle-kill watchdog reads; see `zenui_provider_api::process_cache`.
-type CachedBridge = zenui_provider_api::CachedProcess<CopilotBridgeProcess>;
-
-/// Wire shape of one skill inside a `capabilities` response. Mirrors
-/// the Copilot SDK's `SessionSkillsListResult.skills[]` entry.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeSkill {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    source: String,
-    #[serde(default)]
-    user_invocable: bool,
-    #[serde(default)]
-    #[allow(dead_code)]
-    enabled: bool,
-}
-
-/// Wire shape of one sub-agent inside a `capabilities` response.
-/// Mirrors `SessionAgentListResult.agents[]`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeCopilotAgent {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    display_name: Option<String>,
-}
-
-/// Wire shape of one MCP server inside a `capabilities` response.
-/// Mirrors `SessionMcpListResult.servers[]`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeCopilotMcp {
-    name: String,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    source: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    error: Option<String>,
-}
-
-/// ZenUI Bridge Protocol Messages (Rust → TS)
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-enum BridgeRequest {
-    #[serde(rename = "create_session")]
-    CreateSession {
-        cwd: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model: Option<String>,
-        /// When `Some`, the bridge calls `client.resumeSession(id, …)`
-        /// and only falls back to a fresh create if the SDK rejects the
-        /// resume (session expired, deleted, or the upstream Copilot CLI
-        /// doesn't recognise it). Sourced from
-        /// `session.provider_state.native_thread_id`, which we stamp
-        /// after the first successful turn.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        resume_session_id: Option<String>,
-    },
-    #[serde(rename = "send_prompt")]
-    SendPrompt {
-        prompt: String,
-        permission_mode: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reasoning_effort: Option<String>,
-    },
-    #[serde(rename = "answer_permission")]
-    AnswerPermission {
-        request_id: String,
-        decision: String,
-    },
-    #[serde(rename = "answer_user_input")]
-    AnswerUserInput {
-        request_id: String,
-        answer: String,
-        was_freeform: bool,
-    },
-    #[serde(rename = "cancel_user_input")]
-    CancelUserInput { request_id: String },
-    #[serde(rename = "list_models")]
-    ListModels,
-    /// Enumerate the session's Copilot skills, sub-agents, and MCP
-    /// servers by calling `session.rpc.{skills,agent,mcp}.list()` in
-    /// the bridge. Requires a live session — callers must go through
-    /// `ensure_session_process` first. Fired from
-    /// [`ProviderAdapter::session_command_catalog`] on popup open.
-    #[serde(rename = "list_capabilities")]
-    ListCapabilities,
-    #[serde(rename = "interrupt")]
-    Interrupt,
-}
-
-/// ZenUI Bridge Protocol Messages (TS → Rust)
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-enum BridgeResponse {
-    #[serde(rename = "ready")]
-    Ready,
-    #[serde(rename = "session_created")]
-    SessionCreated { session_id: String },
-    #[serde(rename = "models")]
-    Models { models: Vec<ProviderModel> },
-    /// Response to `BridgeRequest::ListCapabilities`. Skills come with
-    /// the SDK's `userInvocable` flag preserved — the frontend filters
-    /// `!user_invocable` entries out of the popup in
-    /// `mergeCommandsWithCatalog`, so the wire stays rich enough for
-    /// future surfaces (e.g. a Settings pane) to inspect the complete
-    /// set.
-    #[serde(rename = "capabilities")]
-    Capabilities {
-        #[serde(default)]
-        skills: Vec<BridgeSkill>,
-        #[serde(default)]
-        agents: Vec<BridgeCopilotAgent>,
-        #[serde(default)]
-        mcp_servers: Vec<BridgeCopilotMcp>,
-    },
-    #[serde(rename = "response")]
-    Response { output: String },
-    #[serde(rename = "interrupted")]
-    #[allow(dead_code)]
-    Interrupted,
-    #[serde(rename = "error")]
-    Error { error: String },
-    /// Streaming event emitted during send_prompt.
-    #[serde(rename = "stream")]
-    Stream {
-        event: String,
-        #[serde(default)]
-        delta: Option<String>,
-        #[serde(default)]
-        call_id: Option<String>,
-        #[serde(default)]
-        name: Option<String>,
-        #[serde(default)]
-        args: Option<serde_json::Value>,
-        #[serde(default)]
-        output: Option<String>,
-        #[serde(default)]
-        error: Option<String>,
-        #[serde(default)]
-        message: Option<String>,
-        // Round-trip / plan-mode fields
-        #[serde(default)]
-        request_id: Option<String>,
-        #[serde(default)]
-        tool_name: Option<String>,
-        #[serde(default)]
-        input: Option<serde_json::Value>,
-        #[serde(default)]
-        suggested: Option<String>,
-        #[serde(default)]
-        question: Option<String>,
-        #[serde(default)]
-        choices: Option<Vec<String>>,
-        #[serde(default)]
-        allow_freeform: Option<bool>,
-        #[serde(default)]
-        plan_id: Option<String>,
-        #[serde(default)]
-        title: Option<String>,
-        #[serde(default)]
-        steps: Option<serde_json::Value>,
-        #[serde(default)]
-        raw: Option<String>,
-        #[serde(default)]
-        usage: Option<serde_json::Value>,
-        #[serde(default)]
-        rate_limit_info: Option<serde_json::Value>,
-    },
-}
-
-/// GitHub Copilot Provider Adapter
 #[derive(Clone)]
 pub struct GitHubCopilotAdapter {
     working_directory: PathBuf,
@@ -724,30 +523,6 @@ impl GitHubCopilotAdapter {
     }
 }
 
-impl CopilotBridgeProcess {
-    async fn read_response(&mut self) -> Result<BridgeResponse, String> {
-        loop {
-            match self.stdout.next_line().await {
-                Ok(Some(line)) => {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    debug!("Bridge output: {}", line);
-                    return serde_json::from_str(line)
-                        .map_err(|e| format!("Failed to parse bridge response '{line}': {e}"));
-                }
-                Ok(None) => {
-                    return Err("Bridge process closed stdout".to_string());
-                }
-                Err(e) => {
-                    return Err(format!("Failed to read from bridge: {e}"));
-                }
-            }
-        }
-    }
-}
-
 #[async_trait]
 impl ProviderAdapter for GitHubCopilotAdapter {
     fn kind(&self) -> ProviderKind {
@@ -1086,95 +861,4 @@ impl GitHubCopilotAdapter {
             )),
         }
     }
-}
-
-async fn write_request(
-    stdin: &Arc<Mutex<ChildStdin>>,
-    request: &BridgeRequest,
-) -> Result<(), String> {
-    let json = serde_json::to_string(request)
-        .map_err(|e| format!("Failed to serialize bridge request: {e}"))?;
-    let mut guard = stdin.lock().await;
-    guard
-        .write_all(json.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to write to bridge: {e}"))?;
-    guard
-        .write_all(b"\n")
-        .await
-        .map_err(|e| format!("Failed to write to bridge: {e}"))?;
-    guard
-        .flush()
-        .await
-        .map_err(|e| format!("Failed to flush bridge stdin: {e}"))
-}
-
-fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Default => "default",
-        PermissionMode::AcceptEdits => "accept_edits",
-        PermissionMode::Plan => "plan",
-        PermissionMode::Bypass => "bypass",
-        // Copilot has no model-classifier permission mode; the UI
-        // gates the "Auto" option on `supports_auto_permission_mode`
-        // so this arm is defensive. Fall back to the neutral default.
-        PermissionMode::Auto => "default",
-    }
-}
-
-fn permission_decision_to_str(decision: PermissionDecision) -> &'static str {
-    match decision {
-        PermissionDecision::Allow => "allow",
-        PermissionDecision::AllowAlways => "allow_always",
-        PermissionDecision::Deny => "deny",
-        PermissionDecision::DenyAlways => "deny_always",
-    }
-}
-
-fn parse_decision(value: &str) -> PermissionDecision {
-    match value {
-        "allow_always" => PermissionDecision::AllowAlways,
-        "deny" => PermissionDecision::Deny,
-        "deny_always" => PermissionDecision::DenyAlways,
-        _ => PermissionDecision::Allow,
-    }
-}
-
-fn copilot_models() -> Vec<ProviderModel> {
-    // Fallback capability values used only when the live
-    // `listModels()` call fails or returns an empty list. Live
-    // responses beat these via `fetch_models` (which now carries
-    // `context_window` / `max_output_tokens` straight through from
-    // the Copilot SDK's ModelCapabilities.limits). Numbers follow
-    // each vendor's public model cards.
-    vec![
-        ProviderModel {
-            value: "gpt-4.1".to_string(),
-            label: "GPT-4.1".to_string(),
-            context_window: Some(1_047_576),
-            max_output_tokens: Some(32_768),
-            ..ProviderModel::default()
-        },
-        ProviderModel {
-            value: "gpt-4o".to_string(),
-            label: "GPT-4o".to_string(),
-            context_window: Some(128_000),
-            max_output_tokens: Some(16_384),
-            ..ProviderModel::default()
-        },
-        ProviderModel {
-            value: "gpt-5".to_string(),
-            label: "GPT-5".to_string(),
-            context_window: Some(400_000),
-            max_output_tokens: Some(128_000),
-            ..ProviderModel::default()
-        },
-        ProviderModel {
-            value: "claude-sonnet-4-5".to_string(),
-            label: "Claude Sonnet 4.5".to_string(),
-            context_window: Some(200_000),
-            max_output_tokens: Some(64_000),
-            ..ProviderModel::default()
-        },
-    ]
 }
