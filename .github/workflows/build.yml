@@ -21,11 +21,17 @@ jobs:
             tauri-args: --target aarch64-apple-darwin
             bundle-subpath: aarch64-apple-darwin/release/bundle
 
-          - name: windows-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-            tauri-args: ""
-            bundle-subpath: release/bundle
+          # Windows build paused — uncomment to re-enable. Keeps
+          # the matrix entry side-by-side with the macOS one so
+          # diffs stay tight. When re-enabling, also un-comment the
+          # "Enable long paths (Windows)" step, the WIN_SIG read +
+          # windows-x86_64 block in "Generate updater manifest",
+          # and the Windows rows in the release body below.
+          # - name: windows-x64
+          #   runner: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   tauri-args: ""
+          #   bundle-subpath: release/bundle
 
           # - name: linux-x64
           #   runner: ubuntu-22.04
@@ -40,9 +46,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enable long paths (Windows)
-        if: runner.os == 'Windows'
-        run: git config --system core.longpaths true
+      # - name: Enable long paths (Windows)
+      #   if: runner.os == 'Windows'
+      #   run: git config --system core.longpaths true
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -211,7 +217,8 @@ jobs:
           # scheme is deterministic from tag + filename, so we can
           # precompute them here.
           MAC_SIG="$(cat "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz.sig")"
-          WIN_SIG="$(cat "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig")"
+          # Windows build paused — re-add when the matrix entry comes back:
+          # WIN_SIG="$(cat "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig")"
 
           cat > release-assets/latest.json <<EOF
           {
@@ -222,14 +229,16 @@ jobs:
               "darwin-aarch64": {
                 "signature": "${MAC_SIG}",
                 "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-macos-arm64.app.tar.gz"
-              },
-              "windows-x86_64": {
-                "signature": "${WIN_SIG}",
-                "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-windows-x64-setup.exe"
               }
             }
           }
           EOF
+          # When Windows comes back, add a comma after the
+          # darwin-aarch64 block above and insert:
+          #   "windows-x86_64": {
+          #     "signature": "${WIN_SIG}",
+          #     "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-windows-x64-setup.exe"
+          #   }
 
           echo "--- latest.json ---"
           cat release-assets/latest.json
@@ -249,16 +258,20 @@ jobs:
             | Platform | File |
             |----------|------|
             | macOS (Apple Silicon) | `Flowstate-${{ github.ref_name }}-macos-arm64.dmg` |
+            <!-- Windows build paused. When re-enabling, add back:
             | Windows (x64) MSI | `Flowstate-${{ github.ref_name }}-windows-x64.msi` |
             | Windows (x64) Setup | `Flowstate-${{ github.ref_name }}-windows-x64-setup.exe` |
+            -->
 
             ### macOS Installation
             1. Download the `.dmg` file
             2. Open it and double-click "Install Flowstate.command"
             3. This installs to /Applications and clears the quarantine flag
 
+            <!-- Windows build paused. When re-enabling, add back:
             ### Windows Installation
             Download either the `.msi` (standard Windows Installer) or the `-setup.exe` (NSIS installer).
+            -->
 
             ### Auto-updates
             Existing installs will see this version via the in-app
