@@ -1451,6 +1451,31 @@ pub enum RuntimeEvent {
         turn_id: String,
         phase: TurnPhase,
     },
+    /// Incremental token-usage snapshot for the in-flight turn.
+    /// Fires on every provider-level usage update — for the Claude
+    /// Agent SDK that's once per assistant message (per API call in
+    /// the turn's tool loop), plus a final update at result time
+    /// carrying cost and duration.
+    ///
+    /// The numerator fields (`input_tokens`, `cache_read_tokens`,
+    /// `cache_write_tokens`) reflect the LATEST API call, not a sum
+    /// across the turn. Summing cache reads across a long tool loop
+    /// inflates the value far past the context window (each call
+    /// re-reads the same cached prompt), which is how we used to
+    /// render "51M / 1M" on long turns. `output_tokens` is the
+    /// running sum for the turn since each call only reports its
+    /// own output slice.
+    ///
+    /// Clients that render a live context indicator should replace
+    /// the in-flight turn's `usage` with this payload and re-derive
+    /// the display; the final `TurnCompleted.turn.usage` carries
+    /// the same values with `total_cost_usd` / `duration_ms`
+    /// populated.
+    TurnUsageUpdated {
+        session_id: String,
+        turn_id: String,
+        usage: TokenUsage,
+    },
     /// Provider-level auto-retry in progress. Drives the banner
     /// that appears above the composer; cleared on the next
     /// assistant text delta or turn completion.

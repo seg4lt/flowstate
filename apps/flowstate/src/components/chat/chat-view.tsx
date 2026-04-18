@@ -369,6 +369,18 @@ function applyEventToTurns(
           ),
         };
       });
+    // Incremental usage snapshots land on the in-flight turn so the
+    // ContextDisplay popover updates as each API call in the turn's
+    // tool loop completes. Without this, `turn.usage` only gets set
+    // on `turn_completed` — on an 11-minute turn that means 11
+    // minutes of a frozen numerator. See provider-claude-sdk bridge
+    // which now emits `turn_usage` per assistant message carrying
+    // the LATEST call's input/cache (not the aggregated sum that
+    // inflated the display past the window).
+    case "turn_usage_updated":
+      return prev.map((t) =>
+        t.turnId === event.turn_id ? { ...t, usage: event.usage } : t,
+      );
     default:
       return prev;
   }
