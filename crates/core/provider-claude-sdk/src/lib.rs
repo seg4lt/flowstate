@@ -1431,7 +1431,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
     async fn health(&self) -> ProviderStatus {
         let kind = ProviderKind::Claude;
         let label = kind.label();
-        let features = claude_sdk_features();
+        let features = zenui_provider_api::features_for_kind(ProviderKind::Claude);
 
         // The embedded Node.js runtime and SDK bridge both live in the
         // binary itself; the health check just confirms we can extract
@@ -2244,80 +2244,6 @@ fn read_compact_custom_instructions(
         None
     } else {
         Some(trimmed.to_string())
-    }
-}
-
-/// Feature flags the Claude Agent SDK bridge supports today. Keep in
-/// lockstep with the `ProviderFeatures` fields wired by this adapter;
-/// each flag flips to `true` only when both halves of the pipeline
-/// (bridge emission + runtime-core forwarding + frontend consumer)
-/// are actually wired. Setting a flag true before the wire lands
-/// would show UI affordances that silently do nothing.
-fn claude_sdk_features() -> zenui_provider_api::ProviderFeatures {
-    zenui_provider_api::ProviderFeatures {
-        // Commit 1: thinking config replaces maxThinkingTokens.
-        thinking_effort: true,
-
-        // Commit 2: turn-phase labels + API-retry banner. The
-        // basic tool-elapsed counter is driven by the cross-
-        // provider `ToolCall::started_at` field and ships
-        // unconditionally; `tool_progress` is the SDK's per-tool
-        // heartbeat that drives the *stalled-tool* pip (and
-        // demotes the session-wide stuck banner to a fallback).
-        status_labels: true,
-        api_retries: true,
-        tool_progress: true,
-
-        // Commit 3: ghost-text prompt suggestions via the SDK's
-        // `promptSuggestions: true` option + `prompt_suggestion`
-        // messages.
-        prompt_suggestions: true,
-
-        // Commit 4: SessionStart / SessionEnd hooks surface as
-        // `Info` events in the daemon log for diagnostics. Purely
-        // observational; no UI surface today.
-        session_lifecycle_events: true,
-
-        // Mid-turn RPC commit: context-breakdown popover is live
-        // via the pending-RPC dispatch infrastructure in
-        // `CachedBridge.pending_rpcs` + `run_turn`'s drain loop
-        // arm for `BridgeResponse::RpcResponse`. Only functional
-        // during an active turn; the UI already gates on
-        // `isRunning` alongside this flag.
-        context_breakdown: true,
-
-        // The SDK's `'auto'` permission mode routes each tool call
-        // through its own model classifier before falling back to
-        // our `canUseTool` callback. The bridge forwards
-        // `PermissionMode::Auto` straight through to the SDK and
-        // leaves `canUseTool` untouched for classifier-escalated
-        // calls — see the `permissionMode === 'auto'` note in
-        // bridge/src/index.ts::sendPrompt.
-        supports_auto_permission_mode: true,
-
-        // Per-session "Compaction priorities" textarea. Stored in
-        // `provider_state.metadata.compactCustomInstructions`,
-        // wrapped at the bridge into the SDK's
-        // `systemPrompt: { preset: 'claude_code', append: ... }`
-        // shape so the model honors it during compaction. SDK
-        // 0.2.112's PreCompact hook is read-only, so this is the
-        // supported steering surface — see the bridge's Options
-        // construction for the exact wrapping.
-        compact_custom_instructions: true,
-
-        // Per-user-message "Revert file changes since here" action.
-        // Implemented natively in runtime-core by walking the
-        // persisted `FileChangeRecord.before` snapshots — no SDK
-        // round-trip required, so the action works between turns
-        // and after a daemon restart. (The SDK's own
-        // `Query.rewindFiles()` is also available behind
-        // `enableFileCheckpointing: true`, but adding that path
-        // would force every session to pay the SDK's checkpoint
-        // disk overhead just to enable the same UX we already get
-        // for free.)
-        file_checkpoints: true,
-
-        ..zenui_provider_api::ProviderFeatures::default()
     }
 }
 

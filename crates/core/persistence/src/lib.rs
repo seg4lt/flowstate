@@ -526,6 +526,10 @@ impl PersistenceService {
 
     /// Returns the cached health status for a provider along with the ISO-8601
     /// timestamp it was checked at, or None if no entry exists.
+    ///
+    /// The `features` field on the returned status is always overwritten
+    /// from `zenui_provider_api::features_for_kind` — it is not a
+    /// persisted value. See `set_cached_health` for the rationale.
     pub async fn get_cached_health(
         &self,
         kind: ProviderKind,
@@ -547,7 +551,17 @@ impl PersistenceService {
             .and_then(|(checked_at, json)| {
                 serde_json::from_str::<ProviderStatus>(&json)
                     .ok()
-                    .map(|status| (checked_at, status))
+                    .map(|mut status| {
+                        // Features are code-derived; never trust the
+                        // value that came out of the JSON column. A row
+                        // written by an older daemon build is missing
+                        // any flag added since, and `#[serde(default)]`
+                        // silently defaults it to `false`. Recomputing
+                        // here makes that impossible.
+                        status.features =
+                            zenui_provider_api::features_for_kind(status.kind);
+                        (checked_at, status)
+                    })
             })
     }
 
@@ -592,8 +606,18 @@ impl PersistenceService {
     }
 
     /// Persist the health status for a provider with `now` as the checked_at timestamp.
+    ///
+    /// The `features` field is intentionally **not** persisted — it's a
+    /// pure function of the provider kind and the daemon build, so
+    /// caching it would let an older row serve stale capability flags
+    /// to a newer daemon (e.g. a row written before a new flag existed
+    /// reads back with that flag defaulted to `false`). We zero the
+    /// field before serialising; `get_cached_health` repopulates it
+    /// from `zenui_provider_api::features_for_kind` on every read.
     pub async fn set_cached_health(&self, kind: ProviderKind, status: &ProviderStatus) {
-        let json = match serde_json::to_string(status) {
+        let mut to_store = status.clone();
+        to_store.features = zenui_provider_api::ProviderFeatures::default();
+        let json = match serde_json::to_string(&to_store) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -1342,5 +1366,127 @@ fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffort> {
         "xhigh" => Some(ReasoningEffort::Xhigh),
         "max" => Some(ReasoningEffort::Max),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zenui_provider_api::ProviderStatusLevel;
+
+    /// A row written by a daemon that predates a feature flag stores
+    /// `{}` (or an incomplete object) for `features`. After the fix,
+    /// `get_cached_health` must repopulate from
+    /// `features_for_kind(kind)` so the UI sees the current
+    /// capability set — not whatever the old daemon happened to know
+    /// about.
+    #[tokio::test]
+    async fn get_cached_health_recomputes_features_from_registry() {
+        let service = PersistenceService::in_memory().expect("in_memory service");
+
+        // Write a raw row simulating an old-daemon payload: empty
+        // features object, so every flag deserialises to its
+        // serde default (`false`).
+        let stale_json = r#"{
+            "kind":"claude",
+            "label":"Claude",
+            "installed":true,
+            "authenticated":true,
+            "version":null,
+            "status":"ready",
+            "message":null,
+            "models":[],
+            "enabled":true,
+            "features":{}
+        }"#;
+        {
+            let connection = service.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO provider_health_cache (provider, checked_at, status_json)
+                     VALUES (?1, ?2, ?3)",
+                    params!["claude", "2020-01-01T00:00:00Z", stale_json],
+                )
+                .unwrap();
+        }
+
+        let (_checked_at, status) = service
+            .get_cached_health(ProviderKind::Claude)
+            .await
+            .expect("cached row");
+
+        // Features come back from the registry even though the row
+        // had `features:{}` — this is the regression guard.
+        let expected = zenui_provider_api::features_for_kind(ProviderKind::Claude);
+        assert_eq!(
+            status.features, expected,
+            "features must be recomputed from the registry on read"
+        );
+        assert!(
+            status.features.supports_auto_permission_mode,
+            "claude should advertise auto permission mode"
+        );
+        assert!(
+            status.features.thinking_effort,
+            "claude should advertise thinking effort"
+        );
+    }
+
+    /// Round-trip: writing a status with specific features and
+    /// reading it back yields the registry's features (not the
+    /// caller's), because features are not the source of truth at
+    /// the persistence layer.
+    #[tokio::test]
+    async fn set_cached_health_does_not_persist_features() {
+        let service = PersistenceService::in_memory().expect("in_memory service");
+
+        // Caller passes a deliberately-wrong features value; the
+        // write path must ignore it.
+        let mut bogus_features = zenui_provider_api::ProviderFeatures::default();
+        bogus_features.thinking_effort = false; // wrong for Claude
+        let status = ProviderStatus {
+            kind: ProviderKind::Claude,
+            label: "Claude".into(),
+            installed: true,
+            authenticated: true,
+            version: None,
+            status: ProviderStatusLevel::Ready,
+            message: None,
+            models: Vec::new(),
+            enabled: true,
+            features: bogus_features,
+        };
+        service.set_cached_health(ProviderKind::Claude, &status).await;
+
+        // Confirm the persisted JSON carries default features
+        // (stripped on write), proving the on-disk row never
+        // becomes the source of truth.
+        let raw_json: String = {
+            let connection = service.connection.lock().unwrap();
+            connection
+                .query_row(
+                    "SELECT status_json FROM provider_health_cache WHERE provider = 'claude'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let persisted: ProviderStatus = serde_json::from_str(&raw_json).unwrap();
+        assert_eq!(
+            persisted.features,
+            zenui_provider_api::ProviderFeatures::default(),
+            "set_cached_health must strip features before writing"
+        );
+
+        // And the reader repopulates from the registry, so callers
+        // see a correct status regardless of what was written.
+        let (_checked_at, roundtripped) = service
+            .get_cached_health(ProviderKind::Claude)
+            .await
+            .expect("cached row");
+        assert_eq!(
+            roundtripped.features,
+            zenui_provider_api::features_for_kind(ProviderKind::Claude)
+        );
     }
 }

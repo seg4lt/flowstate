@@ -556,6 +556,102 @@ pub struct ProviderFeatures {
     pub supports_auto_permission_mode: bool,
 }
 
+/// Central registry mapping every `ProviderKind` to the capability
+/// flags its adapter supports. This is the single source of truth —
+/// adapters call it from `health()` and the persistence layer calls
+/// it when re-hydrating a cached `ProviderStatus`, so there is no
+/// path by which two copies of "what does Claude support?" can drift
+/// apart.
+///
+/// Features are **not persisted**. They're a pure function of the
+/// provider kind and the daemon build, so caching them would let an
+/// older row serve stale values to a newer daemon (e.g. a row written
+/// before a new flag existed reads back with the flag defaulted to
+/// `false`, even though the current code would return `true`). The
+/// `provider_health_cache` writer strips this field before writing
+/// and the reader repopulates it from this function.
+///
+/// Adding a new flag: flip it on here for the adapter that gained
+/// the capability, ship the daemon, done. No migration, no cache
+/// invalidation, no TTL wait.
+pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
+    match kind {
+        // The Claude Agent SDK bridge — everything we've wired end-
+        // to-end is on. Keep this block in lockstep with the bridge's
+        // actual emissions; a flag here promises a working surface.
+        ProviderKind::Claude => ProviderFeatures {
+            // Commit 1: thinking config replaces maxThinkingTokens.
+            thinking_effort: true,
+
+            // Commit 2: turn-phase labels + API-retry banner. The
+            // basic tool-elapsed counter is driven by the cross-
+            // provider `ToolCall::started_at` field and ships
+            // unconditionally; `tool_progress` is the SDK's per-tool
+            // heartbeat that drives the *stalled-tool* pip (and
+            // demotes the session-wide stuck banner to a fallback).
+            status_labels: true,
+            api_retries: true,
+            tool_progress: true,
+
+            // Commit 3: ghost-text prompt suggestions via the SDK's
+            // `promptSuggestions: true` option + `prompt_suggestion`
+            // messages.
+            prompt_suggestions: true,
+
+            // Commit 4: SessionStart / SessionEnd hooks surface as
+            // `Info` events in the daemon log for diagnostics.
+            // Purely observational; no UI surface today.
+            session_lifecycle_events: true,
+
+            // Mid-turn RPC: context-breakdown popover is live via the
+            // pending-RPC dispatch in `CachedBridge.pending_rpcs` +
+            // `run_turn`'s drain loop arm for
+            // `BridgeResponse::RpcResponse`. Only functional during
+            // an active turn; the UI already gates on `isRunning`
+            // alongside this flag.
+            context_breakdown: true,
+
+            // The SDK's `'auto'` permission mode routes each tool
+            // call through its own model classifier before falling
+            // back to our `canUseTool` callback. The bridge forwards
+            // `PermissionMode::Auto` straight through to the SDK and
+            // leaves `canUseTool` untouched for classifier-escalated
+            // calls.
+            supports_auto_permission_mode: true,
+
+            // Per-session "Compaction priorities" textarea. Stored
+            // in `provider_state.metadata.compactCustomInstructions`,
+            // wrapped at the bridge into the SDK's
+            // `systemPrompt: { preset: 'claude_code', append: ... }`
+            // shape so the model honors it during compaction.
+            compact_custom_instructions: true,
+
+            // Per-user-message "Revert file changes since here"
+            // action. Implemented natively in runtime-core by walking
+            // persisted `FileChangeRecord.before` snapshots — no SDK
+            // round-trip required, so the action works between turns
+            // and after a daemon restart.
+            file_checkpoints: true,
+        },
+
+        // Codex CLI adapter has native `reasoning_effort` on its
+        // turn API. None of the other cross-provider features (tool
+        // heartbeats, compact summaries, file checkpoints, etc.) map
+        // to anything the Codex protocol surfaces today.
+        ProviderKind::Codex => ProviderFeatures {
+            thinking_effort: true,
+            ..ProviderFeatures::default()
+        },
+
+        // Claude CLI, GitHub Copilot (SaaS and CLI) don't expose any
+        // of the flagged capabilities today — the UI hides the
+        // corresponding affordances when selected.
+        ProviderKind::ClaudeCli
+        | ProviderKind::GitHubCopilot
+        | ProviderKind::GitHubCopilotCli => ProviderFeatures::default(),
+    }
+}
+
 /// Where a user-authored `SKILL.md` came from. Drives the "project" /
 /// "global" badge in the slash-command popup. `DiskProject` is a skill
 /// discovered under the session's cwd; `DiskGlobal` lives in a home
@@ -2067,5 +2163,64 @@ pub trait ProviderAdapter: Send + Sync {
             agents: Vec::new(),
             mcp_servers: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `ProviderKind::ALL` variant must have a registry arm —
+    /// otherwise a new kind would trip the exhaustive `match` at
+    /// compile time, but a renamed kind or a silently-forgotten
+    /// `Default::default()` fallback would slip through. The assert
+    /// is defensive: if someone adds a kind and wires the match arm
+    /// to `Default::default()`, they should at least have thought
+    /// about whether it belongs there.
+    #[test]
+    fn features_for_kind_covers_every_variant() {
+        for &kind in ProviderKind::ALL {
+            let _ = features_for_kind(kind);
+        }
+    }
+
+    #[test]
+    fn claude_advertises_flagship_features() {
+        let f = features_for_kind(ProviderKind::Claude);
+        assert!(f.thinking_effort, "claude exposes reasoning effort");
+        assert!(
+            f.supports_auto_permission_mode,
+            "claude exposes auto permission mode"
+        );
+        assert!(f.context_breakdown);
+        assert!(f.compact_custom_instructions);
+        assert!(f.file_checkpoints);
+    }
+
+    #[test]
+    fn codex_only_advertises_thinking_effort() {
+        let f = features_for_kind(ProviderKind::Codex);
+        assert!(f.thinking_effort);
+        assert!(
+            !f.supports_auto_permission_mode,
+            "codex does not map auto permission mode"
+        );
+        assert!(!f.context_breakdown);
+        assert!(!f.file_checkpoints);
+    }
+
+    #[test]
+    fn cli_and_copilot_have_no_flagged_surfaces() {
+        for kind in [
+            ProviderKind::ClaudeCli,
+            ProviderKind::GitHubCopilot,
+            ProviderKind::GitHubCopilotCli,
+        ] {
+            assert_eq!(
+                features_for_kind(kind),
+                ProviderFeatures::default(),
+                "{kind:?} should have all flags off"
+            );
+        }
     }
 }
