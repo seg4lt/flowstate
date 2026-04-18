@@ -11,6 +11,9 @@
     "test": "vitest"
   },
   "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
     "@fontsource-variable/geist": "^5.2.8",
     "@pierre/diffs": "^1.1.15",
     "@pierre/theme": "0.0.28",

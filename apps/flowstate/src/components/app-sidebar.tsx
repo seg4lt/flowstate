@@ -13,6 +13,24 @@ import {
   Trash2,
 } from "lucide-react";
 import {
+  DndContext,
+  DragOverlay,
+  KeyboardSensor,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -49,8 +67,73 @@ import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread
 import { ThreadItem } from "@/components/sidebar/thread-item";
 import type { SessionSummary } from "@/lib/types";
 
+/**
+ * Wraps a single active-project row with dnd-kit's useSortable so
+ * the whole Collapsible can be picked up and moved. The wrapper div
+ * also owns the Collapsible — we don't apply the sortable ref
+ * directly on <Collapsible> because the shared `ui/collapsible.tsx`
+ * wrapper is a plain function component (no forwardRef in React 18)
+ * so refs don't propagate through it.
+ *
+ * `defaultOpen` + `group/collapsible` that used to live on the
+ * per-project <Collapsible> are now owned by this component so the
+ * call site stays declarative.
+ */
+function SortableProject({
+  id,
+  children,
+}: {
+  id: string;
+  children: React.ReactNode;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id });
+
+  const style: React.CSSProperties = {
+    // Translate only — dropping the Scale component kills the text /
+    // icon "zoom" effect that happens when dragging between rows of
+    // different heights (a collapsed project vs. an expanded one).
+    // dnd-kit's default Transform string includes a scaleX/scaleY
+    // computed from the sibling size delta, which propagates to every
+    // child of the dragged element.
+    transform: CSS.Translate.toString(transform),
+    transition,
+    // Source stays visible but clearly dim — it reads as an empty
+    // slot while the DragOverlay renders the crisp preview elsewhere.
+    opacity: isDragging ? 0.35 : undefined,
+    zIndex: isDragging ? 10 : undefined,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...attributes}
+      {...listeners}
+      className={cn(
+        // touch-none stops the browser from claiming pointer events
+        // for native scroll on touch devices — required by dnd-kit
+        // for touch-initiated drags.
+        "cursor-grab touch-none",
+        isDragging &&
+          "cursor-grabbing rounded-md outline-dashed outline-2 outline-sidebar-accent-foreground/40",
+      )}
+    >
+      <Collapsible defaultOpen className="group/collapsible">
+        {children}
+      </Collapsible>
+    </div>
+  );
+}
+
 export function AppSidebar() {
-  const { state, send, createProject } = useApp();
+  const { state, send, createProject, reorderProjects } = useApp();
   const navigate = useNavigate();
   const location = useLocation();
   // Aggregate "wants attention" tone across all non-active threads.
@@ -59,6 +142,66 @@ export function AppSidebar() {
   // attention-wanting row is scrolled out of view. Collapsed sidebar
   // relies on SidebarTrigger's dot instead (ui/sidebar.tsx).
   const attentionTone = useAttentionTone();
+
+  // Drag-to-reorder on the active projects list. Pointer sensor with
+  // a 6px distance activation so normal short clicks still fire
+  // navigation; any pointer movement past 6px starts a drag instead.
+  // Keyboard sensor gives Space-to-pick-up / Arrow-to-move parity for
+  // non-mouse users.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  // Active projects sorted by user-chosen sort_order. Projects with
+  // sortOrder === null (newly created / never manually reordered)
+  // sink to the bottom, alphabetical among themselves — so the
+  // user's explicit arrangement always wins over insertion order.
+  // Worktree-child projects are filtered out (rolled up visually
+  // under their parent elsewhere in this file).
+  const sortedActiveProjects = React.useMemo(() => {
+    const worktreeIds = new Set(state.projectWorktrees.keys());
+    const nameFor = (projectId: string) =>
+      state.projectDisplay.get(projectId)?.name ?? "Untitled project";
+    return state.projects
+      .filter((p) => !worktreeIds.has(p.projectId))
+      .slice()
+      .sort((a, b) => {
+        const oa = state.projectDisplay.get(a.projectId)?.sortOrder;
+        const ob = state.projectDisplay.get(b.projectId)?.sortOrder;
+        if (oa == null && ob == null) {
+          return nameFor(a.projectId).localeCompare(nameFor(b.projectId));
+        }
+        if (oa == null) return 1;
+        if (ob == null) return -1;
+        return oa - ob;
+      });
+  }, [state.projects, state.projectDisplay, state.projectWorktrees]);
+
+  const handleProjectDragEnd = React.useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+      const ids = sortedActiveProjects.map((p) => p.projectId);
+      const from = ids.indexOf(String(active.id));
+      const to = ids.indexOf(String(over.id));
+      if (from < 0 || to < 0) return;
+      const reordered = arrayMove(ids, from, to);
+      // Fire-and-forget — the per-project dispatches inside
+      // reorderProjects land synchronously, so the UI updates on the
+      // next render; the Tauri writes happen in parallel and don't
+      // block the visual reorder.
+      void reorderProjects(reordered);
+    },
+    [sortedActiveProjects, reorderProjects],
+  );
+
+  // Tracks which project is currently being dragged so <DragOverlay>
+  // can render a crisp, natural-size preview that follows the cursor
+  // while the in-place source stays dimmed as the "slot it came from".
+  const [activeProjectId, setActiveProjectId] = React.useState<string | null>(
+    null,
+  );
   // On a narrow window the sidebar renders as a full-screen Sheet
   // overlay that covers the chat view. Without `closeIfMobile()` the
   // sheet stays open after the user picks a thread and they have to
@@ -93,7 +236,6 @@ export function AppSidebar() {
   // the grouping key so worktree threads land under the main repo's
   // section, not as separate top-level entries.
   const knownProjectIds = new Set(state.projects.map((p) => p.projectId));
-  const worktreeProjectIds = new Set(state.projectWorktrees.keys());
   const effectiveProjectId = (rawProjectId: string | null): string | null => {
     if (!rawProjectId) return null;
     return (
@@ -300,20 +442,33 @@ export function AppSidebar() {
                 </SidebarMenuItem>
               </Collapsible>
 
-              {state.projects
-                .filter((project) => !worktreeProjectIds.has(project.projectId))
-                .map((project) => {
-                const threads =
-                  sessionsByProject.get(project.projectId) ?? [];
-                const isActive =
-                  location.pathname === `/project/${project.projectId}`;
-                return (
-                  <Collapsible
-                    key={project.projectId}
-                    defaultOpen
-                    className="group/collapsible"
-                  >
-                    <SidebarMenuItem className="group/project">
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                onDragStart={(event) =>
+                  setActiveProjectId(String(event.active.id))
+                }
+                onDragCancel={() => setActiveProjectId(null)}
+                onDragEnd={(event) => {
+                  setActiveProjectId(null);
+                  handleProjectDragEnd(event);
+                }}
+              >
+                <SortableContext
+                  items={sortedActiveProjects.map((p) => p.projectId)}
+                  strategy={verticalListSortingStrategy}
+                >
+                  {sortedActiveProjects.map((project) => {
+                    const threads =
+                      sessionsByProject.get(project.projectId) ?? [];
+                    const isActive =
+                      location.pathname === `/project/${project.projectId}`;
+                    return (
+                      <SortableProject
+                        key={project.projectId}
+                        id={project.projectId}
+                      >
+                        <SidebarMenuItem className="group/project">
                       <SidebarMenuButton
                         tooltip={projectName(project.projectId)}
                         isActive={isActive}
@@ -394,9 +549,26 @@ export function AppSidebar() {
                         </SidebarMenuSub>
                       </CollapsibleContent>
                     </SidebarMenuItem>
-                  </Collapsible>
-                );
-              })}
+                      </SortableProject>
+                    );
+                  })}
+                </SortableContext>
+                {/* Portal preview of the dragged project. `dropAnimation={null}`
+                    skips the default spring-back — the real list already
+                    renders the new order at drop, so animating the overlay
+                    back onto it would feel laggy. */}
+                <DragOverlay dropAnimation={null}>
+                  {activeProjectId ? (
+                    <div className="pointer-events-none flex items-center gap-2 rounded-md border border-sidebar-border bg-sidebar px-3 py-2 text-sm font-medium shadow-lg">
+                      <FolderIcon className="h-4 w-4 shrink-0" />
+                      <span className="max-w-[180px] truncate">
+                        {state.projectDisplay.get(activeProjectId)?.name ??
+                          "Untitled project"}
+                      </span>
+                    </div>
+                  ) : null}
+                </DragOverlay>
+              </DndContext>
               {/* Archived threads */}
               <Collapsible
                 className="group/collapsible"

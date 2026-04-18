@@ -736,6 +736,11 @@ interface AppContextValue {
   renameSession: (sessionId: string, title: string) => Promise<void>;
   /** Rename a project locally — app-side store only, no SDK call. */
   renameProject: (projectId: string, name: string) => Promise<void>;
+  /** Persist a new ordering for the active projects list. Accepts
+   *  project_ids in their new visual sequence and writes sort_order
+   *  = index for each, both to SQLite (via set_project_display) and
+   *  to the in-memory store. */
+  reorderProjects: (orderedProjectIds: string[]) => Promise<void>;
   /** Create a project via the SDK (path only) and immediately write
    *  the display name into the app-side store. Resolves once both
    *  the SDK row and the app-side display row exist; returns the
@@ -921,6 +926,33 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [],
   );
 
+  const reorderProjects = React.useCallback(
+    async (orderedProjectIds: string[]) => {
+      // Rewrite sort_order = 0..N-1 in the new visual sequence. N is
+      // typically <30, so the O(N) Tauri round-trips are cheap, and
+      // a dense 0..N-1 range keeps future reorders simple (no
+      // fractional-rank rebalancing). Preserve each project's
+      // existing name — we only mutate sortOrder here.
+      await Promise.all(
+        orderedProjectIds.map(async (projectId, index) => {
+          const existing = stateRef.current.projectDisplay.get(projectId);
+          if (existing?.sortOrder === index) return;
+          const display: ProjectDisplay = {
+            name: existing?.name ?? null,
+            sortOrder: index,
+          };
+          await setProjectDisplay(projectId, display);
+          dispatchRef.current({
+            type: "set_project_display",
+            projectId,
+            display,
+          });
+        }),
+      );
+    },
+    [],
+  );
+
   const createProject = React.useCallback(
     async (path: string, name: string): Promise<string> => {
       // Snapshot what's currently in the store so we can detect the
@@ -1040,6 +1072,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       send,
       renameSession,
       renameProject,
+      reorderProjects,
       createProject,
       updateSessionPreview,
       deleteSessionDisplayLocal,
@@ -1052,6 +1085,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       send,
       renameSession,
       renameProject,
+      reorderProjects,
       createProject,
       updateSessionPreview,
       deleteSessionDisplayLocal,
