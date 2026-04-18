@@ -416,6 +416,12 @@ class ClaudeBridge {
       canUseTool,
       abortController: this.abortController,
       includePartialMessages: true,
+      // Ask the SDK to emit `prompt_suggestion` messages predicting
+      // the user's likely next input. Drives the ghost-text
+      // affordance in the composer. Cheap to enable — the SDK only
+      // emits when it has high-confidence predictions, and the UI
+      // renders nothing when no suggestion is in state.
+      promptSuggestions: true,
       // PostCompact fires after the SDK finishes compressing older
       // turns into a summary. That summary is the ONLY place the
       // recap text shows up — the paired `compact_boundary` system
@@ -435,6 +441,48 @@ class ClaudeBridge {
                   event: 'compact_summary',
                   trigger: pc.trigger ?? 'auto',
                   summary: pc.compact_summary ?? '',
+                });
+                return {};
+              },
+            ],
+          },
+        ],
+        // Lifecycle hooks — purely diagnostic today. Forward both
+        // as `info` events so the daemon log carries a trace of
+        // when the SDK thinks each session starts / ends and what
+        // caused it. The data is useful for debugging session
+        // resume + compact flows end-to-end. No UI surface today;
+        // if we ever want one, the Info events are already routed
+        // through the standard toast path.
+        SessionStart: [
+          {
+            hooks: [
+              async (input) => {
+                const s = input as {
+                  source?: 'startup' | 'resume' | 'clear' | 'compact';
+                  agent_type?: string;
+                  model?: string;
+                };
+                const parts = [`source=${s.source ?? 'unknown'}`];
+                if (s.agent_type) parts.push(`agent=${s.agent_type}`);
+                if (s.model) parts.push(`model=${s.model}`);
+                writeStream({
+                  event: 'info',
+                  message: `session_start: ${parts.join(' ')}`,
+                });
+                return {};
+              },
+            ],
+          },
+        ],
+        SessionEnd: [
+          {
+            hooks: [
+              async (input) => {
+                const s = input as { reason?: string };
+                writeStream({
+                  event: 'info',
+                  message: `session_end: reason=${s.reason ?? 'unknown'}`,
                 });
                 return {};
               },
@@ -541,6 +589,20 @@ class ClaudeBridge {
     // state — without this the bypass short-circuit would still
     // read the stale turn-start mode for the rest of the turn.
     this.livePermissionMode = mode;
+  }
+
+  /**
+   * Fetch the SDK's per-category context-usage breakdown for the
+   * live turn. Returns `null` when no query is active; the Rust
+   * caller treats that as "context breakdown not available right
+   * now" and the UI falls back to a disabled state. Any real
+   * failure (SDK throws) propagates as an exception so the
+   * caller can surface a distinct error rather than collapsing
+   * it into the no-active-query case.
+   */
+  async getContextUsage(): Promise<unknown | null> {
+    if (!this.activeQuery) return null;
+    return await this.activeQuery.getContextUsage();
   }
 
   /**
@@ -716,6 +778,21 @@ class ClaudeBridge {
             retry_delay_ms: ar.retry_delay_ms ?? 0,
             error_status: ar.error_status ?? null,
             error: errorMessage,
+          });
+        }
+        return null;
+      }
+      case 'prompt_suggestion': {
+        // Predicted next user prompt. SDK emits these after a turn
+        // when it has high-confidence predictions (and the
+        // `promptSuggestions` option is enabled — which we opt
+        // into in Options). Forward verbatim; the frontend renders
+        // only the latest one per session as ghost text.
+        const ps = msg as { suggestion?: string };
+        if (typeof ps.suggestion === 'string' && ps.suggestion.length > 0) {
+          writeStream({
+            event: 'prompt_suggestion',
+            suggestion: ps.suggestion,
           });
         }
         return null;
@@ -1412,6 +1489,47 @@ async function main(): Promise<void> {
             writeJson({
               type: 'error',
               error: `list_models failed: ${(err as Error).message}`,
+            });
+          }
+        })();
+        break;
+      }
+
+      case 'get_context_usage': {
+        // Mid-turn RPC: call `query.getContextUsage()` on the live
+        // Query. The method is only available while a turn is in
+        // flight; outside that window we reply with an error so
+        // the Rust caller can surface "feature unavailable right
+        // now" instead of hanging on a never-resolving oneshot.
+        // The Rust adapter already gate-checks via
+        // `session_stdin()` (no bridge = Ok(None)) but the bridge
+        // can still receive the request during a narrow window
+        // between turns.
+        const requestId = msg.request_id as string;
+        (async () => {
+          try {
+            const raw = await bridge.getContextUsage();
+            if (raw == null) {
+              writeJson({
+                type: 'rpc_response',
+                request_id: requestId,
+                kind: 'context_usage',
+                error: 'no active query',
+              });
+            } else {
+              writeJson({
+                type: 'rpc_response',
+                request_id: requestId,
+                kind: 'context_usage',
+                payload: raw,
+              });
+            }
+          } catch (err) {
+            writeJson({
+              type: 'rpc_response',
+              request_id: requestId,
+              kind: 'context_usage',
+              error: `get_context_usage failed: ${(err as Error).message}`,
             });
           }
         })();

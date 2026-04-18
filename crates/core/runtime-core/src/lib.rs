@@ -866,6 +866,40 @@ impl RuntimeCore {
                     }),
                 }
             }
+            ClientMessage::GetContextUsage { session_id } => {
+                // Lazy, on-demand RPC — fired when the user opens
+                // the context-usage popover. Adapters that don't
+                // implement context introspection return `Ok(None)`
+                // from the default; frontend hides the popover
+                // trigger upfront via `ProviderFeatures`, so
+                // `None` here only lands if something bypasses
+                // that gate.
+                let session = match self.live_session_detail(&session_id).await {
+                    Some(s) => s,
+                    None => {
+                        return Some(ServerMessage::Error {
+                            message: format!("Session `{session_id}` not found."),
+                        });
+                    }
+                };
+                let Some(adapter) = self.adapters.get(&session.summary.provider).cloned() else {
+                    return Some(ServerMessage::Error {
+                        message: format!(
+                            "No adapter for provider `{}`",
+                            session.summary.provider.label()
+                        ),
+                    });
+                };
+                match adapter.get_context_usage(&session).await {
+                    Ok(breakdown) => Some(ServerMessage::ContextUsage {
+                        session_id,
+                        breakdown,
+                    }),
+                    Err(err) => Some(ServerMessage::Error {
+                        message: format!("get_context_usage failed: {err}"),
+                    }),
+                }
+            }
             ClientMessage::SetProviderEnabled { provider, enabled } => {
                 self.set_provider_enabled(provider, enabled).await;
                 Some(ServerMessage::Ack {
@@ -1827,6 +1861,17 @@ impl RuntimeCore {
                         retry_delay_ms,
                         error_status,
                         error,
+                    });
+                }
+                ProviderTurnEvent::PromptSuggestion { suggestion } => {
+                    // Forward the latest predicted next prompt to
+                    // the frontend. Not persisted — suggestions
+                    // are session-local affordances and stale
+                    // ones aren't useful on re-open.
+                    self.publish(RuntimeEvent::PromptSuggested {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        suggestion,
                     });
                 }
             }

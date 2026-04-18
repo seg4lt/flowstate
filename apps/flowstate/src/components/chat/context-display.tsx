@@ -8,7 +8,10 @@ import {
 } from "@/components/ui/popover";
 import { sessionQueryOptions } from "@/lib/queries";
 import { useApp } from "@/stores/app-store";
+import { useProviderFeatures } from "@/hooks/use-provider-features";
+import { getContextUsage } from "@/lib/api";
 import type {
+  ContextBreakdown,
   RateLimitInfo,
   RateLimitStatus,
   TokenUsage,
@@ -96,6 +99,108 @@ function RateLimitRow({ info }: { info: RateLimitInfo }) {
   );
 }
 
+/**
+ * Per-category context breakdown lazily loaded from the provider's
+ * live SDK Query via the mid-turn RPC plumbing in
+ * `CachedBridge.pending_rpcs`. Fetch fires on popover open; the
+ * section is entirely hidden when the active provider doesn't
+ * support context introspection (feature flag off) or when no turn
+ * is in flight (the SDK's `getContextUsage()` only exists on a
+ * live Query — unavailable between turns).
+ */
+function ContextBreakdownSection({
+  sessionId,
+  visible,
+}: {
+  sessionId: string;
+  visible: boolean;
+}) {
+  const [data, setData] = React.useState<ContextBreakdown | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (!visible) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    getContextUsage(sessionId)
+      .then((b) => {
+        if (!cancelled) setData(b);
+      })
+      .catch((err: Error) => {
+        if (!cancelled) setError(err.message ?? "failed");
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, visible]);
+
+  if (!visible) return null;
+
+  return (
+    <div className="mt-3 border-t border-border/60 pt-2">
+      <div className="mb-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        Breakdown
+      </div>
+      {loading && (
+        <div className="italic text-[11px] text-muted-foreground/60">
+          loading…
+        </div>
+      )}
+      {error && (
+        <div className="italic text-[11px] text-destructive/80">{error}</div>
+      )}
+      {!loading && !error && (!data || data.categories.length === 0) && (
+        <div className="italic text-[11px] text-muted-foreground/60">
+          No breakdown available for this turn.
+        </div>
+      )}
+      {!loading && !error && data && data.categories.length > 0 && (
+        <div className="space-y-1.5">
+          {data.categories.map((cat) => {
+            const pct =
+              data.totalTokens > 0
+                ? Math.min(100, (cat.tokens / data.totalTokens) * 100)
+                : 0;
+            return (
+              <div key={cat.name} className="space-y-0.5">
+                <div className="flex items-center gap-2">
+                  <span
+                    className="inline-block h-2 w-2 shrink-0 rounded-sm"
+                    style={{
+                      backgroundColor: cat.color ?? "hsl(var(--muted-foreground))",
+                    }}
+                  />
+                  <span className="truncate text-[11px] text-foreground/80">
+                    {cat.name}
+                  </span>
+                  <span className="ml-auto text-[11px] tabular-nums text-muted-foreground">
+                    {formatTokens(cat.tokens)}
+                  </span>
+                </div>
+                <div className="h-0.5 w-full overflow-hidden rounded-full bg-muted/40">
+                  <div
+                    className="h-full transition-all"
+                    style={{
+                      width: `${pct}%`,
+                      backgroundColor:
+                        cat.color ?? "hsl(var(--muted-foreground))",
+                    }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function ContextDisplay({ sessionId }: ContextDisplayProps) {
   const { data } = useQuery(sessionQueryOptions(sessionId));
   const { state } = useApp();
@@ -103,6 +208,20 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
     () => findLatestUsage(data?.detail.turns),
     [data?.detail.turns],
   );
+  const [popoverOpen, setPopoverOpen] = React.useState(false);
+
+  // Breakdown availability: provider supports the RPC AND a turn is
+  // actively running (the SDK's `getContextUsage()` is a method on
+  // the live Query, which only exists mid-turn). Both halves must be
+  // true or the section stays hidden — the bone of the feature is
+  // real-time introspection of what's filling context right now.
+  const provider = data?.detail.summary.provider;
+  const features = useProviderFeatures(provider);
+  const hasRunningTurn = React.useMemo(
+    () => (data?.detail.turns ?? []).some((t) => t.status === "running"),
+    [data?.detail.turns],
+  );
+  const showBreakdown = !!features.contextBreakdown && hasRunningTurn;
 
   const rateLimitEntries = React.useMemo(() => {
     const all = Object.values(state.rateLimits);
@@ -169,7 +288,7 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
           : "bg-foreground/60";
 
   return (
-    <Popover>
+    <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
       <PopoverTrigger asChild>
         <button
           type="button"
@@ -247,6 +366,17 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
             )}
           </div>
         )}
+        {/* Per-category breakdown. Lazily fetched on open via the
+            mid-turn bridge RPC; gated on provider capability +
+            an active turn because `query.getContextUsage()` only
+            exists on a live SDK Query. `popoverOpen` is the
+            controlled open state so we don't fire the RPC while
+            the popover is closed. */}
+        <ContextBreakdownSection
+          sessionId={sessionId}
+          visible={popoverOpen && showBreakdown}
+        />
+
         <div className="mt-3 border-t border-border/60 pt-2">
           <div className="mb-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
             Plan usage

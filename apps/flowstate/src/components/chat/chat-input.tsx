@@ -58,6 +58,17 @@ interface ChatInputProps {
    *  tints blue, bypass tints orange; default / accept_edits keep
    *  the neutral styling. */
   permissionMode?: PermissionMode;
+  /** Provider-predicted next user prompt. Rendered as muted ghost
+   *  text in the empty composer. Tab accepts (fills into draft);
+   *  Esc or any other keystroke dismisses via
+   *  `onPromptSuggestionDismissed`. Only shown when the session's
+   *  provider has `features.promptSuggestions` enabled AND the
+   *  composer is empty. */
+  promptSuggestion?: string | null;
+  /** Called by the composer when the user accepts, rejects, or
+   *  types past the ghost text. The parent clears its stored
+   *  suggestion so it doesn't re-appear after a keystroke. */
+  onPromptSuggestionDismissed?: () => void;
 }
 
 export interface QueuedMessage {
@@ -134,6 +145,8 @@ export function ChatInput({
   initialQueue,
   onQueueChange,
   permissionMode,
+  promptSuggestion,
+  onPromptSuggestionDismissed,
 }: ChatInputProps) {
   const [value, setValueRaw] = React.useState(initialValue);
   // Notify the parent of every draft change so it can persist the text
@@ -514,6 +527,27 @@ export function ChatInput({
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
+    // --- Prompt-suggestion ghost text ---
+    // Only active when the composer is empty AND a suggestion
+    // exists. Tab accepts, Esc dismisses. Any other printable key
+    // dismisses the ghost so the user's typing doesn't collide
+    // with a stale prediction; the onChange below handles that
+    // path (this block only handles non-character keys like Tab /
+    // Esc that don't route through onChange).
+    const hasSuggestion =
+      !!promptSuggestion && value.length === 0 && !disabled;
+    if (hasSuggestion && e.key === "Tab" && !showPopup) {
+      e.preventDefault();
+      setValue(promptSuggestion!);
+      onPromptSuggestionDismissed?.();
+      return;
+    }
+    if (hasSuggestion && e.key === "Escape" && !showPopup) {
+      e.preventDefault();
+      onPromptSuggestionDismissed?.();
+      return;
+    }
+
     // --- Autocomplete keyboard navigation ---
     if (showPopup && matches.length > 0) {
       if (e.key === "ArrowDown") {
@@ -686,39 +720,75 @@ export function ChatInput({
               />
             )}
 
-            <textarea
-              ref={textareaRef}
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-              onKeyDown={handleKeyDown}
-              onInput={handleInput}
-              onPaste={handlePaste}
-              placeholder={
-                archived
-                  ? "Archived thread — read-only"
-                  : providerDisabled
-                    ? "Provider disabled — re-enable it in Settings to send"
-                    : queued.length > 0
-                      ? "Compose another message…"
-                      : "Send a message..."
-              }
-              disabled={disabled || providerDisabled || archived}
-              rows={1}
-              className={cn(
-                "flex-1 resize-none rounded-lg border px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
-                // Mode tint. Plan + bypass are the modes where the
-                // next send behaves *differently* from the defaults,
-                // so they get a coloured border and a subtle L→R
-                // fade matching the WorkingIndicator's spinner tone.
-                // Default / accept_edits keep the neutral look so
-                // the tint only draws the eye when it matters.
-                permissionMode === "plan"
-                  ? "border-blue-500/60 bg-gradient-to-r from-blue-500/10 to-transparent focus-visible:ring-blue-500/60"
-                  : permissionMode === "bypass"
-                    ? "border-orange-500/60 bg-gradient-to-r from-orange-500/10 to-transparent focus-visible:ring-orange-500/60"
-                    : "border-input bg-background focus-visible:ring-ring",
-              )}
-            />
+            <div className="relative flex-1">
+              <textarea
+                ref={textareaRef}
+                value={value}
+                onChange={(e) => {
+                  // Any keystroke that writes to the textarea
+                  // dismisses the ghost-text suggestion. The
+                  // user is clearly going a different direction;
+                  // keeping the prediction visible would just
+                  // fight with their typing.
+                  if (promptSuggestion) {
+                    onPromptSuggestionDismissed?.();
+                  }
+                  setValue(e.target.value);
+                }}
+                onKeyDown={handleKeyDown}
+                onInput={handleInput}
+                onPaste={handlePaste}
+                placeholder={
+                  archived
+                    ? "Archived thread — read-only"
+                    : providerDisabled
+                      ? "Provider disabled — re-enable it in Settings to send"
+                      : queued.length > 0
+                        ? "Compose another message…"
+                        : "Send a message..."
+                }
+                disabled={disabled || providerDisabled || archived}
+                rows={1}
+                className={cn(
+                  "w-full resize-none rounded-lg border px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                  // Mode tint. Plan + bypass are the modes where the
+                  // next send behaves *differently* from the defaults,
+                  // so they get a coloured border and a subtle L→R
+                  // fade matching the WorkingIndicator's spinner tone.
+                  // Default / accept_edits keep the neutral look so
+                  // the tint only draws the eye when it matters.
+                  permissionMode === "plan"
+                    ? "border-blue-500/60 bg-gradient-to-r from-blue-500/10 to-transparent focus-visible:ring-blue-500/60"
+                    : permissionMode === "bypass"
+                      ? "border-orange-500/60 bg-gradient-to-r from-orange-500/10 to-transparent focus-visible:ring-orange-500/60"
+                      : "border-input bg-background focus-visible:ring-ring",
+                )}
+              />
+              {/* Ghost-text overlay for prompt-suggestion. Only
+                  shown when the composer is empty and a suggestion
+                  exists. Absolutely positioned over the textarea
+                  so it sits where typed text would appear; the
+                  pointer-events-none + muted tone + Tab hint make
+                  it unambiguously a preview rather than real
+                  content. */}
+              {promptSuggestion &&
+                value.length === 0 &&
+                !disabled &&
+                !providerDisabled &&
+                !archived && (
+                  <div
+                    aria-hidden
+                    className="pointer-events-none absolute inset-0 flex items-start px-3 py-2 text-sm text-muted-foreground/50"
+                  >
+                    <span className="truncate">
+                      {promptSuggestion}
+                      <span className="ml-2 rounded border border-border/50 bg-muted/60 px-1 py-0.5 text-[10px] font-medium text-muted-foreground/80">
+                        Tab
+                      </span>
+                    </span>
+                  </div>
+                )}
+            </div>
 
             {showStop ? (
               <button

@@ -640,6 +640,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [retryState, setRetryState] = React.useState<
     import("@/lib/types").RetryState | null
   >(null);
+  // Latest predicted next prompt from `prompt_suggested` events.
+  // Rendered as ghost text in the empty composer; any keystroke,
+  // new turn start, or turn completion clears it so stale
+  // suggestions don't linger.
+  const [promptSuggestion, setPromptSuggestion] = React.useState<string | null>(
+    null,
+  );
 
   // The diff view is sourced directly from `git diff HEAD` against
   // the project's working tree (plus untracked files). It refreshes
@@ -1183,6 +1190,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           setPendingInput(null);
           setTurnPhase(undefined);
           setRetryState(null);
+          // Clear any stale suggestion from the previous turn —
+          // the new turn will emit its own `prompt_suggested`
+          // if the SDK has a prediction.
+          setPromptSuggestion(null);
           break;
 
         case "turn_completed":
@@ -1221,6 +1232,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             error: event.error,
             startedAt: Date.now(),
           });
+          break;
+
+        case "prompt_suggested":
+          // Latest prediction wins — the SDK may emit several over
+          // the life of a turn and we only show the freshest.
+          setPromptSuggestion(event.suggestion);
           break;
 
         case "tool_call_completed": {
@@ -1845,6 +1862,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             initialQueue={sessionQueues.get(sessionId)}
             onQueueChange={handleQueueChange}
             permissionMode={permissionMode}
+            promptSuggestion={promptSuggestion}
+            onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
           />
         </div>
 

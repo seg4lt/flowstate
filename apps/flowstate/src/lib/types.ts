@@ -232,6 +232,26 @@ export interface MemoryRecallItem {
   content?: string;
 }
 
+/** Mirrors `zenui_provider_api::ContextBreakdown` — the response to
+ *  `ClientMessage::GetContextUsage`. Providers that support context
+ *  introspection (Claude SDK today) populate this; others return
+ *  `null` and the UI hides the popover trigger via the
+ *  `features.contextBreakdown` gate. */
+export interface ContextBreakdown {
+  totalTokens: number;
+  maxTokens: number;
+  categories: ContextCategory[];
+}
+
+export interface ContextCategory {
+  name: string;
+  tokens: number;
+  /** Provider-supplied hex color for a stacked-bar segment (e.g.
+   *  Claude SDK's palette). Optional — the UI falls back to a
+   *  deterministic hash-based colour when absent. */
+  color?: string;
+}
+
 export interface FileChangeRecord {
   callId: string;
   path: string;
@@ -441,7 +461,8 @@ export type ClientMessage =
   | { type: "archive_session"; session_id: string }
   | { type: "unarchive_session"; session_id: string }
   | { type: "list_archived_sessions" }
-  | { type: "refresh_session_commands"; session_id: string };
+  | { type: "refresh_session_commands"; session_id: string }
+  | { type: "get_context_usage"; session_id: string };
 
 export type ServerMessage =
   | { type: "welcome"; bootstrap: BootstrapPayload }
@@ -453,7 +474,8 @@ export type ServerMessage =
   | { type: "event"; event: RuntimeEvent }
   | { type: "error"; message: string }
   | { type: "archived_sessions_list"; sessions: SessionSummary[] }
-  | { type: "attachment"; data: AttachmentData };
+  | { type: "attachment"; data: AttachmentData }
+  | { type: "context_usage"; session_id: string; breakdown: ContextBreakdown | null };
 
 export type RuntimeEvent =
   | { type: "runtime_ready"; message: string }
@@ -479,6 +501,7 @@ export type RuntimeEvent =
   | { type: "memory_recalled"; session_id: string; turn_id: string; mode: "select" | "synthesize"; memories: MemoryRecallItem[] }
   | { type: "turn_status_changed"; session_id: string; turn_id: string; phase: TurnPhase }
   | { type: "turn_retrying"; session_id: string; turn_id: string; attempt: number; max_retries: number; retry_delay_ms: number; error_status?: number; error: string }
+  | { type: "prompt_suggested"; session_id: string; turn_id: string; suggestion: string }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }

@@ -361,6 +361,37 @@ pub struct MemoryRecallItem {
     pub content: Option<String>,
 }
 
+/// Per-category breakdown of what's currently filling the model's
+/// context window. Shape follows the Claude Agent SDK's response
+/// loosely: a list of named categories with their token counts,
+/// plus top-level totals. Intentionally flexible — providers
+/// with different internal accounting can return whatever
+/// categories they track, and the frontend just renders a stacked
+/// bar from whatever it gets.
+///
+/// Returned by the `get_context_usage` adapter RPC (cross-provider,
+/// default `Ok(None)` for adapters that don't implement it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextBreakdown {
+    pub total_tokens: u64,
+    pub max_tokens: u64,
+    pub categories: Vec<ContextCategory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextCategory {
+    pub name: String,
+    pub tokens: u64,
+    /// Provider-supplied hex color (e.g. Claude SDK's palette) so
+    /// the frontend can render a consistent stacked bar. Optional
+    /// so providers without a color convention can omit it and
+    /// the UI falls back to a deterministic hash-based colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
@@ -995,6 +1026,13 @@ pub enum ProviderTurnEvent {
         error_status: Option<u16>,
         error: String,
     },
+    /// Provider-predicted next user prompt. Emitted near the end of
+    /// a turn when the provider supports it. Frontend stores the
+    /// latest suggestion per session and renders it as ghost text
+    /// in the empty composer; any keystroke dismisses it.
+    PromptSuggestion {
+        suggestion: String,
+    },
 }
 
 /// Phase of a turn between streams. Deliberately coarse — only
@@ -1464,6 +1502,15 @@ pub enum RuntimeEvent {
         error_status: Option<u16>,
         error: String,
     },
+    /// Provider-predicted next user prompt. Drives the ghost-text
+    /// suggestion overlay in the composer. Frontend keeps only the
+    /// latest suggestion per session; overwritten on each new
+    /// event, cleared on any composer keystroke or turn start.
+    PromptSuggested {
+        session_id: String,
+        turn_id: String,
+        suggestion: String,
+    },
     Error {
         message: String,
     },
@@ -1653,6 +1700,14 @@ pub enum ClientMessage {
     RefreshSessionCommands {
         session_id: String,
     },
+    /// Request a per-category context-usage breakdown for the
+    /// session. Runtime-core dispatches to the adapter's
+    /// `get_context_usage` and responds with
+    /// `ServerMessage::ContextUsage`. Fired lazily when the user
+    /// opens the context popover — not streamed.
+    GetContextUsage {
+        session_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1670,6 +1725,14 @@ pub enum ServerMessage {
     /// Response to `ClientMessage::GetAttachment`. Carries the full
     /// bytes of a persisted image.
     Attachment { data: AttachmentData },
+    /// Response to `ClientMessage::GetContextUsage`. `breakdown` is
+    /// `None` when the provider doesn't support the RPC (default
+    /// `Ok(None)` from the adapter), which the frontend treats as
+    /// "hide the popover". Errors surface via `ServerMessage::Error`.
+    ContextUsage {
+        session_id: String,
+        breakdown: Option<ContextBreakdown>,
+    },
 }
 
 #[async_trait]
@@ -1760,6 +1823,22 @@ pub trait ProviderAdapter: Send + Sync {
     /// Tear down any long-lived resources held for this session (subprocesses, connections).
     async fn end_session(&self, _session: &SessionDetail) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Return a per-category breakdown of what's currently filling
+    /// the session's context window. Powers the "Context breakdown"
+    /// popover on the session's token counter.
+    ///
+    /// Adapters that don't support context introspection return
+    /// `Ok(None)` (the default); the frontend hides the popover
+    /// trigger when `ProviderFeatures.context_breakdown` is false.
+    /// Returning `Err` surfaces as a user-visible error toast —
+    /// reserve for actual failures, not "not implemented".
+    async fn get_context_usage(
+        &self,
+        _session: &SessionDetail,
+    ) -> Result<Option<ContextBreakdown>, String> {
+        Ok(None)
     }
 
     /// Per-provider disk directories the default

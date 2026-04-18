@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
     CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
@@ -72,6 +72,14 @@ struct CachedBridge {
     /// Number of turns currently running on this bridge. Incremented at
     /// turn start and decremented via RAII in `ActivityGuard::drop`.
     in_flight: Arc<AtomicU32>,
+    /// Pending mid-turn RPC responses keyed by request_id. An adapter
+    /// method fires an RPC to the bridge by inserting a `oneshot::Sender`
+    /// here; `run_turn`'s drain loop forwards the matching
+    /// `BridgeResponse::RpcResponse` back through the sender. The
+    /// caller `await`s the receiver under a timeout and cleans its
+    /// entry on both success and cancellation paths so senders
+    /// don't leak across turn boundaries.
+    pending_rpcs: Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcResponse>>>>,
 }
 
 impl CachedBridge {
@@ -80,6 +88,7 @@ impl CachedBridge {
             process: Arc::new(Mutex::new(process)),
             last_activity: Arc::new(AtomicU64::new(unix_now())),
             in_flight: Arc::new(AtomicU32::new(0)),
+            pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -90,6 +99,35 @@ impl CachedBridge {
             last_activity: self.last_activity.clone(),
         }
     }
+}
+
+/// Discriminator for mid-turn bridge RPCs. A single
+/// `BridgeResponse::RpcResponse` variant carries `kind` so new RPCs
+/// can be added without growing the response enum — the bridge and
+/// adapter agree on the kind string, and the caller parses the
+/// `payload` shape it knows the RPC returns. `snake_case` matches
+/// the rest of our wire conventions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BridgeRpcKind {
+    ContextUsage,
+    // Reserved for later rollouts — keeping the enum lean until
+    // there's a real consumer:
+    //   RewindFiles,
+    //   SeedReadState,
+}
+
+/// Delivered through the pending-RPC oneshot. The adapter's method
+/// interprets `payload` based on the known shape for its RPC kind
+/// (e.g. `ContextUsage` parses as the SDK's
+/// `SDKControlGetContextUsageResponse`). `Err(_)` carries whatever
+/// the bridge reported — either a null-Query guard trip or an
+/// exception from the SDK call.
+#[derive(Debug)]
+struct BridgeRpcResponse {
+    #[allow(dead_code)]
+    kind: BridgeRpcKind,
+    payload: Result<Value, String>,
 }
 
 /// RAII guard held for the duration of a turn. On drop, decrements the
@@ -236,6 +274,15 @@ enum BridgeRequest {
     /// the session summary on the next `ensure_session_process`.
     #[serde(rename = "set_model")]
     SetModel { model: String },
+    /// Request a per-category context breakdown from the live SDK
+    /// Query. The bridge calls `query.getContextUsage()` and
+    /// replies with `BridgeResponse::RpcResponse { request_id,
+    /// kind: 'context_usage', payload | error }`. `request_id` is
+    /// client-generated (UUID) so the caller can route the
+    /// response through the pending-RPC map even when multiple
+    /// RPCs are interleaved with the turn's stream events.
+    #[serde(rename = "get_context_usage")]
+    GetContextUsage { request_id: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +325,21 @@ enum BridgeResponse {
     #[serde(rename = "permission_mode_set")]
     #[allow(dead_code)]
     PermissionModeSet { mode: String },
+    /// Response to a mid-turn RPC request. `request_id` is echoed
+    /// from the originating `BridgeRequest`, `kind` names which RPC
+    /// this is the response to, and exactly one of `payload` /
+    /// `error` is populated. Drain-loop looks up `request_id` in the
+    /// session's `pending_rpcs` map and forwards the response
+    /// through the registered oneshot.
+    #[serde(rename = "rpc_response")]
+    RpcResponse {
+        request_id: String,
+        kind: BridgeRpcKind,
+        #[serde(default)]
+        payload: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    },
     #[serde(rename = "error")]
     Error { error: String },
     /// Streaming event emitted during send_prompt.
@@ -382,12 +444,22 @@ enum BridgeResponse {
         retry_delay_ms: Option<u64>,
         #[serde(default)]
         error_status: Option<u16>,
+        /// Populated on `prompt_suggestion` events — the SDK's
+        /// predicted next user prompt.
+        #[serde(default)]
+        suggestion: Option<String>,
     },
 }
 
 #[derive(Debug, Clone)]
 pub struct ClaudeSdkAdapter {
     working_directory: PathBuf,
+    /// Monotonic counter for mid-turn RPC request IDs. A process-local
+    /// counter is sufficient because request_id correlation happens
+    /// entirely within this adapter instance (the bridge echoes it
+    /// back on the matching response). No cross-process uniqueness is
+    /// required.
+    rpc_counter: Arc<AtomicU64>,
     sessions: Arc<Mutex<HashMap<String, CachedBridge>>>,
     /// Direct, lock-free-from-outside handles to each session's bridge
     /// stdin. `run_turn` holds the outer `sessions` Mutex guard for the
@@ -399,19 +471,39 @@ pub struct ClaudeSdkAdapter {
     /// inner stdin Mutex still serializes writes against the writer task
     /// inside `run_turn`, so the bridge never sees torn JSON lines.
     session_stdins: Arc<Mutex<HashMap<String, Arc<Mutex<ChildStdin>>>>>,
+    /// Parallel handle to each session's pending-RPC map, for the same
+    /// reason as `session_stdins`: mid-turn RPC issuers need to insert
+    /// a oneshot sender into the map while `run_turn` is holding the
+    /// outer `sessions` Mutex. The `Arc` points at the same inner
+    /// map as the owning `CachedBridge.pending_rpcs`, so the drain
+    /// loop (which holds a reference via the `cached` parameter) and
+    /// out-of-band RPC callers mutate the same storage.
+    session_pending_rpcs: Arc<Mutex<HashMap<String, PendingRpcsMap>>>,
     /// Latches true the first time `ensure_session_process` runs so the
     /// idle-kill watchdog is spawned exactly once per adapter instance.
     watchdog_started: Arc<AtomicBool>,
 }
 
+type PendingRpcsMap = Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcResponse>>>>;
+
 impl ClaudeSdkAdapter {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
             working_directory,
+            rpc_counter: Arc::new(AtomicU64::new(0)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_stdins: Arc::new(Mutex::new(HashMap::new())),
+            session_pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
             watchdog_started: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Generate a unique request id for a mid-turn RPC. Format is
+    /// `rpc-<counter>` — unambiguous within this adapter process,
+    /// which is the only scope where correlation matters.
+    fn next_rpc_id(&self) -> String {
+        let n = self.rpc_counter.fetch_add(1, Ordering::Relaxed);
+        format!("rpc-{n}")
     }
 
     /// Spawn the idle-kill watchdog exactly once. Called lazily from
@@ -430,6 +522,7 @@ impl ClaudeSdkAdapter {
         }
         let sessions = self.sessions.clone();
         let session_stdins = self.session_stdins.clone();
+        let session_pending_rpcs = self.session_pending_rpcs.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(
                 BRIDGE_WATCHDOG_INTERVAL_SECS,
@@ -461,8 +554,10 @@ impl ClaudeSdkAdapter {
                 }
                 {
                     let mut stdins = session_stdins.lock().await;
+                    let mut pending = session_pending_rpcs.lock().await;
                     for (sid, _) in &victims {
                         stdins.remove(sid);
+                        pending.remove(sid);
                     }
                 }
                 for (sid, cached) in victims {
@@ -483,6 +578,107 @@ impl ClaudeSdkAdapter {
     /// the session has no live bridge.
     async fn session_stdin(&self, session_id: &str) -> Option<Arc<Mutex<ChildStdin>>> {
         self.session_stdins.lock().await.get(session_id).cloned()
+    }
+
+    /// Lookup the per-session pending-RPC map without locking the outer
+    /// `sessions` Mutex. Returns `None` if no live bridge exists for
+    /// the session — RPC callers treat that as "feature unavailable".
+    async fn session_pending_rpcs(&self, session_id: &str) -> Option<PendingRpcsMap> {
+        self.session_pending_rpcs
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Issue a mid-turn RPC to the bridge and await its response via a
+    /// oneshot routed through `run_turn`'s drain loop.
+    ///
+    /// Caller supplies the `BridgeRequest` (already carrying its own
+    /// `request_id`) and the expected `kind`. Returns:
+    /// - `Ok(Some(payload))` on success
+    /// - `Ok(None)` if the session has no live bridge (no active turn)
+    /// - `Err(_)` on serialization failure, write error, timeout,
+    ///   bridge-reported error, or response-kind mismatch
+    ///
+    /// Cleanup is thorough: the pending-RPC entry is removed on every
+    /// exit path (success, timeout, or write error) so a leaked sender
+    /// can't linger across turn boundaries.
+    async fn issue_rpc(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        request: &BridgeRequest,
+        expected_kind: BridgeRpcKind,
+        timeout: Duration,
+    ) -> Result<Option<Value>, String> {
+        // Both halves (stdin + pending map) must exist. Either missing
+        // means no live bridge, which the caller translates to the
+        // feature-unavailable case.
+        let Some(pending_map) = self.session_pending_rpcs(session_id).await else {
+            return Ok(None);
+        };
+        let Some(stdin) = self.session_stdin(session_id).await else {
+            return Ok(None);
+        };
+
+        let (tx, rx) = oneshot::channel::<BridgeRpcResponse>();
+        {
+            let mut pending = pending_map.lock().await;
+            pending.insert(request_id.to_string(), tx);
+        }
+
+        // RAII guard — on any early return / error, remove the pending
+        // entry so no stale senders accumulate. The successful path
+        // also clears it (via the drain loop's `remove` call before
+        // send), so the guard's fallback `remove` is a no-op there.
+        struct PendingCleanup<'a> {
+            map: &'a PendingRpcsMap,
+            request_id: &'a str,
+        }
+        impl<'a> Drop for PendingCleanup<'a> {
+            fn drop(&mut self) {
+                // Best-effort clean-up — we can't `.await` in drop, so
+                // try_lock; worst case the entry stays and gets
+                // garbage-collected on the next invalidate_session.
+                if let Ok(mut map) = self.map.try_lock() {
+                    map.remove(self.request_id);
+                }
+            }
+        }
+        let _cleanup = PendingCleanup {
+            map: &pending_map,
+            request_id,
+        };
+
+        // Ship the request. Write failures propagate as Err — the
+        // drain loop never sees the request, so nothing will arrive
+        // to resolve our oneshot.
+        write_request(&stdin, request).await?;
+
+        // Await the response under a wall-clock timeout. The drain
+        // loop sends through the oneshot; a dropped sender (bridge
+        // died mid-turn, pending map cleared by invalidate_session)
+        // surfaces as RecvError, which we translate to an Err.
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => {
+                if response.kind != expected_kind {
+                    return Err(format!(
+                        "bridge rpc_response kind mismatch: expected {expected_kind:?}, got {:?}",
+                        response.kind
+                    ));
+                }
+                match response.payload {
+                    Ok(value) => Ok(Some(value)),
+                    Err(err) => Err(err),
+                }
+            }
+            Ok(Err(_)) => Err("bridge closed before rpc response".to_string()),
+            Err(_) => Err(format!(
+                "bridge rpc_response timed out after {}s",
+                timeout.as_secs()
+            )),
+        }
     }
 
     async fn spawn_bridge(&self) -> Result<ClaudeBridgeProcess, String> {
@@ -636,11 +832,24 @@ impl ClaudeSdkAdapter {
         // run_turn, which holds the outer lock for the whole turn.
         let stdin_clone = bridge.stdin.clone();
         let cached = CachedBridge::new(bridge);
+        let pending_rpcs_clone = cached.pending_rpcs.clone();
         {
             let mut stdins = self.session_stdins.lock().await;
             stdins
                 .entry(session.summary.session_id.clone())
                 .or_insert(stdin_clone);
+        }
+        {
+            // Same parallel-map trick for mid-turn RPCs: adapter
+            // methods need to insert a oneshot into this map while
+            // the outer `sessions` Mutex is held by run_turn. The
+            // inner `Arc` here points at the same storage as
+            // `cached.pending_rpcs`, so the drain loop and the
+            // RPC caller see each other's writes.
+            let mut pending = self.session_pending_rpcs.lock().await;
+            pending
+                .entry(session.summary.session_id.clone())
+                .or_insert(pending_rpcs_clone);
         }
         let mut sessions = self.sessions.lock().await;
         Ok(sessions
@@ -654,6 +863,14 @@ impl ClaudeSdkAdapter {
         // request that already cloned it sees its writes fail cleanly
         // when the child process is killed below.
         self.session_stdins.lock().await.remove(session_id);
+        // Drop the pending-RPC map too. Any in-flight awaiters will
+        // see their oneshot senders dropped (via the Arc being
+        // removed from this outer map — the inner Arc clone held
+        // by the awaiter keeps the map alive, but run_turn's drain
+        // loop is gone with the dead bridge, so nobody will ever
+        // resolve them anyway; they'll time out on the configured
+        // deadline).
+        self.session_pending_rpcs.lock().await.remove(session_id);
         let cached = self.sessions.lock().await.remove(session_id);
         if let Some(cached) = cached {
             let mut process = cached.process.lock().await;
@@ -823,6 +1040,7 @@ impl ClaudeSdkAdapter {
                     max_retries,
                     retry_delay_ms,
                     error_status,
+                    suggestion,
                     path,
                     operation,
                     before,
@@ -1033,6 +1251,17 @@ impl ClaudeSdkAdapter {
                             })
                             .await;
                     }
+                    "prompt_suggestion" => {
+                        if let Some(text) = suggestion {
+                            if !text.is_empty() {
+                                events
+                                    .send(ProviderTurnEvent::PromptSuggestion {
+                                        suggestion: text,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
                     other_event => {
                         forward_stream(
                             &events,
@@ -1061,6 +1290,43 @@ impl ClaudeSdkAdapter {
                         )
                         .await;
                     }
+                    }
+                }
+                BridgeResponse::RpcResponse {
+                    request_id,
+                    kind,
+                    payload,
+                    error,
+                } => {
+                    // Route mid-turn RPC response back to the
+                    // waiting caller. Pull the sender out of
+                    // the pending map (one-shot — a second
+                    // response for the same id would have
+                    // nothing to resolve), then dispatch.
+                    // `send` fails only if the receiver was
+                    // dropped (caller timed out / was cancelled);
+                    // that's fine, the pending-map cleanup on
+                    // the caller side already removed the entry
+                    // and we're just discarding a late reply.
+                    let sender_opt = {
+                        let mut pending = cached.pending_rpcs.lock().await;
+                        pending.remove(&request_id)
+                    };
+                    let payload = match (payload, error) {
+                        (_, Some(err)) => Err(err),
+                        (Some(value), None) => Ok(value),
+                        (None, None) => Err(
+                            "bridge rpc_response had neither payload nor error"
+                                .to_string(),
+                        ),
+                    };
+                    if let Some(sender) = sender_opt {
+                        let _ =
+                            sender.send(BridgeRpcResponse { kind, payload });
+                    } else {
+                        debug!(
+                            "bridge rpc_response for unknown request_id: {request_id}"
+                        );
                     }
                 }
                 other => {
@@ -1292,6 +1558,77 @@ impl ProviderAdapter for ClaudeSdkAdapter {
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
         self.invalidate_session(&session.summary.session_id).await;
         Ok(())
+    }
+
+    async fn get_context_usage(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<Option<zenui_provider_api::ContextBreakdown>, String> {
+        // Only works during an active turn — the SDK's
+        // `query.getContextUsage()` is a method on a live Query
+        // object. No live bridge means no active query means
+        // nothing to query. Return Ok(None) in that case; the
+        // frontend feature-gate already hides the popover trigger
+        // when `isRunning` is false, but defending against a
+        // misrouted click here costs nothing.
+        let request_id = self.next_rpc_id();
+        let request = BridgeRequest::GetContextUsage {
+            request_id: request_id.clone(),
+        };
+        let raw = match self
+            .issue_rpc(
+                &session.summary.session_id,
+                &request_id,
+                &request,
+                BridgeRpcKind::ContextUsage,
+                Duration::from_secs(15),
+            )
+            .await?
+        {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+
+        // Translate the SDK's raw response into the cross-provider
+        // `ContextBreakdown` shape. The SDK ships richer data
+        // (grid rows, MCP tool detail, memory file detail); we
+        // only pick up what our UI surfaces today (totals +
+        // category list). Extra fields we ignore flow through
+        // untouched for providers that want them later.
+        let total_tokens = raw
+            .get("totalTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let max_tokens = raw.get("maxTokens").and_then(Value::as_u64).unwrap_or(0);
+        let categories: Vec<zenui_provider_api::ContextCategory> = raw
+            .get("categories")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| zenui_provider_api::ContextCategory {
+                        name: c
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        tokens: c
+                            .get("tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        color: c
+                            .get("color")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(Some(zenui_provider_api::ContextBreakdown {
+            total_tokens,
+            max_tokens,
+            categories,
+        }))
     }
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
@@ -1827,11 +2164,47 @@ fn claude_sdk_features() -> zenui_provider_api::ProviderFeatures {
         status_labels: true,
         api_retries: true,
 
-        // Flipped on by subsequent commits:
-        //   Deferred — tool_progress (heartbeat / stuck detection)
-        //   Commit 3 — context_breakdown, prompt_suggestions
-        //   Commit 4 — file_checkpoints, compact_custom_instructions,
-        //              session_lifecycle_events
+        // Commit 3: ghost-text prompt suggestions via the SDK's
+        // `promptSuggestions: true` option + `prompt_suggestion`
+        // messages.
+        prompt_suggestions: true,
+
+        // Commit 4: SessionStart / SessionEnd hooks surface as
+        // `Info` events in the daemon log for diagnostics. Purely
+        // observational; no UI surface today.
+        session_lifecycle_events: true,
+
+        // Mid-turn RPC commit: context-breakdown popover is live
+        // via the pending-RPC dispatch infrastructure in
+        // `CachedBridge.pending_rpcs` + `run_turn`'s drain loop
+        // arm for `BridgeResponse::RpcResponse`. Only functional
+        // during an active turn; the UI already gates on
+        // `isRunning` alongside this flag.
+        context_breakdown: true,
+
+        // Deferred:
+        //   tool_progress           — wires the SDK's
+        //                             `tool_progress` heartbeat
+        //                             messages for stuck-tool
+        //                             detection.
+        //   file_checkpoints        — same infrastructure (mid-
+        //                             turn RPC) unlocks it, but
+        //                             rewind naturally wants to
+        //                             fire *between* turns; since
+        //                             `rewindFiles` is a Query
+        //                             method we'd need a silent
+        //                             no-op turn to host the
+        //                             call, a persistent idle
+        //                             query, or a flowstate-
+        //                             native snapshot mechanism.
+        //   compact_custom_instr… — the SDK's PreCompact hook is
+        //                             read-only (no output path for
+        //                             `custom_instructions` in the
+        //                             typed API of 0.2.112). Needs
+        //                             either a different injection
+        //                             mechanism (settings file,
+        //                             applyFlagSettings) or a future
+        //                             SDK surface.
         ..zenui_provider_api::ProviderFeatures::default()
     }
 }

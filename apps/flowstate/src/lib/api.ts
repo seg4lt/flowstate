@@ -1,5 +1,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import type { AttachmentData, ClientMessage, ServerMessage } from "./types";
+import type {
+  AttachmentData,
+  ClientMessage,
+  ContextBreakdown,
+  ServerMessage,
+} from "./types";
 
 export function sendMessage(
   message: ClientMessage,
@@ -19,6 +24,29 @@ export async function getAttachment(
   if (resp?.type === "attachment") return resp.data;
   if (resp?.type === "error") throw new Error(resp.message);
   throw new Error("unexpected response to get_attachment");
+}
+
+/**
+ * Fetch the per-category context-usage breakdown for a session's
+ * active turn. Only works while a turn is in flight — the provider
+ * adapter's `get_context_usage` is a mid-turn RPC under the hood,
+ * which only resolves when `run_turn`'s drain loop is alive to
+ * route the response. Returns `null` when the session has no live
+ * bridge or the provider doesn't support the RPC. Throws on
+ * `ServerMessage::Error` (timeouts, kind mismatches, etc.) so the
+ * caller can surface a distinct message rather than silently
+ * treating errors as "unavailable".
+ */
+export async function getContextUsage(
+  sessionId: string,
+): Promise<ContextBreakdown | null> {
+  const resp = await sendMessage({
+    type: "get_context_usage",
+    session_id: sessionId,
+  });
+  if (resp?.type === "context_usage") return resp.breakdown;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to get_context_usage");
 }
 
 export function connectStream(
