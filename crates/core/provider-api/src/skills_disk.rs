@@ -147,7 +147,7 @@ pub fn scan(roots: &[ScanRoot], provider: ProviderKind) -> Vec<ProviderCommand> 
                 continue;
             }
             out.push(ProviderCommand {
-                id: format!("{}:user_skill:{}", provider_tag(provider), parsed.name),
+                id: format!("{}:user_skill:{}", provider.as_tag(), parsed.name),
                 name: parsed.name.clone(),
                 description: parsed.description.clone(),
                 kind: CommandKind::UserSkill { source },
@@ -238,16 +238,6 @@ fn unquote(s: &str) -> String {
         trimmed[1..trimmed.len() - 1].to_string()
     } else {
         trimmed.to_string()
-    }
-}
-
-fn provider_tag(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Codex => "codex",
-        ProviderKind::Claude => "claude",
-        ProviderKind::GitHubCopilot => "github_copilot",
-        ProviderKind::ClaudeCli => "claude_cli",
-        ProviderKind::GitHubCopilotCli => "github_copilot_cli",
     }
 }
 

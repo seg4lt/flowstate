@@ -12,3 +12,9 @@ flate2 = "1"
 tar = "0.4"
 zip = "2"
 tracing.workspace = true
+
+[build-dependencies]
+# Pure-Rust HTTP client so the Node.js download in `build.rs` doesn't
+# depend on a system `curl` (which is absent on bare Windows CI runners
+# and inconsistent across Linux containers).
+ureq = "2"

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 use chrono::Utc;
 use tokio::sync::{Mutex, broadcast};
 use zenui_orchestration::OrchestrationService;
-use zenui_persistence::PersistenceService;
+use zenui_persistence::{FileCheckpointStore, PersistenceService};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
     ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter,
@@ -37,19 +37,6 @@ struct RewindOutcome {
     paths_deleted: Vec<String>,
 }
 
-/// Status snapshot returned by `ConnectionObserver::status` and serialized
-/// by admin endpoints such as `GET /api/status` in the HTTP transport.
-/// Plain serde POD — lives in `runtime-core` so transports and the daemon
-/// lifecycle share a single definition without depending on each other.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DaemonStatus {
-    pub connected_clients: usize,
-    pub in_flight_turns: usize,
-    pub uptime_seconds: u64,
-    pub daemon_version: String,
-    pub started_at: String,
-}
-
 /// Hooks a transport calls whenever a client connects or disconnects, plus
 /// the shutdown-request hook used by daemon-owned admin routes. `daemon-core`
 /// implements this on `DaemonLifecycle` to drive its idle watchdog;
@@ -65,9 +52,12 @@ pub trait ConnectionObserver: Send + Sync {
     fn on_client_connected(&self);
     fn on_client_disconnected(&self);
     fn on_shutdown_requested(&self);
-    /// Optional status snapshot for admin endpoints. Daemons override this;
-    /// the default `None` is what non-daemon callers use.
-    fn status(&self) -> Option<DaemonStatus> {
+    /// Optional status snapshot for admin endpoints. Daemons override
+    /// this; the default `None` is what non-daemon callers use. The
+    /// payload is opaque JSON so the concrete daemon type (and its
+    /// runtime fields like uptime, client counters, …) stays in
+    /// `daemon-core` instead of leaking into the shared runtime.
+    fn status(&self) -> Option<serde_json::Value> {
         None
     }
 }
@@ -85,9 +75,19 @@ impl ConnectionObserver for NoopObserver {
 
 pub struct RuntimeCore {
     adapters: HashMap<ProviderKind, Arc<dyn ProviderAdapter>>,
+    /// Human-readable identifier of the hosting application. Surfaces
+    /// in the `BootstrapPayload.app_name` wire field so clients can
+    /// label the host without runtime-core having to know who is
+    /// embedding it. Provided by the app layer via `RuntimeCore::new`.
+    app_name: String,
     event_tx: broadcast::Sender<RuntimeEvent>,
     orchestration: Arc<OrchestrationService>,
     persistence: Arc<PersistenceService>,
+    /// File I/O for the rewind / file-checkpoint flow. Kept as a trait
+    /// object so `runtime-core` doesn't need `tokio::fs` itself; the
+    /// default wiring points at the `PersistenceService` impl and tests
+    /// can swap in a mock without touching the filesystem.
+    file_checkpoints: Arc<dyn FileCheckpointStore>,
     active_sinks: Arc<Mutex<HashMap<String, TurnEventSink>>>,
     /// Per-session permission policy memory. Keyed by session_id; the inner
     /// map remembers tools the user answered AllowAlways/DenyAlways for, so
@@ -205,6 +205,7 @@ impl RuntimeCore {
         persistence: Arc<PersistenceService>,
         turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
         default_threads_dir: String,
+        app_name: String,
     ) -> Self {
         let adapters = adapters
             .into_iter()
@@ -223,11 +224,14 @@ impl RuntimeCore {
         let registered: Vec<_> = adapters.keys().map(|k| k.label()).collect();
         tracing::info!(?registered, "Registered provider adapters");
 
+        let file_checkpoints: Arc<dyn FileCheckpointStore> = persistence.clone();
         Self {
             adapters,
+            app_name,
             event_tx,
             orchestration,
             persistence,
+            file_checkpoints,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             default_threads_dir,
@@ -257,17 +261,19 @@ impl RuntimeCore {
 
     /// Read-side helper. When the provider has a row in the
     /// `provider_enablement` table, returns that persisted value.
-    /// Otherwise falls back to a per-provider default: Claude and
-    /// GitHub Copilot are enabled out of the box; CLI variants and
-    /// Codex default to disabled until the user turns them on in
-    /// Settings.
+    /// Otherwise falls back to the adapter's `default_enabled()` hook,
+    /// keeping the decision inside the provider crate. If no adapter
+    /// for `kind` is registered the provider is reported disabled.
     pub fn is_provider_enabled(&self, kind: ProviderKind) -> bool {
         self.provider_enablement
             .read()
             .ok()
             .and_then(|lock| lock.get(&kind).copied())
             .unwrap_or_else(|| {
-                matches!(kind, ProviderKind::Claude | ProviderKind::GitHubCopilot)
+                self.adapters
+                    .get(&kind)
+                    .map(|adapter| adapter.default_enabled())
+                    .unwrap_or(false)
             })
     }
 
@@ -523,7 +529,7 @@ impl RuntimeCore {
         }
 
         BootstrapPayload {
-            app_name: "zenui".to_string(),
+            app_name: self.app_name.clone(),
             generated_at: Utc::now().to_rfc3339(),
             ws_url,
             providers: cached_providers,
@@ -2191,9 +2197,14 @@ impl RuntimeCore {
         let mut paths_restored = Vec::new();
         let mut paths_deleted = Vec::new();
         for (path, before) in earliest_before {
+            let fs_path = std::path::Path::new(&path);
             match before {
                 Some(content) => {
-                    if let Err(e) = tokio::fs::write(&path, content).await {
+                    if let Err(e) = self
+                        .file_checkpoints
+                        .write_file(fs_path, content.as_bytes())
+                        .await
+                    {
                         return Err(format!(
                             "Failed to restore `{path}`: {e}"
                         ));
@@ -2205,7 +2216,7 @@ impl RuntimeCore {
                     // it's already gone (user / another tool deleted
                     // it), treat that as success — the desired
                     // post-condition is "the file does not exist".
-                    match tokio::fs::remove_file(&path).await {
+                    match self.file_checkpoints.remove_file(fs_path).await {
                         Ok(()) => paths_deleted.push(path),
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             paths_deleted.push(path);
@@ -2731,6 +2742,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         runtime
@@ -2829,6 +2841,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         );
 
         runtime
@@ -2912,6 +2925,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         );
 
         let response = runtime
@@ -3010,6 +3024,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         );
 
         runtime
@@ -3209,6 +3224,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         // Codex defaults to disabled since the "default only Claude and
@@ -3389,6 +3405,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         // Codex defaults to disabled since the "default only Claude and
@@ -3596,6 +3613,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
         let mut events = runtime.subscribe();
 
@@ -3663,6 +3681,7 @@ mod tests {
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         // Codex defaults to disabled since the "default only Claude and
@@ -3732,6 +3751,7 @@ mod tests {
             persistence.clone(),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         );
 
         // Create a session and hand-stamp it as Running to simulate a prior
@@ -3859,6 +3879,7 @@ mod tests {
             persistence.clone(),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         let payload = runtime.bootstrap("ws://test".to_string()).await;
@@ -3890,6 +3911,7 @@ mod tests {
             persistence.clone(),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         let payload = runtime.bootstrap("ws://test".to_string()).await;
@@ -3975,6 +3997,7 @@ mod tests {
             persistence.clone(),
             None,
             "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
         ));
 
         // Subscribe before bootstrapping so we don't miss the event.

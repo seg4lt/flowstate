@@ -3,7 +3,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, oneshot};
-use zenui_runtime_core::{ConnectionObserver, DaemonStatus, TurnLifecycleObserver};
+use zenui_runtime_core::{ConnectionObserver, TurnLifecycleObserver};
+
+/// Status snapshot returned by admin endpoints such as `GET /api/status`
+/// in the HTTP transport. Lives in `daemon-core` (not `runtime-core`)
+/// because its fields — uptime, client counters, daemon version — are
+/// concerns of the long-running daemon process, not of the core runtime
+/// engine. Transports receive it as opaque JSON via
+/// [`ConnectionObserver::status`](zenui_runtime_core::ConnectionObserver::status).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DaemonStatus {
+    pub connected_clients: usize,
+    pub in_flight_turns: usize,
+    pub uptime_seconds: u64,
+    pub daemon_version: String,
+    pub started_at: String,
+}
 
 /// Runtime state driving the daemon's idle-shutdown behavior.
 ///
@@ -108,14 +123,15 @@ impl ConnectionObserver for DaemonLifecycle {
         self.request_shutdown();
     }
 
-    fn status(&self) -> Option<DaemonStatus> {
-        Some(DaemonStatus {
+    fn status(&self) -> Option<serde_json::Value> {
+        serde_json::to_value(DaemonStatus {
             connected_clients: self.connected_clients(),
             in_flight_turns: self.in_flight_turns(),
             uptime_seconds: self.started_at.elapsed().as_secs(),
             daemon_version: self.daemon_version.clone(),
             started_at: self.started_at_rfc3339.clone(),
         })
+        .ok()
     }
 }
 

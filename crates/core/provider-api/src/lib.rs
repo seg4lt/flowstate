@@ -45,6 +45,67 @@ impl ProviderKind {
             Self::GitHubCopilotCli => "GitHub Copilot (CLI)",
         }
     }
+
+    /// Short, stable string identifier for this variant. Matches the
+    /// serde wire form (`#[serde(rename_all = "snake_case")]` plus the
+    /// explicit renames on the enum). Prefer this over bespoke
+    /// `match`-based codecs; keep one source of truth.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::GitHubCopilot => "github_copilot",
+            Self::ClaudeCli => "claude_cli",
+            Self::GitHubCopilotCli => "github_copilot_cli",
+        }
+    }
+
+    /// Inverse of [`Self::as_tag`]. Returns `None` for unknown tags so
+    /// callers can decide how to handle drift (log + skip, error, etc.)
+    /// rather than silently coercing to a wrong variant.
+    pub fn from_tag(s: &str) -> Option<Self> {
+        Some(match s {
+            "codex" => Self::Codex,
+            "claude" => Self::Claude,
+            "github_copilot" => Self::GitHubCopilot,
+            "claude_cli" => Self::ClaudeCli,
+            "github_copilot_cli" => Self::GitHubCopilotCli,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod provider_kind_tests {
+    use super::ProviderKind;
+
+    #[test]
+    fn as_tag_round_trips_for_every_variant() {
+        for &kind in ProviderKind::ALL {
+            let tag = kind.as_tag();
+            assert_eq!(
+                ProviderKind::from_tag(tag),
+                Some(kind),
+                "tag {tag:?} did not round-trip for {kind:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn as_tag_matches_serde_wire_form() {
+        for &kind in ProviderKind::ALL {
+            let json = serde_json::to_string(&kind).expect("serialize");
+            // JSON strings are quoted; strip the quotes before comparing.
+            let trimmed = json.trim_matches('"');
+            assert_eq!(trimmed, kind.as_tag());
+        }
+    }
+
+    #[test]
+    fn from_tag_rejects_unknown() {
+        assert_eq!(ProviderKind::from_tag("definitely-not-a-provider"), None);
+        assert_eq!(ProviderKind::from_tag(""), None);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,9 +790,6 @@ pub enum SkillSource {
 ///   (Claude's `/compact`, `/context`; Copilot's built-ins).
 /// - `UserSkill` — a user-authored `SKILL.md` discovered on disk. Carries
 ///   its source so the popup can badge project-local vs global skills.
-/// - `TuiOnly` — best-effort string extracted from a provider that has
-///   no programmatic registry (currently unused; reserved for future
-///   Codex integration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
@@ -739,7 +797,6 @@ pub enum SkillSource {
 pub enum CommandKind {
     Builtin,
     UserSkill { source: SkillSource },
-    TuiOnly,
 }
 
 /// A single slash-command / skill entry in a provider's session command
@@ -1058,33 +1115,6 @@ pub struct SessionDetail {
     /// Not persisted in the database.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-}
-
-impl SessionDetail {
-    pub fn format_turn_context(&self, latest_input: &str) -> String {
-        let mut prompt = String::from(
-            "You are operating inside ZenUI, a native coding-agent shell. Respond directly to the user's latest request using the conversation history below when useful.\n\n",
-        );
-
-        if self.turns.is_empty() {
-            prompt.push_str("No prior turns exist for this session yet.\n\n");
-        } else {
-            prompt.push_str("Conversation history:\n");
-            for (index, turn) in self.turns.iter().enumerate() {
-                prompt.push_str(&format!("Turn {} user: {}\n", index + 1, turn.input));
-                if !turn.output.trim().is_empty() {
-                    prompt.push_str(&format!("Turn {} assistant: {}\n", index + 1, turn.output));
-                }
-                prompt.push('\n');
-            }
-        }
-
-        prompt.push_str("Latest user request:\n");
-        prompt.push_str(latest_input.trim());
-        prompt.push_str("\n");
-
-        prompt
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2116,6 +2146,26 @@ pub enum ServerMessage {
 pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
+    /// Whether this provider should be enabled by default when a fresh
+    /// user opens the app (no persisted enablement row yet). Override
+    /// to `false` for providers that should be opt-in — CLI variants
+    /// and experimental adapters typically want this. Persisted user
+    /// preferences always take precedence over this default.
+    fn default_enabled(&self) -> bool {
+        true
+    }
+
+    /// Capability flags advertised to the UI. Defaults to the
+    /// per-kind table in [`features_for_kind`], but adapters are free
+    /// to override — e.g. a future Codex revision that adds tool
+    /// heartbeats can flip `tool_progress: true` here without touching
+    /// `provider-api`. Keeps the feature shape a per-provider concern
+    /// instead of a central match statement that every new capability
+    /// has to edit.
+    fn features(&self) -> ProviderFeatures {
+        features_for_kind(self.kind())
+    }
+
     async fn health(&self) -> ProviderStatus;
 
     /// Fetch the live model catalog from the upstream CLI / SDK.
@@ -2154,9 +2204,6 @@ pub trait ProviderAdapter: Send + Sync {
     /// reference each turn, and delegates compaction / context-window management to the
     /// provider. `SessionDetail.turns` is consumed by the frontend for chat-history
     /// display but is never replayed to any model.
-    ///
-    /// The legacy `format_turn_context` helper below is unused dead code and will be
-    /// removed in a follow-up.
     async fn execute_turn(
         &self,
         session: &SessionDetail,

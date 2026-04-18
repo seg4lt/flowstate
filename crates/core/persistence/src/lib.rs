@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Utc;
@@ -13,6 +14,20 @@ use zenui_provider_api::{
     ProjectRecord, ProviderKind, ProviderModel, ProviderStatus, ReasoningEffort, SessionDetail,
     SessionStatus, SessionSummary, SubagentRecord, ToolCall, TurnRecord, TurnStatus,
 };
+
+/// Runtime-scoped file I/O used by the rewind / file-checkpoint flow.
+///
+/// Extracted as a trait so `runtime-core` can express the intent
+/// ("restore this file to its earlier contents") without depending on
+/// `tokio::fs` directly. The concrete impl on [`PersistenceService`]
+/// is the only consumer today; tests can plug in a mock to assert
+/// which paths would have been written without actually touching the
+/// filesystem.
+#[async_trait]
+pub trait FileCheckpointStore: Send + Sync {
+    async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
+    async fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+}
 
 /// Hard cap on the size of a single image attachment, in bytes. Mirrors
 /// the frontend cap so an oversized payload is rejected before we touch
@@ -42,6 +57,17 @@ fn ext_for_media_type(media_type: &str) -> &'static str {
 pub struct PersistenceService {
     connection: Mutex<Connection>,
     attachments_dir: PathBuf,
+}
+
+#[async_trait]
+impl FileCheckpointStore for PersistenceService {
+    async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
+        tokio::fs::write(path, contents).await
+    }
+
+    async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        tokio::fs::remove_file(path).await
+    }
 }
 
 impl PersistenceService {
@@ -111,7 +137,7 @@ impl PersistenceService {
                     project_id = excluded.project_id",
                 params![
                     session.summary.session_id,
-                    provider_kind_to_str(session.summary.provider),
+                    session.summary.provider.as_tag(),
                     session_status_to_str(session.summary.status),
                     session.summary.created_at,
                     session.summary.updated_at,
@@ -477,7 +503,7 @@ impl PersistenceService {
         connection
             .query_row(
                 "SELECT fetched_at, models_json FROM provider_model_cache WHERE provider = ?1",
-                params![provider_kind_to_str(kind)],
+                params![kind.as_tag()],
                 |row| {
                     let fetched_at: String = row.get(0)?;
                     let models_json: String = row.get(1)?;
@@ -520,7 +546,7 @@ impl PersistenceService {
              ON CONFLICT(provider) DO UPDATE SET
                 fetched_at = excluded.fetched_at,
                 models_json = excluded.models_json",
-            params![provider_kind_to_str(kind), fetched_at, json],
+            params![kind.as_tag(), fetched_at, json],
         );
     }
 
@@ -538,7 +564,7 @@ impl PersistenceService {
         connection
             .query_row(
                 "SELECT checked_at, status_json FROM provider_health_cache WHERE provider = ?1",
-                params![provider_kind_to_str(kind)],
+                params![kind.as_tag()],
                 |row| {
                     let checked_at: String = row.get(0)?;
                     let status_json: String = row.get(1)?;
@@ -601,7 +627,7 @@ impl PersistenceService {
              ON CONFLICT(provider) DO UPDATE SET
                 enabled = excluded.enabled,
                 updated_at = excluded.updated_at",
-            params![provider_kind_to_str(kind), enabled as i64, now],
+            params![kind.as_tag(), enabled as i64, now],
         );
     }
 
@@ -629,7 +655,7 @@ impl PersistenceService {
              ON CONFLICT(provider) DO UPDATE SET
                 checked_at = excluded.checked_at,
                 status_json = excluded.status_json",
-            params![provider_kind_to_str(kind), now, json],
+            params![kind.as_tag(), now, json],
         );
     }
 
@@ -1252,23 +1278,21 @@ fn load_session(
     }))
 }
 
-fn provider_kind_to_str(kind: ProviderKind) -> &'static str {
-    match kind {
-        ProviderKind::Codex => "codex",
-        ProviderKind::Claude => "claude",
-        ProviderKind::GitHubCopilot => "github_copilot",
-        ProviderKind::ClaudeCli => "claude_cli",
-        ProviderKind::GitHubCopilotCli => "github_copilot_cli",
-    }
-}
-
+/// Lenient decoder over [`ProviderKind::from_tag`]. Unknown strings
+/// have historically been coerced to `Codex` (e.g. from rows written
+/// by a newer schema). Preserve that behavior to avoid silently
+/// dropping rows, but surface the drift via `tracing::warn!` so we
+/// notice schema skew in the logs.
 fn provider_kind_from_str(value: &str) -> ProviderKind {
-    match value {
-        "claude" => ProviderKind::Claude,
-        "github_copilot" => ProviderKind::GitHubCopilot,
-        "claude_cli" => ProviderKind::ClaudeCli,
-        "github_copilot_cli" => ProviderKind::GitHubCopilotCli,
-        _ => ProviderKind::Codex,
+    match ProviderKind::from_tag(value) {
+        Some(kind) => kind,
+        None => {
+            tracing::warn!(
+                tag = value,
+                "unknown provider tag in persistence; defaulting to Codex",
+            );
+            ProviderKind::Codex
+        }
     }
 }
 

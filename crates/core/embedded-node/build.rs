@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
 
 const NODE_VERSION: &str = "20.11.1";
 
@@ -67,7 +67,9 @@ fn main() {
         return;
     }
 
-    // Cache miss — download from nodejs.org.
+    // Cache miss — download from nodejs.org using a pure-Rust HTTP
+    // client. Avoids the dependency on system `curl` (missing on bare
+    // Windows CI runners, inconsistent across Linux containers).
     let filename = format!("node-v{}-{}-{}.{}", NODE_VERSION, platform, arch, ext);
     let url = format!("https://nodejs.org/dist/v{}/{}", NODE_VERSION, filename);
 
@@ -76,17 +78,32 @@ fn main() {
         NODE_VERSION, platform, arch
     );
 
-    let status = Command::new("curl")
-        .args(["-fsSL", "-o", &archive_path.to_string_lossy(), &url])
-        .status()
-        .expect("failed to invoke curl");
-    if !status.success() {
-        panic!("failed to download Node.js from {url}");
+    match download_to(&url, &archive_path) {
+        Ok(()) => {}
+        Err(err) => {
+            // Cargo turns `cargo:error=` lines into a clean build error
+            // without dumping a backtrace the way `panic!` does.
+            println!("cargo:error=failed to download Node.js from {url}: {err}");
+            std::process::exit(1);
+        }
     }
 
     // Persist to cache for future builds / cargo clean cycles.
     fs::create_dir_all(&cache_dir).ok();
     fs::copy(&archive_path, &cached_archive).ok();
+}
+
+fn download_to(url: &str, dest: &std::path::Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| format!("request failed: {e}"))?;
+    let mut reader = response.into_reader();
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read body failed: {e}"))?;
+    fs::write(dest, &bytes).map_err(|e| format!("write {} failed: {e}", dest.display()))?;
+    Ok(())
 }
 
 fn detect_platform(target: &str) -> Option<(&'static str, &'static str)> {

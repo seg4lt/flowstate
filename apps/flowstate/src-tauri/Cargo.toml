@@ -39,12 +39,20 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 grep-matcher = "0.1"
 
-# Daemon core with opted-in features: every provider adapter, plus
-# the Tauri transport. flowstate ships with all providers compiled in
-# and lets users toggle them at runtime from Settings. transport-tauri
+# Daemon core with just the Tauri transport. Providers are no longer
+# a daemon-core concern — flowstate constructs its own adapter vector
+# below and passes it into `DaemonConfig::adapters`. transport-tauri
 # is re-exported by daemon-core as `zenui_daemon_core::transport_tauri`.
-# Path dep into the unified workspace at the repo root.
-zenui-daemon-core = { path = "../../../crates/middleman/daemon-core", features = ["all-providers", "transport-tauri"] }
+zenui-daemon-core = { path = "../../../crates/middleman/daemon-core", features = ["transport-tauri"] }
+
+# Provider adapters the app wants to expose. Construction happens in
+# `src/lib.rs`; keeping the path deps here makes the set of supported
+# providers a single-file edit for downstream apps.
+zenui-provider-claude-sdk = { path = "../../../crates/core/provider-claude-sdk" }
+zenui-provider-claude-cli = { path = "../../../crates/core/provider-claude-cli" }
+zenui-provider-codex = { path = "../../../crates/core/provider-codex" }
+zenui-provider-github-copilot = { path = "../../../crates/core/provider-github-copilot" }
+zenui-provider-github-copilot-cli = { path = "../../../crates/core/provider-github-copilot-cli" }
 
 # Types used in Tauri commands
 zenui-provider-api = { path = "../../../crates/core/provider-api" }

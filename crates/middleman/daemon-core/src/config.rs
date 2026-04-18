@@ -1,13 +1,23 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use zenui_provider_api::ProviderKind;
+use zenui_provider_api::ProviderAdapter;
 
 /// Transport-agnostic runtime configuration for the daemon. Any
 /// transport-specific settings (bind address, socket path, frontend
 /// dist, TLS certs, ...) live on the individual `Transport` structs
 /// that the app constructs and passes to `run_blocking`.
-#[derive(Debug, Clone)]
+///
+/// **Adapter ownership:** `adapters` is empty by default. The
+/// hosting app (e.g. `apps/flowstate/src-tauri`) is responsible for
+/// constructing the `ProviderAdapter` instances it wants to expose
+/// and pushing them into this field before calling
+/// `bootstrap_core_async`. Keeping construction out of `daemon-core`
+/// preserves the provider-agnostic layering — middleman bridges
+/// lifecycle and transport concerns and never picks concrete
+/// providers.
+#[derive(Clone)]
 pub struct DaemonConfig {
     pub database_name: String,
     pub project_root: PathBuf,
@@ -15,16 +25,18 @@ pub struct DaemonConfig {
     pub shutdown_grace: Duration,
     pub log_file: Option<PathBuf>,
     pub detach: bool,
-    /// Which providers to instantiate and health-check. Defaults to all
-    /// known providers (`ProviderKind::ALL`). Pass a subset to skip
-    /// providers the app doesn't need.
-    pub enabled_providers: Vec<ProviderKind>,
+    pub adapters: Vec<Arc<dyn ProviderAdapter>>,
+    /// Name the runtime advertises in the Bootstrap wire payload. Lets
+    /// multiple apps (flowstate, experimental shells, tests) embed the
+    /// same runtime without leaking a hard-coded label into core.
+    pub app_name: String,
 }
 
 impl DaemonConfig {
     /// Sensible defaults for a project-rooted daemon with normal
     /// idle-shutdown behavior (60-second idle timeout, 5-second
-    /// shutdown grace).
+    /// shutdown grace). The caller must populate `adapters` before
+    /// calling `bootstrap_core_async`.
     pub fn with_project_root(project_root: PathBuf) -> Self {
         Self {
             database_name: "zenui.db".to_string(),
@@ -33,7 +45,8 @@ impl DaemonConfig {
             shutdown_grace: Duration::from_secs(5),
             log_file: None,
             detach: false,
-            enabled_providers: ProviderKind::ALL.to_vec(),
+            adapters: Vec::new(),
+            app_name: "zenui".to_string(),
         }
     }
 
@@ -52,7 +65,8 @@ impl DaemonConfig {
             shutdown_grace: Duration::from_secs(5),
             log_file: None,
             detach: false,
-            enabled_providers: ProviderKind::ALL.to_vec(),
+            adapters: Vec::new(),
+            app_name: "zenui".to_string(),
         }
     }
 }

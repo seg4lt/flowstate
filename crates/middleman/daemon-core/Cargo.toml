@@ -5,26 +5,13 @@ edition.workspace = true
 publish = false
 
 [features]
-# Nothing on by default — every concrete provider AND transport must
-# be opted in by the consumer. Apps like flowstate enable
-# `all-providers` + `transport-tauri`; the zenui binary enables
-# `all-providers` + `transport-http`. Unused adapter / transport code
-# is stripped from the binary entirely.
+# Nothing on by default — each transport must be opted in by the
+# consumer. Concrete providers are no longer a daemon-core concern:
+# the hosting app constructs its own `Vec<Arc<dyn ProviderAdapter>>`
+# and stuffs it into `DaemonConfig::adapters`. This keeps the
+# "middleman bridges lifecycle + transport; it never picks providers"
+# layering rule honest.
 default = []
-
-# Provider adapters
-provider-codex = ["dep:zenui-provider-codex"]
-provider-claude-sdk = ["dep:zenui-provider-claude-sdk"]
-provider-claude-cli = ["dep:zenui-provider-claude-cli"]
-provider-github-copilot = ["dep:zenui-provider-github-copilot"]
-provider-github-copilot-cli = ["dep:zenui-provider-github-copilot-cli"]
-all-providers = [
-  "provider-codex",
-  "provider-claude-sdk",
-  "provider-claude-cli",
-  "provider-github-copilot",
-  "provider-github-copilot-cli",
-]
 
 # Transports. Each concrete transport is an optional dep; daemon-core
 # re-exports it under the matching feature so consumers only need a
@@ -46,11 +33,6 @@ tracing-subscriber.workspace = true
 zenui-orchestration = { path = "../../core/orchestration" }
 zenui-persistence = { path = "../../core/persistence" }
 zenui-provider-api = { path = "../../core/provider-api" }
-zenui-provider-claude-cli = { path = "../../core/provider-claude-cli", optional = true }
-zenui-provider-claude-sdk = { path = "../../core/provider-claude-sdk", optional = true }
-zenui-provider-codex = { path = "../../core/provider-codex", optional = true }
-zenui-provider-github-copilot = { path = "../../core/provider-github-copilot", optional = true }
-zenui-provider-github-copilot-cli = { path = "../../core/provider-github-copilot-cli", optional = true }
 zenui-runtime-core = { path = "../../core/runtime-core" }
 zenui-transport-tauri = { path = "../transport-tauri", optional = true }
 zenui-transport-http = { path = "../transport-http", optional = true }
