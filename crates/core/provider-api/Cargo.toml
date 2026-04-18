@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+# Phase 0.2 safety net. When enabled, every wire type in this crate
+# additionally derives `ts_rs::TS`. The integration test
+# `tests/ts_bindings.rs` uses that to generate
+# `apps/flowstate/src/lib/generated/types.ts`, and CI asserts drift via
+# `git diff --exit-code` on that file.
+#
+# Deliberately opt-in: production builds (daemon, Tauri app) don't
+# enable it, so `ts-rs` stays out of the release dependency tree.
+ts-bindings = ["dep:ts-rs"]
+
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
@@ -11,6 +22,7 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"], optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
