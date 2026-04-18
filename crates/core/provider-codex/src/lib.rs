@@ -234,6 +234,7 @@ impl ProviderAdapter for CodexAdapter {
             &["--version"],
             &["login", "status"],
             codex_models(),
+            codex_features(),
         )
         .await
     }
@@ -703,6 +704,7 @@ async fn probe_cli(
     version_args: &[&str],
     auth_args: &[&str],
     models: Vec<ProviderModel>,
+    features: zenui_provider_api::ProviderFeatures,
 ) -> ProviderStatus {
     let label = kind.label();
     match Command::new(binary).args(version_args).output().await {
@@ -737,6 +739,7 @@ async fn probe_cli(
                         message,
                         models,
                         enabled: true,
+                        features: features.clone(),
                     }
                 }
                 Err(error) => ProviderStatus {
@@ -751,6 +754,7 @@ async fn probe_cli(
                     )),
                     models,
                     enabled: true,
+                    features,
                 },
             }
         }
@@ -764,6 +768,7 @@ async fn probe_cli(
             message: Some(format!("{label} CLI is unavailable: {error}")),
             models,
             enabled: true,
+            features,
         },
     }
 }
@@ -933,6 +938,18 @@ fn map_permission_mode(mode: PermissionMode) -> (&'static str, &'static str) {
         // happens per turn via `collaborationMode.mode = "plan"` in turn/start.
         PermissionMode::Plan => ("on-request", "workspace-write"),
         PermissionMode::Bypass => ("never", "danger-full-access"),
+    }
+}
+
+/// Feature flags the Codex CLI adapter exposes. Codex has native
+/// `reasoning_effort` support on its turn API; none of the other
+/// cross-provider features (compact summaries, memory recall, tool
+/// elapsed time, etc.) map to anything the Codex protocol surfaces
+/// today, so they stay off.
+fn codex_features() -> zenui_provider_api::ProviderFeatures {
+    zenui_provider_api::ProviderFeatures {
+        thinking_effort: true,
+        ..zenui_provider_api::ProviderFeatures::default()
     }
 }
 

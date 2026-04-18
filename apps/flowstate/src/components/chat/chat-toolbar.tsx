@@ -4,6 +4,7 @@ import { ModeSelector } from "./mode-selector";
 import { ContextDisplay } from "./context-display";
 import { useApp } from "@/stores/app-store";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
+import { useProviderFeatures } from "@/hooks/use-provider-features";
 import type { ProviderKind, ReasoningEffort, PermissionMode } from "@/lib/types";
 
 interface ChatToolbarProps {
@@ -27,6 +28,7 @@ export function ChatToolbar({
 }: ChatToolbarProps) {
   const { state } = useApp();
   const { showContextDisplay } = useContextDisplaySetting();
+  const features = useProviderFeatures(provider);
   const providerLabel = state.providers.find((p) => p.kind === provider)?.label;
 
   return (
@@ -36,7 +38,14 @@ export function ChatToolbar({
         provider={provider}
         currentModel={currentModel}
       />
-      <EffortSelector value={effort} onChange={onEffortChange} />
+      {/* Effort selector only renders for providers whose adapter
+          honours reasoning_effort (Codex's turn/start payload, Claude
+          SDK's thinking config). On Copilot/Claude-CLI the setting
+          silently did nothing, so hiding it stops the user from
+          tuning a control with no effect. */}
+      {features.thinkingEffort && (
+        <EffortSelector value={effort} onChange={onEffortChange} />
+      )}
       <ModeSelector value={permissionMode} onChange={onPermissionModeChange} />
       {providerLabel && (
         <span className="text-xs text-muted-foreground">{providerLabel}</span>

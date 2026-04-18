@@ -259,6 +259,16 @@ pub struct ToolCall {
     /// issued directly by the main agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
+    /// Wall-clock timestamp (RFC 3339 / ISO 8601) of when the tool
+    /// call started. Set by runtime-core on `ToolCallStarted`; the
+    /// frontend reads this to render a live "Bash · 12s" elapsed
+    /// counter while the call is still pending. Optional for two
+    /// reasons: (1) cleanly deserializes older persisted turns, and
+    /// (2) providers whose adapter hasn't opted into
+    /// `ProviderFeatures.tool_progress` will simply have this
+    /// field absent and the UI falls through to no timer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
 }
 
 /// One element of an assistant turn's ordered content stream.
@@ -390,10 +400,71 @@ pub struct ProviderStatus {
     /// value from the `provider_enablement` table before broadcasting.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Per-provider feature capability flags. Frontend UIs gate
+    /// affordances on these booleans so users don't see buttons that
+    /// do nothing on their current provider. Defaults to all-false;
+    /// each adapter opts in to the features it actually supports.
+    /// Persisted `ProviderStatus` rows from before this field existed
+    /// deserialize cleanly because both the field and the struct are
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub features: ProviderFeatures,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Cross-provider capability registry.
+///
+/// Every flag gates a user-visible surface (a UI affordance, a menu
+/// item, a popover trigger). Internal event-emission details don't
+/// earn a flag here — events are cheap; UIs are not. Adding a new
+/// flag is a deliberate act: it admits a new piece of UI into the
+/// "which provider supports this?" decision matrix the frontend has
+/// to carry.
+///
+/// The default is all-false so adapters opt in. New fields MUST have
+/// `#[serde(default)]` behavior (provided by the enclosing
+/// `#[serde(default)]` on the struct) so adding a flag doesn't break
+/// clients running against an older daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ProviderFeatures {
+    /// Emits `TurnStatusChanged` events during non-streaming phases
+    /// (waiting on the API, compacting). Drives the working-indicator
+    /// secondary label ("Working · compacting…").
+    pub status_labels: bool,
+    /// Emits periodic `tool_progress` heartbeat events for running
+    /// tool calls, enabling "possibly stuck" detection. The basic
+    /// elapsed-time counter ("Bash · 12s") is driven by the
+    /// cross-provider `ToolCall::started_at` field and does NOT
+    /// depend on this flag — runtime-core stamps `started_at` on
+    /// every `ToolCallStarted` regardless of provider.
+    pub tool_progress: bool,
+    /// Emits `TurnRetrying` events when auto-retrying a transient API
+    /// error. Drives the "Retrying (2/5)…" banner above the composer.
+    pub api_retries: bool,
+    /// Honours `reasoning_effort` via a native thinking-budget
+    /// mechanism. The UI shows the effort selector only when true —
+    /// providers without real effort support get no selector instead
+    /// of a silently-dropped setting.
+    pub thinking_effort: bool,
+    /// Supports `get_context_usage()` — click-to-reveal breakdown of
+    /// what's filling context (system / tools / messages / memory).
+    pub context_breakdown: bool,
+    /// Emits `PromptSuggested` events after each turn. Drives the
+    /// ghost-text suggestion overlay in the composer.
+    pub prompt_suggestions: bool,
+    /// Supports `rewind_files(user_message_id)` — per-user-message
+    /// "Revert file changes since here" action.
+    pub file_checkpoints: bool,
+    /// Honours a per-session `compact_custom_instructions` setting
+    /// that steers what the provider emphasises when compacting.
+    pub compact_custom_instructions: bool,
+    /// Emits session lifecycle diagnostics (start / end). Surfaced as
+    /// `Info` events in the daemon log; purely observational today.
+    pub session_lifecycle_events: bool,
 }
 
 /// Where a user-authored `SKILL.md` came from. Drives the "project" /
@@ -902,6 +973,55 @@ pub enum ProviderTurnEvent {
         mode: MemoryRecallMode,
         memories: Vec<MemoryRecallItem>,
     },
+    /// Coarse-grained turn-phase signal. Providers emit this when
+    /// they enter / exit a non-streaming phase (waiting on the API
+    /// to start responding, compressing history). Drives the
+    /// working-indicator secondary label so long pauses carry a
+    /// label instead of looking stuck. Absence of events keeps the
+    /// label empty; runtime-core does not synthesize phases.
+    StatusChanged {
+        phase: TurnPhase,
+    },
+    /// The provider is auto-retrying a transient API error. Drives
+    /// the "Retrying (2 of 5)…" banner. Attempts are 1-indexed.
+    /// `retry_delay_ms` is the SDK's planned backoff before the
+    /// next attempt fires. `error_status` is the HTTP status that
+    /// triggered the retry (if known); `error` is a human-readable
+    /// summary that gets tucked into the banner's tooltip.
+    TurnRetrying {
+        attempt: u32,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        error_status: Option<u16>,
+        error: String,
+    },
+}
+
+/// Phase of a turn between streams. Deliberately coarse — only
+/// phases that warrant a UI label earn a variant here. Unknown
+/// or unmapped provider phases fall through to `Idle` so the
+/// working indicator shows no label rather than a misleading one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnPhase {
+    /// No active non-streaming phase. Default; renders no label.
+    Idle,
+    /// Provider is waiting on the model API to start producing
+    /// tokens (Anthropic's `status: "requesting"`, etc.).
+    Requesting,
+    /// Tokens are actively streaming — the spinner is the right
+    /// signal; this phase exists mostly for parity with providers
+    /// that distinguish it from `Idle`.
+    Streaming,
+    /// Provider is compacting older history (auto-compact or user
+    /// triggered). The `compact_boundary` / `PostCompact` recap
+    /// will land after this phase clears.
+    Compacting,
+    /// Turn has paused mid-stream waiting on user input
+    /// (permission prompt, AskUserQuestion, plan-exit approval).
+    /// Renders the "awaiting your answer" label where the normal
+    /// time counter would be.
+    AwaitingInput,
 }
 
 /// Per-session "always allow / always deny" memory keyed by tool name.
@@ -1320,6 +1440,29 @@ pub enum RuntimeEvent {
         turn_id: String,
         mode: MemoryRecallMode,
         memories: Vec<MemoryRecallItem>,
+    },
+    /// Turn-phase transition. Drives the working-indicator's
+    /// secondary label. Runtime-core forwards these verbatim from
+    /// the provider; it does not synthesize phases on its own, so
+    /// providers that don't emit `StatusChanged` simply never have
+    /// a phase label.
+    TurnStatusChanged {
+        session_id: String,
+        turn_id: String,
+        phase: TurnPhase,
+    },
+    /// Provider-level auto-retry in progress. Drives the banner
+    /// that appears above the composer; cleared on the next
+    /// assistant text delta or turn completion.
+    TurnRetrying {
+        session_id: String,
+        turn_id: String,
+        attempt: u32,
+        max_retries: u32,
+        retry_delay_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_status: Option<u16>,
+        error: String,
     },
     Error {
         message: String,

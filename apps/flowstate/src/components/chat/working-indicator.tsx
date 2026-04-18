@@ -1,5 +1,6 @@
 import * as React from "react";
 import { BrailleSpinner, type SpinnerTone } from "./braille-spinner";
+import type { TurnPhase } from "@/lib/types";
 
 interface WorkingIndicatorProps {
   /**
@@ -28,6 +29,15 @@ interface WorkingIndicatorProps {
    * component stays oblivious to how tones map to modes.
    */
   tone: SpinnerTone;
+  /**
+   * Coarse provider-reported turn phase. Only providers that set
+   * `ProviderFeatures.statusLabels` emit these; for others this prop
+   * stays `undefined` and no secondary label renders. Explicitly
+   * `"streaming"` or `"idle"` also produces no label — the main
+   * counter + spinner already carry that signal — so only
+   * `requesting`, `compacting`, and `awaiting_input` render text.
+   */
+  phase?: TurnPhase;
   onInterrupt: () => void;
 }
 
@@ -39,10 +49,26 @@ function formatElapsed(elapsedMs: number): string {
   return `${minutes}m ${rem}s`;
 }
 
+function phaseLabel(phase: TurnPhase | undefined): string | null {
+  switch (phase) {
+    case "requesting":
+      return "requesting…";
+    case "compacting":
+      return "compacting…";
+    case "awaiting_input":
+      return "awaiting input…";
+    // "streaming" and "idle" are the normal states — the spinner +
+    // main counter already convey them, so no secondary label.
+    default:
+      return null;
+  }
+}
+
 function WorkingIndicatorInner({
   turnStartedAt,
   lastEventAt,
   tone,
+  phase,
   onInterrupt,
 }: WorkingIndicatorProps) {
   // Re-render every second so both counters tick. We deliberately
@@ -58,6 +84,7 @@ function WorkingIndicatorInner({
   const now = Date.now();
   const totalLabel = formatElapsed(now - turnStartedAt);
   const idleLabel = formatElapsed(now - lastEventAt);
+  const phaseText = phaseLabel(phase);
 
   return (
     <div className="flex shrink-0 items-center gap-2 border-t border-border/60 bg-muted/30 px-4 py-1.5 text-xs text-muted-foreground">
@@ -66,6 +93,12 @@ function WorkingIndicatorInner({
         Working<span className="animate-pulse">…</span>{" "}
         <span className="font-mono tabular-nums">{totalLabel}</span>
       </span>
+      {phaseText && (
+        <>
+          <span className="text-muted-foreground/50">·</span>
+          <span className="text-muted-foreground/80">{phaseText}</span>
+        </>
+      )}
       <span className="text-muted-foreground/50">·</span>
       <span className="text-muted-foreground/70">
         last updated{" "}

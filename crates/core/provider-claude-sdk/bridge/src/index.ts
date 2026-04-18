@@ -357,21 +357,31 @@ class ClaudeBridge {
       });
     };
 
-    // Claude SDK Options accepts `maxThinkingTokens` (a numeric budget), not an
-    // effort string. Map the runtime's reasoning_effort to a rough token budget;
-    // `minimal` disables thinking entirely by omitting the field.
-    const thinkingBudget: number | null = (() => {
+    // The SDK exposes two parallel knobs for extended thinking:
+    //   - `maxThinkingTokens: number` (deprecated in 0.2.x)
+    //   - `thinking: ThinkingConfig` (the replacement)
+    //
+    // `thinking` accepts `{ type: 'disabled' }`, `{ type: 'adaptive' }`
+    // (SDK auto-tunes based on task complexity), or `{ type: 'enabled',
+    // budgetTokens: N }` (explicit budget). Map flowstate's four-level
+    // ReasoningEffort onto that surface:
+    //   - `minimal` → disabled entirely
+    //   - `low`     → explicit small budget (2048 tokens)
+    //   - `medium`  → adaptive (let the SDK decide)
+    //   - `high`    → explicit large budget (32000 tokens)
+    //   - null / unknown → leave unset, SDK uses its own default
+    const thinkingConfig = (() => {
       switch (reasoningEffort) {
         case 'minimal':
-          return 0;
+          return { type: 'disabled' as const };
         case 'low':
-          return 2048;
+          return { type: 'enabled' as const, budgetTokens: 2048 };
         case 'medium':
-          return 8000;
+          return { type: 'adaptive' as const };
         case 'high':
-          return 32000;
+          return { type: 'enabled' as const, budgetTokens: 32000 };
         default:
-          return null;
+          return undefined;
       }
     })();
 
@@ -437,9 +447,7 @@ class ClaudeBridge {
         : {}),
       ...(this.model ? { model: this.model } : {}),
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
-      ...(thinkingBudget !== null && thinkingBudget > 0
-        ? { maxThinkingTokens: thinkingBudget }
-        : {}),
+      ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
       // Optional: prefer the user's local Claude Code install over
       // the SDK's bundled binary when one is on PATH. Spread is
       // empty (no key set) when no local install was found, so the
@@ -658,6 +666,56 @@ class ClaudeBridge {
               scope: x.scope ?? 'personal',
               content: x.content ?? null,
             })),
+          });
+        }
+        // Turn-phase transitions. The SDK emits `status: null |
+        // 'compacting' | 'requesting'`; we map to our coarse
+        // TurnPhase enum and forward. Unknown strings fall through
+        // to `idle` so the UI's label clears rather than freezing
+        // on a phase the frontend doesn't recognise.
+        if (sub === 'status') {
+          const s = msg as {
+            status?: 'compacting' | 'requesting' | null;
+          };
+          const phase = (() => {
+            switch (s.status) {
+              case 'compacting':
+                return 'compacting';
+              case 'requesting':
+                return 'requesting';
+              default:
+                return 'idle';
+            }
+          })();
+          writeStream({ event: 'turn_status', phase });
+        }
+        // Transient API retry. The SDK auto-retries 5xx / rate-
+        // limit responses before giving up; the UI hides the
+        // retry behind a banner so the user knows the turn is
+        // still alive. `error` is SDKAssistantMessageError —
+        // best-effort stringify down to its message if present.
+        if (sub === 'api_retry') {
+          const ar = msg as {
+            attempt?: number;
+            max_retries?: number;
+            retry_delay_ms?: number;
+            error_status?: number | null;
+            error?: { message?: string } | string;
+          };
+          const errorMessage = (() => {
+            if (typeof ar.error === 'string') return ar.error;
+            if (ar.error && typeof ar.error === 'object' && 'message' in ar.error) {
+              return ar.error.message ?? '';
+            }
+            return '';
+          })();
+          writeStream({
+            event: 'api_retry',
+            attempt: ar.attempt ?? 1,
+            max_retries: ar.max_retries ?? 0,
+            retry_delay_ms: ar.retry_delay_ms ?? 0,
+            error_status: ar.error_status ?? null,
+            error: errorMessage,
           });
         }
         return null;

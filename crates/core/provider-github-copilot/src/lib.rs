@@ -872,6 +872,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 message: Some(format!("embedded Node.js extraction failed: {err:?}")),
                 models: copilot_models(),
                 enabled: true,
+                features: zenui_provider_api::ProviderFeatures::default(),
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -885,6 +886,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 message: Some(format!("Copilot bridge extraction failed: {err:?}")),
                 models: copilot_models(),
                 enabled: true,
+                features: zenui_provider_api::ProviderFeatures::default(),
             };
         }
 
@@ -909,6 +911,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 message: Some(format!("Copilot SDK ready (found at {})", path)),
                 models: copilot_models(),
                 enabled: true,
+                features: zenui_provider_api::ProviderFeatures::default(),
             },
             None => ProviderStatus {
                 kind,
@@ -923,6 +926,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 ),
                 models: copilot_models(),
                 enabled: true,
+                features: zenui_provider_api::ProviderFeatures::default(),
             },
         }
     }

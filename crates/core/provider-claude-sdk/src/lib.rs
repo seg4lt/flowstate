@@ -367,6 +367,21 @@ enum BridgeResponse {
         mode: Option<String>,
         #[serde(default)]
         memories: Option<Value>,
+        /// Populated on `turn_status`. Bridge maps the SDK's
+        /// `status: compacting | requesting | null` to our coarse
+        /// phase strings (`idle | requesting | streaming |
+        /// compacting | awaiting_input`).
+        #[serde(default)]
+        phase: Option<String>,
+        /// Populated on `api_retry` events.
+        #[serde(default)]
+        attempt: Option<u32>,
+        #[serde(default)]
+        max_retries: Option<u32>,
+        #[serde(default)]
+        retry_delay_ms: Option<u64>,
+        #[serde(default)]
+        error_status: Option<u16>,
     },
 }
 
@@ -803,6 +818,11 @@ impl ClaudeSdkAdapter {
                     summary,
                     mode,
                     memories,
+                    phase,
+                    attempt,
+                    max_retries,
+                    retry_delay_ms,
+                    error_status,
                     path,
                     operation,
                     before,
@@ -987,6 +1007,32 @@ impl ClaudeSdkAdapter {
                             })
                             .await;
                     }
+                    "turn_status" => {
+                        use zenui_provider_api::TurnPhase;
+                        let parsed_phase = match phase.as_deref() {
+                            Some("requesting") => TurnPhase::Requesting,
+                            Some("streaming") => TurnPhase::Streaming,
+                            Some("compacting") => TurnPhase::Compacting,
+                            Some("awaiting_input") => TurnPhase::AwaitingInput,
+                            _ => TurnPhase::Idle,
+                        };
+                        events
+                            .send(ProviderTurnEvent::StatusChanged {
+                                phase: parsed_phase,
+                            })
+                            .await;
+                    }
+                    "api_retry" => {
+                        events
+                            .send(ProviderTurnEvent::TurnRetrying {
+                                attempt: attempt.unwrap_or(1),
+                                max_retries: max_retries.unwrap_or(0),
+                                retry_delay_ms: retry_delay_ms.unwrap_or(0),
+                                error_status,
+                                error: error.unwrap_or_default(),
+                            })
+                            .await;
+                    }
                     other_event => {
                         forward_stream(
                             &events,
@@ -1063,6 +1109,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
     async fn health(&self) -> ProviderStatus {
         let kind = ProviderKind::Claude;
         let label = kind.label();
+        let features = claude_sdk_features();
 
         // The embedded Node.js runtime and SDK bridge both live in the
         // binary itself; the health check just confirms we can extract
@@ -1079,6 +1126,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 message: Some(format!("embedded Node.js extraction failed: {err:?}")),
                 models: claude_models(),
                 enabled: true,
+                features: features.clone(),
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -1092,6 +1140,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 message: Some(format!("Claude SDK bridge extraction failed: {err:?}")),
                 models: claude_models(),
                 enabled: true,
+                features: features.clone(),
             };
         }
 
@@ -1105,6 +1154,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             message: Some("Claude Agent SDK bridge ready".to_string()),
             models: claude_models(),
             enabled: true,
+            features,
         }
     }
 
@@ -1753,6 +1803,36 @@ async fn forward_stream(
         _ => {
             debug!("Unknown bridge stream event: {event}");
         }
+    }
+}
+
+/// Feature flags the Claude Agent SDK bridge supports today. Keep in
+/// lockstep with the `ProviderFeatures` fields wired by this adapter;
+/// each flag flips to `true` only when both halves of the pipeline
+/// (bridge emission + runtime-core forwarding + frontend consumer)
+/// are actually wired. Setting a flag true before the wire lands
+/// would show UI affordances that silently do nothing.
+fn claude_sdk_features() -> zenui_provider_api::ProviderFeatures {
+    zenui_provider_api::ProviderFeatures {
+        // Commit 1: thinking config replaces maxThinkingTokens.
+        thinking_effort: true,
+
+        // Commit 2: turn-phase labels + API-retry banner. The
+        // basic tool-elapsed counter is driven by the cross-
+        // provider `ToolCall::started_at` field and doesn't need
+        // a feature flag, so `tool_progress` stays off here — it
+        // reserves for a later commit wiring the SDK's
+        // `tool_progress` heartbeat messages (stuck-tool
+        // detection).
+        status_labels: true,
+        api_retries: true,
+
+        // Flipped on by subsequent commits:
+        //   Deferred — tool_progress (heartbeat / stuck detection)
+        //   Commit 3 — context_breakdown, prompt_suggestions
+        //   Commit 4 — file_checkpoints, compact_custom_instructions,
+        //              session_lifecycle_events
+        ..zenui_provider_api::ProviderFeatures::default()
     }
 }
 

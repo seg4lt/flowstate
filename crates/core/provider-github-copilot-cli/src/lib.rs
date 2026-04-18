@@ -1037,6 +1037,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 ),
                 models: copilot_cli_models(),
                 enabled: true,
+                features: zenui_provider_api::ProviderFeatures::default(),
             };
         }
 
@@ -1060,6 +1061,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     message: Some(format!("Failed to start copilot CLI: {e}")),
                     models: copilot_cli_models(),
                     enabled: true,
+                    features: zenui_provider_api::ProviderFeatures::default(),
                 };
             }
             Err(_) => {
@@ -1073,6 +1075,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     message: Some("Timed out starting copilot CLI".to_string()),
                     models: copilot_cli_models(),
                     enabled: true,
+                    features: zenui_provider_api::ProviderFeatures::default(),
                 };
             }
         };
@@ -1120,6 +1123,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 ),
                 models: copilot_cli_models(),
                 enabled: true,
+                features: zenui_provider_api::ProviderFeatures::default(),
             };
         }
 
@@ -1147,6 +1151,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             message,
             models: copilot_cli_models(),
             enabled: true,
+            features: zenui_provider_api::ProviderFeatures::default(),
         }
     }
 

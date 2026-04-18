@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ChevronRight, Wrench } from "lucide-react";
 import type { ToolCall } from "@/lib/types";
+import { useTicker } from "@/hooks/use-ticker";
 import { renderToolArgs, ToolOutputContent } from "./tool-renderers";
 
 interface ToolCallCardProps {
@@ -62,6 +63,33 @@ function toolPreview(name: string, args: unknown): string | null {
   }
 }
 
+// Live elapsed counter for an in-flight tool call. Only renders when
+// both halves are present: `startedAt` (provided cross-provider by
+// runtime-core on ToolCallStarted) AND status === 'pending'. A
+// ticking 1-second counter is enough resolution for the longest
+// tool call users actually watch in real time.
+function ToolElapsed({ startedAt }: { startedAt: string }) {
+  const now = useTicker(1000);
+  const startedMs = React.useMemo(() => {
+    const t = Date.parse(startedAt);
+    return Number.isNaN(t) ? null : t;
+  }, [startedAt]);
+  if (startedMs == null) return null;
+  const elapsedSec = Math.max(0, Math.floor((now - startedMs) / 1000));
+  const label =
+    elapsedSec < 60
+      ? `${elapsedSec}s`
+      : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
+  return (
+    <span
+      className="ml-2 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/70"
+      aria-label={`Running for ${label}`}
+    >
+      {label}
+    </span>
+  );
+}
+
 export function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const [open, setOpen] = React.useState(false);
 
@@ -73,6 +101,8 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
         : "text-muted-foreground";
 
   const preview = toolPreview(toolCall.name, toolCall.args);
+  const showElapsed =
+    toolCall.status === "pending" && typeof toolCall.startedAt === "string";
 
   return (
     <div className="text-xs">
@@ -91,6 +121,9 @@ export function ToolCallCard({ toolCall }: ToolCallCardProps) {
             <span className="ml-1.5 text-muted-foreground">{preview}</span>
           )}
         </span>
+        {showElapsed && toolCall.startedAt && (
+          <ToolElapsed startedAt={toolCall.startedAt} />
+        )}
         <span className={`ml-2 shrink-0 text-[10px] ${statusColor}`}>
           {toolCall.status}
         </span>

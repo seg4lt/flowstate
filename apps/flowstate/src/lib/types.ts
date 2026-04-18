@@ -21,6 +21,34 @@ export type TurnStatus = "running" | "completed" | "interrupted" | "failed";
 export type ToolCallStatus = "pending" | "completed" | "failed";
 export type PermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
 export type PermissionMode = "default" | "accept_edits" | "plan" | "bypass";
+
+/** Coarse turn-phase signal emitted by providers that support the
+ *  capability (`ProviderFeatures.statusLabels`). Drives the working-
+ *  indicator's secondary label so long non-streaming pauses carry a
+ *  label instead of looking stuck. Not all providers emit every
+ *  phase — the UI treats missing events as `idle`. */
+export type TurnPhase =
+  | "idle"
+  | "requesting"
+  | "streaming"
+  | "compacting"
+  | "awaiting_input";
+
+/** Snapshot of an in-flight provider-level auto-retry for a session.
+ *  Populated from `turn_retrying` events; cleared on the next
+ *  assistant text delta or turn completion. Drives the
+ *  `api-retry-banner` above the composer. */
+export interface RetryState {
+  turnId: string;
+  attempt: number;
+  maxRetries: number;
+  retryDelayMs: number;
+  errorStatus?: number;
+  error: string;
+  /** Epoch ms of when the event landed, so the banner's countdown
+   *  can render `retryDelayMs - (now - startedAt)`. */
+  startedAt: number;
+}
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high";
 export type FileOperation = "write" | "edit" | "delete";
 export type SubagentStatus = "running" | "completed" | "failed";
@@ -102,6 +130,33 @@ export interface ProviderStatus {
   status: ProviderStatusLevel;
   message: string | null;
   models: ProviderModel[];
+  /** Cross-provider capability flags. Drives UI gating — hide the
+   *  effort selector on providers whose adapter doesn't populate
+   *  `thinkingEffort`, hide the rewind action when
+   *  `fileCheckpoints` is off, etc. Optional on the wire for
+   *  backward-compat with older daemon builds; readers should treat
+   *  every flag as `false` when the object is missing. */
+  features?: ProviderFeatures;
+}
+
+/** Mirrors `zenui_provider_api::ProviderFeatures`. Every flag here
+ *  gates a user-visible affordance; the UI reads this object on the
+ *  session's current provider and hides controls whose flag is
+ *  unset. Adapters that don't opt into a feature leave its flag
+ *  `false` / absent, so users never see a button that does nothing.
+ *
+ *  All fields are optional so the interface survives adding new
+ *  flags without breaking TS consumers of older daemon broadcasts. */
+export interface ProviderFeatures {
+  statusLabels?: boolean;
+  toolProgress?: boolean;
+  apiRetries?: boolean;
+  thinkingEffort?: boolean;
+  contextBreakdown?: boolean;
+  promptSuggestions?: boolean;
+  fileCheckpoints?: boolean;
+  compactCustomInstructions?: boolean;
+  sessionLifecycleEvents?: boolean;
 }
 
 export interface PlanStep {
@@ -128,6 +183,13 @@ export interface ToolCall {
   // inside a sub-agent. Undefined for main-agent calls. Used by the
   // turn view to segment the tool-call stream into per-agent groups.
   parentCallId?: string;
+  /** ISO 8601 timestamp of when the tool call was issued. Populated
+   *  by runtime-core on `ToolCallStarted` for every provider; the UI
+   *  renders a live elapsed counter ("Bash · 12s") from this while
+   *  the call is still `pending`. Providers whose adapter doesn't
+   *  opt into `ProviderFeatures.toolProgress` have the timer hidden
+   *  at the UI level even though the field is populated. */
+  startedAt?: string;
 }
 
 // Mirrors `zenui_provider_api::ContentBlock` — the canonical ordered
@@ -415,6 +477,8 @@ export type RuntimeEvent =
   | { type: "plan_proposed"; session_id: string; turn_id: string; plan_id: string; title: string; steps: PlanStep[]; raw: string }
   | { type: "compact_updated"; session_id: string; turn_id: string; trigger: "auto" | "manual"; pre_tokens?: number; post_tokens?: number; duration_ms?: number; summary?: string }
   | { type: "memory_recalled"; session_id: string; turn_id: string; mode: "select" | "synthesize"; memories: MemoryRecallItem[] }
+  | { type: "turn_status_changed"; session_id: string; turn_id: string; phase: TurnPhase }
+  | { type: "turn_retrying"; session_id: string; turn_id: string; attempt: number; max_retries: number; retry_delay_ms: number; error_status?: number; error: string }
   | { type: "error"; message: string }
   | { type: "info"; message: string }
   | { type: "provider_models_updated"; provider: ProviderKind; models: ProviderModel[] }

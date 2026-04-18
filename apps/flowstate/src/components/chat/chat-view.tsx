@@ -50,6 +50,7 @@ import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
+import { ApiRetryBanner } from "./api-retry-banner";
 import { AgentContextPanel } from "./agent-context-panel";
 import {
   findLatestMainTodoWrite,
@@ -626,6 +627,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     Date.now(),
   );
   const [stuckSince, setStuckSince] = React.useState<number | null>(null);
+  // Coarse turn phase ("requesting" / "compacting" / …). Provider-
+  // driven; only Claude SDK emits today. Cleared on turn_completed
+  // so the stale label doesn't linger onto the next turn.
+  const [turnPhase, setTurnPhase] = React.useState<
+    import("@/lib/types").TurnPhase | undefined
+  >(undefined);
+  // In-flight auto-retry banner state. Set from `turn_retrying`
+  // events; cleared on the first subsequent `content_delta` (model
+  // started responding, retry succeeded) or `turn_completed` /
+  // `session_interrupted`.
+  const [retryState, setRetryState] = React.useState<
+    import("@/lib/types").RetryState | null
+  >(null);
 
   // The diff view is sourced directly from `git diff HEAD` against
   // the project's working tree (plus untracked files). It refreshes
@@ -1167,10 +1181,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           // pendingPermissions/pendingQuestion clearing globally
           // (turn_completed / session_interrupted reducer paths).
           setPendingInput(null);
+          setTurnPhase(undefined);
+          setRetryState(null);
           break;
 
         case "turn_completed":
           setPendingInput(null);
+          setTurnPhase(undefined);
+          setRetryState(null);
           // Every completed turn activates the diff subscription
           // (idempotent after the first call) and restarts it so
           // the badge reflects what this turn left on disk. The
@@ -1178,6 +1196,31 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           // — non-blocking for the UI.
           activateDiffSubscription();
           refreshDiffs();
+          break;
+
+        case "content_delta":
+          // First token of the turn clears any in-flight retry
+          // banner — if the provider was retrying and the model
+          // started responding, the retry succeeded. Always
+          // dispatch: React short-circuits a same-value set, so
+          // we don't need to gate on the current retryState.
+          setRetryState(null);
+          break;
+
+        case "turn_status_changed":
+          setTurnPhase(event.phase);
+          break;
+
+        case "turn_retrying":
+          setRetryState({
+            turnId: event.turn_id,
+            attempt: event.attempt,
+            maxRetries: event.max_retries,
+            retryDelayMs: event.retry_delay_ms,
+            errorStatus: event.error_status,
+            error: event.error,
+            startedAt: Date.now(),
+          });
           break;
 
         case "tool_call_completed": {
@@ -1715,9 +1758,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               turnStartedAt={new Date(runningTurn.createdAt).getTime()}
               lastEventAt={lastEventAt}
               tone={toneForMode(permissionMode)}
+              phase={turnPhase}
               onInterrupt={handleInterrupt}
             />
           )}
+
+          {isRunning && retryState && <ApiRetryBanner state={retryState} />}
 
           {pendingQuestion && (
             <QuestionPrompt

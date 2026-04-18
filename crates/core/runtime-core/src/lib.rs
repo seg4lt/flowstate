@@ -289,6 +289,7 @@ impl RuntimeCore {
                 message: Some("No health check yet".to_string()),
                 models: Vec::new(),
                 enabled,
+                features: zenui_provider_api::ProviderFeatures::default(),
             },
         };
         self.publish(RuntimeEvent::ProviderHealthUpdated { status });
@@ -1417,6 +1418,13 @@ impl RuntimeCore {
                         error: None,
                         status: ToolCallStatus::Pending,
                         parent_call_id: parent_call_id.clone(),
+                        // Stamp the issue time so the frontend can
+                        // render a live elapsed counter. We do it
+                        // cross-provider so even adapters that
+                        // haven't opted into the `tool_progress`
+                        // feature flag get a reasonable "Bash ·
+                        // 12s" if the UI ever unhides the timer.
+                        started_at: Some(chrono::Utc::now().to_rfc3339()),
                     });
                     blocks.push(ContentBlock::ToolCall {
                         call_id: call_id.clone(),
@@ -1787,6 +1795,38 @@ impl RuntimeCore {
                         turn_id: tid.clone(),
                         mode,
                         memories,
+                    });
+                }
+                ProviderTurnEvent::StatusChanged { phase } => {
+                    // Pass-through. Working-indicator reads the
+                    // latest phase from chat-view's local state;
+                    // we don't persist phases to `TurnRecord`
+                    // because they're transient and meaningless
+                    // once the turn completes.
+                    self.publish(RuntimeEvent::TurnStatusChanged {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        phase,
+                    });
+                }
+                ProviderTurnEvent::TurnRetrying {
+                    attempt,
+                    max_retries,
+                    retry_delay_ms,
+                    error_status,
+                    error,
+                } => {
+                    // Pure diagnostic signal. Frontend shows a
+                    // banner; clears on the next assistant delta
+                    // or turn completion. Not persisted.
+                    self.publish(RuntimeEvent::TurnRetrying {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        attempt,
+                        max_retries,
+                        retry_delay_ms,
+                        error_status,
+                        error,
                     });
                 }
             }
@@ -2184,6 +2224,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -2226,6 +2267,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -2321,6 +2363,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -2635,6 +2678,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -2744,6 +2788,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -2823,6 +2868,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -2973,6 +3019,7 @@ mod tests {
                 message: None,
                 models: vec![],
                 enabled: true,
+                features: Default::default(),
             }
         }
 
@@ -3461,6 +3508,7 @@ mod tests {
             message: None,
             models,
             enabled: true,
+            features: Default::default(),
         }
     }
 

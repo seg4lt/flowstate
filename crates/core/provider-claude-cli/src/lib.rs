@@ -943,6 +943,10 @@ impl ProviderAdapter for ClaudeCliAdapter {
                 )),
                 models: vec![],
                 enabled: true,
+                // Claude CLI is a black-box subprocess — none of the
+                // cross-provider enrichment features (status, tool
+                // progress, recap, etc.) map to its wire format.
+                features: zenui_provider_api::ProviderFeatures::default(),
             };
         }
 
@@ -990,6 +994,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
             message,
             models: claude_cli_models(),
             enabled: true,
+            features: zenui_provider_api::ProviderFeatures::default(),
         }
     }
 
