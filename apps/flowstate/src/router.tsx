@@ -24,6 +24,7 @@ import { ChatView } from "@/components/chat/chat-view";
 import { CodeView } from "@/components/code/code-view";
 import { ProjectHomeView } from "@/components/project/project-home-view";
 import { SettingsView } from "@/components/settings/settings-view";
+import { UsageView } from "@/components/usage/usage-view";
 import { Toaster } from "@/components/ui/toaster";
 import { UpdateBanner } from "@/components/update-banner";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -345,6 +346,12 @@ const settingsRoute = createRoute({
   component: SettingsView,
 });
 
+const usageRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/usage",
+  component: UsageView,
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
@@ -352,6 +359,7 @@ const routeTree = rootRoute.addChildren([
   browseRoute,
   projectRoute,
   settingsRoute,
+  usageRoute,
 ]);
 
 export const router = createRouter({ routeTree });

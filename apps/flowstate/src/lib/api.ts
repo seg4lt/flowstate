@@ -380,6 +380,115 @@ export function getAppDataDir(): Promise<string> {
   return invoke<string>("get_app_data_dir");
 }
 
+// Usage analytics — reads of the flowstate-app-owned
+// `<app_data_dir>/usage.sqlite`. Writes happen on the Rust side
+// via a subscriber task on `RuntimeEvent::TurnCompleted`; the
+// frontend only reads aggregates. The SDK's daemon database is
+// never touched by these queries — analytics are display-only
+// and live entirely in the app's store. See
+// `src-tauri/src/usage.rs` for schema and boundary rationale.
+
+export type UsageRange =
+  | "last7_days"
+  | "last30_days"
+  | "last90_days"
+  | "all_time";
+
+export type UsageGroupBy = "by_provider" | "by_model";
+
+export type UsageBucket = "daily";
+
+export interface UsageTotals {
+  turnCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalCostUsd: number;
+  costHasUnknowns: boolean;
+  totalDurationMs: number;
+  distinctSessions: number;
+  distinctModels: number;
+}
+
+export interface UsageGroupRow {
+  key: string;
+  label: string;
+  turnCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalCostUsd: number;
+  costHasUnknowns: boolean;
+  totalDurationMs: number;
+}
+
+export interface UsageSummaryPayload {
+  range: UsageRange;
+  totals: UsageTotals;
+  byProvider: UsageGroupRow[];
+  groups: UsageGroupRow[];
+  generatedAt: string;
+}
+
+export interface UsageTimeseriesPoint {
+  bucketStart: string;
+  totals: UsageTotals;
+}
+
+export interface UsageSeries {
+  key: string;
+  label: string;
+  points: UsageTimeseriesPoint[];
+}
+
+export interface UsageTimeseriesPayload {
+  range: UsageRange;
+  bucket: UsageBucket;
+  points: UsageTimeseriesPoint[];
+  series: UsageSeries[];
+  generatedAt: string;
+}
+
+export interface TopSessionRow {
+  sessionId: string;
+  provider: string;
+  providerLabel: string;
+  model: string | null;
+  projectId: string | null;
+  turnCount: number;
+  totalCostUsd: number;
+  costHasUnknowns: boolean;
+  lastActivityAt: string;
+}
+
+export function getUsageSummary(
+  range: UsageRange,
+  groupBy: UsageGroupBy = "by_provider",
+): Promise<UsageSummaryPayload> {
+  return invoke<UsageSummaryPayload>("get_usage_summary", { range, groupBy });
+}
+
+export function getUsageTimeseries(
+  range: UsageRange,
+  bucket: UsageBucket = "daily",
+  splitBy?: UsageGroupBy,
+): Promise<UsageTimeseriesPayload> {
+  return invoke<UsageTimeseriesPayload>("get_usage_timeseries", {
+    range,
+    bucket,
+    splitBy: splitBy ?? null,
+  });
+}
+
+export function getTopSessions(
+  range: UsageRange,
+  limit: number = 10,
+): Promise<TopSessionRow[]> {
+  return invoke<TopSessionRow[]>("get_top_sessions", { range, limit });
+}
+
 // Read a single project file as a UTF-8 string. Rejects on:
 //   * file outside the project root (canonicalisation escape)
 //   * file above CODE_VIEW_MAX_FILE_BYTES (4 MiB)

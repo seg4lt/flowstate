@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
+  BarChart3,
   ChevronRight,
   EllipsisVertical,
   FolderIcon,
@@ -681,6 +682,18 @@ export function AppSidebar() {
 
       <SidebarFooter className="border-t border-sidebar-border">
         <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip="Usage"
+              onClick={() => {
+                navigate({ to: "/usage" });
+                closeIfMobile();
+              }}
+            >
+              <BarChart3 />
+              <span>Usage</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton
               tooltip="Settings"

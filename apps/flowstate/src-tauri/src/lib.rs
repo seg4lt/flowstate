@@ -25,6 +25,14 @@ mod shell_env;
 mod user_config;
 use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
+mod usage;
+use usage::{
+    TopSessionRow, UsageBucket, UsageEvent, UsageGroupBy, UsageRange, UsageStore,
+    UsageSummaryPayload, UsageTimeseriesPayload,
+};
+use zenui_provider_api::RuntimeEvent;
+use tokio::sync::broadcast::error::RecvError;
+
 use std::collections::HashMap;
 
 /// Cheap "does this filesystem entry exist?" probe. Used by the
@@ -1879,6 +1887,44 @@ fn delete_project_worktree(
     store.delete_project_worktree(&project_id)
 }
 
+// ─────────────────────────────────────────────────────────────────
+// usage — flowstate-app-owned analytics store
+// ─────────────────────────────────────────────────────────────────
+//
+// The Usage dashboard in the frontend reads per-turn aggregates
+// (cost, tokens, duration) sliced by time / provider / model /
+// session. Backed by `~/.flowstate/usage.sqlite` — its own file,
+// never shared with the SDK's database. The subscriber task in
+// `setup` writes rows into it on every `RuntimeEvent::TurnCompleted`.
+
+#[tauri::command]
+fn get_usage_summary(
+    store: State<'_, UsageStore>,
+    range: UsageRange,
+    group_by: Option<UsageGroupBy>,
+) -> Result<UsageSummaryPayload, String> {
+    store.summary(range, group_by.unwrap_or_default())
+}
+
+#[tauri::command]
+fn get_usage_timeseries(
+    store: State<'_, UsageStore>,
+    range: UsageRange,
+    bucket: UsageBucket,
+    split_by: Option<UsageGroupBy>,
+) -> Result<UsageTimeseriesPayload, String> {
+    store.timeseries(range, bucket, split_by)
+}
+
+#[tauri::command]
+fn get_top_sessions(
+    store: State<'_, UsageStore>,
+    range: UsageRange,
+    limit: Option<u32>,
+) -> Result<Vec<TopSessionRow>, String> {
+    store.top_sessions(range, limit.unwrap_or(10))
+}
+
 /// Resolved cross-platform app data dir for Flowstate — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
@@ -1944,6 +1990,43 @@ pub fn run() {
                 .expect("failed to open user_config store");
             app.manage(user_config_store);
 
+            // Open the usage analytics store — a *third* sqlite file
+            // at <app_data_dir>/usage.sqlite that backs the in-app
+            // Usage dashboard. Kept separate from user_config so
+            // write-heavy per-turn recording never contends with the
+            // tiny hot-path config reads, and deleting one file
+            // (reset stats) doesn't destroy the other. Opened twice:
+            // once for Tauri-managed state so `#[tauri::command]`
+            // extractors can borrow it, and once for the subscriber
+            // task that writes per-turn rows on
+            // `RuntimeEvent::TurnCompleted`. SQLite is happy with
+            // multiple handles to the same file — the Mutex around
+            // each handle's Connection keeps writes serialized within
+            // that handle, and sqlite's own file locking handles
+            // cross-handle concurrency. Failure is non-fatal: we log
+            // and register a no-op sentinel store so command
+            // invocations return an empty dashboard instead of
+            // panicking the setup chain.
+            let usage_writer: Option<UsageStore> = match UsageStore::open(&flowstate_root) {
+                Ok(store) => Some(store),
+                Err(e) => {
+                    tracing::error!(
+                        "failed to open usage store (writer), disabling analytics recording: {e}"
+                    );
+                    None
+                }
+            };
+            match UsageStore::open(&flowstate_root) {
+                Ok(reader) => {
+                    app.manage(reader);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "failed to open usage store (reader): {e}; dashboard will error"
+                    );
+                }
+            }
+
             let transport = Box::new(TauriTransport::new(app_handle));
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -1961,6 +2044,37 @@ pub fn run() {
                 let core = bootstrap_core_async(&config)
                     .await
                     .expect("daemon bootstrap failed");
+
+                // Usage analytics subscriber. Runs for the life of
+                // the daemon, filtering the RuntimeEvent broadcast
+                // for TurnCompleted events and writing one row per
+                // turn to the usage sqlite. Missing this task is
+                // never fatal — a broadcast lag skips some telemetry
+                // but never corrupts runtime state. We subscribe
+                // BEFORE the transport's serve() so no event is lost
+                // between bootstrap and the first client connect.
+                if let Some(writer) = usage_writer {
+                    let mut rx = core.runtime_core.subscribe();
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            match rx.recv().await {
+                                Ok(RuntimeEvent::TurnCompleted { session, turn, .. }) => {
+                                    let event = UsageEvent::from_turn(&session, &turn);
+                                    if let Err(e) = writer.record_turn(&event) {
+                                        tracing::warn!("record turn usage failed: {e}");
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(RecvError::Lagged(n)) => {
+                                    tracing::warn!(
+                                        "usage subscriber lagged by {n} events; continuing"
+                                    );
+                                }
+                                Err(RecvError::Closed) => break,
+                            }
+                        }
+                    });
+                }
 
                 let bound = transport.bind().expect("transport bind failed");
                 let observer: Arc<dyn ConnectionObserver> = core.lifecycle.clone();
@@ -2033,6 +2147,9 @@ pub fn run() {
             get_project_worktree,
             list_project_worktree,
             delete_project_worktree,
+            get_usage_summary,
+            get_usage_timeseries,
+            get_top_sessions,
             get_app_data_dir,
         ])
         .on_window_event(|window, event| {
