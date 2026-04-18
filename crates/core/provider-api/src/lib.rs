@@ -12,6 +12,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, oneshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Codex,
@@ -46,6 +48,8 @@ impl ProviderKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatusLevel {
     Ready,
@@ -54,6 +58,8 @@ pub enum ProviderStatusLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStatus {
     Ready,
@@ -62,6 +68,8 @@ pub enum SessionStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Running,
@@ -71,6 +79,8 @@ pub enum TurnStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     Pending,
@@ -79,6 +89,8 @@ pub enum ToolCallStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDecision {
     Allow,
@@ -88,6 +100,8 @@ pub enum PermissionDecision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputOption {
     pub id: String,
@@ -97,6 +111,8 @@ pub struct UserInputOption {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
     pub id: String,
@@ -114,6 +130,8 @@ pub struct UserInputQuestion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputAnswer {
     pub question_id: String,
@@ -123,6 +141,8 @@ pub struct UserInputAnswer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     Default,
@@ -145,6 +165,8 @@ impl Default for PermissionMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Minimal,
@@ -181,6 +203,8 @@ impl ReasoningEffort {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum FileOperation {
     Write,
@@ -189,6 +213,8 @@ pub enum FileOperation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentStatus {
     Running,
@@ -197,6 +223,8 @@ pub enum SubagentStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     Proposed,
@@ -205,6 +233,8 @@ pub enum PlanStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct PlanStep {
     pub title: String,
@@ -213,6 +243,8 @@ pub struct PlanStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct PlanRecord {
     pub plan_id: String,
@@ -223,6 +255,8 @@ pub struct PlanRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct FileChangeRecord {
     pub call_id: String,
@@ -235,6 +269,8 @@ pub struct FileChangeRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentRecord {
     pub agent_id: String,
@@ -260,6 +296,8 @@ pub struct SubagentRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     pub call_id: String,
@@ -312,6 +350,8 @@ pub struct ToolCall {
 /// by `call_id` — that's where mutable status/output live; the block
 /// itself only carries position.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
@@ -352,6 +392,8 @@ pub enum ContentBlock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum CompactTrigger {
     Auto,
@@ -359,6 +401,8 @@ pub enum CompactTrigger {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryRecallMode {
     /// Full file bodies surfaced by the parallel selector. `content`
@@ -372,6 +416,8 @@ pub enum MemoryRecallMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryRecallScope {
     Personal,
@@ -379,6 +425,8 @@ pub enum MemoryRecallScope {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryRecallItem {
     pub path: String,
@@ -398,6 +446,8 @@ pub struct MemoryRecallItem {
 /// Returned by the `get_context_usage` adapter RPC (cross-provider,
 /// default `Ok(None)` for adapters that don't implement it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ContextBreakdown {
     pub total_tokens: u64,
@@ -406,6 +456,8 @@ pub struct ContextBreakdown {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ContextCategory {
     pub name: String,
@@ -419,6 +471,8 @@ pub struct ContextCategory {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModel {
     pub value: String,
@@ -465,6 +519,8 @@ pub struct ProviderModel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
     pub kind: ProviderKind,
@@ -512,6 +568,8 @@ fn default_true() -> bool {
 /// `#[serde(default)]` on the struct) so adding a flag doesn't break
 /// clients running against an older daemon.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderFeatures {
     /// Emits `TurnStatusChanged` events during non-streaming phases
@@ -561,6 +619,8 @@ pub struct ProviderFeatures {
 /// discovered under the session's cwd; `DiskGlobal` lives in a home
 /// directory like `~/.claude/skills` and applies across every project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillSource {
     DiskGlobal,
@@ -577,6 +637,8 @@ pub enum SkillSource {
 ///   no programmatic registry (currently unused; reserved for future
 ///   Codex integration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandKind {
     Builtin,
@@ -598,6 +660,8 @@ pub enum CommandKind {
 /// - `arg_hint` is the provider's suggested argument placeholder, e.g.
 ///   `"[path]"`, rendered muted inline after the command name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderCommand {
     pub id: String,
@@ -617,6 +681,8 @@ pub struct ProviderCommand {
 /// composer. Still fully wire-carried when unused so future UIs can
 /// surface them without an adapter change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAgent {
     pub id: String,
@@ -628,6 +694,8 @@ pub struct ProviderAgent {
 /// future UI (session header chip, Settings tab). Not rendered in the
 /// slash popup in v1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerInfo {
     pub id: String,
@@ -642,6 +710,8 @@ pub struct McpServerInfo {
 /// [`ProviderAdapter::session_command_catalog`] and broadcast to the
 /// frontend as [`RuntimeEvent::SessionCommandCatalogUpdated`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct CommandCatalog {
     pub commands: Vec<ProviderCommand>,
@@ -655,6 +725,8 @@ pub struct CommandCatalog {
 /// support text use `input.text` and silently drop `images` after
 /// logging a one-line `warn!`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 pub struct UserInput {
     pub text: String,
     #[serde(default)]
@@ -675,6 +747,8 @@ impl UserInput {
 /// multimodal content blocks; the runtime also persists them to disk
 /// before calling the adapter so they survive across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub struct ImageAttachment {
     /// MIME type, e.g. `"image/png"`.
@@ -690,6 +764,8 @@ pub struct ImageAttachment {
 /// on session load in place of the raw bytes, so opening a thread
 /// with lots of attachments stays cheap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentRef {
     /// UUID — also the filename (sans extension) on disk.
@@ -704,6 +780,8 @@ pub struct AttachmentRef {
 /// client message. Carries the full bytes; fetched lazily when the
 /// user clicks a persisted chip.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentData {
     pub media_type: String,
@@ -718,6 +796,8 @@ pub struct AttachmentData {
 /// fields describe prompt caching cost savings; providers without
 /// prompt caching leave them `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct TokenUsage {
     pub input_tokens: u64,
@@ -742,6 +822,8 @@ pub struct TokenUsage {
 
 /// Current status of a rate-limit bucket. Generic across providers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitStatus {
     Allowed,
@@ -754,6 +836,8 @@ pub enum RateLimitStatus {
 /// bucket taxonomy and human-readable labels, and maps its native
 /// rate-limit concepts onto this struct inside its own adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct RateLimitInfo {
     /// Stable provider-defined id for this bucket. Used as the map
@@ -779,6 +863,8 @@ pub struct RateLimitInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct TurnRecord {
     pub turn_id: String,
@@ -825,6 +911,8 @@ pub struct TurnRecord {
 // `rs-agent-sdk/crates/core/persistence/CLAUDE.md` for the
 // boundary rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectRecord {
     pub project_id: String,
@@ -835,6 +923,8 @@ pub struct ProjectRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
     pub session_id: String,
@@ -850,6 +940,8 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSessionState {
     pub native_thread_id: Option<String>,
@@ -858,6 +950,8 @@ pub struct ProviderSessionState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionDetail {
     pub summary: SessionSummary,
@@ -898,6 +992,8 @@ impl SessionDetail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct AppSnapshot {
     pub generated_at: String,
@@ -907,6 +1003,8 @@ pub struct AppSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct BootstrapPayload {
     pub app_name: String,
@@ -917,6 +1015,8 @@ pub struct BootstrapPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct HealthPayload {
     pub status: String,
@@ -924,6 +1024,8 @@ pub struct HealthPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderTurnOutput {
     pub output: String,
@@ -1120,6 +1222,8 @@ pub enum ProviderTurnEvent {
 /// or unmapped provider phases fall through to `Idle` so the
 /// working indicator shows no label rather than a misleading one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum TurnPhase {
     /// No active non-streaming phase. Default; renders no label.
@@ -1411,6 +1515,8 @@ fn next_request_id(prefix: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuntimeEvent {
     RuntimeReady {
@@ -1700,6 +1806,8 @@ pub enum RuntimeEvent {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Ping,
@@ -1882,6 +1990,8 @@ pub enum ClientMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     Welcome { bootstrap: BootstrapPayload },

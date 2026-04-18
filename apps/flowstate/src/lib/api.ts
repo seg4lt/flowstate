@@ -44,7 +44,7 @@ export async function getContextUsage(
     type: "get_context_usage",
     session_id: sessionId,
   });
-  if (resp?.type === "context_usage") return resp.breakdown;
+  if (resp?.type === "context_usage") return resp.breakdown ?? null;
   if (resp?.type === "error") throw new Error(resp.message);
   throw new Error("unexpected response to get_context_usage");
 }
