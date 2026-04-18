@@ -761,7 +761,7 @@ export function ChatInput({
                 disabled={disabled || providerDisabled || archived}
                 rows={1}
                 className={cn(
-                  "w-full resize-none rounded-lg border px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                  "block h-10 min-h-10 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
                   // Mode tint. Plan + bypass are the modes where the
                   // next send behaves *differently* from the defaults,
                   // so they get a coloured border and a subtle L→R
@@ -805,7 +805,7 @@ export function ChatInput({
               <button
                 type="button"
                 onClick={onInterrupt}
-                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
                 title="Interrupt (Esc Esc)"
               >
                 <Square className="h-4 w-4" />
@@ -815,7 +815,7 @@ export function ChatInput({
                 type="button"
                 onClick={handleSubmit}
                 disabled={sendDisabled}
-                className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
+                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
                 title={
                   isRunning || queued.length > 0
                     ? "Add to queue (fires when current turn ends)"
@@ -826,7 +826,21 @@ export function ChatInput({
               </button>
             )}
           </div>
-          {toolbar && <div className="mt-1.5">{toolbar}</div>}
+          {/* Indent the toolbar so its left edge lines up with the
+              textarea's *text* (textarea = rounded border + px-3
+              inside, so text sits 13px inside the textarea wrapper).
+              Right padding mirrors the left so `-- / --` stays inside
+              the composer outline rather than bleeding past the send
+              button. Inline style, not a Tailwind arbitrary value,
+              so the class is guaranteed to ship even if JIT fails. */}
+          {toolbar && (
+            <div
+              className="mt-1.5"
+              style={{ paddingLeft: 13, paddingRight: 13 }}
+            >
+              {toolbar}
+            </div>
+          )}
         </div>
       </div>
       {lightboxSource && (
