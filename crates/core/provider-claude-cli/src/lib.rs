@@ -5,42 +5,21 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    CommandCatalog, CommandKind, FileOperation, McpServerInfo, PermissionDecision, PermissionMode,
+    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
     ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
-    ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
+    ProviderSessionState, ProviderStatus, ProviderTurnEvent,
     ProviderTurnOutput, RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail, SkillSource,
-    TokenUsage, TurnEventSink, UserInput, UserInputOption, UserInputQuestion, skills_disk,
+    ProbeCliOptions, TokenUsage, TurnEventSink, UserInput, UserInputQuestion, claude_bucket_label,
+    claude_file_change_from_tool_call, parse_options_from_value, probe_cli, session_cwd,
+    skills_disk,
 };
 
-/// Maps Anthropic's rate-limit bucket ids to the human-readable
-/// labels the provider-api `RateLimitInfo.label` field expects.
-/// Duplicated in provider-claude-sdk's bridge to keep each Claude
-/// adapter self-contained; ids are stable upstream.
-fn claude_bucket_label(bucket: &str) -> String {
-    match bucket {
-        "five_hour" => "5-hour limit".to_string(),
-        "seven_day" => "Weekly · all models".to_string(),
-        "seven_day_opus" => "Weekly · Opus".to_string(),
-        "seven_day_sonnet" => "Weekly · Sonnet".to_string(),
-        "overage" => "Overage".to_string(),
-        other => other.to_string(),
-    }
-}
-
 const TURN_TIMEOUT_SECS: u64 = 600;
-
-fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
-    session
-        .cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| fallback.to_path_buf())
-}
 
 // ── subprocess handle ────────────────────────────────────────────────────────
 
@@ -343,7 +322,7 @@ impl ClaudeCliAdapter {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let trimmed = line.trim();
                     if !trimmed.is_empty() {
-                        debug!(target: "claude-cli", "{}", trimmed);
+                        debug!(target: "provider-claude-cli", "{}", trimmed);
                     }
                 }
             });
@@ -547,48 +526,15 @@ impl ClaudeCliAdapter {
                                 })
                                 .await;
 
-                            // Emit structured file-change events for write/edit tools.
-                            match name.as_str() {
-                                "Write" => {
-                                    events
-                                        .send(ProviderTurnEvent::FileChange {
-                                            call_id,
-                                            path: args
-                                                .get("file_path")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            operation: FileOperation::Write,
-                                            before: None,
-                                            after: args
-                                                .get("content")
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string),
-                                        })
-                                        .await;
-                                }
-                                "Edit" => {
-                                    events
-                                        .send(ProviderTurnEvent::FileChange {
-                                            call_id,
-                                            path: args
-                                                .get("file_path")
-                                                .and_then(Value::as_str)
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            operation: FileOperation::Edit,
-                                            before: args
-                                                .get("old_string")
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string),
-                                            after: args
-                                                .get("new_string")
-                                                .and_then(Value::as_str)
-                                                .map(str::to_string),
-                                        })
-                                        .await;
-                                }
-                                _ => {}
+                            // Emit a structured file-change event for
+                            // edit-shaped tools (Write / Edit / MultiEdit
+                            // / NotebookEdit). The mapping lives in
+                            // provider-api so all Claude adapters stay
+                            // in lockstep.
+                            if let Some(file_change) =
+                                claude_file_change_from_tool_call(&call_id, &name, &args)
+                            {
+                                events.send(file_change).await;
                             }
                         }
                     }
@@ -926,85 +872,25 @@ impl ProviderAdapter for ClaudeCliAdapter {
 
     async fn health(&self) -> ProviderStatus {
         let binary = Self::find_claude_binary();
-        let label = ProviderKind::ClaudeCli.label();
-
-        // Check installation via `--version`.
-        let version_output = Command::new(&binary).arg("--version").output().await;
-        let (installed, version) = match version_output {
-            Ok(out) => {
-                let v = first_non_empty_line(&out.stdout)
-                    .or_else(|| first_non_empty_line(&out.stderr));
-                (true, v)
-            }
-            Err(_) => (false, None),
-        };
-
-        if !installed {
-            return ProviderStatus {
-                kind: ProviderKind::ClaudeCli,
-                label: label.to_string(),
-                installed: false,
-                authenticated: false,
-                version: None,
-                status: ProviderStatusLevel::Error,
-                message: Some(format!(
-                    "claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
-                )),
-                models: vec![],
-                enabled: true,
-                // Claude CLI is a black-box subprocess — none of the
-                // cross-provider enrichment features (status, tool
-                // progress, recap, etc.) map to its wire format.
-                features: zenui_provider_api::ProviderFeatures::default(),
-            };
-        }
-
-        // Check auth via `claude auth status`.
-        let auth_output = Command::new(&binary)
-            .args(["auth", "status"])
-            .output()
-            .await;
-        let (authenticated, auth_message) = match auth_output {
-            Ok(out) => {
-                let ok = out.status.success();
-                let msg = first_non_empty_line(&out.stdout)
-                    .or_else(|| first_non_empty_line(&out.stderr));
-                (ok, msg)
-            }
-            // If `auth status` doesn't exist as a subcommand the binary still exists;
-            // treat as authenticated so the user can try.
-            Err(_) => (true, None),
-        };
-
-        let (status, message) = if authenticated {
-            (
-                ProviderStatusLevel::Ready,
-                auth_message
-                    .or_else(|| Some(format!("{label} CLI is installed and authenticated."))),
-            )
-        } else {
-            (
-                ProviderStatusLevel::Warning,
-                auth_message.or_else(|| {
-                    Some(format!(
-                        "{label} CLI is installed but not authenticated. Run: claude auth login"
-                    ))
-                }),
-            )
-        };
-
-        ProviderStatus {
+        probe_cli(ProbeCliOptions {
             kind: ProviderKind::ClaudeCli,
-            label: label.to_string(),
-            installed: true,
-            authenticated,
-            version,
-            status,
-            message,
+            binary: &binary,
+            version_args: &["--version"],
+            auth_args: &["auth", "status"],
             models: claude_cli_models(),
-            enabled: true,
+            // Claude CLI is a black-box subprocess — none of the
+            // cross-provider enrichment features (status, tool
+            // progress, recap, etc.) map to its wire format.
             features: zenui_provider_api::ProviderFeatures::default(),
-        }
+            install_hint: Some("Install with: npm install -g @anthropic-ai/claude-code"),
+            auth_hint: Some("Run: claude auth login"),
+            // Older claude CLIs may not ship an `auth status`
+            // subcommand; if the launch itself fails we still let the
+            // user try a turn rather than blocking on a probing
+            // capability that doesn't exist.
+            auth_err_is_ok: true,
+        })
+        .await
     }
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
@@ -1193,30 +1079,8 @@ async fn write_line(
     stdin: &Arc<Mutex<ChildStdin>>,
     value: &Value,
 ) -> Result<(), String> {
-    let encoded = serde_json::to_string(value)
-        .map_err(|e| format!("Failed to serialize message: {e}"))?;
-    let mut stdin = stdin.lock().await;
-    stdin
-        .write_all(encoded.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to write to claude CLI stdin: {e}"))?;
-    stdin
-        .write_all(b"\n")
-        .await
-        .map_err(|e| format!("Failed to write newline to claude CLI stdin: {e}"))?;
-    stdin
-        .flush()
-        .await
-        .map_err(|e| format!("Failed to flush claude CLI stdin: {e}"))
-}
-
-fn first_non_empty_line(bytes: &[u8]) -> Option<String> {
-    std::str::from_utf8(bytes).ok().and_then(|s| {
-        s.lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(str::to_string)
-    })
+    let mut guard = stdin.lock().await;
+    zenui_provider_api::write_json_line(&mut *guard, value, "claude CLI").await
 }
 
 /// Extract plain text from a tool_result content block.
@@ -1267,7 +1131,7 @@ fn parse_ask_user_questions(tool_input: &Value) -> Vec<UserInputQuestion> {
         .map(str::to_string);
 
     if let Some(text) = text {
-        let options = parse_options_from_value(tool_input.get("options"), 0);
+        let options = parse_options_from_value(tool_input.get("options"), "q0");
         let multi_select = tool_input
             .get("multiSelect")
             .and_then(Value::as_bool)
@@ -1318,7 +1182,7 @@ fn parse_single_question(q: &Value, qi: usize) -> UserInputQuestion {
         .get("multiSelect")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let options = parse_options_from_value(q.get("options"), qi);
+    let options = parse_options_from_value(q.get("options"), &id);
     let allow_freeform = options.is_empty() || options.iter().any(|o| o.label == "Other");
     UserInputQuestion {
         id,
@@ -1329,39 +1193,6 @@ fn parse_single_question(q: &Value, qi: usize) -> UserInputQuestion {
         allow_freeform,
         is_secret: false,
     }
-}
-
-/// Parse an options field that may be either:
-/// - An array of objects `[{ "label": "...", "description": "..." }]`
-/// - An array of strings `["Option A", "Option B"]`
-fn parse_options_from_value(val: Option<&Value>, qi: usize) -> Vec<UserInputOption> {
-    let arr = match val.and_then(Value::as_array) {
-        Some(a) => a,
-        None => return vec![],
-    };
-    arr.iter()
-        .enumerate()
-        .map(|(oi, opt)| {
-            // Object variant: { label, description }
-            if let Some(label) = opt.get("label").and_then(Value::as_str) {
-                UserInputOption {
-                    id: format!("q{qi}_opt{oi}"),
-                    label: label.to_string(),
-                    description: opt
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                }
-            } else {
-                // String variant
-                UserInputOption {
-                    id: format!("q{qi}_opt{oi}"),
-                    label: opt.as_str().unwrap_or("").to_string(),
-                    description: None,
-                }
-            }
-        })
-        .collect()
 }
 
 /// Build the `updatedInput` payload for the `control_response` for `AskUserQuestion`.

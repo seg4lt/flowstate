@@ -18,49 +18,51 @@ import { delimiter as pathDelimiter, join as joinPath } from 'path';
 import { homedir } from 'os';
 
 /**
- * Cross-platform PATH resolution for the `copilot` CLI binary.
- * Pure Node, no shell, no extra deps — works on Linux, macOS, Windows.
+ * Cross-platform PATH resolution for a CLI binary.
  *
+ * This function's body must stay byte-identical to
+ * `resolveLocalClaudeBinary` in `provider-claude-sdk/bridge/src/index.ts`.
+ * The two bridges are compiled as independent packages (single-file
+ * `dist/index.js` output), so a shared TS module would require bundling;
+ * keeping the code identical via convention is the next-best defence
+ * against drift like the pre-2.3 inconsistency where only the Claude
+ * version injected a bare-name PATHEXT fallback.
+ *
+ * Pure Node, no shell, no extra deps — works on Linux, macOS, Windows.
  * Returns an absolute path to the resolved binary, or null if no
- * matching file exists on PATH or in any of the known fallback
- * install locations.
+ * matching file exists on PATH or in any of the known fallback install
+ * locations. `name` is the binary basename without extension.
  */
-function resolveCopilotBinary(): string | null {
+function resolveBinaryOnPath(
+  name: string,
+  fallbackPaths: readonly string[],
+): string | null {
   const isWindows = process.platform === 'win32';
   const exeExtensions = isWindows
-    ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.toLowerCase())
+    ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
+        .split(';')
+        .filter((e) => e.length > 0)
     : [''];
+  // Always include the bare name on every platform, in case the user
+  // installed a shim script without an extension on Windows.
+  if (!exeExtensions.includes('')) {
+    exeExtensions.unshift('');
+  }
 
-  const pathEntries = (process.env.PATH ?? '').split(pathDelimiter).filter(Boolean);
+  const pathEntries = (process.env.PATH ?? '')
+    .split(pathDelimiter)
+    .filter((entry) => entry.length > 0);
+
   for (const dir of pathEntries) {
     for (const ext of exeExtensions) {
-      const candidate = joinPath(dir, `copilot${ext}`);
+      const candidate = joinPath(dir, `${name}${ext}`);
       try {
         if (existsSync(candidate)) return candidate;
       } catch {
-        // ENOENT/EACCES on individual entries shouldn't abort the walk.
+        // Permission errors on individual entries shouldn't abort the walk.
       }
     }
   }
-
-  // Fallback: well-known install locations across the three OSes.
-  // Tried only when PATH lookup fails (e.g. host process didn't
-  // forward PATH, or the binary lives in a directory the user hasn't
-  // added to PATH).
-  const home = homedir();
-  const fallbackPaths: string[] = isWindows
-    ? [
-        joinPath(home, 'AppData', 'Local', 'Programs', 'copilot', 'copilot.exe'),
-        joinPath(home, 'AppData', 'Roaming', 'npm', 'copilot.cmd'),
-        'C:\\Program Files\\GitHub CLI\\copilot.exe',
-      ]
-    : [
-        joinPath(home, '.local', 'bin', 'copilot'),
-        '/opt/homebrew/bin/copilot',
-        '/usr/local/bin/copilot',
-        '/home/linuxbrew/.linuxbrew/bin/copilot',
-        '/usr/bin/copilot',
-      ];
 
   for (const candidate of fallbackPaths) {
     try {
@@ -71,6 +73,25 @@ function resolveCopilotBinary(): string | null {
   }
 
   return null;
+}
+
+function resolveCopilotBinary(): string | null {
+  const home = homedir();
+  const fallbackPaths: string[] =
+    process.platform === 'win32'
+      ? [
+          joinPath(home, 'AppData', 'Local', 'Programs', 'copilot', 'copilot.exe'),
+          joinPath(home, 'AppData', 'Roaming', 'npm', 'copilot.cmd'),
+          'C:\\Program Files\\GitHub CLI\\copilot.exe',
+        ]
+      : [
+          joinPath(home, '.local', 'bin', 'copilot'),
+          '/opt/homebrew/bin/copilot',
+          '/usr/local/bin/copilot',
+          '/home/linuxbrew/.linuxbrew/bin/copilot',
+          '/usr/bin/copilot',
+        ];
+  return resolveBinaryOnPath('copilot', fallbackPaths);
 }
 
 // ZenUI protocol types
@@ -107,6 +128,29 @@ const pendingPermissions = new Map<
 /** Write a stream event JSON line to stdout. */
 function writeStream(payload: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify({ type: 'stream', ...payload }) + '\n');
+}
+
+/**
+ * Resolve every still-pending permission/user-input handler with a
+ * "turn aborted" sentinel and clear both maps.
+ *
+ * Without this, an `interrupt` (or an error that aborts `sendPrompt`
+ * mid-flight) leaves resolvers dangling in both Maps, hanging the
+ * promise chain inside the SDK's `canUseTool`/`askUser` invocation and
+ * leaking the closures for the lifetime of the bridge process. Run this
+ * whenever a turn ends — on interrupt, on `sendPrompt` error, and on
+ * normal completion's finally-block — so the bridge enters the next
+ * turn with clean state.
+ */
+function drainPendingOnAbort(): void {
+  for (const [, resolver] of pendingUserInputs) {
+    resolver({ answer: '[aborted]', wasFreeform: true });
+  }
+  pendingUserInputs.clear();
+  for (const [, resolver] of pendingPermissions) {
+    resolver({ kind: 'denied-interactively-by-user' });
+  }
+  pendingPermissions.clear();
 }
 
 /** Best-effort markdown bullet/numbered-list parser for plan content. */
@@ -815,6 +859,14 @@ async function main(): Promise<void> {
                   }) + '\n',
                 );
               } finally {
+                // A turn can end while the SDK still has outstanding
+                // `canUseTool` / `askUser` promises awaiting a user
+                // decision (most commonly on error paths). Resolve them
+                // with abort sentinels so the next turn starts clean;
+                // otherwise the resolver closures leak and a
+                // subsequent request_id collision would deliver the
+                // wrong answer.
+                drainPendingOnAbort();
                 promptInFlight = null;
               }
             })();
@@ -867,6 +919,10 @@ async function main(): Promise<void> {
 
           case 'interrupt': {
             await bridge.interrupt();
+            // Free any pending permission/user-input resolvers the SDK
+            // was waiting on — the user explicitly aborted, so their
+            // answers are no longer relevant.
+            drainPendingOnAbort();
             process.stdout.write(
               JSON.stringify({ type: 'interrupted' }) + '\n',
             );

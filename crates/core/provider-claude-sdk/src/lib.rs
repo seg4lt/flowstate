@@ -4,13 +4,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -19,16 +19,8 @@ use zenui_provider_api::{
     ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputAnswer,
-    UserInputOption, UserInputQuestion, skills_disk,
+    UserInputQuestion, session_cwd, skills_disk,
 };
-
-fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
-    session
-        .cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| fallback.to_path_buf())
-}
 
 /// Result of asking the user a question: either they answered or dismissed.
 /// Carried over the writer-task channel so the bridge can be told which
@@ -44,6 +36,19 @@ struct ClaudeBridgeProcess {
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Lines<BufReader<ChildStdout>>,
     bridge_session_id: String,
+    /// Pending mid-turn RPC responses keyed by request_id. An adapter
+    /// method fires an RPC to the bridge by inserting a `oneshot::Sender`
+    /// here; `run_turn`'s drain loop forwards the matching
+    /// `BridgeResponse::RpcResponse` back through the sender. The
+    /// caller `await`s the receiver under a timeout and cleans its
+    /// entry on both success and cancellation paths so senders don't
+    /// leak across turn boundaries.
+    ///
+    /// Kept here (rather than on the cache slot) so migrating the
+    /// outer sessions map to the shared `ProcessCache<T>` helper
+    /// doesn't need a per-provider extension: `T` carries whatever
+    /// auxiliary state is truly adapter-specific.
+    pending_rpcs: Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcResponse>>>>,
 }
 
 /// Idle timeout: a cached bridge with no in-flight turn is killed after
@@ -53,53 +58,13 @@ const BRIDGE_IDLE_TIMEOUT_SECS: u64 = 120;
 /// bridge crossing the idle threshold and actually being killed.
 const BRIDGE_WATCHDOG_INTERVAL_SECS: u64 = 30;
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Cached bridge entry with activity tracking. Wraps the long-lived
-/// bridge process with two atomics so a background watchdog can safely
-/// cull idle entries without racing against `run_turn`.
-#[derive(Debug, Clone)]
-struct CachedBridge {
-    process: Arc<Mutex<ClaudeBridgeProcess>>,
-    /// Unix epoch seconds at which the last turn finished (or the bridge
-    /// was created). Only consulted when `in_flight == 0`.
-    last_activity: Arc<AtomicU64>,
-    /// Number of turns currently running on this bridge. Incremented at
-    /// turn start and decremented via RAII in `ActivityGuard::drop`.
-    in_flight: Arc<AtomicU32>,
-    /// Pending mid-turn RPC responses keyed by request_id. An adapter
-    /// method fires an RPC to the bridge by inserting a `oneshot::Sender`
-    /// here; `run_turn`'s drain loop forwards the matching
-    /// `BridgeResponse::RpcResponse` back through the sender. The
-    /// caller `await`s the receiver under a timeout and cleans its
-    /// entry on both success and cancellation paths so senders
-    /// don't leak across turn boundaries.
-    pending_rpcs: Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcResponse>>>>,
-}
-
-impl CachedBridge {
-    fn new(process: ClaudeBridgeProcess) -> Self {
-        Self {
-            process: Arc::new(Mutex::new(process)),
-            last_activity: Arc::new(AtomicU64::new(unix_now())),
-            in_flight: Arc::new(AtomicU32::new(0)),
-            pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    fn activity_guard(&self) -> ActivityGuard {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        ActivityGuard {
-            in_flight: self.in_flight.clone(),
-            last_activity: self.last_activity.clone(),
-        }
-    }
-}
+/// Alias for the shared `ProcessCache` entry type — see
+/// `zenui_provider_api::process_cache` for the idle-watchdog and
+/// activity-guard plumbing. The claude-sdk adapter keeps two sibling
+/// maps (`session_stdins`, `session_pending_rpcs`) so mid-turn callers
+/// can bypass `run_turn`'s outer lock without re-locking the cached
+/// process. See `ClaudeSdkAdapter` docs.
+type CachedBridge = zenui_provider_api::CachedProcess<ClaudeBridgeProcess>;
 
 /// Discriminator for mid-turn bridge RPCs. A single
 /// `BridgeResponse::RpcResponse` variant carries `kind` so new RPCs
@@ -111,10 +76,6 @@ impl CachedBridge {
 #[serde(rename_all = "snake_case")]
 enum BridgeRpcKind {
     ContextUsage,
-    // Reserved for later rollouts — keeping the enum lean until
-    // there's a real consumer:
-    //   RewindFiles,
-    //   SeedReadState,
 }
 
 /// Delivered through the pending-RPC oneshot. The adapter's method
@@ -128,21 +89,6 @@ struct BridgeRpcResponse {
     #[allow(dead_code)]
     kind: BridgeRpcKind,
     payload: Result<Value, String>,
-}
-
-/// RAII guard held for the duration of a turn. On drop, decrements the
-/// in-flight counter and stamps `last_activity = now`, starting the
-/// idle clock.
-struct ActivityGuard {
-    in_flight: Arc<AtomicU32>,
-    last_activity: Arc<AtomicU64>,
-}
-
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        self.last_activity.store(unix_now(), Ordering::Release);
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 /// Wire-shape image attachment passed through to the TS bridge. Mirrors
@@ -474,7 +420,7 @@ enum BridgeResponse {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClaudeSdkAdapter {
     working_directory: PathBuf,
     /// Monotonic counter for mid-turn RPC request IDs. A process-local
@@ -483,28 +429,24 @@ pub struct ClaudeSdkAdapter {
     /// back on the matching response). No cross-process uniqueness is
     /// required.
     rpc_counter: Arc<AtomicU64>,
-    sessions: Arc<Mutex<HashMap<String, CachedBridge>>>,
+    sessions: Arc<zenui_provider_api::ProcessCache<ClaudeBridgeProcess>>,
     /// Direct, lock-free-from-outside handles to each session's bridge
-    /// stdin. `run_turn` holds the outer `sessions` Mutex guard for the
+    /// stdin. `run_turn` holds the cached process Mutex guard for the
     /// duration of the turn (because it owns `&mut process.stdout`), so
     /// any control message that needs to write to the bridge mid-turn
     /// (interrupt, set_permission_mode, …) would deadlock if it had to
-    /// re-lock the same outer Mutex. Storing a clone of the inner stdin
-    /// Arc here lets control paths bypass the outer lock entirely; the
-    /// inner stdin Mutex still serializes writes against the writer task
-    /// inside `run_turn`, so the bridge never sees torn JSON lines.
+    /// re-lock the same Mutex. Storing a clone of the inner stdin Arc
+    /// here lets control paths bypass the process lock entirely; the
+    /// inner stdin Mutex still serializes writes against the writer
+    /// task inside `run_turn`, so the bridge never sees torn JSON lines.
     session_stdins: Arc<Mutex<HashMap<String, Arc<Mutex<ChildStdin>>>>>,
     /// Parallel handle to each session's pending-RPC map, for the same
     /// reason as `session_stdins`: mid-turn RPC issuers need to insert
     /// a oneshot sender into the map while `run_turn` is holding the
-    /// outer `sessions` Mutex. The `Arc` points at the same inner
-    /// map as the owning `CachedBridge.pending_rpcs`, so the drain
-    /// loop (which holds a reference via the `cached` parameter) and
-    /// out-of-band RPC callers mutate the same storage.
+    /// cached process Mutex. The `Arc` points at the same inner map
+    /// as the owning `ClaudeBridgeProcess.pending_rpcs`, so the drain
+    /// loop and out-of-band RPC callers mutate the same storage.
     session_pending_rpcs: Arc<Mutex<HashMap<String, PendingRpcsMap>>>,
-    /// Latches true the first time `ensure_session_process` runs so the
-    /// idle-kill watchdog is spawned exactly once per adapter instance.
-    watchdog_started: Arc<AtomicBool>,
 }
 
 type PendingRpcsMap = Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcResponse>>>>;
@@ -514,10 +456,13 @@ impl ClaudeSdkAdapter {
         Self {
             working_directory,
             rpc_counter: Arc::new(AtomicU64::new(0)),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(zenui_provider_api::ProcessCache::new(
+                BRIDGE_IDLE_TIMEOUT_SECS,
+                BRIDGE_WATCHDOG_INTERVAL_SECS,
+                "provider-claude-sdk",
+            )),
             session_stdins: Arc::new(Mutex::new(HashMap::new())),
             session_pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
-            watchdog_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -529,69 +474,37 @@ impl ClaudeSdkAdapter {
         format!("rpc-{n}")
     }
 
-    /// Spawn the idle-kill watchdog exactly once. Called lazily from
-    /// `ensure_session_process` (rather than `new()`) so we don't rely
-    /// on `tokio::spawn` being available at adapter construction time.
-    ///
-    /// The watchdog ticks every 30s, scans the sessions map, and kills
-    /// any bridge whose `in_flight == 0` and whose `last_activity` is
-    /// older than 2 minutes. Removal happens under the outer `sessions`
-    /// Mutex, so a concurrent `ensure_session_process` either wins the
-    /// race (turn proceeds on the existing bridge) or misses (spawns a
-    /// fresh bridge) — no torn state.
+    /// Spawn the idle-kill watchdog exactly once via the shared
+    /// `ProcessCache` helper. The helper handles the core cache/kill
+    /// path; we additionally wipe the sibling `session_stdins` and
+    /// `session_pending_rpcs` maps from a pre-kill hook so stale
+    /// handles don't accumulate there. That cleanup is approximate
+    /// — we don't know the session_id from the shared helper's kill
+    /// closure, so we compare the stdin Arc identity in the sibling
+    /// maps against the one the watchdog is about to kill. This is
+    /// O(sessions) per tick, but `sessions` is bounded by active
+    /// users and the watchdog runs at 30s.
     fn ensure_watchdog(&self) {
-        if self.watchdog_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let sessions = self.sessions.clone();
         let session_stdins = self.session_stdins.clone();
         let session_pending_rpcs = self.session_pending_rpcs.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(
-                BRIDGE_WATCHDOG_INTERVAL_SECS,
-            ));
-            // Consume the immediate first tick so we don't cull on boot.
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let now = unix_now();
-                let victims: Vec<(String, CachedBridge)> = {
-                    let mut map = sessions.lock().await;
-                    let stale: Vec<String> = map
-                        .iter()
-                        .filter(|(_, c)| {
-                            c.in_flight.load(Ordering::Acquire) == 0
-                                && now.saturating_sub(
-                                    c.last_activity.load(Ordering::Acquire),
-                                ) > BRIDGE_IDLE_TIMEOUT_SECS
-                        })
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    stale
-                        .into_iter()
-                        .filter_map(|k| map.remove(&k).map(|c| (k, c)))
-                        .collect()
+        self.sessions.ensure_watchdog(move |cached| {
+            let session_stdins = session_stdins.clone();
+            let session_pending_rpcs = session_pending_rpcs.clone();
+            async move {
+                let (stdin_arc, pending_arc) = {
+                    let p = cached.inner().lock().await;
+                    (p.stdin.clone(), p.pending_rpcs.clone())
                 };
-                if victims.is_empty() {
-                    continue;
-                }
                 {
                     let mut stdins = session_stdins.lock().await;
+                    stdins.retain(|_, v| !Arc::ptr_eq(v, &stdin_arc));
+                }
+                {
                     let mut pending = session_pending_rpcs.lock().await;
-                    for (sid, _) in &victims {
-                        stdins.remove(sid);
-                        pending.remove(sid);
-                    }
+                    pending.retain(|_, v| !Arc::ptr_eq(v, &pending_arc));
                 }
-                for (sid, cached) in victims {
-                    info!(
-                        session_id = %sid,
-                        "claude-sdk bridge idle {}s, killing",
-                        BRIDGE_IDLE_TIMEOUT_SECS
-                    );
-                    let mut process = cached.process.lock().await;
-                    let _ = process.child.start_kill();
-                }
+                let mut process = cached.inner().lock().await;
+                let _ = process.child.start_kill();
             }
         });
     }
@@ -767,6 +680,10 @@ impl ClaudeSdkAdapter {
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
             bridge_session_id: String::new(),
+            // Overwritten by `ensure_session_process` with an Arc that's
+            // also cloned into `session_pending_rpcs` so mid-turn RPC
+            // callers can insert without re-locking the bridge.
+            pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
         };
 
         debug!("Waiting for bridge ready signal...");
@@ -798,13 +715,7 @@ impl ClaudeSdkAdapter {
         session: &SessionDetail,
     ) -> Result<CachedBridge, String> {
         self.ensure_watchdog();
-        if let Some(existing) = self
-            .sessions
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned()
-        {
+        if let Some(existing) = self.sessions.get(&session.summary.session_id).await {
             return Ok(existing);
         }
 
@@ -848,14 +759,17 @@ impl ClaudeSdkAdapter {
             }
         }
 
-        // Clone the bridge's stdin Arc into the parallel session_stdins
-        // map BEFORE wrapping the bridge in its outer Mutex. Control
-        // paths (interrupt, set_permission_mode) read from this map
-        // instead of locking the bridge so they don't deadlock against
-        // run_turn, which holds the outer lock for the whole turn.
+        // Clone the bridge's stdin + pending-rpcs Arcs BEFORE inserting
+        // into the cache. Control paths (interrupt, set_permission_mode)
+        // and mid-turn RPC issuers read from these parallel maps instead
+        // of locking the bridge, so they don't deadlock against run_turn
+        // which holds the process lock for the whole turn.
         let stdin_clone = bridge.stdin.clone();
-        let cached = CachedBridge::new(bridge);
-        let pending_rpcs_clone = cached.pending_rpcs.clone();
+        // Fresh pending-rpcs map installed inside the bridge so the
+        // shared `ProcessCache<T>` only needs to track one `T` per slot.
+        let pending_rpcs_clone: PendingRpcsMap = Arc::new(Mutex::new(HashMap::new()));
+        let mut bridge = bridge;
+        bridge.pending_rpcs = pending_rpcs_clone.clone();
         {
             let mut stdins = self.session_stdins.lock().await;
             stdins
@@ -863,22 +777,21 @@ impl ClaudeSdkAdapter {
                 .or_insert(stdin_clone);
         }
         {
-            // Same parallel-map trick for mid-turn RPCs: adapter
-            // methods need to insert a oneshot into this map while
-            // the outer `sessions` Mutex is held by run_turn. The
-            // inner `Arc` here points at the same storage as
-            // `cached.pending_rpcs`, so the drain loop and the
-            // RPC caller see each other's writes.
             let mut pending = self.session_pending_rpcs.lock().await;
             pending
                 .entry(session.summary.session_id.clone())
                 .or_insert(pending_rpcs_clone);
         }
-        let mut sessions = self.sessions.lock().await;
-        Ok(sessions
-            .entry(session.summary.session_id.clone())
-            .or_insert_with(|| cached.clone())
-            .clone())
+        // Double-check for a concurrent insertion before committing.
+        if let Some(existing) = self.sessions.get(&session.summary.session_id).await {
+            let mut dropped = bridge;
+            let _ = dropped.child.start_kill();
+            return Ok(existing);
+        }
+        Ok(self
+            .sessions
+            .insert(session.summary.session_id.clone(), bridge)
+            .await)
     }
 
     async fn invalidate_session(&self, session_id: &str) {
@@ -887,16 +800,11 @@ impl ClaudeSdkAdapter {
         // when the child process is killed below.
         self.session_stdins.lock().await.remove(session_id);
         // Drop the pending-RPC map too. Any in-flight awaiters will
-        // see their oneshot senders dropped (via the Arc being
-        // removed from this outer map — the inner Arc clone held
-        // by the awaiter keeps the map alive, but run_turn's drain
-        // loop is gone with the dead bridge, so nobody will ever
-        // resolve them anyway; they'll time out on the configured
-        // deadline).
+        // see their oneshot senders dropped; they'll time out on the
+        // configured deadline.
         self.session_pending_rpcs.lock().await.remove(session_id);
-        let cached = self.sessions.lock().await.remove(session_id);
-        if let Some(cached) = cached {
-            let mut process = cached.process.lock().await;
+        if let Some(cached) = self.sessions.remove(session_id).await {
+            let mut process = cached.inner().lock().await;
             let _ = process.child.start_kill();
         }
     }
@@ -914,7 +822,7 @@ impl ClaudeSdkAdapter {
         // decrementing in_flight and stamping last_activity = now so the
         // 2-minute idle timer starts ticking.
         let _activity = cached.activity_guard();
-        let mut process = cached.process.lock().await;
+        let mut process = cached.inner().lock().await;
 
         let mode_str = permission_mode_to_str(permission_mode);
         let bridge_images: Vec<BridgeImageAttachment> = input
@@ -1156,9 +1064,15 @@ impl ClaudeSdkAdapter {
                         }
                     }
                     "rate_limit_update" => {
-                        if let Some(info) = rate_limit_info
+                        if let Some(mut info) = rate_limit_info
                             .and_then(|v| serde_json::from_value::<zenui_provider_api::RateLimitInfo>(v).ok())
                         {
+                            // Canonicalize the label against the shared
+                            // Rust table so the two Claude adapters always
+                            // agree on phrasing, even if the bridge's
+                            // fallback copy ever drifts (see
+                            // `claude_bucket_label`).
+                            info.label = zenui_provider_api::claude_bucket_label(&info.bucket);
                             events
                                 .send(ProviderTurnEvent::RateLimitUpdated { info })
                                 .await;
@@ -1365,7 +1279,7 @@ impl ClaudeSdkAdapter {
                     // the caller side already removed the entry
                     // and we're just discarding a late reply.
                     let sender_opt = {
-                        let mut pending = cached.pending_rpcs.lock().await;
+                        let mut pending = process.pending_rpcs.lock().await;
                         pending.remove(&request_id)
                     };
                     let payload = match (payload, error) {
@@ -1920,21 +1834,8 @@ async fn write_request(
     stdin: &Arc<Mutex<ChildStdin>>,
     request: &BridgeRequest,
 ) -> Result<(), String> {
-    let json = serde_json::to_string(request)
-        .map_err(|e| format!("Failed to serialize bridge request: {e}"))?;
     let mut guard = stdin.lock().await;
-    guard
-        .write_all(json.as_bytes())
-        .await
-        .map_err(|e| format!("Failed to write to bridge: {e}"))?;
-    guard
-        .write_all(b"\n")
-        .await
-        .map_err(|e| format!("Failed to write to bridge: {e}"))?;
-    guard
-        .flush()
-        .await
-        .map_err(|e| format!("Failed to flush bridge stdin: {e}"))
+    zenui_provider_api::write_json_line(&mut *guard, request, "bridge").await
 }
 
 fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
@@ -1979,9 +1880,12 @@ fn parse_compact_trigger(value: Option<&str>) -> zenui_provider_api::CompactTrig
 /// Parse Claude SDK's `AskUserQuestion` tool input into zenui's cross-provider
 /// question list. Claude's shape is
 /// `{ questions: [{ question, header, options: [{label, description}], multiSelect }] }`,
-/// per https://code.claude.com/docs/en/agent-sdk/user-input. We synthesize `id` as
-/// the question's array index so `answerQuestion` in the bridge can map answers
-/// back to the original question text (Claude's answer map is keyed by question text).
+/// per https://code.claude.com/docs/en/agent-sdk/user-input. Question ids are
+/// synthesized as `q{i}` (matching the Claude-CLI adapter) and option ids are
+/// `q{i}_opt{j}` via the shared `parse_options_from_value` helper. The bridge's
+/// `answerQuestion` strips the `q` prefix to recover the original question
+/// index and look up the text Claude expects as the `updatedInput.answers`
+/// map key.
 fn parse_claude_questions(raw: Option<&Value>) -> Vec<UserInputQuestion> {
     let Some(array) = raw.and_then(Value::as_array) else {
         return Vec::new();
@@ -1990,29 +1894,10 @@ fn parse_claude_questions(raw: Option<&Value>) -> Vec<UserInputQuestion> {
         .iter()
         .enumerate()
         .map(|(i, q)| {
-            let options = q
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|opts| {
-                    opts.iter()
-                        .enumerate()
-                        .map(|(j, o)| UserInputOption {
-                            id: j.to_string(),
-                            label: o
-                                .get("label")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            description: o
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let id = format!("q{i}");
+            let options = zenui_provider_api::parse_options_from_value(q.get("options"), &id);
             UserInputQuestion {
-                id: i.to_string(),
+                id,
                 text: q
                     .get("question")
                     .and_then(Value::as_str)
