@@ -135,8 +135,21 @@ export function ThreadItem({
           className="h-7 w-full min-w-0 rounded-md border border-input bg-background px-2 text-xs outline-none"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
+          // Keep pointer / keyboard events inside the rename input
+          // from bubbling up to the ancestor SortableProject wrapper
+          // in app-sidebar.tsx. Without this, a drag-select past the
+          // PointerSensor's 6px distance — or pressing Space/Enter
+          // while typing — picks up the parent project via dnd-kit's
+          // KeyboardSensor and starts a reorder. Editing should
+          // never activate a drag.
+          onPointerDown={(e) => e.stopPropagation()}
           onBlur={commitRename}
           onKeyDown={(e) => {
+            // Stop every key from reaching the SortableProject
+            // wrapper's onKeyDown (dnd-kit KeyboardSensor activates
+            // on Space/Enter; typing a literal space into the title
+            // would otherwise pick the project up).
+            e.stopPropagation();
             if (e.key === "Enter") commitRename();
             if (e.key === "Escape") {
               setDraft(title);
