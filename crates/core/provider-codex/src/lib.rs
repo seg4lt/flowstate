@@ -1,29 +1,23 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use zenui_provider_api::{
     PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
-    ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
-    SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
+    ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
+    ProbeCliOptions, SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption,
+    UserInputQuestion, probe_cli, session_cwd,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
-fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
-    session
-        .cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| fallback.to_path_buf())
-}
 const RECOVERABLE_THREAD_RESUME_ERRORS: &[&str] = &[
     "not found",
     "missing thread",
@@ -232,14 +226,17 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn health(&self) -> ProviderStatus {
-        probe_cli(
-            &self.binary_path,
-            ProviderKind::Codex,
-            &["--version"],
-            &["login", "status"],
-            codex_models(),
-            zenui_provider_api::features_for_kind(ProviderKind::Codex),
-        )
+        probe_cli(ProbeCliOptions {
+            kind: ProviderKind::Codex,
+            binary: &self.binary_path,
+            version_args: &["--version"],
+            auth_args: &["login", "status"],
+            models: codex_models(),
+            features: zenui_provider_api::features_for_kind(ProviderKind::Codex),
+            install_hint: None,
+            auth_hint: None,
+            auth_err_is_ok: false,
+        })
         .await
     }
 
@@ -631,20 +628,7 @@ impl CodexSessionProcess {
     }
 
     async fn write_message(&mut self, value: Value) -> Result<(), String> {
-        let encoded =
-            serde_json::to_string(&value).map_err(|error| format!("invalid JSON payload: {error}"))?;
-        self.stdin
-            .write_all(encoded.as_bytes())
-            .await
-            .map_err(|error| format!("failed to write to Codex app-server stdin: {error}"))?;
-        self.stdin
-            .write_all(b"\n")
-            .await
-            .map_err(|error| format!("failed to write to Codex app-server stdin: {error}"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|error| format!("failed to flush Codex app-server stdin: {error}"))
+        zenui_provider_api::write_json_line(&mut self.stdin, &value, "Codex app-server").await
     }
 
     async fn read_message(&mut self) -> Result<ProtocolMessage, String> {
@@ -702,80 +686,6 @@ impl CodexSessionProcess {
     }
 }
 
-async fn probe_cli(
-    binary: &str,
-    kind: ProviderKind,
-    version_args: &[&str],
-    auth_args: &[&str],
-    models: Vec<ProviderModel>,
-    features: zenui_provider_api::ProviderFeatures,
-) -> ProviderStatus {
-    let label = kind.label();
-    match Command::new(binary).args(version_args).output().await {
-        Ok(version_output) => {
-            let version = first_non_empty_line(&version_output.stdout)
-                .or_else(|| first_non_empty_line(&version_output.stderr));
-
-            match Command::new(binary).args(auth_args).output().await {
-                Ok(auth_output) => {
-                    let authenticated = auth_output.status.success();
-                    let message = if authenticated {
-                        Some(format!("{label} CLI is installed and authenticated."))
-                    } else {
-                        first_non_empty_line(&auth_output.stderr)
-                            .or_else(|| first_non_empty_line(&auth_output.stdout))
-                            .or_else(|| {
-                                Some(format!("{label} CLI is installed but not authenticated."))
-                            })
-                    };
-
-                    ProviderStatus {
-                        kind,
-                        label: label.to_string(),
-                        installed: true,
-                        authenticated,
-                        version,
-                        status: if authenticated {
-                            ProviderStatusLevel::Ready
-                        } else {
-                            ProviderStatusLevel::Warning
-                        },
-                        message,
-                        models,
-                        enabled: true,
-                        features: features.clone(),
-                    }
-                }
-                Err(error) => ProviderStatus {
-                    kind,
-                    label: label.to_string(),
-                    installed: true,
-                    authenticated: false,
-                    version,
-                    status: ProviderStatusLevel::Warning,
-                    message: Some(format!(
-                        "{label} CLI is installed, but auth probing failed: {error}"
-                    )),
-                    models,
-                    enabled: true,
-                    features,
-                },
-            }
-        }
-        Err(error) => ProviderStatus {
-            kind,
-            label: label.to_string(),
-            installed: false,
-            authenticated: false,
-            version: None,
-            status: ProviderStatusLevel::Error,
-            message: Some(format!("{label} CLI is unavailable: {error}")),
-            models,
-            enabled: true,
-            features,
-        },
-    }
-}
 
 /// Heuristic parser for the codex `model/list` response. The shape isn't
 /// formally documented, so we recursively walk the response looking for any
@@ -1340,10 +1250,3 @@ fn extract_file_change(item: &Value) -> Option<ProviderTurnEvent> {
     })
 }
 
-fn first_non_empty_line(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-}

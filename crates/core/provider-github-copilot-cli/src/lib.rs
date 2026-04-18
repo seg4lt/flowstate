@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -16,19 +14,11 @@ use zenui_provider_api::{
     ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion, skills_disk,
+    UserInputQuestion, session_cwd, skills_disk,
 };
 
 const TURN_TIMEOUT_SECS: u64 = 600;
 const HEALTH_TIMEOUT_SECS: u64 = 10;
-
-fn session_cwd(session: &SessionDetail, fallback: &Path) -> PathBuf {
-    session
-        .cwd
-        .as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| fallback.to_path_buf())
-}
 
 // ── JSON-RPC 2.0 framing ─────────────────────────────────────────────────────
 //
@@ -143,6 +133,10 @@ struct CopilotCliProcess {
     /// Channel forwarding server callbacks (`permission.request`,
     /// `userInput.request`) to the active turn loop.
     callback_tx: CallbackSender,
+    /// Copilot CLI sessionId bound to this process — stored alongside
+    /// the child handle (rather than in a sibling map) so the shared
+    /// `ProcessCache<T>` only needs to cache one type per session.
+    native_session_id: String,
 }
 
 impl CopilotCliProcess {
@@ -287,135 +281,41 @@ const CLI_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Watchdog tick interval.
 const CLI_WATCHDOG_INTERVAL_SECS: u64 = 30;
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Cached CLI process entry with activity tracking. Wraps the long-lived
-/// copilot CLI subprocess with two atomics so a background watchdog can
-/// safely cull idle entries without racing against `run_turn`.
-#[derive(Clone)]
-struct CachedProcess {
-    process: Arc<Mutex<CopilotCliProcess>>,
-    /// Unix epoch seconds at which the last turn finished (or the
-    /// process was spawned). Only consulted when `in_flight == 0`.
-    last_activity: Arc<AtomicU64>,
-    /// Number of turns currently running on this process.
-    in_flight: Arc<AtomicU32>,
-    /// Copilot CLI sessionId for this cached process — persisted here
-    /// (not just in `create_params`) so `session_command_catalog`
-    /// can route `session.skills.list` / `.agent.list` / `.mcp.list`
-    /// without re-resolving from `provider_state`.
-    native_session_id: String,
-}
-
-impl CachedProcess {
-    fn new(process: CopilotCliProcess, native_session_id: String) -> Self {
-        Self {
-            process: Arc::new(Mutex::new(process)),
-            last_activity: Arc::new(AtomicU64::new(unix_now())),
-            in_flight: Arc::new(AtomicU32::new(0)),
-            native_session_id,
-        }
-    }
-
-    fn activity_guard(&self) -> ActivityGuard {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
-        ActivityGuard {
-            in_flight: self.in_flight.clone(),
-            last_activity: self.last_activity.clone(),
-        }
-    }
-}
-
-/// RAII guard held for the duration of a turn. On drop, stamps
-/// `last_activity = now` and decrements the in-flight counter so the
-/// 2-minute idle timer starts ticking.
-struct ActivityGuard {
-    in_flight: Arc<AtomicU32>,
-    last_activity: Arc<AtomicU64>,
-}
-
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        self.last_activity.store(unix_now(), Ordering::Release);
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+/// Alias for the shared `ProcessCache` entry type — see
+/// `zenui_provider_api::process_cache` for the idle-watchdog and
+/// activity-guard plumbing. The copilot CLI's per-session metadata
+/// (`native_session_id`) lives inside `CopilotCliProcess` so a single
+/// cache slot is enough.
+type CachedProcess = zenui_provider_api::CachedProcess<CopilotCliProcess>;
 
 // ── Adapter ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct GitHubCopilotCliAdapter {
     working_directory: PathBuf,
-    /// One process per ZenUI session.
-    active_processes: Arc<Mutex<HashMap<String, CachedProcess>>>,
-    /// Latches true the first time `ensure_session_process` runs so the
-    /// idle-kill watchdog is spawned exactly once per adapter instance.
-    watchdog_started: Arc<AtomicBool>,
+    /// One process per ZenUI session. Backed by the shared
+    /// `ProcessCache` helper so the idle-kill watchdog logic stays in
+    /// lockstep with the SDK/bridge adapters.
+    active_processes: Arc<zenui_provider_api::ProcessCache<CopilotCliProcess>>,
 }
 
 impl GitHubCopilotCliAdapter {
     pub fn new(working_directory: PathBuf) -> Self {
         Self {
             working_directory,
-            active_processes: Arc::new(Mutex::new(HashMap::new())),
-            watchdog_started: Arc::new(AtomicBool::new(false)),
+            active_processes: Arc::new(zenui_provider_api::ProcessCache::new(
+                CLI_IDLE_TIMEOUT_SECS,
+                CLI_WATCHDOG_INTERVAL_SECS,
+                "provider-github-copilot-cli",
+            )),
         }
     }
 
-    /// Spawn the idle-kill watchdog exactly once. Called lazily from
-    /// `ensure_session_process` (rather than `new()`) so we don't rely
-    /// on `tokio::spawn` being available at adapter construction time.
-    ///
-    /// Ticks every 30s, scans `active_processes`, and kills any CLI
-    /// process whose `in_flight == 0` and whose `last_activity` is
-    /// older than 2 minutes. Removal happens under the outer Mutex so
-    /// a concurrent `ensure_session_process` either reuses the existing
-    /// entry or spawns a fresh one — no torn state.
+    /// Spawn the idle-kill watchdog exactly once via the shared helper.
     fn ensure_watchdog(&self) {
-        if self.watchdog_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let active_processes = self.active_processes.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(
-                CLI_WATCHDOG_INTERVAL_SECS,
-            ));
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let now = unix_now();
-                let victims: Vec<(String, CachedProcess)> = {
-                    let mut map = active_processes.lock().await;
-                    let stale: Vec<String> = map
-                        .iter()
-                        .filter(|(_, c)| {
-                            c.in_flight.load(Ordering::Acquire) == 0
-                                && now.saturating_sub(
-                                    c.last_activity.load(Ordering::Acquire),
-                                ) > CLI_IDLE_TIMEOUT_SECS
-                        })
-                        .map(|(k, _)| k.clone())
-                        .collect();
-                    stale
-                        .into_iter()
-                        .filter_map(|k| map.remove(&k).map(|c| (k, c)))
-                        .collect()
-                };
-                for (sid, cached) in victims {
-                    info!(
-                        session_id = %sid,
-                        "copilot CLI process idle {}s, killing",
-                        CLI_IDLE_TIMEOUT_SECS
-                    );
-                    let mut proc = cached.process.lock().await;
-                    let _ = proc.child.start_kill();
-                }
-            }
+        self.active_processes.ensure_watchdog(|cached| async move {
+            let mut proc = cached.inner().lock().await;
+            let _ = proc.child.start_kill();
         });
     }
 
@@ -467,7 +367,7 @@ impl GitHubCopilotCliAdapter {
                 while let Ok(Some(line)) = lines.next_line().await {
                     let t = line.trim();
                     if !t.is_empty() {
-                        debug!(target: "copilot-cli", "{}", t);
+                        debug!(target: "provider-github-copilot-cli", "{}", t);
                     }
                 }
             });
@@ -495,6 +395,9 @@ impl GitHubCopilotCliAdapter {
             next_id: Arc::new(Mutex::new(1)),
             event_tx,
             callback_tx,
+            // Populated by the caller (`ensure_session_process`) after a
+            // successful `session.create` / `session.resume` handshake.
+            native_session_id: String::new(),
         })
     }
 
@@ -510,19 +413,13 @@ impl GitHubCopilotCliAdapter {
         session: &SessionDetail,
     ) -> Result<CachedProcess, String> {
         self.ensure_watchdog();
-        if let Some(existing) = self
-            .active_processes
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned()
-        {
+        if let Some(existing) = self.active_processes.get(&session.summary.session_id).await {
             return Ok(existing);
         }
 
         let binary = Self::find_copilot_binary();
         let resolved_cwd = session_cwd(session, &self.working_directory);
-        let process = Self::spawn_process(&binary, &resolved_cwd).await?;
+        let mut process = Self::spawn_process(&binary, &resolved_cwd).await?;
 
         let native_session_id = session
             .provider_state
@@ -530,6 +427,7 @@ impl GitHubCopilotCliAdapter {
             .and_then(|s| s.native_thread_id.as_deref())
             .map(str::to_string)
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        process.native_session_id = native_session_id.clone();
 
         let cwd = resolved_cwd.to_string_lossy().to_string();
         let model = session.summary.model.as_deref().unwrap_or("gpt-4o");
@@ -591,12 +489,17 @@ impl GitHubCopilotCliAdapter {
 
         info!("copilot CLI: session ready ({})", native_session_id);
 
-        let cached = CachedProcess::new(process, native_session_id);
-        let mut sessions = self.active_processes.lock().await;
-        Ok(sessions
-            .entry(session.summary.session_id.clone())
-            .or_insert_with(|| cached.clone())
-            .clone())
+        // Double-check under the cache lock to preserve first-writer-wins
+        // on concurrent misses.
+        if let Some(existing) = self.active_processes.get(&session.summary.session_id).await {
+            let mut dropped = process;
+            let _ = dropped.child.start_kill();
+            return Ok(existing);
+        }
+        Ok(self
+            .active_processes
+            .insert(session.summary.session_id.clone(), process)
+            .await)
     }
 
     /// Run one turn: send the prompt and consume events until session.idle / error.
@@ -1285,7 +1188,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             .to_string();
 
         Self::run_turn(
-            cached.process.clone(),
+            cached.inner().clone(),
             native_session_id,
             input.text.clone(),
             permission_mode,
@@ -1295,12 +1198,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     }
 
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
-        let cached = self
-            .active_processes
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned();
+        let cached = self.active_processes.get(&session.summary.session_id).await;
 
         if let Some(cached) = cached {
             let native_id = session
@@ -1310,7 +1208,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 .unwrap_or(&session.summary.session_id)
                 .to_string();
 
-            let proc = cached.process.lock().await;
+            let proc = cached.inner().lock().await;
             if let Err(e) = proc
                 .call("session.abort", serde_json::json!({ "sessionId": native_id }))
                 .await
@@ -1323,11 +1221,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     }
 
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
-        let cached = self
-            .active_processes
-            .lock()
-            .await
-            .remove(&session.summary.session_id);
+        let cached = self.active_processes.remove(&session.summary.session_id).await;
 
         if let Some(cached) = cached {
             let native_id = session
@@ -1337,14 +1231,14 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 .unwrap_or(&session.summary.session_id)
                 .to_string();
 
-            let proc = cached.process.lock().await;
+            let proc = cached.inner().lock().await;
             // Best-effort destroy then kill.
             let _ = proc
                 .call("session.destroy", serde_json::json!({ "sessionId": native_id }))
                 .await;
             drop(proc);
 
-            let mut proc = cached.process.lock().await;
+            let mut proc = cached.inner().lock().await;
             let _ = proc.child.start_kill();
         }
 
@@ -1449,8 +1343,8 @@ impl GitHubCopilotCliAdapter {
     > {
         let cached = self.ensure_session_process(session).await?;
         let _guard = cached.activity_guard();
-        let native = cached.native_session_id.clone();
-        let process = cached.process.lock().await;
+        let process = cached.inner().lock().await;
+        let native = process.native_session_id.clone();
 
         let (skills, agents, mcp) = tokio::try_join!(
             process.call(

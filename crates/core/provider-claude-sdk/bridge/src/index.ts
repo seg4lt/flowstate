@@ -99,7 +99,19 @@ interface StructuredAnswer {
  * Computed once at module load and cached — the binary location
  * doesn't change between turns within a single bridge process.
  */
-function resolveLocalClaudeBinary(): string | null {
+/**
+ * Cross-platform PATH resolution for a CLI binary.
+ *
+ * This function's body must stay byte-identical to `resolveBinaryOnPath`
+ * in `provider-github-copilot/bridge/src/index.ts`. The two bridges are
+ * compiled as independent packages (single-file `dist/index.js` output),
+ * so a shared TS module would require bundling; keeping the code
+ * identical via convention is the next-best defence against drift.
+ */
+function resolveBinaryOnPath(
+  name: string,
+  fallbackPaths: readonly string[],
+): string | null {
   const isWindows = process.platform === 'win32';
   const exeExtensions = isWindows
     ? (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
@@ -118,7 +130,7 @@ function resolveLocalClaudeBinary(): string | null {
 
   for (const dir of pathEntries) {
     for (const ext of exeExtensions) {
-      const candidate = joinPath(dir, `claude${ext}`);
+      const candidate = joinPath(dir, `${name}${ext}`);
       try {
         if (existsSync(candidate)) return candidate;
       } catch {
@@ -126,24 +138,6 @@ function resolveLocalClaudeBinary(): string | null {
       }
     }
   }
-
-  // Fallback: well-known install locations across the three OSes.
-  // Tried only when PATH lookup misses (e.g. host process didn't
-  // forward PATH, or `claude` is installed somewhere unusual).
-  const home = homedir();
-  const fallbackPaths: string[] = isWindows
-    ? [
-        joinPath(home, 'AppData', 'Local', 'Programs', 'claude', 'claude.exe'),
-        joinPath(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
-        'C:\\Program Files\\Claude\\claude.exe',
-      ]
-    : [
-        joinPath(home, '.local', 'bin', 'claude'),
-        '/opt/homebrew/bin/claude',
-        '/usr/local/bin/claude',
-        '/home/linuxbrew/.linuxbrew/bin/claude',
-        '/usr/bin/claude',
-      ];
 
   for (const candidate of fallbackPaths) {
     try {
@@ -154,6 +148,25 @@ function resolveLocalClaudeBinary(): string | null {
   }
 
   return null;
+}
+
+function resolveLocalClaudeBinary(): string | null {
+  const home = homedir();
+  const fallbackPaths: string[] =
+    process.platform === 'win32'
+      ? [
+          joinPath(home, 'AppData', 'Local', 'Programs', 'claude', 'claude.exe'),
+          joinPath(home, 'AppData', 'Roaming', 'npm', 'claude.cmd'),
+          'C:\\Program Files\\Claude\\claude.exe',
+        ]
+      : [
+          joinPath(home, '.local', 'bin', 'claude'),
+          '/opt/homebrew/bin/claude',
+          '/usr/local/bin/claude',
+          '/home/linuxbrew/.linuxbrew/bin/claude',
+          '/usr/bin/claude',
+        ];
+  return resolveBinaryOnPath('claude', fallbackPaths);
 }
 
 const RESOLVED_LOCAL_CLAUDE_PATH: string | null = resolveLocalClaudeBinary();
@@ -1675,11 +1688,13 @@ class ClaudeBridge {
     pendingQuestions.delete(requestId);
 
     // Claude expects `updatedInput: { questions, answers: { "<question text>": "<value>" } }`.
-    // We synthesized `questionId` as the question's array index on the Rust side, so
-    // look up each answer's original question text here.
+    // Rust emits `questionId` as `q{i}` (shared format with the Claude-CLI adapter)
+    // but older builds emitted a bare integer; accept either shape so we don't
+    // break during a staggered rollout.
     const answerMap: Record<string, string> = {};
     for (const a of answers) {
-      const idx = Number(a.questionId);
+      const raw = a.questionId.startsWith('q') ? a.questionId.slice(1) : a.questionId;
+      const idx = Number(raw);
       const q = pending.questions[idx];
       if (!q) continue;
       answerMap[q.question] = a.answer;

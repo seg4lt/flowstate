@@ -1,7 +1,16 @@
 mod binary_resolver;
+pub mod helpers;
+pub mod probe;
+pub mod process_cache;
 pub mod skills_disk;
 
 pub use binary_resolver::find_cli_binary;
+pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
+pub use helpers::{
+    claude_bucket_label, claude_file_change_from_tool_call, first_non_empty_line,
+    parse_options_from_value, session_cwd, write_json_line,
+};
+pub use probe::{ProbeCliOptions, probe_cli};
 
 use std::collections::HashMap;
 use std::sync::Arc;
