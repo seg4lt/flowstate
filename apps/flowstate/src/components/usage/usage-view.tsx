@@ -11,8 +11,10 @@ import {
   useUsageTimeseries,
 } from "./hooks/use-usage";
 
-// Usage page. Four KPI cards across the top, two charts side by
-// side, then three tables stacked below. Reads from the
+// Usage page. Five KPI cards (spend / turns / tokens / cache /
+// avg duration) across the top, two charts side by side (cost
+// over time, tokens over time with a by-kind ↔ by-model toggle),
+// then three tables stacked below. Reads from the
 // flowstate-app-owned `usage.sqlite` via the three Tauri commands
 // registered in `src-tauri/src/lib.rs`.
 
@@ -50,7 +52,12 @@ export function UsageView() {
 
   const summaryQuery = useUsageSummary(range, "by_provider");
   const modelsQuery = useUsageSummary(range, "by_model");
-  const timeseriesQuery = useUsageTimeseries(range, "daily", "by_provider");
+  // Cost chart stays split by provider (its colors come from the
+  // provider table). The tokens chart needs its own query so it
+  // can offer a per-model split alongside the by-kind view —
+  // see UsageTokensChart for the toggle.
+  const costTimeseriesQuery = useUsageTimeseries(range, "daily", "by_provider");
+  const tokensTimeseriesQuery = useUsageTimeseries(range, "daily", "by_model");
   const topSessionsQuery = useTopSessions(range, 10);
 
   // First-load gating: show the big "no usage yet" message only
@@ -60,7 +67,7 @@ export function UsageView() {
   const isEmpty =
     summary !== undefined &&
     summary.totals.turnCount === 0 &&
-    timeseriesQuery.data !== undefined;
+    costTimeseriesQuery.data !== undefined;
 
   return (
     <div className="flex h-svh flex-col">
@@ -80,16 +87,19 @@ export function UsageView() {
             <EmptyState />
           ) : summary ? (
             <>
-              <UsageKpiCards totals={summary.totals} />
+              <UsageKpiCards
+                totals={summary.totals}
+                modelGroups={modelsQuery.data?.groups}
+              />
 
               <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-                {timeseriesQuery.data ? (
-                  <UsageCostChart data={timeseriesQuery.data} />
+                {costTimeseriesQuery.data ? (
+                  <UsageCostChart data={costTimeseriesQuery.data} />
                 ) : (
                   <LoadingState />
                 )}
-                {timeseriesQuery.data ? (
-                  <UsageTokensChart data={timeseriesQuery.data} />
+                {tokensTimeseriesQuery.data ? (
+                  <UsageTokensChart data={tokensTimeseriesQuery.data} />
                 ) : (
                   <LoadingState />
                 )}

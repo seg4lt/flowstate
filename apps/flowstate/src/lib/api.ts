@@ -9,4 +9,5 @@ export * from "./api/git";
 export * from "./api/pty";
 export * from "./api/display";
 export * from "./api/usage";
+export * from "./api/pricing";
 export * from "./api/fs";

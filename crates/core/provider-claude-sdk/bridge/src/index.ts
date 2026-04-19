@@ -1343,6 +1343,18 @@ class ClaudeBridge {
             cacheReadTokens: cacheRead,
             model: observedMainModel,
           };
+          // Snapshot of what's actually filling the model's context
+          // RIGHT NOW: this API call's prompt + the running output.
+          // Distinct from the SDK-aggregate sum we'll emit at result
+          // time (which counts the cached system prompt once per
+          // tool-loop iteration). Carrying both lets the dashboard
+          // show billable totals while the live indicator shows
+          // current context fill. See TokenUsage.live_context_tokens.
+          const liveContextTokens =
+            inputTokens +
+            this.outputTokensTotal +
+            (cacheRead ?? 0) +
+            (cacheWrite ?? 0);
           writeStream({
             event: 'turn_usage',
             usage: {
@@ -1355,6 +1367,7 @@ class ClaudeBridge {
               // First-turn mid-stream emits carry null and the
               // client falls back to the provider-declared window.
               contextWindow: this.lastContextWindow,
+              liveContextTokens,
               // Cost and duration are only authoritative at turn end.
               totalCostUsd: null,
               durationMs: null,
@@ -1594,6 +1607,21 @@ class ClaudeBridge {
         }
         if (this.lastAssistantUsage || r.usage) {
           const last = this.lastAssistantUsage;
+          // Preserve the per-call snapshot for the live context
+          // indicator. The aggregate fields below are correct for
+          // the dashboard (they match `r.total_cost_usd`'s scope),
+          // but they overcount cached prompt reads — once per tool
+          // loop iteration — so they're the wrong numerator for
+          // "context window fill". We carry the parent's last per-
+          // call values plus the running output total. Subagents
+          // run in their own context windows and don't affect the
+          // parent's, so excluding them here is correct.
+          const liveContextTokens = last
+            ? last.inputTokens +
+              this.outputTokensTotal +
+              (last.cacheReadTokens ?? 0) +
+              (last.cacheWriteTokens ?? 0)
+            : null;
           writeStream({
             event: 'turn_usage',
             usage: {
@@ -1604,6 +1632,7 @@ class ClaudeBridge {
               cacheReadTokens:
                 r.usage?.cache_read_input_tokens ?? last?.cacheReadTokens ?? null,
               contextWindow: resolvedContextWindow,
+              liveContextTokens,
               totalCostUsd: r.total_cost_usd ?? null,
               durationMs: r.duration_ms ?? null,
               // Parent model. On Task-heavy turns subagents may have

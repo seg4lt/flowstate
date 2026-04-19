@@ -112,7 +112,21 @@ cacheReadTokens?: number,
  * Model's max context window in tokens, when the provider
  * knows it. UIs use this as the denominator for "N of M" fills.
  */
-contextWindow?: number, totalCostUsd?: number, durationMs?: number, model?: string, };
+contextWindow?: number, 
+/**
+ * Approximate tokens currently occupying the model's context
+ * window — i.e. the *snapshot* size at the most recent API
+ * call, not the SDK-aggregate sum across the whole turn's tool
+ * loop. Providers should compute this as
+ * `last_call.input + last_call.cache_read + last_call.cache_write
+ *  + running_output`. UIs prefer this over summing the aggregate
+ * `input_tokens + cache_read_tokens + cache_write_tokens +
+ * output_tokens` because aggregate values multi-count the cached
+ * system prompt across each tool-loop iteration (the "51M / 1M"
+ * inflation bug). Absent on providers that don't expose per-call
+ * usage; consumers fall back to the aggregate sum in that case.
+ */
+liveContextTokens?: number, totalCostUsd?: number, durationMs?: number, model?: string, };
 
 export type RateLimitInfo = { 
 /**

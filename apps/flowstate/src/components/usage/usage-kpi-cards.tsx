@@ -1,6 +1,7 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
-import type { UsageTotals } from "@/lib/api";
+import type { UsageGroupRow, UsageTotals } from "@/lib/api";
+import { estimateCacheReadSavingsUsd } from "@/lib/api";
 
 // KPI card grid that sits above the fold of the Usage dashboard.
 // Plain Tailwind — no shadcn Card primitive is installed in this
@@ -31,10 +32,25 @@ function formatDuration(ms: number): string {
   return `${(minutes / 60).toFixed(1)}h`;
 }
 
-function cacheReadRatio(totals: UsageTotals): number | null {
-  const totalInput = totals.inputTokens + totals.cacheReadTokens;
+// Cache hit rate uses the *standard* denominator: every input
+// token the API saw, whether it was new, written to cache, or
+// served from cache. The pre-fix formula omitted cache writes,
+// which inflated the apparent hit rate on bursty days that wrote
+// fresh prefixes mid-session.
+function cacheHitRatio(totals: UsageTotals): number | null {
+  const totalInput =
+    totals.inputTokens + totals.cacheReadTokens + totals.cacheWriteTokens;
   if (totalInput === 0) return null;
   return totals.cacheReadTokens / totalInput;
+}
+
+// What the dashboard *should* call "input": the full prompt volume
+// the API processed, not just the new-tokens slice that the
+// Anthropic SDK reports as `input_tokens`. Without this, the card
+// reads "6.2k in" when the actual processed prompt was 1.2M+
+// tokens — a 200× understatement on cache-heavy workloads.
+function totalProcessedInput(totals: UsageTotals): number {
+  return totals.inputTokens + totals.cacheReadTokens + totals.cacheWriteTokens;
 }
 
 function PartialBadge() {
@@ -73,15 +89,59 @@ function Card({
   );
 }
 
-export function UsageKpiCards({ totals }: { totals: UsageTotals }) {
-  const ratio = cacheReadRatio(totals);
+// Sum a per-model savings estimate across the per-model breakdown.
+// Splitting per model (rather than using grand totals + a single
+// price) keeps the math honest on multi-model ranges where one
+// Opus turn would otherwise smear its expensive rate over Haiku
+// reads. Returns null when no group has known pricing — the card
+// then hides the dollar figure rather than guessing.
+function aggregateCacheSavings(groups: UsageGroupRow[] | undefined): {
+  savedUsd: number | null;
+  unknownGroupCount: number;
+} {
+  if (!groups || groups.length === 0) {
+    return { savedUsd: null, unknownGroupCount: 0 };
+  }
+  let saved = 0;
+  let known = 0;
+  let unknown = 0;
+  for (const g of groups) {
+    if (g.cacheReadTokens === 0) continue;
+    const slice = estimateCacheReadSavingsUsd(g.label, g.cacheReadTokens);
+    if (slice === null) {
+      unknown += 1;
+      continue;
+    }
+    saved += slice;
+    known += 1;
+  }
+  return {
+    savedUsd: known === 0 ? null : saved,
+    unknownGroupCount: unknown,
+  };
+}
+
+export interface UsageKpiCardsProps {
+  totals: UsageTotals;
+  /// Per-model breakdown for the same range, used to estimate
+  /// cache savings at family-specific rates. Optional — when
+  /// omitted (e.g. in unit tests), the Cache card omits the
+  /// dollar figure and shows just counts + hit rate.
+  modelGroups?: UsageGroupRow[];
+}
+
+export function UsageKpiCards({ totals, modelGroups }: UsageKpiCardsProps) {
+  const hitRatio = cacheHitRatio(totals);
+  const processedIn = totalProcessedInput(totals);
   const avgDurationMs =
     totals.turnCount === 0
       ? 0
       : Math.round(totals.totalDurationMs / totals.turnCount);
+  const { savedUsd, unknownGroupCount } = aggregateCacheSavings(modelGroups);
+  const hasAnyCache = totals.cacheReadTokens > 0 || totals.cacheWriteTokens > 0;
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
       <Card title="Total spend">
         <div className="flex items-baseline">
           <div className="text-2xl font-semibold tabular-nums">
@@ -106,16 +166,74 @@ export function UsageKpiCards({ totals }: { totals: UsageTotals }) {
       </Card>
 
       <Card title="Tokens">
-        <div className="flex items-baseline gap-2 text-lg font-semibold tabular-nums">
-          <span>{formatCompact(totals.inputTokens)}</span>
+        <div
+          className="flex items-baseline gap-2 text-lg font-semibold tabular-nums"
+          title={
+            "Total prompt tokens the API processed (new + cached reads + cache writes), " +
+            "vs total tokens the model generated."
+          }
+        >
+          <span>{formatCompact(processedIn)}</span>
           <span className="text-muted-foreground">/</span>
           <span>{formatCompact(totals.outputTokens)}</span>
         </div>
         <div className="text-xs text-muted-foreground">
           in / out
-          {ratio !== null
-            ? ` · ${Math.round(ratio * 100)}% cache read`
-            : ""}
+        </div>
+        <div
+          className="text-xs text-muted-foreground tabular-nums"
+          title={
+            "New: first-time tokens billed at 1×.\n" +
+            "Cached: read from prompt cache, billed at ~0.1×.\n" +
+            "Writes: first-time tokens written to the cache, billed at ~1.25×."
+          }
+        >
+          <span>{formatCompact(totals.inputTokens)} new</span>
+          <span className="px-1">·</span>
+          <span>{formatCompact(totals.cacheReadTokens)} cached</span>
+          <span className="px-1">·</span>
+          <span>{formatCompact(totals.cacheWriteTokens)} writes</span>
+        </div>
+      </Card>
+
+      <Card title="Cache">
+        <div className="text-2xl font-semibold tabular-nums">
+          {hitRatio === null ? "—" : `${Math.round(hitRatio * 100)}%`}
+          <span className="ml-1 text-xs font-normal text-muted-foreground">
+            hit
+          </span>
+        </div>
+        <div
+          className="text-xs text-muted-foreground tabular-nums"
+          title={
+            "Cache hit rate = cache_read / (input + cache_read + cache_write)."
+          }
+        >
+          {hasAnyCache ? (
+            <>
+              <span>{formatCompact(totals.cacheReadTokens)} read</span>
+              <span className="px-1">·</span>
+              <span>{formatCompact(totals.cacheWriteTokens)} write</span>
+            </>
+          ) : (
+            <span>no cache activity</span>
+          )}
+        </div>
+        <div
+          className="text-xs text-muted-foreground"
+          title={
+            unknownGroupCount > 0
+              ? `Estimate excludes ${unknownGroupCount} model${
+                  unknownGroupCount === 1 ? "" : "s"
+                } with unknown pricing.`
+              : "Estimated savings from prompt caching at Anthropic list rates."
+          }
+        >
+          {savedUsd === null
+            ? hasAnyCache
+              ? "savings: —"
+              : "savings: $0"
+            : `~${formatCost(savedUsd)}${unknownGroupCount > 0 ? "+" : ""} saved`}
         </div>
       </Card>
 

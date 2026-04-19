@@ -232,21 +232,24 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
     (r) => r.status === "allowed_warning" || r.status === "rejected",
   );
 
-  // Current context-window occupancy. The provider bridge is
-  // responsible for ensuring inputTokens / cacheReadTokens /
-  // cacheWriteTokens are the LATEST API call's values (not summed
-  // across every call in the turn's tool loop), so this formula
-  // reads "current prompt size + running output". Summing cache
-  // reads across a long loop would re-count the same cached prompt
-  // once per iteration and push the numerator past the window —
-  // the "51M / 1M" bug. See provider-claude-sdk bridge, where
-  // `assistant` messages emit `turn_usage` per call with per-call
-  // input/cache fields and an accumulated output total.
+  // Current context-window occupancy. We prefer the bridge-supplied
+  // `liveContextTokens` snapshot — it's computed from the LAST API
+  // call's prompt + the running output, which is the right
+  // numerator for "what's filling context right now". The aggregate
+  // fields (inputTokens / cacheReadTokens / cacheWriteTokens) sum
+  // across every iteration of the turn's tool loop and so multi-
+  // count the cached system prompt; using them here pushes the
+  // indicator past 100% on every tool-heavy turn (the "51M / 1M"
+  // inflation bug). The aggregate sum stays as a fallback for
+  // providers that don't yet emit liveContextTokens. See
+  // provider-claude-sdk bridge `result` and per-assistant-message
+  // handlers, where both events carry `liveContextTokens`.
   const used = usage
-    ? usage.inputTokens +
-      usage.outputTokens +
-      (usage.cacheReadTokens ?? 0) +
-      (usage.cacheWriteTokens ?? 0)
+    ? (usage.liveContextTokens ??
+        usage.inputTokens +
+          usage.outputTokens +
+          (usage.cacheReadTokens ?? 0) +
+          (usage.cacheWriteTokens ?? 0))
     : null;
 
   // Denominator resolution: provider-declared ProviderModel
