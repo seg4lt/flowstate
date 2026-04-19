@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 use zenui_persistence::{FileCheckpointStore, PersistenceService};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
@@ -145,6 +145,21 @@ pub struct RuntimeCore {
     /// `permission_mode` parameter, which went stale after the
     /// override.
     in_flight_permission_mode: Arc<RwLock<HashMap<String, PermissionMode>>>,
+    /// Per-session notifier tripped at the very end of `send_turn`'s
+    /// exit path, right after `TurnCompleted` publishes. `steer_turn`
+    /// awaits this after cooperatively interrupting the in-flight turn
+    /// so the follow-up `send_turn` only fires once the bridge's
+    /// `turnInProgress` flag has cleared — closing the race where two
+    /// back-to-back RPCs (`interrupt_turn` + `send_turn`) from the old
+    /// frontend steer dance could hit the bridge before the pump had
+    /// observed the post-interrupt `result`.
+    ///
+    /// Keyed by session id; entries are created lazily on first use
+    /// and live for the session's lifetime (cheap — just an `Arc<Notify>`).
+    /// A `Notify` with no waiters simply drops the notification, so
+    /// the finish-turn `notify_waiters()` call is a no-op when nobody
+    /// is steering.
+    turn_finalized_notifiers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
 }
 
@@ -193,6 +208,7 @@ impl RuntimeCore {
             session_command_catalogs: Arc::new(RwLock::new(HashMap::new())),
             in_flight_catalog_refreshes: Arc::new(Mutex::new(HashSet::new())),
             in_flight_permission_mode: Arc::new(RwLock::new(HashMap::new())),
+            turn_finalized_notifiers: Arc::new(Mutex::new(HashMap::new())),
             turn_observer,
         }
     }
@@ -733,6 +749,22 @@ impl RuntimeCore {
             }
             ClientMessage::InterruptTurn { session_id } => {
                 match self.interrupt_turn(session_id).await {
+                    Ok(message) => Some(ServerMessage::Ack { message }),
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
+            ClientMessage::SteerTurn {
+                session_id,
+                input,
+                images,
+                permission_mode,
+                reasoning_effort,
+            } => {
+                let mode = permission_mode.unwrap_or_default();
+                match self
+                    .steer_turn(session_id, input, images, mode, reasoning_effort)
+                    .await
+                {
                     Ok(message) => Some(ServerMessage::Ack { message }),
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
@@ -2086,6 +2118,21 @@ impl RuntimeCore {
             turn: merged_turn,
         });
 
+        // Wake any `steer_turn` awaiting the turn's post-interrupt
+        // unwind. `notify_waiters()` is a no-op when nobody is waiting,
+        // so the normal (non-steer) completion path pays nothing for
+        // this. We look up (but don't create) the per-session entry —
+        // `steer_turn` is responsible for inserting before it awaits.
+        if let Some(notifier) = self
+            .turn_finalized_notifiers
+            .lock()
+            .await
+            .get(&session.summary.session_id)
+            .cloned()
+        {
+            notifier.notify_waiters();
+        }
+
         result
     }
 
@@ -2302,6 +2349,84 @@ impl RuntimeCore {
         adapter.interrupt_turn(&session).await
     }
 
+    /// Atomic "steer" — cooperatively interrupt the in-flight turn,
+    /// wait for the bridge/adapter to unwind it (i.e. for the existing
+    /// `send_turn` to publish `TurnCompleted`), and then dispatch
+    /// `input` as the next turn on the same session.
+    ///
+    /// Why this exists: the frontend used to implement steering as two
+    /// back-to-back RPCs (`interrupt_turn` + `send_turn`). Under some
+    /// timings the second RPC reached the Claude bridge before its
+    /// pump had observed the post-interrupt `result`, so
+    /// `bridge.sendPrompt` rejected with "Another turn is already in
+    /// flight". Collapsing the sequence into a single daemon-side
+    /// operation closes that window — the `send_turn` below only fires
+    /// after the finish-turn exit path has published `TurnCompleted`,
+    /// which means the bridge's `turnInProgress` flag has cleared.
+    ///
+    /// If no turn is in flight this degrades to a plain `send_turn`.
+    /// A small timeout guards against an adapter that (bug or otherwise)
+    /// never publishes completion — we fall through to the `send_turn`
+    /// anyway and let it surface whatever error the bridge returns.
+    async fn steer_turn(
+        &self,
+        session_id: String,
+        input: String,
+        images: Vec<ImageAttachment>,
+        permission_mode: PermissionMode,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<String, String> {
+        // Is there actually a turn in flight for this session right
+        // now? Read the live snapshot map rather than inspecting
+        // persistence, so we don't race against a turn that just
+        // started but hasn't had its first event written back.
+        let turn_in_flight = match self.in_flight_turns.read() {
+            Ok(map) => map.contains_key(&session_id),
+            Err(_) => false,
+        };
+
+        if turn_in_flight {
+            // Arm the wakeup FIRST so we can't miss the notification
+            // if `finish_turn` happens to publish between our
+            // interrupt call and our `notified()` await. `Notify`
+            // holds a permit for future waits when nobody is
+            // waiting — but we explicitly need `notified()` to be
+            // registered before the notifier fires. The
+            // `notified()` future registers its waiter when polled,
+            // so we construct it and pin it before calling
+            // `interrupt_turn`. Even if the interrupt races ahead
+            // and finish_turn publishes first, `notify_waiters()`
+            // will still wake us on the next `finish_turn` exit if
+            // one is in progress — see tokio Notify semantics.
+            let notifier = {
+                let mut guard = self.turn_finalized_notifiers.lock().await;
+                guard
+                    .entry(session_id.clone())
+                    .or_insert_with(|| Arc::new(Notify::new()))
+                    .clone()
+            };
+            let wait = notifier.notified();
+            tokio::pin!(wait);
+            // Kick the cooperative interrupt. If the session has
+            // disappeared between the flight check and here,
+            // `interrupt_turn` will surface that as an error and we
+            // bail without ever reaching the send.
+            self.interrupt_turn(session_id.clone()).await?;
+
+            // Bounded wait. 10s is generous — the SDK's
+            // post-interrupt unwind typically resolves in tens of
+            // milliseconds (spike logs: ~4ms from `interrupt()` to
+            // the error-result being emitted). The timeout exists
+            // purely to avoid pinning a task forever if a provider
+            // adapter is broken; on expiry we still fall through to
+            // `send_turn`, which will surface the real problem.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(10), &mut wait).await;
+        }
+
+        self.send_turn(session_id, input, images, permission_mode, reasoning_effort)
+            .await
+    }
+
     async fn delete_session(&self, session_id: String) -> Result<String, String> {
         if let Some(session) = self.persistence.get_session(&session_id).await {
             let adapter = self.adapters.get(&session.summary.provider).cloned();
@@ -2322,6 +2447,13 @@ impl RuntimeCore {
 
         // Drop the session's permission policy so it doesn't grow forever.
         self.session_policies.lock().await.remove(&session_id);
+        // Drop the per-session steer-wakeup notifier. Any `steer_turn`
+        // currently awaiting on it will be cancelled by its own session
+        // lookup failing before it reaches the wait.
+        self.turn_finalized_notifiers
+            .lock()
+            .await
+            .remove(&session_id);
 
         self.publish(RuntimeEvent::SessionDeleted {
             session_id: session_id.clone(),

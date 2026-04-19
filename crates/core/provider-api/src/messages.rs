@@ -344,6 +344,25 @@ pub enum ClientMessage {
     InterruptTurn {
         session_id: String,
     },
+    /// Atomic "steer": cooperatively interrupt the in-flight turn (if
+    /// any) and, once the bridge confirms the turn has unwound, dispatch
+    /// `input` as the next turn on the same session. Collapses the
+    /// previous two-RPC interrupt→send dance into a single daemon-side
+    /// operation so the frontend can't race itself against the bridge's
+    /// `turnInProgress` guard.
+    ///
+    /// Payload mirrors `SendTurn` exactly — the eventual dispatch after
+    /// the interrupt unwinds is a normal `send_turn` under the hood.
+    SteerTurn {
+        session_id: String,
+        input: String,
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     /// Switch the active session's permission mode mid-turn. The runtime
     /// forwards this to the session's adapter; for Claude Agent SDK
     /// sessions the bridge calls `query.setPermissionMode` on the live

@@ -1649,7 +1649,42 @@ class ClaudeBridge {
         if (r.subtype === 'success') {
           return r.result ?? '';
         }
-        return null;
+        // Every `result` message is a turn boundary — the SDK emits
+        // exactly one per turn. If we fall through to `return null`
+        // here, the pump loop's `if (text != null)` at lines 807-816
+        // is skipped, `pendingTurn` never resolves, `sendPrompt`'s
+        // finally at line 592 never clears `turnInProgress`, and every
+        // subsequent `sendPrompt` throws "Another turn is already in
+        // flight". From the user's perspective the thread becomes
+        // permanently unusable after one interrupt — this is the
+        // "session gets wiped / thread dead after steer or
+        // interrupt-during-tool-call" bug.
+        //
+        // `SDKResultError` covers four subtypes; all are terminal:
+        //   - `error_during_execution` — the SDK's canonical response
+        //     to `Query.interrupt()`. By far the most common path.
+        //   - `error_max_turns`
+        //   - `error_max_budget_usd`
+        //   - `error_max_structured_output_retries`
+        //
+        // `SDKResultError` has no `result` field (unlike
+        // `SDKResultSuccess`), so we return the same `'[interrupted]'`
+        // marker the iterator-end branch at line 826 uses. runtime-core
+        // only treats this string as a fallback — when the user
+        // interrupted mid-turn, the `interrupted_sessions` flag is
+        // already set on the Rust side, so `send_turn`'s exit path at
+        // `lib.rs:1981-2000` finalises with TurnStatus::Interrupted and
+        // the canonical text comes from the streamed `accumulated`
+        // content the user already saw. The marker is only visible for
+        // non-interrupt error subtypes (budget/turn/retry limits),
+        // where it's a reasonable placeholder.
+        //
+        // `resumeSessionId` has already been promoted above (line 1567)
+        // from this same error result's `session_id`, which the live
+        // SDK spike confirmed is a safe resume anchor — the persisted
+        // `native_thread_id` remains valid and the thread stays usable
+        // after recovery.
+        return '[interrupted]';
       }
       default:
         return null;

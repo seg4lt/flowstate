@@ -31,6 +31,11 @@ import { ImageLightbox, type LightboxSource } from "./image-lightbox";
 interface ChatInputProps {
   onSend: (input: string, images: AttachedImage[]) => void;
   onInterrupt: () => void;
+  /** Atomic steer: interrupt the current turn AND dispatch `input`
+   *  as the next turn in a single daemon-side RPC. Used by the
+   *  "Send now" affordance on queued chips so there's no
+   *  frontend-side interrupt→send race. */
+  onSteer: (input: string, images: AttachedImage[]) => void;
   sessionStatus: SessionStatus | undefined;
   disabled: boolean;
   /** When true, the session's provider has been toggled off in
@@ -149,6 +154,7 @@ function newQueueId(): string {
 export function ChatInput({
   onSend,
   onInterrupt,
+  onSteer,
   sessionStatus,
   disabled,
   providerDisabled = false,
@@ -214,7 +220,6 @@ export function ChatInput({
   const [editText, setEditText] = React.useState("");
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const editTextareaRef = React.useRef<HTMLTextAreaElement>(null);
-  const steerRef = React.useRef<QueuedMessage | null>(null);
 
   // Land focus in the composer on every mount *and* whenever the
   // composer transitions from non-interactive → interactive. ChatView
@@ -318,6 +323,11 @@ export function ChatInput({
   // (running -> ready) and an explicit interrupt (running -> interrupted)
   // drain the head of the queue, because after a stop there is no
   // in-flight send_turn to race against.
+  //
+  // Steer (the "Send now" button on a queued chip) no longer hooks
+  // this effect — it's an atomic daemon-side RPC (`steer_turn`) that
+  // handles its own interrupt-then-send sequencing. This effect now
+  // only handles the "turn completed → drain head of queue" path.
   const prevStatusRef = React.useRef(
     // If mounting with a non-empty queue and the session already
     // finished, pretend the previous status was "running" so the
@@ -334,24 +344,6 @@ export function ChatInput({
     const nowReady = sessionStatus === "ready" || sessionStatus === "interrupted";
     prevStatusRef.current = sessionStatus;
     if (!wasRunning || !nowReady) return;
-
-    // Steer takes priority over normal queue drain. When the user
-    // clicked "Send now" on a specific queued message, steerRef holds
-    // that message — send it instead of the queue head, then return so
-    // the remaining queue items drain on subsequent turn completions.
-    const steered = steerRef.current;
-    if (steered) {
-      steerRef.current = null;
-      if (editingId === steered.id) {
-        setEditingId(null);
-        setEditText("");
-      }
-      onSend(steered.text, steered.images);
-      for (const img of steered.images) {
-        URL.revokeObjectURL(img.previewUrl);
-      }
-      return;
-    }
 
     // Normal drain — pop the head of the queue.
     if (queued.length === 0) return;
@@ -393,11 +385,12 @@ export function ChatInput({
     });
   }
 
-  /** Steer: interrupt the current turn and send a specific queued
-   *  message immediately, plucking it from the queue while preserving
-   *  the order of remaining items. The drain effect picks up the
-   *  steered message (via steerRef) on the running→interrupted
-   *  transition instead of popping the queue head. */
+  /** Steer: cooperatively interrupt the current turn and dispatch a
+   *  specific queued message as the next turn — both in a single
+   *  daemon-side RPC. The daemon serialises interrupt →
+   *  wait-for-finalize → send so we don't have to dance with status
+   *  transitions on the client. Remaining queued items drain on the
+   *  steered turn's natural completion via the drain effect. */
   function steerMessage(id: string) {
     if (sessionStatus !== "running") return;
     const target = queued.find((item) => item.id === id);
@@ -406,11 +399,18 @@ export function ChatInput({
       setEditingId(null);
       setEditText("");
     }
-    steerRef.current = target;
-    // Remove from queue WITHOUT revoking image URLs — the drain
-    // effect will revoke them after sending the steered message.
+    // Pluck from the queue before firing — on a successful steer the
+    // chip is gone immediately; on a surfaced error the message is
+    // lost from the queue, which is the same contract as a normal
+    // send that returns an error.
     setQueued((q) => q.filter((item) => item.id !== id));
-    onInterrupt();
+    onSteer(target.text, target.images);
+    // Revoke the attached image preview URLs now that we've handed
+    // the encoded payload off to the daemon. Mirrors the cleanup
+    // the drain effect does for naturally-drained messages.
+    for (const img of target.images) {
+      URL.revokeObjectURL(img.previewUrl);
+    }
   }
 
   function startEditQueued(id: string, currentText: string) {

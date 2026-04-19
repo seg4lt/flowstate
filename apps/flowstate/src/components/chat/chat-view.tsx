@@ -1517,6 +1517,42 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     await sendMessage({ type: "interrupt_turn", session_id: sessionId });
   }
 
+  /** Atomic steer: cooperatively interrupt the current turn (if any)
+   *  AND dispatch the provided input as the next turn in a single
+   *  daemon-side operation. The daemon serialises interrupt →
+   *  wait-for-finalize → send so the frontend can't race itself
+   *  against the bridge's `turnInProgress` guard. Single RPC, no
+   *  status-transition dance on the client. */
+  async function handleSteer(input: string, images: AttachedImage[] = []) {
+    // Clear drafts / queues the same way handleSend does — the
+    // steered message counts as an actually-dispatched user turn.
+    sessionDrafts.delete(sessionId);
+    // Note: we intentionally do NOT delete sessionQueues here —
+    // only the plucked message is leaving; the rest of the queue
+    // survives and will drain on the resulting turn's completion.
+    // Optimistic echo so the composer collapses instantly; the
+    // real `turn_started` event from the daemon replaces it.
+    setPendingInput(input);
+    setUserSendTick((n) => n + 1);
+    try {
+      await sendMessage({
+        type: "steer_turn",
+        session_id: sessionId,
+        input,
+        images: images.map((img) => ({
+          media_type: img.mediaType,
+          data_base64: img.dataBase64,
+          name: img.name,
+        })),
+        permission_mode: permissionMode,
+        reasoning_effort: effort,
+      });
+    } catch (err) {
+      setPendingInput(null);
+      throw err;
+    }
+  }
+
   async function handlePermissionDecision(
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
@@ -1965,6 +2001,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             key={sessionId}
             onSend={handleSend}
             onInterrupt={handleInterrupt}
+            onSteer={handleSteer}
             sessionStatus={session?.status}
             disabled={loading}
             providerDisabled={providerDisabled}
