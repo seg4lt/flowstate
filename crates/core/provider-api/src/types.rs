@@ -943,6 +943,46 @@ pub struct AttachmentData {
     pub name: Option<String>,
 }
 
+/// Per-agent token breakdown for a single turn. Populated by providers
+/// that can attribute tokens to individual agents running inside the
+/// turn — specifically the main (parent) agent vs. each Task/Agent
+/// sub-agent the SDK dispatched.
+///
+/// The sum of `input`, `output`, `cache_read`, and `cache_write` across
+/// every `AgentUsage` in `TokenUsage.agents` MUST equal the turn-level
+/// aggregate fields. The dashboard relies on that invariant when it
+/// allocates cost proportionally across agents.
+///
+/// `agent_id` is `None` for the main-agent bucket; sub-agents carry
+/// the SDK's `parent_tool_use_id` (the `Task`/`Agent` tool call id
+/// that spawned them). `agent_type` is `None` for main and the subagent
+/// catalog type (`"general-purpose"`, `"Explore"`, `"Plan"`, …) for
+/// sub-agents. `model` is the model the provider actually ran this
+/// agent on (subagents can differ from the main agent's model).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct AgentUsage {
+    /// SDK tool-use id of the Task/Agent that spawned this sub-agent.
+    /// `None` identifies the main (parent) agent bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    /// Sub-agent catalog type, e.g. `"Explore"`, `"general-purpose"`.
+    /// `None` for the main agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_type: Option<String>,
+    /// Model the provider actually ran this agent on, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+}
+
 /// Per-turn token accounting. All fields are optional so providers
 /// can emit whatever their underlying engine reports — a minimal
 /// provider only needs `input_tokens` + `output_tokens`. Cache
@@ -984,6 +1024,15 @@ pub struct TokenUsage {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-agent token breakdown within this turn. When present, the
+    /// sum of every entry's token fields equals the turn-level
+    /// `input_tokens` / `output_tokens` / `cache_*` totals above, so
+    /// dashboards can allocate `total_cost_usd` across agents
+    /// proportionally without double-counting. Absent for providers
+    /// that can't attribute per-agent tokens, in which case consumers
+    /// treat the whole turn as one "main agent" bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<AgentUsage>>,
 }
 
 /// Current status of a rate-limit bucket. Generic across providers.

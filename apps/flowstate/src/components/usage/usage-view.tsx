@@ -3,10 +3,12 @@ import { UsageKpiCards } from "./usage-kpi-cards";
 import { UsageCostChart } from "./usage-cost-chart";
 import { UsageTokensChart } from "./usage-tokens-chart";
 import { UsageBreakdownTable } from "./usage-breakdown-table";
+import { UsageAgentsTable } from "./usage-agents-table";
 import { UsageTopSessionsTable } from "./usage-top-sessions-table";
 import { UsageRangePicker, useUsageRange } from "./usage-range-picker";
 import {
   useTopSessions,
+  useUsageByAgent,
   useUsageSummary,
   useUsageTimeseries,
 } from "./hooks/use-usage";
@@ -59,6 +61,9 @@ export function UsageView() {
   const costTimeseriesQuery = useUsageTimeseries(range, "daily", "by_provider");
   const tokensTimeseriesQuery = useUsageTimeseries(range, "daily", "by_model");
   const topSessionsQuery = useTopSessions(range, 10);
+  // Per-agent breakdown (Main + each subagent role). Distinct query
+  // from summary so a refetch doesn't invalidate the top-line cards.
+  const agentsQuery = useUsageByAgent(range);
 
   // First-load gating: show the big "no usage yet" message only
   // when every query has resolved and the grand totals are empty.
@@ -121,6 +126,7 @@ export function UsageView() {
                   keyColumnLabel="Model"
                   rows={modelsQuery.data?.groups ?? []}
                 />
+                <UsageAgentsTable rows={agentsQuery.data?.groups ?? []} />
               </div>
 
               {topSessionsQuery.data ? (

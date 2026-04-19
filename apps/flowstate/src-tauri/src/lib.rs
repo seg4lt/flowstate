@@ -30,8 +30,8 @@ use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigSto
 mod usage;
 use tokio::sync::broadcast::error::RecvError;
 use usage::{
-    TopSessionRow, UsageBucket, UsageEvent, UsageGroupBy, UsageRange, UsageStore,
-    UsageSummaryPayload, UsageTimeseriesPayload,
+    TopSessionRow, UsageAgentPayload, UsageBucket, UsageEvent, UsageGroupBy, UsageRange,
+    UsageStore, UsageSummaryPayload, UsageTimeseriesPayload,
 };
 use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
 use zenui_provider_claude_cli::ClaudeCliAdapter;
@@ -1563,6 +1563,19 @@ fn get_top_sessions(
     store.top_sessions(range, limit.unwrap_or(10))
 }
 
+/// Per-agent dashboard breakdown: returns one row per (agent_type)
+/// aggregated over the range, with the synthetic "main" key for the
+/// parent agent. Cost is pre-allocated at insert time, so this is a
+/// plain GROUP BY against `usage_event_agents` — cheap even on a
+/// couple hundred thousand rows.
+#[tauri::command]
+fn get_usage_by_agent(
+    store: State<'_, UsageStore>,
+    range: UsageRange,
+) -> Result<UsageAgentPayload, String> {
+    store.summary_by_agent(range)
+}
+
 /// Resolved cross-platform app data dir for Flowstate — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
@@ -1808,6 +1821,7 @@ pub fn run() {
             get_usage_summary,
             get_usage_timeseries,
             get_top_sessions,
+            get_usage_by_agent,
             get_app_data_dir,
         ])
         .on_window_event(|window, event| {

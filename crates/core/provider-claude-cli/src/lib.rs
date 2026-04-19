@@ -777,6 +777,15 @@ impl ClaudeCliAdapter {
                                     total_cost_usd,
                                     duration_ms,
                                     model,
+                                    // claude-cli doesn't emit a per-agent
+                                    // breakdown — its `result` message
+                                    // bundles all subagent usage into one
+                                    // aggregate. Leaving this `None` lets
+                                    // the host store synthesize a single
+                                    // "main" row, which is the correct
+                                    // representation when the provider
+                                    // can't attribute tokens per agent.
+                                    agents: None,
                                 },
                             })
                             .await;

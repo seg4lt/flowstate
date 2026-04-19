@@ -40,7 +40,9 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-use zenui_provider_api::{ProviderKind, SessionSummary, TokenUsage, TurnRecord, TurnStatus};
+use zenui_provider_api::{
+    AgentUsage, ProviderKind, SessionSummary, TokenUsage, TurnRecord, TurnStatus,
+};
 
 /// Requested time range for dashboard queries. Resolved to an
 /// inclusive `[from, to]` pair in UTC before hitting SQL.
@@ -163,6 +165,50 @@ pub struct UsageTimeseriesPayload {
     pub generated_at: String,
 }
 
+/// One row of the "By agent" dashboard breakdown. Analogous to
+/// `UsageGroupRow` but grouped on `agent_type` (with the synthetic
+/// "main" key for the parent agent), so power users can see what
+/// share of their cost is going to which subagent role. Cost is the
+/// proportionally-allocated slice from `usage_event_agents.cost_usd`
+/// — it's already computed at insert time, so the GROUP BY here is a
+/// plain SUM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAgentGroupRow {
+    /// Stable key: `"main"` for the parent agent, catalog subagent
+    /// type (e.g. `"Explore"`, `"general-purpose"`) otherwise. The
+    /// key is what the dashboard persists in UI state so the user's
+    /// preferred sort survives range changes.
+    pub key: String,
+    pub label: String,
+    /// Count of distinct turns that contributed to this bucket.
+    /// A single turn that dispatched two Explore subagents
+    /// contributes once to `main` and once to `Explore` (turn_count
+    /// = 1 in both), matching how the provider/model breakdowns
+    /// count turns.
+    pub turn_count: u64,
+    /// Count of individual invocations: for `main` this equals
+    /// `turn_count` (every turn has exactly one parent row); for a
+    /// subagent bucket a turn with two dispatches contributes 2. Gives
+    /// the dashboard a second column "how many times did this agent
+    /// actually run" distinct from "how many turns involved it".
+    pub invocation_count: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub total_cost_usd: f64,
+    pub cost_has_unknowns: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAgentPayload {
+    pub range: UsageRange,
+    pub groups: Vec<UsageAgentGroupRow>,
+    pub generated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopSessionRow {
@@ -175,6 +221,26 @@ pub struct TopSessionRow {
     pub total_cost_usd: f64,
     pub cost_has_unknowns: bool,
     pub last_activity_at: String,
+}
+
+/// Per-agent slice of a turn's usage — one row per agent that did
+/// work on the turn (main + each Task/Agent sub-agent). Owned by the
+/// `UsageEvent` it's attached to; `record_turn` writes these into
+/// `usage_event_agents` in the same transaction as the parent event.
+#[derive(Debug, Clone)]
+pub struct UsageAgentSlice {
+    /// `None` identifies the main (parent) agent bucket. Sub-agents
+    /// carry the SDK's tool-use id that spawned them.
+    pub agent_id: Option<String>,
+    /// Catalog type ("Explore", "Plan", "general-purpose", ...). `None`
+    /// for main; the dashboard renders main as the synthetic "main"
+    /// row when grouping by agent type.
+    pub agent_type: Option<String>,
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
 }
 
 /// Raw event mapping — what the subscriber task hands to `record_turn`.
@@ -197,6 +263,12 @@ pub struct UsageEvent {
     pub total_cost_usd: f64,
     pub has_cost: bool,
     pub duration_ms: u64,
+    /// Per-agent breakdown when the provider supplied one. Empty for
+    /// providers that don't attribute tokens per agent; consumers
+    /// treat the whole turn as one implicit main-agent bucket in that
+    /// case (recovered on read via the COALESCE path in
+    /// `summary_by_agent`).
+    pub agents: Vec<UsageAgentSlice>,
 }
 
 impl UsageEvent {
@@ -213,6 +285,16 @@ impl UsageEvent {
         let model = usage
             .and_then(|u| u.model.clone())
             .or_else(|| session.model.clone());
+        // Lift the provider's per-agent breakdown into the store's
+        // own type. Kept as an owned Vec (not Option) so downstream
+        // code doesn't have to branch — "provider didn't report any
+        // agents" is represented by an empty vec, which the insert
+        // path then treats as "the whole turn is one implicit main
+        // bucket" (matching how the dashboard would render it).
+        let agents: Vec<UsageAgentSlice> = usage
+            .and_then(|u| u.agents.as_ref())
+            .map(|xs| xs.iter().map(agent_slice_from_api).collect())
+            .unwrap_or_default();
         Self {
             turn_id: turn.turn_id.clone(),
             session_id: session.session_id.clone(),
@@ -228,7 +310,24 @@ impl UsageEvent {
             total_cost_usd: usage.and_then(|u| u.total_cost_usd).unwrap_or(0.0),
             has_cost,
             duration_ms: usage.and_then(|u| u.duration_ms).unwrap_or(0),
+            agents,
         }
+    }
+}
+
+/// Project `AgentUsage` (the provider-api wire type) onto `UsageAgentSlice`
+/// (the store's owned type). Copies every numeric field verbatim and
+/// clones the identifying strings. Kept as a free function so the
+/// provider-api type doesn't leak into the store's public surface.
+fn agent_slice_from_api(a: &AgentUsage) -> UsageAgentSlice {
+    UsageAgentSlice {
+        agent_id: a.agent_id.clone(),
+        agent_type: a.agent_type.clone(),
+        model: a.model.clone(),
+        input_tokens: a.input_tokens,
+        output_tokens: a.output_tokens,
+        cache_read_tokens: a.cache_read_tokens,
+        cache_write_tokens: a.cache_write_tokens,
     }
 }
 
@@ -317,7 +416,58 @@ impl UsageStore {
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_usage_daily_rollups_day
-                    ON usage_daily_rollups(day_utc);",
+                    ON usage_daily_rollups(day_utc);
+
+                CREATE TABLE IF NOT EXISTS usage_event_agents (
+                    -- Composite PK with `turn_id` matches the parent
+                    -- row's PK so `INSERT OR IGNORE` semantics cascade
+                    -- on re-emission of the same turn (matches the
+                    -- idempotency contract on `usage_events`).
+                    turn_id            TEXT NOT NULL,
+                    -- 0 = main (parent) agent, 1..N = sub-agents in
+                    -- dispatch order. Used as a tiebreaker in the PK
+                    -- and for deterministic sort on display.
+                    agent_ordinal      INTEGER NOT NULL,
+                    -- NULL for main (the parent agent has no tool-use
+                    -- id that spawned it); sub-agents carry the SDK's
+                    -- Task/Agent call_id.
+                    agent_id           TEXT,
+                    -- NULL for main; 'general-purpose'/'Explore'/...
+                    -- for sub-agents. Used as the GROUP BY key in
+                    -- `summary_by_agent` so cross-turn analytics
+                    -- aggregate by agent role rather than by the
+                    -- per-turn tool_use id (which is unique per
+                    -- dispatch and meaningless across sessions).
+                    agent_type         TEXT,
+                    model              TEXT,
+                    input_tokens       INTEGER NOT NULL DEFAULT 0,
+                    output_tokens      INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    -- Cost allocated proportionally from the parent
+                    -- turn's `total_cost_usd` using (input + output
+                    -- + cache_read + cache_write) as the weight.
+                    -- Written at insert time so the dashboard can
+                    -- SUM cheaply; the invariant
+                    --   SUM(cost_usd) FOR turn_id = usage_events.total_cost_usd
+                    -- holds modulo floating-point rounding.
+                    cost_usd           REAL NOT NULL DEFAULT 0.0,
+                    -- Same semantics as `usage_events.has_cost`: 0
+                    -- means the turn-level cost was unknown, which
+                    -- propagates to every agent row for that turn.
+                    has_cost           INTEGER NOT NULL DEFAULT 0,
+                    -- Denormalised for index-covered range queries
+                    -- without a JOIN back to `usage_events`.
+                    occurred_day_utc   TEXT NOT NULL,
+                    provider           TEXT NOT NULL,
+                    session_id         TEXT NOT NULL,
+                    PRIMARY KEY (turn_id, agent_ordinal)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_usage_event_agents_day
+                    ON usage_event_agents(occurred_day_utc);
+                CREATE INDEX IF NOT EXISTS idx_usage_event_agents_type
+                    ON usage_event_agents(agent_type, occurred_day_utc);",
             )
             .map_err(|e| format!("create usage schema: {e}"))
     }
@@ -376,6 +526,22 @@ impl UsageStore {
                 ],
             )
             .map_err(|e| format!("insert usage_event: {e}"))?;
+
+        // Per-agent slice rows. Written inside the same transaction
+        // so the invariant "sum of per-agent rows = parent event" is
+        // atomic — a crash between inserts would be rolled back.
+        // Uses `INSERT OR IGNORE` on the composite PK
+        // (turn_id, agent_ordinal) so turn replays (crash-replay,
+        // lagged broadcast) don't double-insert, matching the parent
+        // `usage_events.turn_id` primary key semantics. Only fires
+        // when the parent insert was new — for duplicate turns we
+        // skip this entire block so we don't even touch the agents
+        // table with potentially-different-shaped agents from a
+        // retried/interrupted turn (the source of truth is the first
+        // insert that won).
+        if inserted > 0 {
+            insert_agent_rows(&tx, event, &day, provider_str)?;
+        }
 
         // Only roll up if the event was actually new. Duplicate
         // turn_ids (replay) fall through without touching the rollup.
@@ -504,6 +670,87 @@ impl UsageStore {
         })
     }
 
+    /// Aggregate token/cost totals broken down by agent role over the
+    /// range. Rolls the `usage_event_agents` table up by `agent_type`
+    /// (with `NULL` collapsed to the synthetic `"main"` key), sorted
+    /// by cost descending so the biggest spender is always the first
+    /// row the dashboard renders.
+    ///
+    /// Counts two different things side-by-side on every row:
+    ///   * `turn_count` — turns where this agent role did ANY work.
+    ///     A turn that dispatched three Explore subagents counts once
+    ///     in the Explore row (matches the semantics of provider /
+    ///     model groupings elsewhere on the dashboard).
+    ///   * `invocation_count` — individual agent invocations. Same
+    ///     turn contributes 3 to Explore's invocation_count. This
+    ///     gives the dashboard a cheap "Explore ran 17 times across
+    ///     9 turns" summary without a second query.
+    pub fn summary_by_agent(&self, range: UsageRange) -> Result<UsageAgentPayload, String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Utc::now();
+        let (from, to) = range.to_day_bounds(now);
+
+        // Use COALESCE(agent_type, 'main') both as the GROUP BY key
+        // and as the returned key so the main bucket has a stable
+        // name. The CASE on has_cost propagates the "one row had
+        // unknown cost" marker up to the aggregate level.
+        let mut stmt = connection
+            .prepare(
+                "SELECT COALESCE(agent_type, 'main') AS agent_key,
+                        COUNT(DISTINCT turn_id)      AS turn_count,
+                        COUNT(*)                     AS invocation_count,
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cache_read_tokens), 0),
+                        COALESCE(SUM(cache_write_tokens), 0),
+                        COALESCE(SUM(cost_usd), 0.0),
+                        MAX(CASE WHEN has_cost = 0 THEN 1 ELSE 0 END)
+                 FROM usage_event_agents
+                 WHERE occurred_day_utc >= ?1 AND occurred_day_utc <= ?2
+                 GROUP BY agent_key
+                 ORDER BY SUM(cost_usd) DESC, COUNT(*) DESC",
+            )
+            .map_err(|e| format!("prepare by_agent: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![from, to], |row| {
+                let key: String = row.get(0)?;
+                // Friendly label: expose `main` as "Main agent"; keep
+                // subagent labels verbatim (they already come from the
+                // provider's catalog and are human-readable).
+                let label = if key == "main" {
+                    "Main agent".to_string()
+                } else {
+                    key.clone()
+                };
+                Ok(UsageAgentGroupRow {
+                    key,
+                    label,
+                    turn_count: row.get::<_, i64>(1)? as u64,
+                    invocation_count: row.get::<_, i64>(2)? as u64,
+                    input_tokens: row.get::<_, i64>(3)? as u64,
+                    output_tokens: row.get::<_, i64>(4)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(5)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(6)? as u64,
+                    total_cost_usd: row.get(7)?,
+                    cost_has_unknowns: row.get::<_, i64>(8)? != 0,
+                })
+            })
+            .map_err(|e| format!("query by_agent: {e}"))?;
+        let mut groups = Vec::new();
+        for r in rows {
+            groups.push(r.map_err(|e| format!("row by_agent: {e}"))?);
+        }
+        Ok(UsageAgentPayload {
+            range,
+            groups,
+            generated_at: now.to_rfc3339(),
+        })
+    }
+
     /// Top sessions by total cost over the range. Uses `ORDER BY
     /// total_cost_usd DESC` with a secondary order on turn_count so
     /// free-tier sessions (cost = 0) still have a stable ranking by
@@ -581,6 +828,125 @@ fn turn_status_to_str(status: TurnStatus) -> &'static str {
         TurnStatus::Interrupted => "interrupted",
         TurnStatus::Failed => "failed",
     }
+}
+
+/// Insert per-agent slice rows for a freshly-recorded turn.
+///
+/// Allocates `event.total_cost_usd` across agents proportionally to
+/// each agent's "billable weight" (input + output + cache_read +
+/// cache_write tokens). The weight choice matches how the SDK itself
+/// bills — every token type has a per-model rate that's > 0, so
+/// using the sum is a close proxy for the cost share without needing
+/// a per-model pricing table on the Rust side. When the total weight
+/// is zero (no tokens at all) we skip the allocation and leave every
+/// row at cost 0, which still satisfies `SUM(cost_usd) == 0`.
+///
+/// When the provider didn't supply an `agents` breakdown
+/// (`event.agents.is_empty()`) we synthesize a single "main" row
+/// carrying the turn's totals verbatim. That keeps the invariant
+/// `SUM(usage_event_agents.cost_usd) == usage_events.total_cost_usd`
+/// intact for every turn in the database, regardless of provider
+/// support — the dashboard's By-Agent view can then treat missing
+/// breakdowns as legitimate main-only turns.
+fn insert_agent_rows(
+    tx: &rusqlite::Transaction<'_>,
+    event: &UsageEvent,
+    day: &str,
+    provider_str: &str,
+) -> Result<(), String> {
+    // Build the row set: synthesize a lone main row when the
+    // provider gave us nothing, otherwise use the provider's slices
+    // verbatim. The ordinal starts at 0 and increments in input order
+    // so `ORDER BY agent_ordinal` is the natural dispatch order.
+    let mut slices: Vec<UsageAgentSlice> = if event.agents.is_empty() {
+        vec![UsageAgentSlice {
+            agent_id: None,
+            agent_type: None,
+            model: event.model.clone(),
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_read_tokens: event.cache_read_tokens,
+            cache_write_tokens: event.cache_write_tokens,
+        }]
+    } else {
+        event.agents.clone()
+    };
+
+    // Proportional cost allocation. Compute weights and the cumulative
+    // running remainder so the final agent absorbs any floating-point
+    // drift — the invariant SUM(cost_usd) == event.total_cost_usd must
+    // hold exactly for the rollup math to stay consistent with
+    // `usage_events.total_cost_usd`.
+    let weights: Vec<u64> = slices
+        .iter()
+        .map(|s| s.input_tokens + s.output_tokens + s.cache_read_tokens + s.cache_write_tokens)
+        .collect();
+    let total_weight: u64 = weights.iter().sum();
+    let costs: Vec<f64> = if total_weight == 0 {
+        // No tokens reported at all: the turn's cost is likely 0 too
+        // (or unknown), and any nonzero total_cost_usd can't be
+        // attributed. Give it all to the first (main) agent so the
+        // sum still matches; this path is exceedingly rare in
+        // practice.
+        let mut c = vec![0.0_f64; slices.len()];
+        if let Some(first) = c.first_mut() {
+            *first = event.total_cost_usd;
+        }
+        c
+    } else {
+        // All but the last row get `floor(share * total_cost)`; the
+        // last row absorbs the residual. This mirrors how we'd hand
+        // out a fixed-point bill and guarantees the SUM invariant.
+        let mut c = Vec::with_capacity(slices.len());
+        let mut running = 0.0_f64;
+        for (i, w) in weights.iter().enumerate() {
+            if i + 1 == weights.len() {
+                c.push(event.total_cost_usd - running);
+            } else {
+                let share = (*w as f64 / total_weight as f64) * event.total_cost_usd;
+                running += share;
+                c.push(share);
+            }
+        }
+        c
+    };
+
+    let has_cost = if event.has_cost { 1_i64 } else { 0_i64 };
+    for (ordinal, (slice, cost)) in slices.drain(..).zip(costs.into_iter()).enumerate() {
+        tx.execute(
+            "INSERT OR IGNORE INTO usage_event_agents (
+                turn_id, agent_ordinal, agent_id, agent_type, model,
+                input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens,
+                cost_usd, has_cost,
+                occurred_day_utc, provider, session_id
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7,
+                ?8, ?9,
+                ?10, ?11,
+                ?12, ?13, ?14
+             )",
+            params![
+                event.turn_id,
+                ordinal as i64,
+                slice.agent_id,
+                slice.agent_type,
+                slice.model,
+                slice.input_tokens as i64,
+                slice.output_tokens as i64,
+                slice.cache_read_tokens as i64,
+                slice.cache_write_tokens as i64,
+                cost,
+                has_cost,
+                day,
+                provider_str,
+                event.session_id,
+            ],
+        )
+        .map_err(|e| format!("insert usage_event_agents: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Extract the UTC `YYYY-MM-DD` day from an RFC3339 timestamp.
@@ -946,6 +1312,7 @@ mod tests {
             total_cost_usd: cost.unwrap_or(0.0),
             has_cost: cost.is_some(),
             duration_ms: 1_000,
+            agents: Vec::new(),
         }
     }
 
@@ -1325,5 +1692,154 @@ mod tests {
         // limit=9999 clamps to 50 (we only have 1 row so we see 1).
         let top = store.top_sessions(UsageRange::Last7Days, 9_999).unwrap();
         assert_eq!(top.len(), 1);
+    }
+
+    /// Turn with no per-agent breakdown supplied: the store must
+    /// synthesize a single main-agent row so the invariant
+    /// `SUM(usage_event_agents.cost_usd) == usage_events.total_cost_usd`
+    /// still holds and the By-Agent view treats legacy / non-SDK
+    /// providers as all-main.
+    #[test]
+    fn by_agent_synthesizes_main_when_breakdown_missing() {
+        let store = UsageStore::in_memory().unwrap();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
+        store
+            .record_turn(&sample_event(
+                "t1",
+                "s1",
+                ProviderKind::Claude,
+                Some("sonnet"),
+                &now_ish,
+                100,
+                200,
+                Some(0.05),
+            ))
+            .unwrap();
+        let payload = store.summary_by_agent(UsageRange::Last7Days).unwrap();
+        assert_eq!(payload.groups.len(), 1);
+        let row = &payload.groups[0];
+        assert_eq!(row.key, "main");
+        assert_eq!(row.label, "Main agent");
+        assert_eq!(row.turn_count, 1);
+        assert_eq!(row.invocation_count, 1);
+        assert_eq!(row.input_tokens, 100);
+        assert_eq!(row.output_tokens, 200);
+        assert!((row.total_cost_usd - 0.05).abs() < 1e-9);
+    }
+
+    /// Turn with a full provider-supplied breakdown: one main bucket
+    /// plus two Explore subagents. Verifies that (a) cost is
+    /// allocated proportionally to the billable-weight sum and (b)
+    /// summing per-agent cost over the turn reconciles exactly with
+    /// the turn-level total.
+    #[test]
+    fn by_agent_allocates_cost_proportionally_to_weight() {
+        let store = UsageStore::in_memory().unwrap();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
+        // Main agent: 100 + 200 + 0 + 0 = 300 weight
+        // Explore #1: 50 + 100 + 50 + 0 = 200 weight
+        // Explore #2: 50 + 100 + 0 + 50 = 200 weight
+        // Total weight = 700; main should get 300/700 * $0.70 = $0.30
+        let event = UsageEvent {
+            turn_id: "t1".into(),
+            session_id: "s1".into(),
+            provider: ProviderKind::Claude,
+            model: Some("sonnet".into()),
+            project_id: None,
+            status: TurnStatus::Completed,
+            occurred_at: now_ish.clone(),
+            input_tokens: 200,
+            output_tokens: 400,
+            cache_read_tokens: 50,
+            cache_write_tokens: 50,
+            total_cost_usd: 0.70,
+            has_cost: true,
+            duration_ms: 1_000,
+            agents: vec![
+                UsageAgentSlice {
+                    agent_id: None,
+                    agent_type: None,
+                    model: Some("sonnet".into()),
+                    input_tokens: 100,
+                    output_tokens: 200,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                UsageAgentSlice {
+                    agent_id: Some("call_abc".into()),
+                    agent_type: Some("Explore".into()),
+                    model: Some("sonnet".into()),
+                    input_tokens: 50,
+                    output_tokens: 100,
+                    cache_read_tokens: 50,
+                    cache_write_tokens: 0,
+                },
+                UsageAgentSlice {
+                    agent_id: Some("call_def".into()),
+                    agent_type: Some("Explore".into()),
+                    model: Some("sonnet".into()),
+                    input_tokens: 50,
+                    output_tokens: 100,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 50,
+                },
+            ],
+        };
+        store.record_turn(&event).unwrap();
+
+        let payload = store.summary_by_agent(UsageRange::Last7Days).unwrap();
+        assert_eq!(payload.groups.len(), 2);
+        // Explore shows up first because its total cost ($0.40)
+        // exceeds main ($0.30).
+        let explore = payload.groups.iter().find(|r| r.key == "Explore").unwrap();
+        let main = payload.groups.iter().find(|r| r.key == "main").unwrap();
+        assert_eq!(explore.invocation_count, 2);
+        assert_eq!(explore.turn_count, 1);
+        assert!((explore.total_cost_usd - 0.40).abs() < 1e-9);
+        assert!((main.total_cost_usd - 0.30).abs() < 1e-9);
+        // SUM invariant holds exactly (last-bucket absorbs rounding).
+        let sum: f64 = payload.groups.iter().map(|r| r.total_cost_usd).sum();
+        assert!((sum - 0.70).abs() < 1e-9);
+    }
+
+    /// Replay of the same turn_id must not double-insert agent rows.
+    /// The `INSERT OR IGNORE` on the composite PK guarantees idempotency.
+    #[test]
+    fn by_agent_idempotent_on_turn_replay() {
+        let store = UsageStore::in_memory().unwrap();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
+        let event = UsageEvent {
+            turn_id: "t1".into(),
+            session_id: "s1".into(),
+            provider: ProviderKind::Claude,
+            model: Some("sonnet".into()),
+            project_id: None,
+            status: TurnStatus::Completed,
+            occurred_at: now_ish,
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_cost_usd: 0.10,
+            has_cost: true,
+            duration_ms: 1_000,
+            agents: vec![UsageAgentSlice {
+                agent_id: None,
+                agent_type: None,
+                model: Some("sonnet".into()),
+                input_tokens: 100,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }],
+        };
+        store.record_turn(&event).unwrap();
+        store.record_turn(&event).unwrap();
+        store.record_turn(&event).unwrap();
+        let payload = store.summary_by_agent(UsageRange::Last7Days).unwrap();
+        assert_eq!(payload.groups.len(), 1);
+        assert_eq!(payload.groups[0].invocation_count, 1);
+        assert_eq!(payload.groups[0].turn_count, 1);
+        assert!((payload.groups[0].total_cost_usd - 0.10).abs() < 1e-9);
     }
 }
