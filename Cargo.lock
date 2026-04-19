@@ -1387,6 +1387,7 @@ dependencies = [
 name = "flowstate"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "dirs 5.0.1",
  "fff-search",

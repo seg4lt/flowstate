@@ -27,14 +27,23 @@ use crate::{ProjectRecord, ProviderKind, SessionDetail, SessionSummary};
 #[serde(rename_all = "camelCase")]
 pub struct SessionDigest {
     pub summary: SessionSummary,
+    /// User-set display title (what shows in the sidebar), sourced
+    /// from the host app's display layer. `None` when the user hasn't
+    /// renamed the session or when the host doesn't expose titles to
+    /// the runtime — consumers fall back to `firstInputPreview`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// User-set display name for the session's project. Same shape as
+    /// `title` — host-app display metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     /// Resolved project path (joined from `summary.project_id` →
     /// `ProjectRecord.path`). Gives the agent a human-readable anchor
     /// for "which project is this?" without a second lookup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_path: Option<String>,
-    /// First turn's user-message input, truncated. Serves as a de
-    /// facto title when the agent doesn't have access to the frontend
-    /// display layer's rename.
+    /// First turn's user-message input, truncated. Serves as a
+    /// disambiguator when `title` is unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_input_preview: Option<String>,
     /// Last turn's final assistant reply, truncated. Useful when the
@@ -48,15 +57,20 @@ const PREVIEW_CHAR_CAP: usize = 200;
 impl SessionDigest {
     /// Build a digest from the parts the dispatcher already has on
     /// hand. `project_path` is looked up by the caller (the runtime
-    /// has the projects table).
+    /// has the projects table); `title` / `project_name` come from
+    /// the app-layer metadata resolver when one is installed.
     pub fn from_parts(
         summary: SessionSummary,
+        title: Option<String>,
+        project_name: Option<String>,
         project_path: Option<String>,
         first_input: Option<&str>,
         last_output: Option<&str>,
     ) -> Self {
         Self {
             summary,
+            title,
+            project_name,
             project_path,
             first_input_preview: first_input.map(truncate_preview),
             last_output_preview: last_output.map(truncate_preview),
@@ -156,6 +170,45 @@ pub enum RuntimeCall {
     /// "use my other project" and the agent doesn't already know the
     /// project_id. Returns every persisted project record.
     ListProjects,
+    /// Create a git worktree off an existing project. Returns a
+    /// worktree blueprint (new project id + on-disk path + branch).
+    /// Host app must have installed a `WorktreeProvisioner`; otherwise
+    /// this returns `Internal` with "worktree support not available".
+    CreateWorktree {
+        base_project_id: String,
+        branch: String,
+        #[serde(default)]
+        base_ref: Option<String>,
+        #[serde(default)]
+        create_branch: Option<bool>,
+    },
+    /// List worktrees. When `base_project_id` is set, restrict to
+    /// worktrees rooted at that project; otherwise list them all.
+    ListWorktrees {
+        #[serde(default)]
+        base_project_id: Option<String>,
+    },
+    /// Convenience combo: create a worktree, then spawn a session
+    /// inside it with `initial_message`. If `await_reply` is true,
+    /// block until the new session produces its first assistant reply
+    /// (same contract as `SpawnAndAwait`).
+    SpawnInWorktree {
+        base_project_id: String,
+        branch: String,
+        #[serde(default)]
+        base_ref: Option<String>,
+        #[serde(default)]
+        create_branch: Option<bool>,
+        initial_message: String,
+        #[serde(default)]
+        provider: Option<ProviderKind>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        await_reply: Option<bool>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,8 +233,40 @@ pub enum RuntimeCallResult {
     // no room for the `kind` discriminator to ride alongside it. Wrapping
     // the list in a field sidesteps the restriction and keeps the wire
     // shape predictable for the bridge.
-    Sessions { sessions: Vec<SessionDigest> },
-    Projects { projects: Vec<ProjectRecord> },
+    Sessions {
+        sessions: Vec<SessionDigest>,
+    },
+    Projects {
+        projects: Vec<ProjectRecord>,
+    },
+    Worktree(WorktreeSummary),
+    Worktrees {
+        worktrees: Vec<WorktreeSummary>,
+    },
+    /// Result of `SpawnInWorktree`. Carries both the worktree metadata
+    /// and the spawned session's id (+ reply if `await_reply` was true).
+    SpawnedInWorktree {
+        worktree: WorktreeSummary,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply: Option<String>,
+    },
+}
+
+/// Wire-shape mirror of `runtime_core::WorktreeBlueprint`. Kept in
+/// `provider-api` so the orchestration result types don't have to
+/// reach into runtime-core.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSummary {
+    pub project_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

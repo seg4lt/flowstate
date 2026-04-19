@@ -24,7 +24,9 @@ mod file_index;
 
 mod shell_env;
 
+mod orchestration_adapters;
 mod user_config;
+use orchestration_adapters::{AppMetadataProviderImpl, WorktreeProvisionerImpl};
 use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
 mod usage;
@@ -418,23 +420,34 @@ fn create_git_worktree(
     base_ref: String,
     checkout_existing: Option<bool>,
 ) -> Result<GitWorktree, String> {
+    create_git_worktree_internal(
+        &project_path,
+        &worktree_path,
+        &branch,
+        &base_ref,
+        checkout_existing.unwrap_or(false),
+    )
+}
+
+/// Synchronous internal helper — same logic as `create_git_worktree`
+/// but callable from non-Tauri contexts (orchestration dispatcher).
+pub(crate) fn create_git_worktree_internal(
+    project_path: &str,
+    worktree_path: &str,
+    branch: &str,
+    base_ref: &str,
+    checkout_existing: bool,
+) -> Result<GitWorktree, String> {
     if branch.trim().is_empty() {
         return Err("empty branch name".into());
     }
     if worktree_path.trim().is_empty() {
         return Err("empty worktree path".into());
     }
-    let output = if checkout_existing.unwrap_or(false) {
+    let output = if checkout_existing {
         // Check out an existing branch into the new worktree.
         Command::new("git")
-            .args([
-                "-C",
-                &project_path,
-                "worktree",
-                "add",
-                &worktree_path,
-                &branch,
-            ])
+            .args(["-C", project_path, "worktree", "add", worktree_path, branch])
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?
     } else {
@@ -442,13 +455,13 @@ fn create_git_worktree(
         Command::new("git")
             .args([
                 "-C",
-                &project_path,
+                project_path,
                 "worktree",
                 "add",
                 "-b",
-                &branch,
-                &worktree_path,
-                &base_ref,
+                branch,
+                worktree_path,
+                base_ref,
             ])
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?
@@ -478,7 +491,8 @@ fn create_git_worktree(
     // Resolve the git root first — when the project path is a
     // submodule directory git may report worktree paths relative to
     // the resolved repo root rather than the raw project path.
-    let effective_path = resolve_git_root_sync(&project_path).unwrap_or(project_path);
+    let effective_path =
+        resolve_git_root_sync(project_path).unwrap_or_else(|| project_path.to_string());
     let all = list_git_worktrees_sync(effective_path)?;
     all.into_iter()
         .find(|w| w.path.trim_end_matches('/') == worktree_path.trim_end_matches('/'))
@@ -1640,6 +1654,10 @@ pub fn run() {
             // belongs in the daemon's schema.
             let user_config_store =
                 UserConfigStore::open(&flowstate_root).expect("failed to open user_config store");
+            // Keep a clone for the orchestration adapters below —
+            // `app.manage` takes ownership but UserConfigStore is
+            // cheap to clone (Arc<Mutex<Connection>> inside).
+            let user_config_for_orch = user_config_store.clone();
             app.manage(user_config_store);
 
             // Open the usage analytics store — a *third* sqlite file
@@ -1714,6 +1732,23 @@ pub fn run() {
                 let core = bootstrap_core_async(&config)
                     .await
                     .expect("daemon bootstrap failed");
+
+                // Wire the app-layer orchestration adapters now that
+                // the runtime exists. Metadata provider lets the
+                // orchestration dispatcher read sidebar titles;
+                // worktree provisioner lets agents spin up git
+                // worktrees via the `create_worktree` / `spawn_in_worktree`
+                // MCP tools. Both hold their own clones of the
+                // UserConfigStore + a Weak back-ref into RuntimeCore.
+                core.runtime_core.install_metadata_provider(Arc::new(
+                    AppMetadataProviderImpl::new(user_config_for_orch.clone()),
+                ));
+                core.runtime_core.install_worktree_provisioner(Arc::new(
+                    WorktreeProvisionerImpl::new(
+                        user_config_for_orch.clone(),
+                        Arc::downgrade(&core.runtime_core),
+                    ),
+                ));
 
                 // Usage analytics subscriber. Runs for the life of
                 // the daemon, filtering the RuntimeEvent broadcast

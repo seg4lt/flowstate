@@ -19,9 +19,11 @@ use crate::orchestration::{RuntimeCall, RuntimeCallResult};
 /// bridge RPC back to `runtime-core`.
 #[derive(Debug, Clone)]
 pub struct AgentCapabilityTool {
-    /// Tool name as the model sees it. Convention: `flowstate_<verb>`.
-    /// Stable across providers so prompts and docs can address a tool
-    /// consistently.
+    /// Canonical tool name. Providers using MCP-style transports (Claude
+    /// Agent SDK) namespace this under a server prefix on the wire — the
+    /// model sees `mcp__flowstate__<name>` — so we deliberately leave the
+    /// name itself bare. Other providers may add their own prefix when
+    /// they wire up.
     pub name: &'static str,
     pub description: &'static str,
     /// JSON Schema describing the tool's input args. Rendered into
@@ -34,7 +36,7 @@ pub struct AgentCapabilityTool {
 pub fn capability_tools() -> Vec<AgentCapabilityTool> {
     vec![
         AgentCapabilityTool {
-            name: "flowstate_spawn_and_await",
+            name: "spawn_and_await",
             description: "Create a brand-new flowstate session (optionally in a different project) \
                 with an initial user message, and block until that session produces its next \
                 assistant reply. Returns the new session's id and the reply text. Use when you \
@@ -70,11 +72,11 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_spawn",
+            name: "spawn",
             description: "Create a brand-new flowstate session with an initial user message, \
                 and return its session id immediately without waiting for a reply. Use this \
                 when you want to start a peer running in the background; poll for its reply \
-                with flowstate_poll.",
+                with the poll tool.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -90,7 +92,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_send_and_await",
+            name: "send_and_await",
             description: "Deliver a message to an existing flowstate session and block until \
                 that session's next assistant reply. Use when you want a quick round of chat \
                 with an already-running peer.",
@@ -99,7 +101,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                 "properties": {
                     "session_id": {
                         "type": "string",
-                        "description": "Id of the target session (get it from flowstate_spawn, flowstate_list_sessions, or your roster)."
+                        "description": "Id of the target session (get it from a previous spawn call, list_sessions, or your roster)."
                     },
                     "message": { "type": "string" },
                     "timeout_secs": {
@@ -112,7 +114,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_send",
+            name: "send",
             description: "Deliver a message to an existing flowstate session without blocking. \
                 If the target is idle, a turn starts immediately; otherwise the message is \
                 queued for delivery at the next turn boundary.",
@@ -126,7 +128,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_poll",
+            name: "poll",
             description: "Return the most recent completed reply from the target session, \
                 optionally after a specific turn id. Returns {status: 'pending'} if nothing new.",
             input_schema: json!({
@@ -139,7 +141,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_read_session",
+            name: "read_session",
             description: "Read a session's summary and most-recent turns — useful for catching up \
                 on a peer's conversation before messaging. `last_turns` caps how many turns come \
                 back.",
@@ -157,11 +159,11 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_list_sessions",
+            name: "list_sessions",
             description: "List sessions you can message. Filter by `project_id` if you know it; \
                 omit to list across all projects. Each entry includes a short preview of the \
                 first user message and last assistant reply so you can pick the right thread \
-                without a follow-up flowstate_read_session call.",
+                without a follow-up read_session call.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -170,7 +172,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
-            name: "flowstate_list_projects",
+            name: "list_projects",
             description: "List every project the runtime knows about. Returns \
                 `{project_id, path}` entries. Use this when the user mentions a project by \
                 name and you don't already have its id — match `path` against the user's words \
@@ -178,6 +180,81 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        AgentCapabilityTool {
+            name: "create_worktree",
+            description: "Create a git worktree off an existing project. Runs \
+                `git worktree add` at a host-chosen path, creates a new flowstate project \
+                for it, and links it to the parent. Returns the new `{project_id, path, \
+                branch, parent_project_id}`. Pass `create_branch: true` to create a fresh \
+                branch from `base_ref` (defaults to HEAD); pass `create_branch: false` to \
+                check out an existing branch. Use this when the user says something like \
+                'spin up a worktree for fix/login and work there'.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "base_project_id": {
+                        "type": "string",
+                        "description": "Project to branch the worktree from. Get it from list_projects."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name to check out in the new worktree."
+                    },
+                    "base_ref": {
+                        "type": "string",
+                        "description": "When create_branch is true, git forks the new branch from this ref. Defaults to HEAD."
+                    },
+                    "create_branch": {
+                        "type": "boolean",
+                        "description": "true (default): create the branch fresh. false: check out an already-existing branch."
+                    }
+                },
+                "required": ["base_project_id", "branch"]
+            }),
+        },
+        AgentCapabilityTool {
+            name: "list_worktrees",
+            description: "List git worktrees the runtime knows about. Pass \
+                `base_project_id` to filter to worktrees descending from one project; omit \
+                to list every worktree. Useful when the user says 'continue the work I \
+                started in that worktree'.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "base_project_id": { "type": "string" }
+                }
+            }),
+        },
+        AgentCapabilityTool {
+            name: "spawn_in_worktree",
+            description: "Convenience combo: create a git worktree for `branch` off \
+                `base_project_id`, then spawn a new session inside it with `initial_message`. \
+                If `await_reply` is true, blocks until the new session produces its first \
+                assistant reply (same contract as spawn_and_await). Returns the worktree \
+                metadata and the new session id.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "base_project_id": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "base_ref": { "type": "string" },
+                    "create_branch": { "type": "boolean" },
+                    "initial_message": { "type": "string" },
+                    "provider": {
+                        "type": "string",
+                        "enum": ["claude", "codex", "github_copilot", "claude_cli", "github_copilot_cli"]
+                    },
+                    "model": { "type": "string" },
+                    "await_reply": { "type": "boolean" },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600
+                    }
+                },
+                "required": ["base_project_id", "branch", "initial_message"]
             }),
         },
     ]
@@ -213,40 +290,60 @@ pub fn parse_runtime_call(tool_name: &str, args: &Value) -> Result<RuntimeCall, 
     };
 
     match tool_name {
-        "flowstate_spawn_and_await" => Ok(RuntimeCall::SpawnAndAwait {
+        "spawn_and_await" => Ok(RuntimeCall::SpawnAndAwait {
             project_id: get_str("project_id"),
             provider: get_provider(),
             model: get_str("model"),
             initial_message: get_required_str("initial_message")?,
             timeout_secs: get_u64("timeout_secs"),
         }),
-        "flowstate_spawn" => Ok(RuntimeCall::Spawn {
+        "spawn" => Ok(RuntimeCall::Spawn {
             project_id: get_str("project_id"),
             provider: get_provider(),
             model: get_str("model"),
             initial_message: get_required_str("initial_message")?,
         }),
-        "flowstate_send_and_await" => Ok(RuntimeCall::SendAndAwait {
+        "send_and_await" => Ok(RuntimeCall::SendAndAwait {
             session_id: get_required_str("session_id")?,
             message: get_required_str("message")?,
             timeout_secs: get_u64("timeout_secs"),
         }),
-        "flowstate_send" => Ok(RuntimeCall::Send {
+        "send" => Ok(RuntimeCall::Send {
             session_id: get_required_str("session_id")?,
             message: get_required_str("message")?,
         }),
-        "flowstate_poll" => Ok(RuntimeCall::Poll {
+        "poll" => Ok(RuntimeCall::Poll {
             session_id: get_required_str("session_id")?,
             since_turn_id: get_str("since_turn_id"),
         }),
-        "flowstate_read_session" => Ok(RuntimeCall::ReadSession {
+        "read_session" => Ok(RuntimeCall::ReadSession {
             session_id: get_required_str("session_id")?,
             last_turns: get_u32("last_turns"),
         }),
-        "flowstate_list_sessions" => Ok(RuntimeCall::ListSessions {
+        "list_sessions" => Ok(RuntimeCall::ListSessions {
             project_id: get_str("project_id"),
         }),
-        "flowstate_list_projects" => Ok(RuntimeCall::ListProjects),
+        "list_projects" => Ok(RuntimeCall::ListProjects),
+        "create_worktree" => Ok(RuntimeCall::CreateWorktree {
+            base_project_id: get_required_str("base_project_id")?,
+            branch: get_required_str("branch")?,
+            base_ref: get_str("base_ref"),
+            create_branch: obj.get("create_branch").and_then(Value::as_bool),
+        }),
+        "list_worktrees" => Ok(RuntimeCall::ListWorktrees {
+            base_project_id: get_str("base_project_id"),
+        }),
+        "spawn_in_worktree" => Ok(RuntimeCall::SpawnInWorktree {
+            base_project_id: get_required_str("base_project_id")?,
+            branch: get_required_str("branch")?,
+            base_ref: get_str("base_ref"),
+            create_branch: obj.get("create_branch").and_then(Value::as_bool),
+            initial_message: get_required_str("initial_message")?,
+            provider: get_provider(),
+            model: get_str("model"),
+            await_reply: obj.get("await_reply").and_then(Value::as_bool),
+            timeout_secs: get_u64("timeout_secs"),
+        }),
         other => Err(format!("unknown runtime call tool `{other}`")),
     }
 }
@@ -278,7 +375,7 @@ mod tests {
             "initial_message": "hello",
             "timeout_secs": 60
         });
-        let call = parse_runtime_call("flowstate_spawn_and_await", &args).unwrap();
+        let call = parse_runtime_call("spawn_and_await", &args).unwrap();
         match call {
             RuntimeCall::SpawnAndAwait {
                 project_id,
@@ -297,7 +394,7 @@ mod tests {
     #[test]
     fn parses_send_and_await() {
         let args = json!({ "session_id": "s-1", "message": "ping" });
-        let call = parse_runtime_call("flowstate_send_and_await", &args).unwrap();
+        let call = parse_runtime_call("send_and_await", &args).unwrap();
         assert!(matches!(call, RuntimeCall::SendAndAwait { .. }));
     }
 
@@ -309,7 +406,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_required_field() {
-        let err = parse_runtime_call("flowstate_spawn", &json!({})).unwrap_err();
+        let err = parse_runtime_call("spawn", &json!({})).unwrap_err();
         assert!(err.contains("initial_message"));
     }
 

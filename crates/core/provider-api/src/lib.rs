@@ -41,7 +41,7 @@ pub use helpers::{
 pub use messages::*;
 pub use orchestration::{
     PollOutcome, RuntimeCall, RuntimeCallDispatcher, RuntimeCallError, RuntimeCallOrigin,
-    RuntimeCallResult, SessionCreator, SessionDigest,
+    RuntimeCallResult, SessionCreator, SessionDigest, WorktreeSummary,
 };
 pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};

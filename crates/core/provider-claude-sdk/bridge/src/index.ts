@@ -351,7 +351,7 @@ const flowstateOrchestrationServer = createSdkMcpServer({
   version: '0.1.0',
   tools: [
     tool(
-      'flowstate_spawn_and_await',
+      'spawn_and_await',
       'Create a brand-new flowstate session (optionally in a different project) with an initial user message, and block until that session produces its next assistant reply. Returns the new session id and the reply text.',
       {
         project_id: z.string().optional(),
@@ -368,10 +368,10 @@ const flowstateOrchestrationServer = createSdkMcpServer({
         initial_message: z.string(),
         timeout_secs: z.number().int().min(1).max(600).optional(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_spawn_and_await', args),
+      async (args) => dispatchRuntimeCall('spawn_and_await', args),
     ),
     tool(
-      'flowstate_spawn',
+      'spawn',
       'Create a brand-new flowstate session with an initial user message, and return its session id immediately without waiting for a reply.',
       {
         project_id: z.string().optional(),
@@ -387,58 +387,101 @@ const flowstateOrchestrationServer = createSdkMcpServer({
         model: z.string().optional(),
         initial_message: z.string(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_spawn', args),
+      async (args) => dispatchRuntimeCall('spawn', args),
     ),
     tool(
-      'flowstate_send_and_await',
+      'send_and_await',
       'Deliver a message to an existing flowstate session and block until that session produces its next assistant reply.',
       {
         session_id: z.string(),
         message: z.string(),
         timeout_secs: z.number().int().min(1).max(600).optional(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_send_and_await', args),
+      async (args) => dispatchRuntimeCall('send_and_await', args),
     ),
     tool(
-      'flowstate_send',
-      "Deliver a message to an existing flowstate session without blocking.",
+      'send',
+      'Deliver a message to an existing flowstate session without blocking.',
       {
         session_id: z.string(),
         message: z.string(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_send', args),
+      async (args) => dispatchRuntimeCall('send', args),
     ),
     tool(
-      'flowstate_poll',
-      "Return the most recent completed reply from the target session, optionally after a specific turn id.",
+      'poll',
+      'Return the most recent completed reply from the target session, optionally after a specific turn id.',
       {
         session_id: z.string(),
         since_turn_id: z.string().optional(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_poll', args),
+      async (args) => dispatchRuntimeCall('poll', args),
     ),
     tool(
-      'flowstate_read_session',
+      'read_session',
       "Read a session's summary and most-recent turns.",
       {
         session_id: z.string(),
         last_turns: z.number().int().min(1).max(100).optional(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_read_session', args),
+      async (args) => dispatchRuntimeCall('read_session', args),
     ),
     tool(
-      'flowstate_list_sessions',
+      'list_sessions',
       'List sessions you can message. Each entry includes a preview of the first user message and last assistant reply, so you can match "the UI refactor thread" without reading each session. Optional project_id filter.',
       {
         project_id: z.string().optional(),
       },
-      async (args) => dispatchRuntimeCall('flowstate_list_sessions', args),
+      async (args) => dispatchRuntimeCall('list_sessions', args),
     ),
     tool(
-      'flowstate_list_projects',
+      'list_projects',
       'List every project the runtime knows about. Use this to look up a project_id when the user mentions a project by name — match the returned `path` against their words.',
       {},
-      async (args) => dispatchRuntimeCall('flowstate_list_projects', args),
+      async (args) => dispatchRuntimeCall('list_projects', args),
+    ),
+    tool(
+      'create_worktree',
+      'Create a git worktree off an existing project and register a flowstate project for it. Returns { projectId, path, branch, parentProjectId }. Set create_branch=true (default) to make a new branch from base_ref, or false to check out an existing branch.',
+      {
+        base_project_id: z.string(),
+        branch: z.string(),
+        base_ref: z.string().optional(),
+        create_branch: z.boolean().optional(),
+      },
+      async (args) => dispatchRuntimeCall('create_worktree', args),
+    ),
+    tool(
+      'list_worktrees',
+      'List worktrees the runtime knows about. Pass base_project_id to restrict to worktrees rooted at one project.',
+      {
+        base_project_id: z.string().optional(),
+      },
+      async (args) => dispatchRuntimeCall('list_worktrees', args),
+    ),
+    tool(
+      'spawn_in_worktree',
+      'Create a worktree for `branch` off `base_project_id` and spawn a session inside it with `initial_message`. Set await_reply=true to block until the session produces its first assistant reply.',
+      {
+        base_project_id: z.string(),
+        branch: z.string(),
+        base_ref: z.string().optional(),
+        create_branch: z.boolean().optional(),
+        initial_message: z.string(),
+        provider: z
+          .enum([
+            'claude',
+            'codex',
+            'github_copilot',
+            'claude_cli',
+            'github_copilot_cli',
+          ])
+          .optional(),
+        model: z.string().optional(),
+        await_reply: z.boolean().optional(),
+        timeout_secs: z.number().int().min(1).max(600).optional(),
+      },
+      async (args) => dispatchRuntimeCall('spawn_in_worktree', args),
     ),
   ],
 });

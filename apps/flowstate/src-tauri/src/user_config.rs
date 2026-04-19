@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -60,13 +60,16 @@ pub struct ProjectWorktree {
     pub branch: Option<String>,
 }
 
-/// Owned by Tauri state. The connection is wrapped in a Mutex
-/// because rusqlite's Connection is not Sync; the lock is held
-/// for the duration of a single read/write which is fine — these
-/// commands are off the UI thread and the queries are
-/// microsecond-level on local SQLite.
+/// Owned by Tauri state and cloned into the orchestration layer
+/// (for the runtime's metadata provider + worktree provisioner).
+/// The connection is wrapped in `Arc<Mutex<...>>` so handles can be
+/// shared cheaply — `Mutex<Connection>` is neither `Sync` nor
+/// `Clone` on its own. The lock is held only for the duration of a
+/// single read/write, which is fine — queries are microsecond-level
+/// on local SQLite.
+#[derive(Clone)]
 pub struct UserConfigStore {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
 }
 
 impl UserConfigStore {
@@ -120,7 +123,7 @@ impl UserConfigStore {
             )
             .map_err(|e| format!("create user_config schema: {e}"))?;
         Ok(Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
         })
     }
 

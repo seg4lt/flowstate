@@ -66,6 +66,99 @@ pub trait ConnectionObserver: Send + Sync {
     }
 }
 
+/// Read-side hook that lets the host app inject display-layer metadata
+/// — session titles, project names — into the orchestration dispatcher.
+///
+/// runtime-core's persistence only stores SDK-level state (session_id,
+/// provider, status, ...); user-facing titles and names live in the
+/// host app's own store (flowstate's `session_display` /
+/// `project_display` tables). Rather than duplicating that data or
+/// moving it into runtime-core, we accept a lazy resolver — the
+/// dispatcher calls into it when building tool responses. An agent
+/// running `list_sessions` then sees the same titles a human sees in
+/// the sidebar.
+///
+/// Default (no provider installed): titles and names are `None` and
+/// agents fall back to `firstInputPreview` for disambiguation.
+#[async_trait::async_trait]
+pub trait AppMetadataProvider: Send + Sync {
+    async fn session_title(&self, session_id: &str) -> Option<String>;
+    async fn project_name(&self, project_id: &str) -> Option<String>;
+}
+
+/// Host-provided git worktree creator. Runtime-core has no git
+/// knowledge — this trait lets the Tauri app layer (which already
+/// owns `create_git_worktree` / `list_git_worktrees` commands) expose
+/// that capability to the orchestration dispatcher so agents can spawn
+/// a session directly into a new worktree.
+///
+/// Implementations are responsible for the full round-trip:
+/// 1. Run `git worktree add …` at a path derived from the parent.
+/// 2. Create an SDK project row for the new worktree via persistence.
+/// 3. Link it to the parent in whatever host-side table tracks
+///    worktree ancestry (flowstate's `project_worktree`).
+/// 4. Return a `WorktreeBlueprint` describing the new state.
+///
+/// Missing implementation = `RuntimeCall::CreateWorktree` /
+/// `SpawnInWorktree` / `ListWorktrees` return `Internal` errors with
+/// a "worktree support not available" message.
+#[async_trait::async_trait]
+pub trait WorktreeProvisioner: Send + Sync {
+    /// Create a new git worktree off `base_project_id` and an SDK
+    /// project row to go with it. Returns the new project id + path +
+    /// branch info.
+    ///
+    /// - `branch` — the branch the worktree will check out. If
+    ///   `create_branch` is true, git creates it from `base_ref`
+    ///   (default: HEAD of the base project).
+    /// - `base_ref` — ignored when `create_branch` is false.
+    /// - `create_branch` — true: `git worktree add -b <branch>`;
+    ///   false: `git worktree add <path> <branch>` (checks out
+    ///   existing branch).
+    async fn create_worktree(
+        &self,
+        base_project_id: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        create_branch: bool,
+    ) -> Result<WorktreeBlueprint, String>;
+
+    /// List worktrees. If `base_project_id` is `Some(pid)`, restrict to
+    /// worktrees whose parent is `pid`; otherwise return every known
+    /// worktree.
+    async fn list_worktrees(
+        &self,
+        base_project_id: Option<&str>,
+    ) -> Result<Vec<WorktreeBlueprint>, String>;
+}
+
+/// Description of a git worktree as the runtime sees it — the new
+/// SDK project id, its on-disk path, the branch, and the parent
+/// project it descends from. Returned by [`WorktreeProvisioner`] and
+/// carried in [`zenui_provider_api::RuntimeCallResult::Worktree`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeBlueprint {
+    pub project_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_project_id: Option<String>,
+}
+
+/// Translate the runtime-core blueprint into the provider-api wire
+/// shape the dispatcher returns. Keeps the provider-api crate free of
+/// a runtime-core dependency.
+fn blueprint_to_summary(bp: WorktreeBlueprint) -> zenui_provider_api::WorktreeSummary {
+    zenui_provider_api::WorktreeSummary {
+        project_id: bp.project_id,
+        path: bp.path,
+        branch: bp.branch,
+        parent_project_id: bp.parent_project_id,
+    }
+}
+
 /// No-op `ConnectionObserver`. Hand this to a transport when you don't care
 /// about connection counting (in-process tests, embedded shells without
 /// idle-shutdown behavior).
@@ -181,6 +274,16 @@ pub struct RuntimeCore {
     /// `Arc::new(RuntimeCore::new(...))`; left as `None` on pure
     /// unit-test builds that never spawn cross-session work.
     self_weak: std::sync::RwLock<Option<std::sync::Weak<RuntimeCore>>>,
+    /// Optional host-app metadata resolver — supplies session titles
+    /// and project names to the orchestration dispatcher. Installed
+    /// via `install_metadata_provider` from the app layer. `None`
+    /// means agents see no titles / names (they fall back to
+    /// `firstInputPreview` for disambiguation).
+    metadata_provider: std::sync::RwLock<Option<Arc<dyn AppMetadataProvider>>>,
+    /// Optional host-app worktree provisioner. Installed via
+    /// `install_worktree_provisioner`. `None` means worktree
+    /// orchestration tools return a structured "not available" error.
+    worktree_provisioner: std::sync::RwLock<Option<Arc<dyn WorktreeProvisioner>>>,
 }
 
 impl RuntimeCore {
@@ -232,7 +335,54 @@ impl RuntimeCore {
             turn_observer,
             orchestration_state: OrchestrationState::new(),
             self_weak: std::sync::RwLock::new(None),
+            metadata_provider: std::sync::RwLock::new(None),
+            worktree_provisioner: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Wire a host-app metadata resolver. Call once after construction
+    /// before serving traffic. Safe to call repeatedly; the last caller
+    /// wins (useful for tests that swap a fake in and out).
+    pub fn install_metadata_provider(&self, provider: Arc<dyn AppMetadataProvider>) {
+        if let Ok(mut slot) = self.metadata_provider.write() {
+            *slot = Some(provider);
+        }
+    }
+
+    /// Wire a host-app worktree provisioner. Call once after
+    /// construction; leave unset on platforms / host apps that don't
+    /// support git worktrees.
+    pub fn install_worktree_provisioner(&self, provisioner: Arc<dyn WorktreeProvisioner>) {
+        if let Ok(mut slot) = self.worktree_provisioner.write() {
+            *slot = Some(provisioner);
+        }
+    }
+
+    fn metadata_provider(&self) -> Option<Arc<dyn AppMetadataProvider>> {
+        self.metadata_provider.read().ok()?.clone()
+    }
+
+    fn worktree_provisioner(&self) -> Option<Arc<dyn WorktreeProvisioner>> {
+        self.worktree_provisioner.read().ok()?.clone()
+    }
+
+    /// Create a flowstate project row for the given on-disk path and
+    /// publish `ProjectCreated`. Provided so the app-layer
+    /// `WorktreeProvisioner` can register a project for a freshly-
+    /// created worktree without duplicating persistence plumbing.
+    pub async fn create_project_for_path(
+        &self,
+        path: String,
+    ) -> Result<zenui_provider_api::ProjectRecord, String> {
+        let project = self
+            .persistence
+            .create_project(Some(path))
+            .await
+            .ok_or_else(|| "persistence.create_project returned None".to_string())?;
+        self.publish(RuntimeEvent::ProjectCreated {
+            project: project.clone(),
+        });
+        Ok(project)
     }
 
     /// Install a Weak back-reference to the owning Arc. Called once by
@@ -2341,6 +2491,49 @@ impl RuntimeCore {
                 self.dispatch_list_sessions(origin, project_id).await
             }
             RuntimeCall::ListProjects => self.dispatch_list_projects().await,
+            RuntimeCall::CreateWorktree {
+                base_project_id,
+                branch,
+                base_ref,
+                create_branch,
+            } => {
+                self.dispatch_create_worktree(
+                    &base_project_id,
+                    &branch,
+                    base_ref.as_deref(),
+                    create_branch.unwrap_or(true),
+                )
+                .await
+            }
+            RuntimeCall::ListWorktrees { base_project_id } => {
+                self.dispatch_list_worktrees(base_project_id.as_deref())
+                    .await
+            }
+            RuntimeCall::SpawnInWorktree {
+                base_project_id,
+                branch,
+                base_ref,
+                create_branch,
+                initial_message,
+                provider,
+                model,
+                await_reply,
+                timeout_secs,
+            } => {
+                self.dispatch_spawn_in_worktree(
+                    origin,
+                    base_project_id,
+                    branch,
+                    base_ref,
+                    create_branch.unwrap_or(true),
+                    initial_message,
+                    provider,
+                    model,
+                    await_reply.unwrap_or(false),
+                    timeout_secs,
+                )
+                .await
+            }
         }
     }
 
@@ -2648,6 +2841,7 @@ impl RuntimeCore {
             })
             .collect();
 
+        let metadata = self.metadata_provider();
         let mut digests = Vec::with_capacity(filtered.len());
         for summary in filtered {
             // Cheap read: pull the first and last turn from persistence
@@ -2673,8 +2867,26 @@ impl RuntimeCore {
                 .project_id
                 .as_ref()
                 .and_then(|pid| project_paths.get(pid).cloned());
+
+            // Resolve host-layer metadata (sidebar titles, project
+            // names). Absent provider = None for both; agents fall
+            // back to `firstInputPreview`.
+            let (title, project_name) = match metadata.as_ref() {
+                Some(m) => {
+                    let title = m.session_title(&summary.session_id).await;
+                    let project_name = match summary.project_id.as_ref() {
+                        Some(pid) => m.project_name(pid).await,
+                        None => None,
+                    };
+                    (title, project_name)
+                }
+                None => (None, None),
+            };
+
             digests.push(zenui_provider_api::SessionDigest::from_parts(
                 summary,
+                title,
+                project_name,
                 project_path,
                 first_input.as_deref(),
                 last_output.as_deref(),
@@ -2688,6 +2900,155 @@ impl RuntimeCore {
     ) -> Result<RuntimeCallResult, RuntimeCallError> {
         let projects = self.persistence.list_projects().await;
         Ok(RuntimeCallResult::Projects { projects })
+    }
+
+    async fn dispatch_create_worktree(
+        self: Arc<Self>,
+        base_project_id: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        create_branch: bool,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let provisioner =
+            self.worktree_provisioner()
+                .ok_or_else(|| RuntimeCallError::Internal {
+                    message: "worktree support not available on this host".to_string(),
+                })?;
+        let bp = provisioner
+            .create_worktree(base_project_id, branch, base_ref, create_branch)
+            .await
+            .map_err(|message| RuntimeCallError::Internal { message })?;
+        Ok(RuntimeCallResult::Worktree(blueprint_to_summary(bp)))
+    }
+
+    async fn dispatch_list_worktrees(
+        self: Arc<Self>,
+        base_project_id: Option<&str>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let provisioner =
+            self.worktree_provisioner()
+                .ok_or_else(|| RuntimeCallError::Internal {
+                    message: "worktree support not available on this host".to_string(),
+                })?;
+        let list = provisioner
+            .list_worktrees(base_project_id)
+            .await
+            .map_err(|message| RuntimeCallError::Internal { message })?;
+        Ok(RuntimeCallResult::Worktrees {
+            worktrees: list.into_iter().map(blueprint_to_summary).collect(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_spawn_in_worktree(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        base_project_id: String,
+        branch: String,
+        base_ref: Option<String>,
+        create_branch: bool,
+        initial_message: String,
+        provider: Option<ProviderKind>,
+        model: Option<String>,
+        await_reply: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let provisioner =
+            self.worktree_provisioner()
+                .ok_or_else(|| RuntimeCallError::Internal {
+                    message: "worktree support not available on this host".to_string(),
+                })?;
+        let bp = provisioner
+            .create_worktree(
+                &base_project_id,
+                &branch,
+                base_ref.as_deref(),
+                create_branch,
+            )
+            .await
+            .map_err(|message| RuntimeCallError::Internal { message })?;
+
+        // Spawn a session in the new worktree's project. We route
+        // through the existing spawn path (`start_session` + scheduled
+        // `send_turn`) so permissions, events, and the SessionLinked
+        // badge all behave the same as a bare `spawn`/`spawn_and_await`.
+        let (resolved_provider, resolved_model) = self
+            .clone()
+            .resolve_spawn_defaults(&origin, provider, model)
+            .await?;
+        if !self.is_provider_enabled(resolved_provider) {
+            return Err(RuntimeCallError::ProviderDisabled {
+                provider: resolved_provider.label().to_string(),
+            });
+        }
+        let new_session = self
+            .start_session(
+                resolved_provider,
+                resolved_model,
+                Some(bp.project_id.clone()),
+            )
+            .await
+            .map_err(|e| RuntimeCallError::Internal { message: e })?;
+        let new_sid = new_session.summary.session_id.clone();
+        self.publish(RuntimeEvent::SessionLinked {
+            from_session_id: origin.session_id.clone(),
+            to_session_id: new_sid.clone(),
+            reason: SessionLinkReason::Spawn,
+        });
+
+        let summary = blueprint_to_summary(bp);
+
+        if await_reply {
+            self.orchestration_state
+                .register_await(&origin.session_id, &new_sid)
+                .await?;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            self.orchestration_state
+                .register_reply(
+                    &new_sid,
+                    PendingReply {
+                        after_turn_id: None,
+                        sender: reply_tx,
+                    },
+                )
+                .await;
+
+            crate::orchestration::spawn_peer_turn(
+                self.clone(),
+                new_sid.clone(),
+                initial_message,
+                "spawn_in_worktree",
+            );
+
+            let timeout = clamp_timeout(timeout_secs);
+            let outcome = tokio::time::timeout(timeout, reply_rx).await;
+            self.orchestration_state
+                .unregister_await(&origin.session_id, &new_sid)
+                .await;
+            match outcome {
+                Ok(Ok((_turn_id, reply))) => Ok(RuntimeCallResult::SpawnedInWorktree {
+                    worktree: summary,
+                    session_id: new_sid,
+                    reply: Some(reply),
+                }),
+                Ok(Err(_)) => Err(RuntimeCallError::Cancelled),
+                Err(_) => Err(RuntimeCallError::Timeout {
+                    session_id: new_sid,
+                }),
+            }
+        } else {
+            crate::orchestration::spawn_peer_turn(
+                self.clone(),
+                new_sid.clone(),
+                initial_message,
+                "spawn_in_worktree",
+            );
+            Ok(RuntimeCallResult::SpawnedInWorktree {
+                worktree: summary,
+                session_id: new_sid,
+                reply: None,
+            })
+        }
     }
 
     /// Walk this session's turns from `turn_id` forward, restore
