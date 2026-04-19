@@ -434,3 +434,143 @@ impl UserConfigStore {
         Ok(())
     }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// user_config — flowstate-app-owned key/value store
+// ─────────────────────────────────────────────────────────────────
+//
+// Backed by `~/.flowstate/user_config.sqlite` (its own file, not the
+// daemon's database). Used for app-level UI tunables like the
+// highlighter pool size. Frontend wraps these as
+// `getUserConfig` / `setUserConfig` in `src/lib/api.ts`.
+
+use tauri::State;
+
+#[tauri::command]
+pub fn get_user_config(
+    store: State<'_, UserConfigStore>,
+    key: String,
+) -> Result<Option<String>, String> {
+    store.get(&key)
+}
+
+#[tauri::command]
+pub fn set_user_config(
+    store: State<'_, UserConfigStore>,
+    key: String,
+    value: String,
+) -> Result<(), String> {
+    store.set(&key, &value)
+}
+
+// Per-session and per-project display metadata: titles, names,
+// previews, ordering. Lives in the same `user_config.sqlite`
+// file as the kv table above, in dedicated tables. The agent
+// SDK no longer persists any of this — its persistence layer
+// only stores fields the runtime needs to execute or resume
+// agents. See `rs-agent-sdk/crates/core/persistence/CLAUDE.md`
+// for the boundary.
+
+#[tauri::command]
+pub fn set_session_display(
+    store: State<'_, UserConfigStore>,
+    session_id: String,
+    display: SessionDisplay,
+) -> Result<(), String> {
+    store.set_session_display(&session_id, &display)
+}
+
+#[tauri::command]
+pub fn get_session_display(
+    store: State<'_, UserConfigStore>,
+    session_id: String,
+) -> Result<Option<SessionDisplay>, String> {
+    store.get_session_display(&session_id)
+}
+
+#[tauri::command]
+pub fn list_session_display(
+    store: State<'_, UserConfigStore>,
+) -> Result<HashMap<String, SessionDisplay>, String> {
+    store.list_session_display()
+}
+
+#[tauri::command]
+pub fn delete_session_display(
+    store: State<'_, UserConfigStore>,
+    session_id: String,
+) -> Result<(), String> {
+    store.delete_session_display(&session_id)
+}
+
+#[tauri::command]
+pub fn set_project_display(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+    display: ProjectDisplay,
+) -> Result<(), String> {
+    store.set_project_display(&project_id, &display)
+}
+
+#[tauri::command]
+pub fn get_project_display(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<Option<ProjectDisplay>, String> {
+    store.get_project_display(&project_id)
+}
+
+#[tauri::command]
+pub fn list_project_display(
+    store: State<'_, UserConfigStore>,
+) -> Result<HashMap<String, ProjectDisplay>, String> {
+    store.list_project_display()
+}
+
+#[tauri::command]
+pub fn delete_project_display(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<(), String> {
+    store.delete_project_display(&project_id)
+}
+
+// Parent/child worktree links — a flowstate-app concept, not an SDK
+// concept. Each worktree has its own SDK project (so the SDK's
+// existing cwd resolution picks up the worktree folder), and this
+// table just records "project X is a worktree of project Y, on
+// branch Z". The sidebar uses these links to group worktree threads
+// under the parent project visually.
+
+#[tauri::command]
+pub fn set_project_worktree(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+    parent_project_id: String,
+    branch: Option<String>,
+) -> Result<(), String> {
+    store.set_project_worktree(&project_id, &parent_project_id, branch.as_deref())
+}
+
+#[tauri::command]
+pub fn get_project_worktree(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<Option<ProjectWorktree>, String> {
+    store.get_project_worktree(&project_id)
+}
+
+#[tauri::command]
+pub fn list_project_worktree(
+    store: State<'_, UserConfigStore>,
+) -> Result<HashMap<String, ProjectWorktree>, String> {
+    store.list_project_worktree()
+}
+
+#[tauri::command]
+pub fn delete_project_worktree(
+    store: State<'_, UserConfigStore>,
+    project_id: String,
+) -> Result<(), String> {
+    store.delete_project_worktree(&project_id)
+}

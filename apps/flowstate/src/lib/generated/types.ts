@@ -300,9 +300,9 @@ enabled: boolean,
  */
 features: ProviderFeatures, };
 
-export type CommandKind = { "kind": "builtin" } | { "kind": "user_skill", source: SkillSource, } | { "kind": "tui_only" };
+export type CommandKind = { "kind": "builtin" } | { "kind": "user_skill", source: SkillSource, };
 
-export type ProviderCommand = { id: string, name: string, description: string, userInvocable: boolean, argHint?: string, } & ({ "kind": "builtin" } | { "kind": "user_skill", source: SkillSource, } | { "kind": "tui_only" });
+export type ProviderCommand = { id: string, name: string, description: string, userInvocable: boolean, argHint?: string, } & ({ "kind": "builtin" } | { "kind": "user_skill", source: SkillSource, });
 
 export type ProviderAgent = { id: string, name: string, description: string, };
 
@@ -345,7 +345,16 @@ cwd?: string, };
 
 export type AppSnapshot = { generatedAt: string, sessions: Array<SessionDetail>, projects: Array<ProjectRecord>, };
 
-export type BootstrapPayload = { appName: string, generatedAt: string, wsUrl: string, providers: Array<ProviderStatus>, snapshot: AppSnapshot, };
+export type BootstrapPayload = { appName: string, generatedAt: string, 
+/**
+ * WebSocket endpoint for the event stream. `Some(url)` under the
+ * HTTP transport; `None` for in-proc transports like Tauri where
+ * events are already streamed through the host channel and no
+ * separate WS dial is needed. Before Phase 4.10 this was an
+ * empty string under Tauri, which frontend code could not
+ * distinguish from an HTTP misconfiguration.
+ */
+wsUrl?: string, providers: Array<ProviderStatus>, snapshot: AppSnapshot, };
 
 export type ContentBlock = { "kind": "text", text: string, } | { "kind": "reasoning", text: string, } | { "kind": "tool_call", callId: string, } | { "kind": "compact", trigger: CompactTrigger, preTokens?: number, postTokens?: number, durationMs?: number, summary?: string, } | { "kind": "memory_recall", mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, };
 

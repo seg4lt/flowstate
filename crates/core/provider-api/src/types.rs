@@ -1127,7 +1127,13 @@ pub struct AppSnapshot {
 pub struct BootstrapPayload {
     pub app_name: String,
     pub generated_at: String,
-    pub ws_url: String,
+    /// WebSocket endpoint for the event stream. `Some(url)` under the
+    /// HTTP transport; `None` for in-proc transports like Tauri where
+    /// events are already streamed through the host channel and no
+    /// separate WS dial is needed. Before Phase 4.10 this was an
+    /// empty string under Tauri, which frontend code could not
+    /// distinguish from an HTTP misconfiguration.
+    pub ws_url: Option<String>,
     pub providers: Vec<ProviderStatus>,
     pub snapshot: AppSnapshot,
 }

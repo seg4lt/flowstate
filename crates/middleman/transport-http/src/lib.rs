@@ -216,7 +216,7 @@ async fn health_handler() -> Json<HealthPayload> {
 }
 
 async fn bootstrap_handler(State(state): State<ApiState>) -> Json<BootstrapPayload> {
-    Json(state.runtime.bootstrap(state.ws_url.clone()).await)
+    Json(state.runtime.bootstrap(Some(state.ws_url.clone())).await)
 }
 
 async fn snapshot_handler(State(state): State<ApiState>) -> Json<AppSnapshot> {
@@ -279,7 +279,7 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<ServerMessage>();
 
     let welcome = ServerMessage::Welcome {
-        bootstrap: state.runtime.bootstrap(state.ws_url.clone()).await,
+        bootstrap: state.runtime.bootstrap(Some(state.ws_url.clone())).await,
     };
     if out_tx.send(welcome).is_err() {
         return;
