@@ -11,6 +11,7 @@ import {
   PanelLeftClose,
   Regex,
   Search,
+  Sparkles,
   SlidersHorizontal,
 } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
@@ -45,9 +46,10 @@ import { Multibuffer } from "./multibuffer";
 //   └──────────────┴─────────────────────────────────┘
 //
 // Heavy work is offloaded:
-//  * File listing: rust `list_project_files` (ignore crate)
-//  * Content search: rust `search_file_contents` (grep-searcher
-//    + grep-regex, same lineage as ignore)
+//  * File listing: rust `list_project_files` (fff-search, per-worktree
+//    live-watched index; see src-tauri/src/file_index.rs)
+//  * Content search: rust `search_file_contents` (fff-search grep,
+//    bigram-prefiltered + mmap-backed)
 //  * Syntax highlighting + virtualization: @pierre/diffs <File>
 //    inside <Virtualizer>, sharing the worker pool from main.tsx
 
@@ -89,6 +91,10 @@ interface ContentSearchUiOptions {
   include: string;
   exclude: string;
   useRegex: boolean;
+  /** Fuzzy match each line via fff-search's frizbee scorer —
+   *  tolerates typos and out-of-order characters. Overrides
+   *  `useRegex` when on. */
+  useFuzzy: boolean;
   caseSensitive: boolean;
 }
 
@@ -98,6 +104,7 @@ function defaultContentSearchUiOptions(): ContentSearchUiOptions {
     include: "",
     exclude: "",
     useRegex: false,
+    useFuzzy: false,
     caseSensitive: true,
   };
 }
@@ -261,6 +268,7 @@ export function CodeView(props: CodeViewProps) {
     const apiOptions: ContentSearchOptions = {
       ...defaultContentSearchOptions(),
       useRegex: contentOptions.useRegex,
+      useFuzzy: contentOptions.useFuzzy,
       caseSensitive: contentOptions.caseSensitive,
       includes: splitGlobList(contentOptions.include),
       excludes: splitGlobList(contentOptions.exclude),
@@ -293,6 +301,7 @@ export function CodeView(props: CodeViewProps) {
     query,
     projectPath,
     contentOptions.useRegex,
+    contentOptions.useFuzzy,
     contentOptions.caseSensitive,
     contentOptions.include,
     contentOptions.exclude,
@@ -720,7 +729,14 @@ function ContentSearchAdvancedRow({
         size="icon-xs"
         aria-pressed={options.useRegex}
         onClick={() =>
-          onChange((prev) => ({ ...prev, useRegex: !prev.useRegex }))
+          // Regex and fuzzy are mutually exclusive — flipping one on
+          // flips the other off so the backend's precedence
+          // (useFuzzy > useRegex) can't surprise the user.
+          onChange((prev) => ({
+            ...prev,
+            useRegex: !prev.useRegex,
+            useFuzzy: prev.useRegex ? prev.useFuzzy : false,
+          }))
         }
         title="Use regex (.*)"
         aria-label="Toggle regex matching"
@@ -731,17 +747,41 @@ function ContentSearchAdvancedRow({
       <Button
         variant="ghost"
         size="icon-xs"
+        aria-pressed={options.useFuzzy}
+        onClick={() =>
+          onChange((prev) => ({
+            ...prev,
+            useFuzzy: !prev.useFuzzy,
+            useRegex: prev.useFuzzy ? prev.useRegex : false,
+          }))
+        }
+        title="Fuzzy match (typo-tolerant, overrides regex)"
+        aria-label="Toggle fuzzy matching"
+        className={options.useFuzzy ? "bg-muted text-foreground" : undefined}
+      >
+        <Sparkles className="h-3 w-3" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-xs"
         aria-pressed={options.caseSensitive}
+        disabled={options.useFuzzy}
         onClick={() =>
           onChange((prev) => ({
             ...prev,
             caseSensitive: !prev.caseSensitive,
           }))
         }
-        title="Case sensitive (aA)"
+        title={
+          options.useFuzzy
+            ? "Case sensitivity is ignored in fuzzy mode"
+            : "Case sensitive (aA)"
+        }
         aria-label="Toggle case sensitivity"
         className={
-          options.caseSensitive ? "bg-muted text-foreground" : undefined
+          options.caseSensitive && !options.useFuzzy
+            ? "bg-muted text-foreground"
+            : undefined
         }
       >
         <CaseSensitive className="h-3 w-3" />
