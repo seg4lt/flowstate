@@ -78,6 +78,16 @@ jobs:
         with:
           bun-version: latest
 
+      # Zig: src-tauri enables fff-search/zlob for SIMD-optimised grep.
+      # Upstream's build.rs shells out to `zig` to compile the
+      # accelerated kernel and hard-panics under CI=true without it.
+      # brew is preinstalled on macos-14; when the Windows / Linux
+      # matrix rows are re-enabled, swap this for a per-OS step
+      # (choco install zig on Windows, apt / snap on Linux).
+      - name: Install zig
+        if: runner.os == 'macOS'
+        run: brew install zig
+
       # - name: Install Linux deps
       #   if: runner.os == 'Linux'
       #   run: |
