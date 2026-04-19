@@ -7,6 +7,7 @@ import type {
   SessionSummary,
   SkillSource,
 } from "@/lib/types";
+import { PROVIDER_META } from "@/lib/providers";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -228,13 +229,14 @@ export function isCoreCommand(name: string): boolean {
 
 /** Format the string that should land in the composer when the user
  * selects a non-core command. Codex uses `$name` for its skill-like
- * invocations; every other provider uses `/name`. */
+ * invocations; every other provider uses `/name`. Driven by
+ * `PROVIDER_META[provider].slashPrefix`. */
 export function formatSkillInvocation(
   name: string,
   provider: ProviderKind | undefined,
 ): string {
-  if (provider === "codex") return `$${name}`;
-  return `/${name}`;
+  const prefix = provider ? PROVIDER_META[provider].slashPrefix : "/";
+  return `${prefix}${name}`;
 }
 
 // ---------------------------------------------------------------------------

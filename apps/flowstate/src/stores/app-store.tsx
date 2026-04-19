@@ -766,10 +766,20 @@ const initialState: AppState = {
   ready: false,
 };
 
+/** Shape of the single, store-owned stream subscription. Chat-view
+ *  used to open its own `connectStream` channel (doubling every IPC
+ *  event); now it subscribes through `addServerMessageListener` on
+ *  the store context, so the daemon only sees one subscriber. */
+export type ServerMessageListener = (message: ServerMessage) => void;
+
 interface AppContextValue {
   state: AppState;
   dispatch: React.Dispatch<AppAction>;
   send: (message: ClientMessage) => Promise<ServerMessage | null>;
+  /** Register a listener invoked for every `ServerMessage` delivered
+   *  by the store's single `connectStream` subscription. Returns an
+   *  unsubscribe function; call it from the effect's cleanup. */
+  addServerMessageListener: (listener: ServerMessageListener) => () => void;
   /** Rename a session locally — app-side store only, no SDK call. */
   renameSession: (sessionId: string, title: string) => Promise<void>;
   /** Rename a project locally — app-side store only, no SDK call. */
@@ -815,6 +825,24 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   // display maps without stale closures or useCallback dependency churn.
   const stateRef = React.useRef(state);
   stateRef.current = state;
+
+  // Single-source stream subscription. Any consumer that wants
+  // per-view reactions to `RuntimeEvent`s registers through
+  // `addServerMessageListener` — the store owns the only open
+  // `connectStream` channel, dispatches reducer updates, and then
+  // notifies listeners. Previously chat-view opened a second
+  // channel, so every IPC event was routed through two handlers
+  // and the daemon saw twice the fan-out.
+  const listenersRef = React.useRef<Set<ServerMessageListener>>(new Set());
+  const addServerMessageListener = React.useCallback(
+    (listener: ServerMessageListener) => {
+      listenersRef.current.add(listener);
+      return () => {
+        listenersRef.current.delete(listener);
+      };
+    },
+    [],
+  );
 
   // Subscribe to OS-level window focus so the turn_completed handler
   // and the dock badge can tell the difference between "user is on
@@ -862,7 +890,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             type: "set_provider_enabled",
             provider: kind,
             enabled: true,
-          }).catch(() => {/* best effort */});
+          }).catch((err) => {
+            // Best effort — the SDK may already have this provider
+            // enabled, or the daemon may be racing shutdown. Log at
+            // debug level so the failure isn't fully silent.
+            console.debug("[app-store] set_provider_enabled burst failed", err);
+          });
         }
       }
       // Side-effect cleanup: when the SDK reports a session or
@@ -884,6 +917,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             projectId: message.event.project_id,
             display: null,
           });
+        }
+      }
+      // Fan out to registered listeners AFTER the reducer and the
+      // display-cleanup side effects have run, so any per-view code
+      // that reads the store sees fully-updated state. Iterating a
+      // copy insulates against concurrent listener unsubscribes.
+      const snapshot = Array.from(listenersRef.current);
+      for (const listener of snapshot) {
+        try {
+          listener(message);
+        } catch (err) {
+          console.error("[app-store] stream listener threw", err);
         }
       }
     });
@@ -1108,6 +1153,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       state,
       dispatch,
       send,
+      addServerMessageListener,
       renameSession,
       renameProject,
       reorderProjects,
@@ -1121,6 +1167,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     [
       state,
       send,
+      addServerMessageListener,
       renameSession,
       renameProject,
       reorderProjects,
@@ -1167,4 +1214,61 @@ export function useSessionCommandCatalog(
   const { state } = useApp();
   if (!sessionId) return undefined;
   return state.sessionCommands.get(sessionId);
+}
+
+// Narrow slice hooks. Each projects just the fields in its slice so
+// consumers only re-render on the data they actually read. We still
+// wrap `useApp()` under the hood (single reducer) but the component
+// surface reads as if the store were sliced by domain. When the
+// reducer is eventually fractured into four separate reducers (§5.2
+// full), these hooks stay — swap the implementation, leave the call
+// sites alone.
+
+/** Session-domain slice: active/archived sessions, `doneSessionIds`,
+ *  `awaitingInputSessionIds`, active id, window focus. */
+export function useSessionSlice() {
+  const { state } = useApp();
+  return {
+    sessions: state.sessions,
+    archivedSessions: state.archivedSessions,
+    activeSessionId: state.activeSessionId,
+    doneSessionIds: state.doneSessionIds,
+    awaitingInputSessionIds: state.awaitingInputSessionIds,
+    isWindowFocused: state.isWindowFocused,
+    ready: state.ready,
+  };
+}
+
+/** Pending-prompt slice: permission queues, in-flight questions,
+ *  per-session composer permission mode. */
+export function usePendingSlice() {
+  const { state } = useApp();
+  return {
+    pendingPermissionsBySession: state.pendingPermissionsBySession,
+    pendingQuestionBySession: state.pendingQuestionBySession,
+    permissionModeBySession: state.permissionModeBySession,
+  };
+}
+
+/** Provider-domain slice: adapter statuses, rate limits, per-session
+ *  command catalogs. */
+export function useProviderSlice() {
+  const { state } = useApp();
+  return {
+    providers: state.providers,
+    rateLimits: state.rateLimits,
+    sessionCommands: state.sessionCommands,
+  };
+}
+
+/** Project-domain slice: SDK project list, app-side display
+ *  metadata, worktree links. */
+export function useProjectSlice() {
+  const { state } = useApp();
+  return {
+    projects: state.projects,
+    projectDisplay: state.projectDisplay,
+    projectWorktrees: state.projectWorktrees,
+    sessionDisplay: state.sessionDisplay,
+  };
 }

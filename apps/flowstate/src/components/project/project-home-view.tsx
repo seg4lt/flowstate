@@ -48,7 +48,7 @@ import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialo
 import { useTerminal } from "@/stores/terminal-store";
 import type {
   AggregatedFileDiff,
-} from "@/lib/session-diff";
+} from "@/lib/git-diff-stream";
 import type { ProviderKind, SessionSummary } from "@/lib/types";
 
 /** Strip trailing slash for path comparison — git's porcelain output

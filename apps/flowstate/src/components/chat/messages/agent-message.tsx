@@ -1,8 +1,9 @@
 import * as React from "react";
-import type { ProviderKind, TurnStatus } from "@/lib/types";
+import type { TurnStatus } from "@/lib/types";
 import { MarkdownContent } from "./markdown-content";
 import { CopyButton } from "./copy-button";
-import { MessageModelInfo } from "../message-model-info";
+import { MessageModelInfo } from "./message-model-info";
+import { useSessionContext } from "../session-context";
 
 interface AgentMessageProps {
   output: string;
@@ -12,9 +13,6 @@ interface AgentMessageProps {
    *  known. Usually `turn.usage.model` once the turn completes, else
    *  falls back to `session.summary.model` from the caller. */
   model?: string;
-  /** Provider kind for looking up the display label in the info
-   *  popover. */
-  providerKind?: ProviderKind;
 }
 
 function BlinkingCursor() {
@@ -28,8 +26,12 @@ function AgentMessageInner({
   streaming,
   status,
   model,
-  providerKind,
 }: AgentMessageProps) {
+  // Provider kind now comes from SessionContext rather than a prop —
+  // replaces the four-hop prop-drill ChatView → MessageList →
+  // TurnView → AgentMessage and kills one memo dep downstream.
+  const sessionCtx = useSessionContext();
+  const providerKind = sessionCtx?.provider;
   // Defer the markdown parse during rapid streaming deltas — React
   // concurrent mode will render stale markdown if the main thread is
   // busy, then catch up when it has time. No manual throttling.
@@ -78,6 +80,5 @@ export const AgentMessage = React.memo(
     prev.output === next.output &&
     prev.streaming === next.streaming &&
     prev.status === next.status &&
-    prev.model === next.model &&
-    prev.providerKind === next.providerKind,
+    prev.model === next.model,
 );
