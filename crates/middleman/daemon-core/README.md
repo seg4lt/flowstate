@@ -197,7 +197,6 @@ every transport is serving; deleted on graceful shutdown.
 ```json
 {
   "pid": 12345,
-  "protocol_version": 1,
   "started_at": "2026-04-11T17:32:01Z",
   "daemon_version": "0.1.0",
   "project_root": "/path/to/project",
@@ -212,7 +211,10 @@ every transport is serving; deleted on graceful shutdown.
 ```
 
 Multi-transport daemons list every wire in the `transports[]` array.
-`daemon-client` picks whichever transport its caller prefers.
+A client picks whichever transport it prefers. The former
+`protocol_version` field was removed in Phase 6.8 — no reader ever
+checked it, and there was no v1 schema to guard against. Reintroduce
+it *and* a matching reader check if the on-disk shape ever breaks.
 
 ## Graceful shutdown sequence
 

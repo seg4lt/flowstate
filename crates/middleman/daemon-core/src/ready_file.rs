@@ -7,22 +7,20 @@ use serde::{Deserialize, Serialize};
 
 use zenui_runtime_core::transport::TransportAddressInfo;
 
-/// Ready file format version. ZenUI is pre-release; this is the only
-/// format we've ever written on disk. The field is kept for future
-/// evolution — bump it when the schema breaks and add a version check
-/// to the reader.
-const PROTOCOL_VERSION: u32 = 1;
-
 /// Contents of the daemon's ready file.
 ///
 /// Written atomically **after** every transport is accepting connections;
 /// deleted on graceful shutdown. Clients discover a running daemon via
 /// this file and pick whichever transport they speak from the
 /// `transports` array.
+///
+/// Phase 6.8: the former `protocol_version` field was removed — no
+/// reader ever checked it, no schema branch existed. If the on-disk
+/// shape ever needs to break, reintroduce the field AND have the
+/// reader reject unknown values with a clear upgrade message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyFileContent {
     pub pid: u32,
-    pub protocol_version: u32,
     pub started_at: String,
     pub daemon_version: String,
     pub project_root: String,
@@ -38,7 +36,6 @@ impl ReadyFileContent {
     pub fn new(project_root: String, transports: Vec<TransportAddressInfo>) -> Self {
         Self {
             pid: std::process::id(),
-            protocol_version: PROTOCOL_VERSION,
             started_at: chrono::Utc::now().to_rfc3339(),
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             project_root,
@@ -156,7 +153,6 @@ mod tests {
         let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
         rf.write_atomic(&content).expect("write");
         let read = rf.read().expect("read").expect("present");
-        assert_eq!(read.protocol_version, PROTOCOL_VERSION);
         assert_eq!(read.transports.len(), 1);
         match &read.transports[0] {
             TransportAddressInfo::Http { http_base, ws_url } => {

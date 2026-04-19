@@ -9,8 +9,10 @@ Grab the latest build for your platform from
 [Releases](https://github.com/seg4lt/flowstate/releases/latest):
 
 - **macOS (Apple Silicon)** — `Flowstate-<version>-macos-arm64.dmg`
-- **Windows (x64)** — `Flowstate-<version>-windows-x64.msi` or
-  `-setup.exe`
+
+Windows and Linux builds are temporarily paused — the matrix rows are
+kept commented in `.github/workflows/build.yml` and can be re-enabled
+without further changes.
 
 On macOS, open the DMG and double-click **Install Flowstate.command**
 to copy the app to `/Applications` and clear the quarantine flag.
