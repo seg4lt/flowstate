@@ -1969,6 +1969,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             permissionMode={permissionMode}
             promptSuggestion={promptSuggestion}
             onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
+            projectPath={projectPath}
           />
         </div>
 
