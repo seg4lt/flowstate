@@ -581,12 +581,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         "accept_edits",
     );
 
-  // Load user-configured defaults from Settings for fresh sessions.
-  // Only override when sessionStorage has no value (i.e. the session
-  // hasn't been touched yet). Once the user changes a value in-session
-  // it sticks — navigating away and back won't reset it.
+  // Load user-configured defaults from Settings for freshly-created
+  // threads only. "Fresh" = session has loaded AND has zero turns yet
+  // (i.e. the user just created this thread and hasn't sent anything).
+  // Applying the default on every thread switch is wrong: existing
+  // threads carry their own mode/effort forward (see the
+  // restore-from-last-turn effect below for permissionMode), and a
+  // stale sessionStorage miss — e.g. first visit to an older thread
+  // in a new browser session — must not clobber that. We also
+  // short-circuit when sessionStorage already has a value, so an
+  // in-session choice survives navigation away and back.
   React.useEffect(() => {
     if (sessionStorage.getItem(effortStorageKey)) return;
+    const data = sessionQuery.data;
+    if (!data || data.detail.turns.length > 0) return;
     let cancelled = false;
     readDefaultEffort().then((saved) => {
       if (!cancelled && saved) setEffort(saved);
@@ -594,10 +602,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [effortStorageKey]);
+  }, [effortStorageKey, sessionQuery.data]);
 
   React.useEffect(() => {
     if (sessionStorage.getItem(permissionStorageKey)) return;
+    const data = sessionQuery.data;
+    if (!data || data.detail.turns.length > 0) return;
     let cancelled = false;
     readDefaultPermissionMode().then((saved) => {
       if (!cancelled && saved) setPermissionMode(saved);
@@ -605,7 +615,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [permissionStorageKey]);
+  }, [permissionStorageKey, sessionQuery.data]);
 
   // Strict Plan Mode preference — opt-in frontend policy that auto-
   // denies any mutating-tool permission request while the session is
