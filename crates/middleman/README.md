@@ -8,39 +8,42 @@ behavior of its own.
 ## What lives here
 
 - **[`daemon-core/`](./daemon-core/README.md)** — Daemon lifecycle +
-  the `Transport` trait definition. `bootstrap_core()`,
-  `run_blocking(config, transports)`, `DaemonLifecycle` counters,
-  `idle_watchdog` task, `ReadyFile` coordination (v2 format with a
-  `transports[]` array), graceful shutdown sequence. Defines the
-  `Transport` / `Bound` / `TransportHandle` traits every transport
-  crate implements.
-- **[`transport-http/`](./transport-http/README.md)** — The
-  `axum`-based HTTP + WebSocket transport. Implements
-  `daemon_core::Transport` for `HttpTransport`. Exposes the REST
-  surface (`/api/bootstrap`, `/api/snapshot`, `/api/health`,
-  `/api/status`, `/api/shutdown`) and streams `RuntimeEvent`s over
-  `/ws`. Pure transport — does not serve any UI; serving a frontend is
-  the application's responsibility.
-- **[`daemon-client/`](./daemon-client/README.md)** — Client-side
-  daemon discovery. `connect_or_spawn()` reads the ready file (v1 and
-  v2), filters by `preferred_transport`, health-checks a running
-  daemon, or auto-spawns one under an advisory lock. Deliberately
-  depends on neither `runtime-core` nor `daemon-core` — this is the
-  only crate a desktop shell needs to pull in to attach to a daemon.
+  the `Transport` trait re-export. `bootstrap_core_async()`,
+  `DaemonLifecycle` counters, `idle_watchdog` task, `ReadyFile`
+  coordination (v2 format with a `transports[]` array), graceful
+  shutdown sequence. Re-exports the `Transport` / `Bound` /
+  `TransportHandle` traits from `runtime-core` so transport crates
+  can implement them without a middleman dep cycle. The sync
+  `bootstrap_core` + `run_blocking` entry points (for a standalone
+  daemon binary driven from a sync `main`) sit behind the
+  `standalone-binary` feature flag.
+- **[`transport-tauri/`](./transport-tauri/README.md)** — In-proc
+  transport for Tauri apps. Implements `daemon_core::Transport`
+  over Tauri's host `Channel<T>` so messages and events never
+  leave the process. Opted in via the `transport-tauri` feature of
+  `daemon-core`.
+
+### Dropped in Phase 6.1
+
+The HTTP + WebSocket transport (`transport-http`) and the client-side
+daemon-discovery crate (`daemon-client`) were removed from the
+workspace — no in-tree consumer used them. The code lives in git
+history if a future binary wants an external HTTP surface or
+auto-spawn client; reintroduce by re-adding to `[workspace.members]`
+and wiring optional deps in `daemon-core`.
 
 ## Dependency shape
 
 ```
 daemon-core     ──►  core/runtime-core, core/provider-api,
-                      core/orchestration, core/persistence,
-                      all five core/provider-*
+                      core/persistence
+                  (optional) middleman/transport-tauri
 
-transport-http  ──►  daemon-core (for Transport trait),
-                      core/runtime-core, core/provider-api
-
-daemon-client   ──►  (nothing from core or middleman — it's a thin client)
+transport-tauri ──►  core/runtime-core (for the Transport trait),
+                      core/provider-api
 ```
 
-`daemon-core` does NOT depend on any transport crate. Transport crates
-depend ON `daemon-core` for the trait. Apps are the composition root
-and pull in whichever transports they want.
+`daemon-core` does NOT depend on any transport crate except through
+optional features. Transport crates depend on `runtime-core` for the
+trait. Apps are the composition root and pull in whichever transports
+they want (flowstate: just `transport-tauri`).

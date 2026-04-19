@@ -129,6 +129,15 @@ pub(crate) fn reasoning_effort_from_str(value: &str) -> Option<ReasoningEffort> 
         "high" => Some(ReasoningEffort::High),
         "xhigh" => Some(ReasoningEffort::Xhigh),
         "max" => Some(ReasoningEffort::Max),
-        _ => None,
+        other => {
+            // Phase 6.17: log unknown values so future provider
+            // additions show up in the daemon log instead of being
+            // silently dropped from replayed turns.
+            tracing::warn!(
+                value = %other,
+                "unknown reasoning_effort in persisted turn; dropping"
+            );
+            None
+        }
     }
 }

@@ -3724,7 +3724,7 @@ mod tests {
             "test-app".to_string(),
         ));
 
-        let payload = runtime.bootstrap("ws://test".to_string()).await;
+        let payload = runtime.bootstrap(Some("ws://test".to_string())).await;
         assert_eq!(payload.providers.len(), 1);
         let models = &payload.providers[0].models;
         assert_eq!(models.len(), 1);
@@ -3756,7 +3756,7 @@ mod tests {
             "test-app".to_string(),
         ));
 
-        let payload = runtime.bootstrap("ws://test".to_string()).await;
+        let payload = runtime.bootstrap(Some("ws://test".to_string())).await;
         assert_eq!(payload.providers.len(), 1);
         let models = &payload.providers[0].models;
         assert_eq!(models.len(), 1);
@@ -3844,7 +3844,7 @@ mod tests {
 
         // Subscribe before bootstrapping so we don't miss the event.
         let mut events = runtime.subscribe();
-        let payload = runtime.bootstrap("ws://test".to_string()).await;
+        let payload = runtime.bootstrap(Some("ws://test".to_string())).await;
 
         // Bootstrap merges the stale (but still present) model cache
         // into the payload, so the frontend still gets SOMETHING to

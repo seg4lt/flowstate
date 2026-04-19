@@ -38,10 +38,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 use zenui_persistence::PersistenceService;
+#[cfg(feature = "standalone-binary")]
 use zenui_provider_api::RuntimeEvent;
-use zenui_runtime_core::{
-    ConnectionObserver, OrchestrationService, RuntimeCore, TurnLifecycleObserver,
-};
+#[cfg(feature = "standalone-binary")]
+use zenui_runtime_core::ConnectionObserver;
+use zenui_runtime_core::{OrchestrationService, RuntimeCore, TurnLifecycleObserver};
 
 pub use config::DaemonConfig;
 pub use lifecycle::{DaemonLifecycle, DaemonStatus, IdleShutdownReason, idle_watchdog};
@@ -53,15 +54,14 @@ pub use shutdown::graceful_shutdown;
 // Re-exported here for API stability.
 pub use zenui_runtime_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 
-// Concrete transport crates, re-exported under stable module aliases.
-// Consumers opt in via the matching Cargo feature (`transport-tauri`,
-// `transport-http`, or the `all-transports` meta feature) and then
-// import via `zenui_daemon_core::transport_tauri::…` etc. — same
-// centralised entry-point pattern as the provider crates above.
+// Concrete transport crate, re-exported under a stable module alias.
+// Consumers opt in via the `transport-tauri` Cargo feature and then
+// import via `zenui_daemon_core::transport_tauri::…`. The HTTP
+// transport was dropped in Phase 6.1 of the architecture audit — no
+// in-tree consumer used it. Re-add an optional dep + `pub use` here
+// if a future binary needs it.
 #[cfg(feature = "transport-tauri")]
 pub use zenui_transport_tauri as transport_tauri;
-#[cfg(feature = "transport-http")]
-pub use zenui_transport_http as transport_http;
 
 /// Headless runtime handle returned by [`bootstrap_core`]. Owns the tokio
 /// runtime, the `RuntimeCore`, and the `DaemonLifecycle`. Callers use
@@ -72,6 +72,7 @@ pub use zenui_transport_http as transport_http;
 /// Library embedders that already have a tokio runtime should prefer
 /// [`bootstrap_core_async`] + [`InProcessCore`] instead, to avoid a
 /// second runtime in the process.
+#[cfg(feature = "standalone-binary")]
 pub struct BootstrappedCore {
     pub tokio_runtime: tokio::runtime::Runtime,
     pub runtime_core: Arc<RuntimeCore>,
@@ -111,6 +112,7 @@ pub struct InProcessCore {
 ///
 /// Does **not** start any transport — the caller (usually
 /// `run_blocking`) is responsible for that.
+#[cfg(feature = "standalone-binary")]
 pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -156,7 +158,13 @@ pub fn bootstrap_core(config: &DaemonConfig) -> Result<BootstrappedCore> {
 /// start any transport — embedders call `RuntimeCore` methods
 /// directly.
 pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore> {
-    init_tracing();
+    // Tracing initialisation is the *binary's* job, not the library's.
+    // Host apps (flowstate's `tracing_setup::init_tracing`, standalone
+    // daemon binaries, integration tests) opt in by calling
+    // [`init_tracing`] themselves before this bootstrap runs — that
+    // way one subscriber filter wins, not whichever call reached
+    // `try_init()` first. Removed in Phase 6.5 of the architecture
+    // audit.
 
     let working_directory = config.project_root.clone();
     let database_path = working_directory.join(".zenui").join(&config.database_name);
@@ -229,6 +237,7 @@ pub fn init_tracing() {
 /// Zero-transport daemons are allowed. In that case the idle watchdog
 /// fires immediately unless `config.idle_timeout == Duration::MAX`
 /// (which `DaemonConfig::zero_transport` sets automatically).
+#[cfg(feature = "standalone-binary")]
 pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -> Result<()> {
     let BootstrappedCore {
         tokio_runtime,
