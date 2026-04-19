@@ -58,6 +58,13 @@ zenui-provider-github-copilot-cli = { path = "../../../crates/core/provider-gith
 zenui-provider-api = { path = "../../../crates/core/provider-api" }
 zenui-runtime-core = { path = "../../../crates/core/runtime-core" }
 
+# Flowstate-app-owned analytics store. Per-turn token/cost rollups
+# for the in-app Usage dashboard. Moved out of src-tauri in Phase 4:
+# the analytics ORM is not a Tauri-lifetime concern and now lives in
+# its own core crate, with src-tauri keeping only the thin Tauri
+# command forwarders + the subscriber wiring.
+zenui-usage-store = { path = "../../../crates/core/usage-store" }
+
 # Async
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"

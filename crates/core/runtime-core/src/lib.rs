@@ -423,7 +423,7 @@ impl RuntimeCore {
         total
     }
 
-    pub async fn bootstrap(&self, ws_url: String) -> BootstrapPayload {
+    pub async fn bootstrap(&self, ws_url: Option<String>) -> BootstrapPayload {
         // Load cached health for every adapter so the frontend gets a
         // populated providers list immediately. If the cache is stale
         // (>24h) or missing, spawn a background health check to refresh.

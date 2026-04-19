@@ -1274,6 +1274,7 @@ dependencies = [
  "zenui-provider-github-copilot",
  "zenui-provider-github-copilot-cli",
  "zenui-runtime-core",
+ "zenui-usage-store",
 ]
 
 [[package]]
@@ -6869,6 +6870,17 @@ dependencies = [
  "tracing",
  "zenui-provider-api",
  "zenui-runtime-core",
+]
+
+[[package]]
+name = "zenui-usage-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "zenui-provider-api",
 ]
 
 [[package]]

@@ -4,8 +4,12 @@
   "description": "Capability for the main window",
   "windows": ["main"],
   "permissions": [
-    "core:default",
+    "core:app:default",
+    "core:event:default",
+    "core:path:default",
+    "core:webview:default",
     "core:webview:allow-set-webview-zoom",
+    "core:window:default",
     "core:window:allow-set-badge-count",
     "opener:default",
     "dialog:default",

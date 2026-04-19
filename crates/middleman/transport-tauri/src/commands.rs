@@ -29,7 +29,11 @@ pub async fn connect(
     let mut rx = state.runtime.subscribe();
 
     let welcome = ServerMessage::Welcome {
-        bootstrap: state.runtime.bootstrap(String::new()).await,
+        // Tauri's transport streams events through a host `Channel<T>`
+        // — there is no separate WS endpoint to dial, so advertise
+        // `None` rather than an empty string the frontend would have
+        // to special-case.
+        bootstrap: state.runtime.bootstrap(None).await,
     };
     if on_event.send(welcome).is_err() {
         state.observer.on_client_disconnected();
