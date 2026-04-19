@@ -33,8 +33,14 @@ const TOKEN_COLORS = {
   cacheWrite: "#f59e0b",
 } as const;
 
+// Label for the `input` segment is intentionally "Uncached" rather
+// than "New input": with default Agent SDK cache_control, Anthropic's
+// `input_tokens` field counts only the trailing scaffold bytes after
+// the last cache breakpoint — typically 1–100 tokens per turn. The
+// user's actually-new content lands in cache_creation_input_tokens
+// (= "Cache write" segment), so calling this slice "new" misleads.
 const TOKEN_LABELS: Record<keyof typeof TOKEN_COLORS, string> = {
-  input: "New input",
+  input: "Uncached",
   output: "Output",
   cacheRead: "Cache read",
   cacheWrite: "Cache write",
