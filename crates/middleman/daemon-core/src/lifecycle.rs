@@ -193,7 +193,14 @@ pub enum IdleShutdownReason {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    // All lifecycle tests run on a paused virtual clock. The idle watchdog
+    // gates on `tokio::time::sleep` for its idle window, so pausing time lets
+    // the runtime auto-advance instantly instead of paying real wall-clock
+    // waits. This keeps these tests comfortably under a millisecond of real
+    // time each — a negative-result test like `waits_on_client_and_turn`
+    // otherwise has to burn real time to be meaningful.
+
+    #[tokio::test(start_paused = true)]
     async fn idle_watchdog_fires_on_idle_timeout() {
         let lifecycle = DaemonLifecycle::new(Duration::from_millis(50));
         let (tx, rx) = oneshot::channel();
@@ -206,7 +213,7 @@ mod tests {
         assert_eq!(reason, IdleShutdownReason::Idle);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_watchdog_waits_on_client_and_turn() {
         let lifecycle = DaemonLifecycle::new(Duration::from_millis(50));
         lifecycle.client_connected();
@@ -215,12 +222,14 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(idle_watchdog(lifecycle.clone(), tx));
 
-        // With client+turn both active, watchdog should not fire.
+        // With client+turn both active, watchdog should not fire. Virtual time
+        // auto-advances through the full 200ms since no timer is armed, so the
+        // timeout is what resolves — proving the watchdog stayed blocked.
         let result = tokio::time::timeout(Duration::from_millis(200), rx).await;
         assert!(result.is_err(), "watchdog fired too early: {:?}", result);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_watchdog_fires_on_explicit_request() {
         let lifecycle = DaemonLifecycle::new(Duration::from_secs(3600));
         lifecycle.client_connected();

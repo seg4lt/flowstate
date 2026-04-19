@@ -38,3 +38,6 @@ zenui-transport-http = { path = "../transport-http", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the idle-watchdog
+# tests run on a virtual clock instead of burning real wall-clock sleeps.
+tokio = { workspace = true, features = ["test-util"] }
