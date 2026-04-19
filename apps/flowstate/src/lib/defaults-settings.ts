@@ -10,6 +10,7 @@
 
 import { getUserConfig, setUserConfig } from "./api";
 import type { PermissionMode, ProviderKind, ReasoningEffort } from "./types";
+import { DEFAULT_ENABLED_PROVIDERS, PROVIDER_KINDS } from "./providers";
 
 // --- Config keys ---
 
@@ -23,18 +24,10 @@ const CONFIG_KEY_STRICT_PLAN_MODE = "defaults.strict_plan_mode";
 // --- Provider-enabled defaults ---
 
 /** Providers enabled out of the box. Everything else starts disabled. */
-export const DEFAULT_ENABLED_PROVIDERS: ReadonlySet<ProviderKind> = new Set([
-  "claude",
-  "github_copilot",
-]);
+export { DEFAULT_ENABLED_PROVIDERS };
 
-export const ALL_PROVIDER_KINDS: readonly ProviderKind[] = [
-  "claude",
-  "claude_cli",
-  "codex",
-  "github_copilot",
-  "github_copilot_cli",
-];
+/** Back-compat alias. Prefer `PROVIDER_KINDS` from `@/lib/providers`. */
+export const ALL_PROVIDER_KINDS: readonly ProviderKind[] = PROVIDER_KINDS;
 
 // --- Validation helpers ---
 

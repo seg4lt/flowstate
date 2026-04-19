@@ -9,18 +9,18 @@ import {
   YAxis,
 } from "recharts";
 import type { UsageTimeseriesPayload } from "@/lib/api";
+import { PROVIDER_META } from "@/lib/providers";
+import type { ProviderKind } from "@/lib/types";
 
 // Stacked area chart of daily cost, one stack per provider (or
 // model, when `series` carries a split). When no split is
 // provided, renders a single "total" area.
 
-const PROVIDER_COLORS: Record<string, string> = {
-  claude: "#f59e0b",
-  claude_cli: "#a855f7",
-  codex: "#10b981",
-  github_copilot: "#3b82f6",
-  github_copilot_cli: "#06b6d4",
-};
+const PROVIDER_COLORS: Record<string, string> = Object.fromEntries(
+  (Object.entries(PROVIDER_META) as [ProviderKind, (typeof PROVIDER_META)[ProviderKind]][]).map(
+    ([kind, meta]) => [kind, meta.hex],
+  ),
+);
 
 // Stable palette for model splits (fallback for anything not in
 // the provider table). Visually distinct without being loud.

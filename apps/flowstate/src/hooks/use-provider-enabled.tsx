@@ -1,10 +1,10 @@
 import * as React from "react";
 import type { ProviderKind } from "@/lib/types";
 import {
-  DEFAULT_ENABLED_PROVIDERS,
   readAllProviderEnabled,
   writeProviderEnabled,
 } from "@/lib/defaults-settings";
+import { DEFAULT_ENABLED_PROVIDERS, PROVIDER_KINDS } from "@/lib/providers";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,15 +24,8 @@ interface ProviderEnabledValue {
 /** Initial map used before the SQLite read completes. Matches
  *  `DEFAULT_ENABLED_PROVIDERS` so pre-hydration renders are correct. */
 function buildDefaults(): Map<ProviderKind, boolean> {
-  const ALL: ProviderKind[] = [
-    "claude",
-    "claude_cli",
-    "codex",
-    "github_copilot",
-    "github_copilot_cli",
-  ];
   return new Map(
-    ALL.map((k) => [k, DEFAULT_ENABLED_PROVIDERS.has(k)] as const),
+    PROVIDER_KINDS.map((k) => [k, DEFAULT_ENABLED_PROVIDERS.has(k)] as const),
   );
 }
 

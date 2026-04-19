@@ -3,7 +3,6 @@ import { ChevronDown, ChevronUp, Timer } from "lucide-react";
 import type {
   AttachmentRef,
   ContentBlock,
-  ProviderKind,
   SubagentRecord,
   ToolCall,
   TurnStatus,
@@ -405,12 +404,9 @@ export interface MessageItem {
   /** Raw provider-level model id used for this turn's reply. Sourced
    *  from `TurnRecord.usage.model` when available, falling back to
    *  `SessionSummary.model` mid-stream. Drives the agent-message
-   *  info popover and (via subagents[]) the subagent header. */
+   *  info popover and (via subagents[]) the subagent header.
+   *  Provider kind now comes from SessionContext. */
   model?: string;
-  /** Provider kind for this session. Identical across turns of a
-   *  session but threaded per-item so the UI layer never has to
-   *  cross-reference the session cache. */
-  providerKind?: ProviderKind;
   /** Subagents spawned during this turn, carried forward so the
    *  per-subagent model can show up in the subagent box header. */
   subagents?: SubagentRecord[];
@@ -495,7 +491,6 @@ function TurnViewInner({ item, onOpenAttachment, onRevertFiles }: TurnViewProps)
                 streaming={item.streaming && idx === lastTextRenderIdx}
                 status={item.status}
                 model={item.model}
-                providerKind={item.providerKind}
               />
             );
           case "reasoning":
@@ -579,7 +574,6 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
     // session alias to a pinned id; subagents[] grows as subagents
     // stream in and flips `model` when SubagentModelObserved fires.
     a.model === b.model &&
-    a.providerKind === b.providerKind &&
     a.subagents === b.subagents
   );
 });

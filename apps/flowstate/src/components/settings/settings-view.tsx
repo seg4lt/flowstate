@@ -50,29 +50,15 @@ import type {
   ReasoningEffort,
 } from "@/lib/types";
 
-const PROVIDER_COLORS: Record<ProviderKind, string> = {
-  claude: "bg-amber-500",
-  claude_cli: "bg-purple-500",
-  codex: "bg-green-500",
-  github_copilot: "bg-blue-500",
-  github_copilot_cli: "bg-cyan-500",
-};
+import {
+  PROVIDER_COLORS,
+  PROVIDER_KINDS as PROVIDER_ORDER,
+  PROVIDER_META,
+} from "@/lib/providers";
 
-const PROVIDER_LABELS: Record<ProviderKind, string> = {
-  claude: "Claude",
-  claude_cli: "Claude 2",
-  codex: "Codex",
-  github_copilot: "GitHub Copilot",
-  github_copilot_cli: "GitHub Copilot 2",
-};
-
-const PROVIDER_ORDER: ProviderKind[] = [
-  "claude",
-  "claude_cli",
-  "codex",
-  "github_copilot",
-  "github_copilot_cli",
-];
+const PROVIDER_LABELS: Record<ProviderKind, string> = Object.fromEntries(
+  PROVIDER_ORDER.map((k) => [k, PROVIDER_META[k].label]),
+) as Record<ProviderKind, string>;
 
 const THEME_OPTIONS: {
   value: ThemePreference;

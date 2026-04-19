@@ -21,7 +21,7 @@ import {
 import { openInEditor } from "@/lib/api";
 import { prefetchProjectFiles } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
-import type { AggregatedFileDiff } from "@/lib/session-diff";
+import type { AggregatedFileDiff } from "@/lib/git-diff-stream";
 import { selectDockOpen, useTerminal } from "@/stores/terminal-store";
 
 interface HeaderActionsProps {

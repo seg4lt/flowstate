@@ -4,7 +4,7 @@ import { ChevronDown, ChevronRight, Maximize2, Minimize2, X } from "lucide-react
 import { Button } from "@/components/ui/button";
 import { getGitDiffFile, type GitFileContents } from "@/lib/api";
 import type { DiffStreamStatus } from "@/lib/git-diff-stream";
-import type { AggregatedFileDiff } from "@/lib/session-diff";
+import type { AggregatedFileDiff } from "@/lib/git-diff-stream";
 import { useTheme } from "@/hooks/use-theme";
 
 export type DiffStyle = "split" | "unified";

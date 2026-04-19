@@ -4,7 +4,6 @@ import { ArrowDown, Loader2 } from "lucide-react";
 import type {
   AttachmentRef,
   ContentBlock,
-  ProviderKind,
   TurnRecord,
 } from "@/lib/types";
 import { TurnView, type MessageItem } from "./turn-view";
@@ -35,12 +34,10 @@ interface MessageListProps {
    *  to read history. Decoupled from `pendingInput` so the effect fires
    *  exactly once per send and doesn't get skipped if React batches. */
   userSendTick: number;
-  /** Provider kind of the current session — used to label the model
-   *  info popover on each agent reply. */
-  providerKind?: ProviderKind;
   /** Session-level configured model. Used as the per-turn model
    *  fallback when `turn.usage.model` hasn't been populated yet
-   *  (happens mid-stream and on very old rows). */
+   *  (happens mid-stream and on very old rows). Provider kind comes
+   *  from SessionContext. */
   sessionModel?: string;
   /** Click handler for the per-user-message "Revert file changes
    *  since here" button. Receives the `turn_id` of the user
@@ -55,7 +52,6 @@ const EMPTY_BLOCKS: ContentBlock[] = [];
 
 function turnToItem(
   turn: TurnRecord,
-  providerKind: ProviderKind | undefined,
   sessionModel: string | undefined,
 ): MessageItem {
   return {
@@ -72,14 +68,12 @@ function turnToItem(
     // the pinned id is better because it encodes exactly which
     // build answered this specific turn.
     model: turn.usage?.model ?? sessionModel,
-    providerKind,
     subagents: turn.subagents,
   };
 }
 
 function pendingItem(
   input: string,
-  providerKind: ProviderKind | undefined,
   sessionModel: string | undefined,
 ): MessageItem {
   return {
@@ -90,7 +84,6 @@ function pendingItem(
     toolCalls: null,
     streaming: true,
     model: sessionModel,
-    providerKind,
   };
 }
 
@@ -110,7 +103,6 @@ export function MessageList({
   onLoadOlder,
   onOpenAttachment,
   userSendTick,
-  providerKind,
   sessionModel,
   onRevertFiles,
 }: MessageListProps) {
@@ -132,13 +124,13 @@ export function MessageList({
   // chat-view sees turn_started arrive.
   const displayItems = React.useMemo<MessageItem[]>(() => {
     const items: MessageItem[] = turns.map((t) =>
-      turnToItem(t, providerKind, sessionModel),
+      turnToItem(t, sessionModel),
     );
     if (pendingInput !== null) {
-      items.push(pendingItem(pendingInput, providerKind, sessionModel));
+      items.push(pendingItem(pendingInput, sessionModel));
     }
     return items;
-  }, [turns, pendingInput, providerKind, sessionModel]);
+  }, [turns, pendingInput, sessionModel]);
 
   // Jump to the latest message whenever the user navigates to a
   // new thread. MessageList doesn't remount between sessions (that
