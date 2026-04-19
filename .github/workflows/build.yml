@@ -78,16 +78,6 @@ jobs:
         with:
           bun-version: latest
 
-      # Zig: src-tauri enables fff-search/zlob for SIMD-optimised grep.
-      # Upstream's build.rs shells out to `zig` to compile the
-      # accelerated kernel and hard-panics under CI=true without it.
-      # brew is preinstalled on macos-14; when the Windows / Linux
-      # matrix rows are re-enabled, swap this for a per-OS step
-      # (choco install zig on Windows, apt / snap on Linux).
-      - name: Install zig
-        if: runner.os == 'macOS'
-        run: brew install zig
-
       # - name: Install Linux deps
       #   if: runner.os == 'Linux'
       #   run: |
@@ -116,6 +106,15 @@ jobs:
           # (no password), so the PASSWORD env var can stay empty.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          # fff-search 0.5.2's build.rs hard-panics under CI=true
+          # unless the zig-backed `zlob` SIMD feature is enabled. We
+          # deliberately don't enable zlob to avoid forcing a zig
+          # install on every release-matrix platform (macOS / Windows
+          # / Linux each need a different package manager). Spoofing
+          # CI=false picks the same pure-Rust grep path local dev
+          # uses. See apps/flowstate/src-tauri/Cargo.toml for the
+          # full rationale inline on the fff-search dep.
+          CI: "false"
         run: pnpm tauri build ${{ matrix.tauri-args }}
 
       - name: Repackage DMG with install script (macOS)
