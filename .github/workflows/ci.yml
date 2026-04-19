@@ -43,6 +43,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Bun: build.rs in provider-claude-sdk / provider-github-copilot
+      # shells out to `bun install` + `bun run build` to produce the
+      # bridge/dist/index.js bundle that gets include_str!'d into the
+      # Rust crate. Without bun the build fails before clippy even
+      # runs (bridge-assets-fingerprint.txt is missing).
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      # Zig: `--all-features` enables fff-search's `zlob` feature,
+      # whose build.rs panics with "CI detected but Zig is not
+      # installed" if zig isn't on PATH. Pinned to 0.14.x so the
+      # toolchain doesn't drift under us across runs.
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: 0.14.1
       - uses: Swatinem/rust-cache@v2
       # The audit §0.1 specifies `-D warnings`, but the workspace
       # already carries pre-existing clippy warnings (large-enum-variant
@@ -58,6 +73,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Same reason as in the clippy job: the Claude SDK + Copilot
+      # bridge crates' build.rs needs `bun` on PATH to bundle
+      # bridge/dist/index.js before the Rust crate compiles.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
