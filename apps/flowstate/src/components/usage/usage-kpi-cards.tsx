@@ -1,7 +1,7 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 import type { UsageGroupRow, UsageTotals } from "@/lib/api";
-import { estimateCacheReadSavingsUsd } from "@/lib/api";
+import { estimateCacheReadSavingsUsd } from "@/lib/pricing";
 
 // KPI card grid that sits above the fold of the Usage dashboard.
 // Plain Tailwind — no shadcn Card primitive is installed in this

@@ -1,0 +1,12 @@
+[package]
+name = "zenui-daemon-client"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+fs4 = { version = "0.13", features = ["sync"] }
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "2", default-features = false }
