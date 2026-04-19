@@ -74,7 +74,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # bigram-indexed file list in the background so indexing cost is paid
 # once per worktree and amortised across every search. See
 # `src/file_index.rs` for the integration.
-fff-search = "0.5.2"
+#
+# The `zlob` feature pulls in the zig-compiled SIMD grep primitives —
+# upstream hard-gates CI builds on this ("CI detected but `zlob`
+# feature is not enabled" panic in build.rs). Enabling it uniformly
+# here keeps local dev, CI, and release on the same code path and
+# requires zig on PATH at build time (brew on macOS runners).
+fff-search = { version = "0.5.2", features = ["zlob"] }
 # Compile user-supplied include/exclude globs (`*.rs`, `target/*`) for
 # pre-filtering the indexed file list before content search.
 globset = "0.4.18"
