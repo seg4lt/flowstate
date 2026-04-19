@@ -62,17 +62,19 @@ jobs:
       - run: cargo test --workspace
 
   feature-flag-bitrot:
-    # Audit §6.2 — daemon-core's granular provider feature flags are
-    # never enabled by any consumer, so a compile error inside one of
-    # them would only surface when someone tried the combination for
-    # real. Run one explicit minimal build to keep them honest.
+    # Audit §6.2 — daemon-core only carries transport feature flags
+    # now ("Concrete providers are no longer a daemon-core concern",
+    # see crates/middleman/daemon-core/Cargo.toml). A consumer still
+    # only opts in to one transport at a time, so a regression inside
+    # a transport crate would only surface when its flag is flipped.
+    # Run one explicit minimal build to keep the combination honest.
     name: cargo check (minimal feature combo)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check -p zenui-daemon-core --no-default-features --features provider-claude-sdk,transport-tauri
+      - run: cargo check -p zenui-daemon-core --no-default-features --features transport-tauri
 
   ts-bindings-drift:
     # Audit §0.2 — regenerate the TS bindings from the Rust wire types
