@@ -1,5 +1,6 @@
 import * as React from "react";
 import { Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import type {
   AttachedImage,
   PermissionMode,
@@ -14,8 +15,17 @@ import {
 } from "@/lib/slash-commands";
 import { cn } from "@/lib/utils";
 import { toast } from "@/hooks/use-toast";
+import { projectFilesQueryOptions } from "@/lib/queries";
+import {
+  applyMentionPick,
+  detectMentionContext,
+  rankFileMatches,
+  type MentionContext,
+} from "@/lib/mention-utils";
 import { SlashCommandPopup } from "./slash-command-popup";
+import { MentionPopup } from "./mention-popup";
 import { InFluxAttachmentChip } from "./attachment-chip";
+import { FileMentionChip } from "./file-mention-chip";
 import { ImageLightbox, type LightboxSource } from "./image-lightbox";
 
 interface ChatInputProps {
@@ -69,6 +79,12 @@ interface ChatInputProps {
    *  types past the ghost text. The parent clears its stored
    *  suggestion so it doesn't re-appear after a keystroke. */
   onPromptSuggestionDismissed?: () => void;
+  /** Absolute path to the session's project/worktree. Drives the
+   *  `@<filename>` mention autocomplete — when null/undefined the
+   *  mention popup is disabled (e.g. on threads without a project).
+   *  The file list is served by the `fff-search` index and cached
+   *  forever via `projectFilesQueryOptions`. */
+  projectPath?: string | null;
 }
 
 export interface QueuedMessage {
@@ -147,6 +163,7 @@ export function ChatInput({
   permissionMode,
   promptSuggestion,
   onPromptSuggestionDismissed,
+  projectPath,
 }: ChatInputProps) {
   const [value, setValueRaw] = React.useState(initialValue);
   // Notify the parent of every draft change so it can persist the text
@@ -179,6 +196,17 @@ export function ChatInput({
   );
   const [popupIndex, setPopupIndex] = React.useState(0);
   const [attachedImages, setAttachedImages] = React.useState<AttachedImage[]>([]);
+  // --- `@<filename>` mention state ---
+  // `attachedFiles` is the chip list (dedup'd, preserves insertion
+  // order). The source of truth for what the agent sees is the raw
+  // `@<path>` text tokens in `value` — these chips are a UI hint.
+  const [attachedFiles, setAttachedFiles] = React.useState<string[]>([]);
+  // `mentionCtx` is the lexical context at the caret. Recomputed on
+  // every onChange / onKeyUp / onSelect so caret moves also update
+  // the popup. Null means "no open mention right now".
+  const [mentionCtx, setMentionCtx] =
+    React.useState<MentionContext | null>(null);
+  const [mentionIndex, setMentionIndex] = React.useState(0);
   const [lightboxSource, setLightboxSource] = React.useState<LightboxSource | null>(
     null,
   );
@@ -240,6 +268,32 @@ export function ChatInput({
   React.useEffect(() => {
     setPopupIndex(0);
   }, [matches.length, inputToken]);
+
+  // --- `@<filename>` mention autocomplete ---
+  // The project file list is served by the `fff-search` index and
+  // cached forever via `projectFilesQueryOptions`, so the second
+  // mention in the same session is instant. When `projectPath` is
+  // null (unlikely but possible for degenerate sessions) the query
+  // short-circuits and we get an empty list, which turns the popup
+  // off naturally.
+  const filesQuery = useQuery(projectFilesQueryOptions(projectPath ?? null));
+  const mentionMatches = React.useMemo(
+    () =>
+      mentionCtx
+        ? rankFileMatches(filesQuery.data ?? [], mentionCtx.query)
+        : [],
+    [mentionCtx, filesQuery.data],
+  );
+  // The slash-command popup wins if both could render on the same
+  // draft — in practice they can't (different prefixes) but keep the
+  // guard so a future edit can't cross-trigger them.
+  const showMentionPopup =
+    !!mentionCtx && mentionMatches.length > 0 && !showPopup && !disabled;
+
+  // Reset the highlighted mention row when the list shape changes.
+  React.useEffect(() => {
+    setMentionIndex(0);
+  }, [mentionMatches.length, mentionCtx?.query]);
 
   // Track the last skill token we pre-filled into the composer from a
   // popup select. When the user hits Enter on that exact token (no
@@ -413,6 +467,66 @@ export function ChatInput({
     });
   }
 
+  /** Recompute the `@`-mention context from the live textarea at the
+   *  current caret position. Shared by onChange / onKeyUp / onSelect
+   *  so every interaction that can move the caret keeps the popup
+   *  in sync. Passing in `nextValue` lets onChange feed the value
+   *  it's about to commit (the textarea's own `value` is one render
+   *  behind at that point). */
+  function refreshMentionCtx(nextValue?: string) {
+    const el = textareaRef.current;
+    const v = nextValue ?? el?.value ?? value;
+    const caret = el?.selectionStart ?? v.length;
+    setMentionCtx(detectMentionContext(v, caret));
+  }
+
+  /** Accept the currently-highlighted mention: splice the picked
+   *  path into the draft at the token position, add the file to
+   *  the chip list (deduped), close the popup, and restore focus
+   *  one past the inserted trailing space. */
+  function acceptMention(path: string) {
+    const el = textareaRef.current;
+    if (!el || !mentionCtx) return;
+    const caret = el.selectionStart ?? value.length;
+    const { value: next, caret: nextCaret } = applyMentionPick(
+      value,
+      mentionCtx.atIndex,
+      caret,
+      path,
+    );
+    setValue(next);
+    setAttachedFiles((prev) => (prev.includes(path) ? prev : [...prev, path]));
+    setMentionCtx(null);
+    requestAnimationFrame(() => {
+      const node = textareaRef.current;
+      if (!node) return;
+      node.focus();
+      node.selectionStart = node.selectionEnd = nextCaret;
+      // The insertion may have grown the textarea past its current
+      // row count — mirror `handleInput`'s autosize math.
+      node.style.height = "auto";
+      node.style.height = `${Math.min(node.scrollHeight, 200)}px`;
+    });
+  }
+
+  /** Drop a file chip AND strip any matching `@<path>` tokens from
+   *  the draft. The regex only targets standalone tokens (bordered
+   *  by whitespace or string edges) so it can't accidentally chew
+   *  into substrings of unrelated words. */
+  function removeAttachedFile(path: string) {
+    setAttachedFiles((prev) => prev.filter((p) => p !== path));
+    const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const tokenRe = new RegExp(`(^|\\s)@${escaped}(?=\\s|$)`, "g");
+    setValue((v) =>
+      v
+        .replace(tokenRe, "$1")
+        // Collapse any whitespace-only runs that were adjacent to
+        // the removed token back to a single space.
+        .replace(/[ \t]{2,}/g, " ")
+        .replace(/[ \t]+$/g, ""),
+    );
+  }
+
   /** Paste handler — picks up clipboard images and turns them into
    * `AttachedImage` chips. Falls through to the default text paste
    * when the clipboard contains no image entries. */
@@ -494,6 +608,8 @@ export function ChatInput({
     if (isRunning || (queued.length > 0 && sessionStatus !== "interrupted")) {
       enqueue(textToSend, imagesToSend);
       setValue("");
+      setAttachedFiles([]);
+      setMentionCtx(null);
       resetHeight();
       return;
     }
@@ -505,6 +621,8 @@ export function ChatInput({
       URL.revokeObjectURL(img.previewUrl);
     }
     setValue("");
+    setAttachedFiles([]);
+    setMentionCtx(null);
     resetHeight();
   }
 
@@ -555,6 +673,46 @@ export function ChatInput({
       e.preventDefault();
       onPromptSuggestionDismissed?.();
       return;
+    }
+
+    // --- Mention autocomplete keyboard navigation ---
+    // Sits before the slash-popup branch. The two are mutually
+    // exclusive via `showMentionPopup`'s `!showPopup` guard, but
+    // putting mention first keeps the flow obvious: if a mention
+    // is live, the arrow/Enter/Tab keys belong to it.
+    if (showMentionPopup) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setMentionIndex((i) => (i + 1) % mentionMatches.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setMentionIndex(
+          (i) => (i - 1 + mentionMatches.length) % mentionMatches.length,
+        );
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        const pick = mentionMatches[mentionIndex];
+        if (pick) acceptMention(pick);
+        return;
+      }
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const pick = mentionMatches[mentionIndex];
+        if (pick) acceptMention(pick);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        // Stop propagation so ChatView's Esc-to-interrupt doesn't
+        // fire on the same keystroke.
+        e.stopPropagation();
+        setMentionCtx(null);
+        return;
+      }
     }
 
     // --- Autocomplete keyboard navigation ---
@@ -705,7 +863,7 @@ export function ChatInput({
       )}
       <div className="border-t border-border px-3 pb-2 pt-3">
         <div>
-          {attachedImages.length > 0 && (
+          {(attachedImages.length > 0 || attachedFiles.length > 0) && (
             <div className="mb-2 flex flex-wrap gap-1">
               {attachedImages.map((img) => (
                 <InFluxAttachmentChip
@@ -717,6 +875,13 @@ export function ChatInput({
                   }
                 />
               ))}
+              {attachedFiles.map((p) => (
+                <FileMentionChip
+                  key={p}
+                  path={p}
+                  onRemove={() => removeAttachedFile(p)}
+                />
+              ))}
             </div>
           )}
           <div className="relative flex items-end gap-2">
@@ -726,6 +891,13 @@ export function ChatInput({
                 matches={matches}
                 selectedIndex={popupIndex}
                 onSelect={handlePopupSelect}
+              />
+            )}
+            {showMentionPopup && (
+              <MentionPopup
+                matches={mentionMatches}
+                selectedIndex={mentionIndex}
+                onSelect={acceptMention}
               />
             )}
 
@@ -743,8 +915,19 @@ export function ChatInput({
                     onPromptSuggestionDismissed?.();
                   }
                   setValue(e.target.value);
+                  // Recompute the `@`-mention context against the
+                  // about-to-be-committed value. onChange fires before
+                  // the state flush, so we can't read `value` here —
+                  // pass the fresh string in directly.
+                  refreshMentionCtx(e.target.value);
                 }}
                 onKeyDown={handleKeyDown}
+                // Arrow keys / Home / End / mouse clicks move the
+                // caret without firing onChange. Re-detect on
+                // keyUp + select so the popup tracks caret position
+                // even when the text is unchanged.
+                onKeyUp={() => refreshMentionCtx()}
+                onSelect={() => refreshMentionCtx()}
                 onInput={handleInput}
                 onPaste={handlePaste}
                 placeholder={
