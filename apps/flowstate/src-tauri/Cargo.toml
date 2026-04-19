@@ -75,12 +75,26 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # once per worktree and amortised across every search. See
 # `src/file_index.rs` for the integration.
 #
-# The `zlob` feature pulls in the zig-compiled SIMD grep primitives —
-# upstream hard-gates CI builds on this ("CI detected but `zlob`
-# feature is not enabled" panic in build.rs). Enabling it uniformly
-# here keeps local dev, CI, and release on the same code path and
-# requires zig on PATH at build time (brew on macOS runners).
-fff-search = { version = "0.5.2", features = ["zlob"] }
+# NOTE: the `zlob` feature (zig-compiled SIMD grep primitives) is
+# deliberately NOT enabled. Upstream fff-search pulls zig in as a
+# *build-time* dependency when zlob is on, which would force every
+# CI job, every release-matrix platform (Windows/Linux when we flip
+# them back on), and every contributor laptop to install zig via a
+# per-OS package manager (brew / choco / apt-snap). That's four
+# tool-install footguns for a performance knob on a dep we don't
+# author. The pure-Rust grep path (memchr + aho-corasick, same stack
+# ripgrep uses) is what local dev has shipped all along and has been
+# more than fast enough for our code-view search surface.
+#
+# fff-search's build.rs *also* hard-panics under CI=true without
+# zlob, so every workflow step that compiles this crate overrides
+# `CI=false` in its env block. Search for `CI: "false"` in
+# `.github/workflows/*.yml` for the rationale inline.
+#
+# Revisit if search latency becomes the bottleneck — re-enabling zlob
+# is a one-line change + reinstating the zig install steps in both
+# workflows.
+fff-search = "0.5.2"
 # Compile user-supplied include/exclude globs (`*.rs`, `target/*`) for
 # pre-filtering the indexed file list before content search.
 globset = "0.4.18"

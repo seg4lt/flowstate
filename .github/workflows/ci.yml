@@ -51,14 +51,6 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      # Zig: fff-search 0.5.2's build.rs panics with "CI detected but
-      # Zig is not installed" if zig isn't on PATH — even without
-      # `--all-features`; the zlob toggle only affects *whether* it's
-      # used, not whether it's sniffed at build time. We install via
-      # Homebrew (preinstalled on macos-14) because the dedicated
-      # setup-zig actions have unreliable mirror availability for
-      # older pins and hang on 404/503 chains.
-      - run: brew install zig
       - uses: Swatinem/rust-cache@v2
       # The audit §0.1 specifies `-D warnings`, but the workspace
       # already carries pre-existing clippy warnings (large-enum-variant
@@ -66,7 +58,16 @@ jobs:
       # derivable Default impls on PermissionMode/ReasoningEffort). A
       # follow-up PR should clean those up and promote this to
       # `-D warnings` — same one-line change.
+      #
+      # `CI: "false"` override: fff-search 0.5.2 hard-panics in its
+      # build.rs whenever it sees CI=true without the `zlob` feature
+      # enabled. We deliberately don't enable zlob (see the dep
+      # comment in apps/flowstate/src-tauri/Cargo.toml) to keep this
+      # workflow cross-platform without per-OS zig installs. Spoofing
+      # CI=false picks the same pure-Rust grep path local dev uses.
       - run: cargo clippy --workspace --all-features
+        env:
+          CI: "false"
 
   rust-test:
     name: cargo test (workspace)
@@ -80,11 +81,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      # fff-search 0.5.2's build.rs panics in CI without zig on PATH
-      # — see clippy job above for the full reasoning.
-      - run: brew install zig
       - uses: Swatinem/rust-cache@v2
+      # See clippy job above for the CI=false rationale — fff-search
+      # refuses to build under CI=true without its zig-backed zlob
+      # feature, which we intentionally skip.
       - run: cargo test --workspace
+        env:
+          CI: "false"
 
   feature-flag-bitrot:
     # Audit §6.2 — daemon-core only carries transport feature flags
