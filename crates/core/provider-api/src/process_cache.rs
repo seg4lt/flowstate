@@ -250,9 +250,12 @@ mod tests {
         assert!(cache.get("a").await.is_none());
     }
 
-    #[tokio::test]
+    // Paused virtual clock: the watchdog uses a 1-second `tokio::time::interval`,
+    // but `start_paused` auto-advances when the runtime is idle, so the test
+    // runs in near-zero real time instead of paying a full second of wall-clock
+    // sleep for the second tick.
+    #[tokio::test(start_paused = true)]
     async fn watchdog_culls_stale_entries() {
-        // 1-second interval is the minimum `tokio::time::interval` allows;
         // idle-timeout 0 means "anything not currently in flight is stale".
         let cache = Arc::new(ProcessCache::<u32>::new(0, 1, "test"));
         // Insert an idle entry with activity stamped in the past.
@@ -270,14 +273,10 @@ mod tests {
             });
         }
 
-        // First tick is consumed on boot; watchdog kills on the second.
-        // Poll with a generous timeout to absorb CI jitter.
-        for _ in 0..50 {
-            if kill_count.load(Ordering::SeqCst) > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        // First tick is consumed on boot; watchdog kills on the second. With
+        // paused time, sleeping past the second tick is instantaneous.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
         assert!(
             kill_count.load(Ordering::SeqCst) >= 1,
             "watchdog did not run"

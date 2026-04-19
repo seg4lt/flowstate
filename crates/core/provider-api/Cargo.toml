@@ -26,3 +26,6 @@ ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"], option
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` enables `tokio::time::pause` / `#[tokio::test(start_paused = true)]`
+# so our watchdog tests run on a virtual clock instead of burning real seconds.
+tokio = { workspace = true, features = ["test-util"] }

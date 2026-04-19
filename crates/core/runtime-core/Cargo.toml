@@ -16,3 +16,8 @@ tracing.workspace = true
 uuid.workspace = true
 zenui-persistence = { path = "../persistence" }
 zenui-provider-api = { path = "../provider-api" }
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` so tests exercising
+# deliberate in-adapter sleeps run on a virtual clock instead of real time.
+tokio = { workspace = true, features = ["test-util"] }

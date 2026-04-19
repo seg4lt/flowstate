@@ -2846,7 +2846,10 @@ mod tests {
 
     /// Proves the turn drain loop does not depend on a live broadcast subscriber.
     /// If it did, `send_turn` would hang forever here and the timeout would fire.
-    #[tokio::test]
+    ///
+    /// Runs on a paused virtual clock so the adapter's deliberate 100ms sleep
+    /// auto-advances and the test costs near-zero real time.
+    #[tokio::test(start_paused = true)]
     async fn turn_completes_without_subscribers() {
         let runtime = RuntimeCore::new(
             vec![Arc::new(SlowFakeAdapter)],
