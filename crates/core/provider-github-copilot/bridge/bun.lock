@@ -5,7 +5,7 @@
     "": {
       "name": "zenui-copilot-bridge",
       "dependencies": {
-        "@github/copilot-sdk": "^0.2.1",
+        "@github/copilot-sdk": "^0.2.2",
       },
       "devDependencies": {
         "@types/node": "^20.0.0",
