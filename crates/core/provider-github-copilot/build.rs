@@ -76,9 +76,7 @@ fn main() {
 
     let bridge_src = PathBuf::from("bridge/dist/index.js");
     if !bridge_src.exists() {
-        println!(
-            "cargo:warning=bridge/dist/index.js missing; Copilot bridge will not be embedded"
-        );
+        println!("cargo:warning=bridge/dist/index.js missing; Copilot bridge will not be embedded");
         return;
     }
 

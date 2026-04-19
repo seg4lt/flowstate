@@ -10,10 +10,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use zenui_provider_api::{
-    PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
-    ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
-    ProbeCliOptions, SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption,
-    UserInputQuestion, probe_cli, session_cwd,
+    PermissionMode, ProbeCliOptions, ProviderAdapter, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
+    SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
+    probe_cli, session_cwd,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -109,7 +109,9 @@ impl CodexAdapter {
             return Ok(existing);
         }
 
-        let process = self.create_session_process(session, permission_mode).await?;
+        let process = self
+            .create_session_process(session, permission_mode)
+            .await?;
         let process = Arc::new(Mutex::new(process));
         let mut sessions = self.sessions.lock().await;
         Ok(sessions
@@ -334,7 +336,9 @@ impl ProviderAdapter for CodexAdapter {
         // mode switch requires tearing down and recreating the thread. The runtime's
         // provider_state round-trips native_thread_id, so the recreated process
         // can call thread/resume and conversation history is preserved.
-        let process = self.ensure_session_process(session, permission_mode).await?;
+        let process = self
+            .ensure_session_process(session, permission_mode)
+            .await?;
         {
             let current_mode = process.lock().await.active_mode;
             if current_mode != permission_mode {
@@ -342,14 +346,14 @@ impl ProviderAdapter for CodexAdapter {
                 self.invalidate_session(&session.summary.session_id).await;
             }
         }
-        let process = self.ensure_session_process(session, permission_mode).await?;
+        let process = self
+            .ensure_session_process(session, permission_mode)
+            .await?;
 
         let result = {
             let mut process = process.lock().await;
             let provider_thread_id = process.provider_thread_id.clone();
-            let effort_str = reasoning_effort
-                .unwrap_or(ReasoningEffort::Medium)
-                .as_str();
+            let effort_str = reasoning_effort.unwrap_or(ReasoningEffort::Medium).as_str();
             let mut turn_params = json!({
                 "input": [{
                     "text": input.text.as_str(),
@@ -645,9 +649,8 @@ impl CodexSessionProcess {
                 continue;
             }
 
-            let value: Value = serde_json::from_str(trimmed).map_err(|error| {
-                format!("received invalid JSON from Codex app-server: {error}")
-            })?;
+            let value: Value = serde_json::from_str(trimmed)
+                .map_err(|error| format!("received invalid JSON from Codex app-server: {error}"))?;
 
             if let Some(method) = value.get("method").and_then(Value::as_str) {
                 if value.get("id").is_some() {
@@ -686,7 +689,6 @@ impl CodexSessionProcess {
     }
 }
 
-
 /// Heuristic parser for the codex `model/list` response. The shape isn't
 /// formally documented, so we recursively walk the response looking for any
 /// JSON array whose objects have a model-identifier-shaped field. Accepts:
@@ -702,10 +704,7 @@ fn walk_for_models(value: &Value, out: &mut Vec<ProviderModel>) {
     match value {
         Value::Array(arr) => {
             // If every entry looks like a model object, harvest the array.
-            let parsed: Vec<ProviderModel> = arr
-                .iter()
-                .filter_map(extract_model_entry)
-                .collect();
+            let parsed: Vec<ProviderModel> = arr.iter().filter_map(extract_model_entry).collect();
             if !parsed.is_empty() && parsed.len() >= arr.len() / 2 {
                 out.extend(parsed);
                 return;
@@ -818,14 +817,8 @@ fn parse_codex_questions(params: &Value) -> Vec<UserInputQuestion> {
                 header: q.get("header").and_then(Value::as_str).map(str::to_string),
                 options,
                 multi_select: false,
-                allow_freeform: q
-                    .get("isOther")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
-                is_secret: q
-                    .get("isSecret")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
+                allow_freeform: q.get("isOther").and_then(Value::as_bool).unwrap_or(true),
+                is_secret: q.get("isSecret").and_then(Value::as_bool).unwrap_or(false),
             }
         })
         .collect()
@@ -926,7 +919,8 @@ fn normalize_id(value: &Value) -> String {
 }
 
 fn extract_thread_id(value: &Value) -> Option<String> {
-    value.get("thread")
+    value
+        .get("thread")
         .and_then(|thread| thread.get("id"))
         .and_then(Value::as_str)
         .or_else(|| value.get("threadId").and_then(Value::as_str))
@@ -934,7 +928,8 @@ fn extract_thread_id(value: &Value) -> Option<String> {
 }
 
 fn extract_turn_id(value: &Value) -> Option<String> {
-    value.get("turn")
+    value
+        .get("turn")
         .and_then(|turn| turn.get("id"))
         .and_then(Value::as_str)
         .or_else(|| value.get("turnId").and_then(Value::as_str))
@@ -942,21 +937,24 @@ fn extract_turn_id(value: &Value) -> Option<String> {
 }
 
 fn notification_turn_id(value: &Value) -> Option<String> {
-    value.get("turn")
+    value
+        .get("turn")
         .and_then(|turn| turn.get("id"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
 
 fn notification_turn_status(value: &Value) -> Option<String> {
-    value.get("turn")
+    value
+        .get("turn")
         .and_then(|turn| turn.get("status"))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
 
 fn notification_turn_error(value: &Value) -> Option<String> {
-    value.get("turn")
+    value
+        .get("turn")
         .and_then(|turn| turn.get("error"))
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
@@ -1046,7 +1044,9 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
         // agent messages / reasoning. We emit ToolCallStarted only for the tool-ish
         // item types so the UI can track them.
         "item/started" => {
-            let Some(item) = params.get("item") else { return };
+            let Some(item) = params.get("item") else {
+                return;
+            };
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
             if is_tool_like_item_type(item_type) {
                 let call_id = item
@@ -1073,7 +1073,9 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
         // For tool-like items → emit ToolCallCompleted. For fileChange items →
         // emit FileChange.
         "item/completed" => {
-            let Some(item) = params.get("item") else { return };
+            let Some(item) = params.get("item") else {
+                return;
+            };
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
 
             if is_tool_like_item_type(item_type) {
@@ -1123,16 +1125,15 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|entry| {
-                            entry
-                                .get("step")
-                                .and_then(Value::as_str)
-                                .map(|s| zenui_provider_api::PlanStep {
+                            entry.get("step").and_then(Value::as_str).map(|s| {
+                                zenui_provider_api::PlanStep {
                                     title: s.to_string(),
                                     detail: entry
                                         .get("status")
                                         .and_then(Value::as_str)
                                         .map(str::to_string),
-                                })
+                                }
+                            })
                         })
                         .collect::<Vec<_>>()
                 })
@@ -1198,15 +1199,12 @@ fn tool_item_args(item: &Value) -> Option<Value> {
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     match item_type {
         "commandExecution" => {
-            let command = item
-                .get("command")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    item.get("argv")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| arr.first())
-                        .and_then(Value::as_str)
-                });
+            let command = item.get("command").and_then(Value::as_str).or_else(|| {
+                item.get("argv")
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.first())
+                    .and_then(Value::as_str)
+            });
             command.map(|c| json!({ "command": c }))
         }
         _ => item.get("args").cloned().or_else(|| Some(item.clone())),
@@ -1249,4 +1247,3 @@ fn extract_file_change(item: &Value) -> Option<ProviderTurnEvent> {
         after,
     })
 }
-

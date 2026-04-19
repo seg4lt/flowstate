@@ -69,7 +69,6 @@ pub(crate) struct BridgeCopilotMcp {
 
 /// ZenUI Bridge Protocol Messages (Rust → TS)
 #[derive(Debug, Serialize)]
-
 #[serde(tag = "type")]
 pub(crate) enum BridgeRequest {
     #[serde(rename = "create_session")]

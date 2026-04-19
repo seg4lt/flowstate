@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::ipc::Channel;
 
 pub type PtyId = u64;
@@ -226,7 +226,11 @@ fn which_in_path(binary: &str) -> bool {
     false
 }
 
-fn reader_loop(mut reader: Box<dyn Read + Send>, channel: Channel<Vec<u8>>, paused: Arc<AtomicBool>) {
+fn reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    channel: Channel<Vec<u8>>,
+    paused: Arc<AtomicBool>,
+) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         // Lightweight busy-sleep while paused. The pty buffer will

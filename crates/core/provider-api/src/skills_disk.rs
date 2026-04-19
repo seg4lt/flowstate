@@ -373,11 +373,7 @@ mod tests {
         fs::write(root.join("no-skill-md").join("notes.md"), "hi").unwrap();
         // Loose file at root — ignored.
         fs::write(root.join("loose.txt"), "nothing").unwrap();
-        write_skill(
-            &root,
-            "valid",
-            "---\nname: valid\ndescription: ok\n---\n",
-        );
+        write_skill(&root, "valid", "---\nname: valid\ndescription: ok\n---\n");
         let roots = vec![ScanRoot {
             path: root,
             source: SkillSource::DiskProject,

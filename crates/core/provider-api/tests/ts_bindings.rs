@@ -113,7 +113,6 @@ fn export_ts_bindings() {
     // Target: apps/flowstate/src/lib/generated/types.ts (committed).
     let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../apps/flowstate/src/lib/generated/types.ts");
-    std::fs::create_dir_all(target.parent().unwrap())
-        .expect("create generated dir");
+    std::fs::create_dir_all(target.parent().unwrap()).expect("create generated dir");
     std::fs::write(&target, out).expect("write generated types.ts");
 }

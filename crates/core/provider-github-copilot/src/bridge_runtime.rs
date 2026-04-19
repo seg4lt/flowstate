@@ -32,9 +32,7 @@ pub fn ensure_extracted() -> Result<BridgeRuntime> {
 fn extract_once() -> Result<BridgeRuntime> {
     let file_count = BridgeAssets::iter().count();
     if file_count == 0 {
-        anyhow::bail!(
-            "Copilot bridge assets are empty; rebuild with bridge/dist/index.js present"
-        );
+        anyhow::bail!("Copilot bridge assets are empty; rebuild with bridge/dist/index.js present");
     }
 
     let cache_root = dirs::cache_dir()
@@ -75,13 +73,8 @@ fn extract_once() -> Result<BridgeRuntime> {
     if let Some(parent) = cache_root.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::rename(&staging, &cache_root).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            staging.display(),
-            cache_root.display()
-        )
-    })?;
+    fs::rename(&staging, &cache_root)
+        .with_context(|| format!("rename {} -> {}", staging.display(), cache_root.display()))?;
 
     if !script.exists() {
         anyhow::bail!(

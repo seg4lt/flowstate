@@ -23,7 +23,7 @@ use zenui_provider_api::{
 
 use crate::config::copilot_models;
 use crate::process::{
-    BRIDGE_IDLE_TIMEOUT_SECS, BRIDGE_WATCHDOG_INTERVAL_SECS, BRIDGE_TIMEOUT_MS, CachedBridge,
+    BRIDGE_IDLE_TIMEOUT_SECS, BRIDGE_TIMEOUT_MS, BRIDGE_WATCHDOG_INTERVAL_SECS, CachedBridge,
     CopilotBridgeProcess, write_request,
 };
 use crate::wire::{
@@ -121,11 +121,8 @@ impl GitHubCopilotAdapter {
         };
 
         debug!("Waiting for bridge ready signal...");
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            process.read_response(),
-        )
-        .await
+        match tokio::time::timeout(std::time::Duration::from_secs(10), process.read_response())
+            .await
         {
             Ok(Ok(BridgeResponse::Ready)) => {
                 info!("Bridge is ready");
@@ -196,8 +193,7 @@ impl GitHubCopilotAdapter {
         let stdin = process.stdin.clone();
         let (perm_tx, mut perm_rx) =
             tokio::sync::mpsc::unbounded_channel::<(String, PermissionDecision)>();
-        let (q_tx, mut q_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(String, UserInputOutcome)>();
+        let (q_tx, mut q_rx) = tokio::sync::mpsc::unbounded_channel::<(String, UserInputOutcome)>();
         let stdin_for_writer = stdin.clone();
         let writer_task = tokio::spawn(async move {
             loop {
@@ -235,8 +231,8 @@ impl GitHubCopilotAdapter {
             }
         });
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(BRIDGE_TIMEOUT_MS);
 
         let result = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -415,9 +411,7 @@ impl GitHubCopilotAdapter {
                         if let Some(u) = usage.and_then(|v| {
                             serde_json::from_value::<zenui_provider_api::TokenUsage>(v).ok()
                         }) {
-                            events
-                                .send(ProviderTurnEvent::TurnUsage { usage: u })
-                                .await;
+                            events.send(ProviderTurnEvent::TurnUsage { usage: u }).await;
                         }
                     }
                     "rate_limit_update" => {
@@ -683,13 +677,11 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         // call client.listModels(), kill the process.
         let mut bridge = self.spawn_bridge().await?;
         write_request(&bridge.stdin, &BridgeRequest::ListModels).await?;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            bridge.read_response(),
-        )
-        .await
-        .map_err(|_| "Timeout fetching Copilot models".to_string())?
-        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), bridge.read_response())
+                .await
+                .map_err(|_| "Timeout fetching Copilot models".to_string())?
+                .map_err(|e| format!("Bridge read error: {e}"))?;
         let _ = bridge.child.start_kill();
 
         match response {
@@ -812,10 +804,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         let mcp_servers = sdk_mcp
             .into_iter()
             .map(|m| McpServerInfo {
-                enabled: matches!(
-                    m.status.as_deref(),
-                    Some("connected") | Some("pending")
-                ),
+                enabled: matches!(m.status.as_deref(), Some("connected") | Some("pending")),
                 id: format!("github_copilot:mcp:{}", m.name),
                 name: m.name,
             })
@@ -837,7 +826,11 @@ impl GitHubCopilotAdapter {
         &self,
         session: &SessionDetail,
     ) -> Result<
-        (Vec<BridgeSkill>, Vec<BridgeCopilotAgent>, Vec<BridgeCopilotMcp>),
+        (
+            Vec<BridgeSkill>,
+            Vec<BridgeCopilotAgent>,
+            Vec<BridgeCopilotMcp>,
+        ),
         String,
     > {
         let cached = self.ensure_session_process(session).await?;

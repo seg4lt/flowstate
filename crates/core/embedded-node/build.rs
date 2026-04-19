@@ -40,7 +40,11 @@ fn main() {
 
     // Also write an empty file for the other format so include_bytes!
     // compiles on every platform (the unused one is just empty bytes).
-    let other_filename = if is_windows { "node.tar.gz" } else { "node.zip" };
+    let other_filename = if is_windows {
+        "node.tar.gz"
+    } else {
+        "node.zip"
+    };
     let other_path = out_dir.join(other_filename);
     if !other_path.exists() {
         fs::write(&other_path, &[] as &[u8]).ok();

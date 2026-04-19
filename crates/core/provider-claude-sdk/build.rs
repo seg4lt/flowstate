@@ -125,13 +125,9 @@ fn main() {
     let fingerprint_path = out_dir.join("bridge-assets-fingerprint.txt");
     let existing = fs::read_to_string(&fingerprint_path).ok();
     if existing.as_deref() != Some(fingerprint.as_str()) {
-        fs::write(&fingerprint_path, &fingerprint)
-            .expect("write bridge-assets-fingerprint.txt");
+        fs::write(&fingerprint_path, &fingerprint).expect("write bridge-assets-fingerprint.txt");
     }
-    println!(
-        "cargo:rerun-if-changed={}",
-        fingerprint_path.display()
-    );
+    println!("cargo:rerun-if-changed={}", fingerprint_path.display());
 }
 
 /// Inline FNV-1a over a byte slice — same family as `assets_fingerprint`

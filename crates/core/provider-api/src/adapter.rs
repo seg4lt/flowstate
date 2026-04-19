@@ -142,10 +142,7 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// [`session_command_catalog`]: ProviderAdapter::session_command_catalog
     fn skill_scan_roots(&self) -> (&'static [&'static str], &'static [&'static str]) {
-        (
-            &[".claude"],
-            &[".claude/skills", ".agents/skills"],
-        )
+        (&[".claude"], &[".claude/skills", ".agents/skills"])
     }
 
     /// Enumerate the slash commands, agents, and MCP servers available
@@ -182,4 +179,3 @@ pub trait ProviderAdapter: Send + Sync {
         })
     }
 }
-

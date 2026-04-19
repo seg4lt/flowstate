@@ -427,9 +427,17 @@ pub enum ContentBlock {
         trigger: CompactTrigger,
         #[serde(rename = "preTokens", default, skip_serializing_if = "Option::is_none")]
         pre_tokens: Option<u64>,
-        #[serde(rename = "postTokens", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "postTokens",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         post_tokens: Option<u64>,
-        #[serde(rename = "durationMs", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "durationMs",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         duration_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
@@ -757,9 +765,9 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
         // Claude CLI, GitHub Copilot (SaaS and CLI) don't expose any
         // of the flagged capabilities today — the UI hides the
         // corresponding affordances when selected.
-        ProviderKind::ClaudeCli
-        | ProviderKind::GitHubCopilot
-        | ProviderKind::GitHubCopilotCli => ProviderFeatures::default(),
+        ProviderKind::ClaudeCli | ProviderKind::GitHubCopilot | ProviderKind::GitHubCopilotCli => {
+            ProviderFeatures::default()
+        }
     }
 }
 

@@ -84,8 +84,8 @@ impl UserConfigStore {
             return Err(format!("create data dir: {e}"));
         }
         let db_path = data_dir.join("user_config.sqlite");
-        let connection = Connection::open(&db_path)
-            .map_err(|e| format!("open user_config sqlite: {e}"))?;
+        let connection =
+            Connection::open(&db_path).map_err(|e| format!("open user_config sqlite: {e}"))?;
         connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS user_config (
@@ -183,10 +183,7 @@ impl UserConfigStore {
         Ok(())
     }
 
-    pub fn get_session_display(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<SessionDisplay>, String> {
+    pub fn get_session_display(&self, session_id: &str) -> Result<Option<SessionDisplay>, String> {
         let connection = match self.connection.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -273,10 +270,7 @@ impl UserConfigStore {
         Ok(())
     }
 
-    pub fn get_project_display(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<ProjectDisplay>, String> {
+    pub fn get_project_display(&self, project_id: &str) -> Result<Option<ProjectDisplay>, String> {
         let connection = match self.connection.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -389,9 +383,7 @@ impl UserConfigStore {
             .map_err(|e| format!("get project_worktree: {e}"))
     }
 
-    pub fn list_project_worktree(
-        &self,
-    ) -> Result<HashMap<String, ProjectWorktree>, String> {
+    pub fn list_project_worktree(&self) -> Result<HashMap<String, ProjectWorktree>, String> {
         let connection = match self.connection.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),

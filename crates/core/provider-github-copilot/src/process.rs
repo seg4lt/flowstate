@@ -62,7 +62,6 @@ impl CopilotBridgeProcess {
     }
 }
 
-
 pub(crate) async fn write_request(
     stdin: &Arc<Mutex<ChildStdin>>,
     request: &BridgeRequest,

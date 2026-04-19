@@ -1,6 +1,6 @@
+mod internals;
 pub mod session_ops;
 pub mod transport;
-mod internals;
 
 pub use session_ops::OrchestrationService;
 
@@ -447,11 +447,7 @@ impl RuntimeCore {
 
             match self.persistence.get_cached_health(kind).await {
                 Some((checked_at, mut status)) => {
-                    tracing::info!(
-                        ?kind,
-                        ?checked_at,
-                        "loaded cached provider health"
-                    );
+                    tracing::info!(?kind, ?checked_at, "loaded cached provider health");
                     status.enabled = self.is_provider_enabled(kind);
                     if let Some((_, ref models)) = cached_models {
                         status.models = models.clone();
@@ -568,9 +564,7 @@ impl RuntimeCore {
                 );
             }
 
-            let _ = event_tx.send(RuntimeEvent::ProviderHealthUpdated {
-                status,
-            });
+            let _ = event_tx.send(RuntimeEvent::ProviderHealthUpdated { status });
 
             // Release the in-flight slot.
             {
@@ -747,7 +741,10 @@ impl RuntimeCore {
                 session_id,
                 permission_mode,
             } => {
-                match self.update_permission_mode(session_id, permission_mode).await {
+                match self
+                    .update_permission_mode(session_id, permission_mode)
+                    .await
+                {
                     Ok(()) => Some(ServerMessage::Ack {
                         message: "Permission mode updated.".to_string(),
                     }),
@@ -768,7 +765,10 @@ impl RuntimeCore {
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
-            ClientMessage::RewindFiles { session_id, turn_id } => {
+            ClientMessage::RewindFiles {
+                session_id,
+                turn_id,
+            } => {
                 match self.rewind_files(&session_id, &turn_id).await {
                     Ok(outcome) => {
                         let restored = outcome.paths_restored.len();
@@ -786,9 +786,7 @@ impl RuntimeCore {
                             paths_deleted: outcome.paths_deleted,
                         });
                         Some(ServerMessage::Ack {
-                            message: format!(
-                                "Rewound {restored} restored, {deleted} deleted."
-                            ),
+                            message: format!("Rewound {restored} restored, {deleted} deleted."),
                         })
                     }
                     Err(error) => Some(ServerMessage::Error { message: error }),
@@ -822,7 +820,8 @@ impl RuntimeCore {
                 request_id,
                 answers,
             } => {
-                self.answer_question(&session_id, &request_id, answers).await;
+                self.answer_question(&session_id, &request_id, answers)
+                    .await;
                 Some(ServerMessage::Ack {
                     message: "Question answer recorded.".to_string(),
                 })
@@ -982,16 +981,12 @@ impl RuntimeCore {
                     // surfaced — the model is already persisted, so the
                     // worst case is the bridge picks it up on next restart.
                     if let Some(adapter) = self.adapters.get(&session.summary.provider) {
-                        if let Err(e) = adapter.update_session_model(&session, model.clone()).await {
-                            tracing::warn!(
-                                "Failed to forward model change to adapter: {e}"
-                            );
+                        if let Err(e) = adapter.update_session_model(&session, model.clone()).await
+                        {
+                            tracing::warn!("Failed to forward model change to adapter: {e}");
                         }
                     }
-                    self.publish(RuntimeEvent::SessionModelUpdated {
-                        session_id,
-                        model,
-                    });
+                    self.publish(RuntimeEvent::SessionModelUpdated { session_id, model });
                     Some(ServerMessage::Ack {
                         message: "Session model updated.".to_string(),
                     })
@@ -1068,7 +1063,11 @@ impl RuntimeCore {
             sink.resolve_permission_with_mode(request_id, decision, mode_override)
                 .await;
         } else {
-            tracing::warn!(session_id, request_id, "no active sink for permission answer");
+            tracing::warn!(
+                session_id,
+                request_id,
+                "no active sink for permission answer"
+            );
         }
     }
 
@@ -1195,7 +1194,11 @@ impl RuntimeCore {
             }
             Err(error) => {
                 tracing::error!(?error, "Adapter start_session failed");
-                return Err(format!("Failed to start {} session: {}", provider.label(), error));
+                return Err(format!(
+                    "Failed to start {} session: {}",
+                    provider.label(),
+                    error
+                ));
             }
         }
 
@@ -1307,11 +1310,7 @@ impl RuntimeCore {
         // every downstream consumer (TurnStarted event, in-flight
         // snapshot, final upsert) sees them.
         turn.input_attachments = persisted_attachments.clone();
-        if let Some(stored) = session
-            .turns
-            .iter_mut()
-            .find(|t| t.turn_id == turn.turn_id)
-        {
+        if let Some(stored) = session.turns.iter_mut().find(|t| t.turn_id == turn.turn_id) {
             stored.input_attachments = persisted_attachments;
         }
 
@@ -1338,9 +1337,7 @@ impl RuntimeCore {
             let mut guard = self.session_policies.lock().await;
             guard
                 .entry(session.summary.session_id.clone())
-                .or_insert_with(|| {
-                    Arc::new(Mutex::new(HashMap::new()))
-                })
+                .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
                 .clone()
         };
         let sink = TurnEventSink::with_policy(event_tx, session_policy);
@@ -1425,7 +1422,9 @@ impl RuntimeCore {
                     accumulated.push_str(&delta);
                     match blocks.last_mut() {
                         Some(ContentBlock::Text { text }) => text.push_str(&delta),
-                        _ => blocks.push(ContentBlock::Text { text: delta.clone() }),
+                        _ => blocks.push(ContentBlock::Text {
+                            text: delta.clone(),
+                        }),
                     }
                     self.publish(RuntimeEvent::ContentDelta {
                         session_id: sid.clone(),
@@ -1438,7 +1437,9 @@ impl RuntimeCore {
                     reasoning.push_str(&delta);
                     match blocks.last_mut() {
                         Some(ContentBlock::Reasoning { text }) => text.push_str(&delta),
-                        _ => blocks.push(ContentBlock::Reasoning { text: delta.clone() }),
+                        _ => blocks.push(ContentBlock::Reasoning {
+                            text: delta.clone(),
+                        }),
                     }
                     self.publish(RuntimeEvent::ReasoningDelta {
                         session_id: sid.clone(),
@@ -1488,7 +1489,11 @@ impl RuntimeCore {
                         parent_call_id,
                     });
                 }
-                ProviderTurnEvent::ToolCallCompleted { call_id, output, error } => {
+                ProviderTurnEvent::ToolCallCompleted {
+                    call_id,
+                    output,
+                    error,
+                } => {
                     if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.call_id == call_id) {
                         tc.output = Some(output.clone());
                         tc.error = error.clone();
@@ -1572,14 +1577,10 @@ impl RuntimeCore {
                         .and_then(|live| live.get(&sid).copied())
                         .unwrap_or(permission_mode);
                     if effective_mode == PermissionMode::Bypass {
-                        let sink =
-                            self.active_sinks.lock().await.get(&sid).cloned();
+                        let sink = self.active_sinks.lock().await.get(&sid).cloned();
                         if let Some(sink) = sink {
-                            sink.resolve_permission(
-                                &request_id,
-                                PermissionDecision::Allow,
-                            )
-                            .await;
+                            sink.resolve_permission(&request_id, PermissionDecision::Allow)
+                                .await;
                         } else {
                             tracing::warn!(
                                 session_id = %sid,
@@ -2099,11 +2100,7 @@ impl RuntimeCore {
     /// (the diff panel and toasts read both). Errors surface as
     /// strings, mirroring the rest of this module's `Result<_, String>`
     /// discipline.
-    async fn rewind_files(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-    ) -> Result<RewindOutcome, String> {
+    async fn rewind_files(&self, session_id: &str, turn_id: &str) -> Result<RewindOutcome, String> {
         let session = self
             .live_session_detail(session_id)
             .await
@@ -2116,11 +2113,7 @@ impl RuntimeCore {
             .turns
             .iter()
             .position(|t| t.turn_id == turn_id)
-            .ok_or_else(|| {
-                format!(
-                    "Turn `{turn_id}` not found in session `{session_id}`."
-                )
-            })?;
+            .ok_or_else(|| format!("Turn `{turn_id}` not found in session `{session_id}`."))?;
         let span = &session.turns[anchor_index..];
 
         // Walk in chronological order. The FIRST FileChangeRecord we
@@ -2129,8 +2122,7 @@ impl RuntimeCore {
         // created in this span and should therefore be deleted).
         // Later records on the same path are intermediate states the
         // user wants undone, so they're ignored.
-        let mut earliest_before: BTreeMap<String, Option<String>> =
-            BTreeMap::new();
+        let mut earliest_before: BTreeMap<String, Option<String>> = BTreeMap::new();
         for turn in span {
             for change in &turn.file_changes {
                 earliest_before
@@ -2155,9 +2147,7 @@ impl RuntimeCore {
                         .write_file(fs_path, content.as_bytes())
                         .await
                     {
-                        return Err(format!(
-                            "Failed to restore `{path}`: {e}"
-                        ));
+                        return Err(format!("Failed to restore `{path}`: {e}"));
                     }
                     paths_restored.push(path);
                 }
@@ -2172,9 +2162,7 @@ impl RuntimeCore {
                             paths_deleted.push(path);
                         }
                         Err(e) => {
-                            return Err(format!(
-                                "Failed to delete `{path}`: {e}"
-                            ));
+                            return Err(format!("Failed to delete `{path}`: {e}"));
                         }
                     }
                 }
@@ -2343,19 +2331,17 @@ impl RuntimeCore {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use crate::session_ops::OrchestrationService;
+    use async_trait::async_trait;
     use zenui_persistence::PersistenceService;
     use zenui_provider_api::{
-        ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind,
-        ProviderStatus, ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput,
-        ReasoningEffort, RuntimeEvent, SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus,
-        UserInput,
+        ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
+        ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, RuntimeEvent,
+        SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus, UserInput,
     };
 
     use super::RuntimeCore;
@@ -2621,9 +2607,7 @@ mod tests {
         });
 
         // Wait for the adapter to signal it's mid-turn.
-        mid_rx
-            .await
-            .expect("adapter should signal mid-turn");
+        mid_rx.await.expect("adapter should signal mid-turn");
 
         // While the turn is paused, live_session_detail must already
         // surface the in-flight turn with its still-pending tool call.
@@ -2634,7 +2618,11 @@ mod tests {
             .live_session_detail(&session_id)
             .await
             .expect("session should exist");
-        assert_eq!(live.turns.len(), 1, "in-flight turn must appear in live detail");
+        assert_eq!(
+            live.turns.len(),
+            1,
+            "in-flight turn must appear in live detail"
+        );
         let live_turn = &live.turns[0];
         assert_eq!(live_turn.status, TurnStatus::Running);
         assert_eq!(live_turn.tool_calls.len(), 1);
@@ -2997,9 +2985,7 @@ mod tests {
                     output: "[interrupted]".to_string(),
                     provider_state: None,
                 }),
-                InterruptOutcome::Err => {
-                    Err("adapter stdout closed during interrupt".to_string())
-                }
+                InterruptOutcome::Err => Err("adapter stdout closed during interrupt".to_string()),
             }
         }
     }
@@ -3373,17 +3359,13 @@ mod tests {
             native_thread_id: Some("sdk-session-ABC".to_string()),
             metadata: None,
         };
-        let persisted = run_interrupt_with_seeded_state(
-            Some(seeded.clone()),
-            InterruptStateOutcome::Err,
-        )
-        .await;
+        let persisted =
+            run_interrupt_with_seeded_state(Some(seeded.clone()), InterruptStateOutcome::Err).await;
         let got = persisted
             .provider_state
             .expect("seeded provider_state must survive Err interrupt");
         assert_eq!(
-            got.native_thread_id,
-            seeded.native_thread_id,
+            got.native_thread_id, seeded.native_thread_id,
             "interrupt-Err path must not clobber committed native_thread_id"
         );
     }
@@ -3399,17 +3381,14 @@ mod tests {
             native_thread_id: Some("sdk-session-DEF".to_string()),
             metadata: None,
         };
-        let persisted = run_interrupt_with_seeded_state(
-            Some(seeded.clone()),
-            InterruptStateOutcome::OkNoState,
-        )
-        .await;
+        let persisted =
+            run_interrupt_with_seeded_state(Some(seeded.clone()), InterruptStateOutcome::OkNoState)
+                .await;
         let got = persisted
             .provider_state
             .expect("seeded provider_state must survive Ok-no-state interrupt");
         assert_eq!(
-            got.native_thread_id,
-            seeded.native_thread_id,
+            got.native_thread_id, seeded.native_thread_id,
             "interrupt-Ok-no-state path must not clobber committed native_thread_id"
         );
     }
@@ -3659,9 +3638,7 @@ mod tests {
     /// the bootstrap tests. The embedded `models` field is what ships in
     /// `status_json`; the tests assert whether it or `provider_model_cache`
     /// wins during bootstrap.
-    fn fake_status_with_models(
-        models: Vec<zenui_provider_api::ProviderModel>,
-    ) -> ProviderStatus {
+    fn fake_status_with_models(models: Vec<zenui_provider_api::ProviderModel>) -> ProviderStatus {
         ProviderStatus {
             kind: ProviderKind::Codex,
             label: "Codex".to_string(),
@@ -3705,10 +3682,7 @@ mod tests {
         // The user then clicked "Refresh models" which wrote to
         // provider_model_cache (with a fresh, non-stale timestamp).
         persistence
-            .set_cached_models(
-                ProviderKind::Codex,
-                &[model("fresh-model", "Fresh")],
-            )
+            .set_cached_models(ProviderKind::Codex, &[model("fresh-model", "Fresh")])
             .await;
 
         // Simulate an app restart: brand-new RuntimeCore against the
@@ -3823,11 +3797,7 @@ mod tests {
         // Stale model cache: fetched_at 25h in the past.
         let stale = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
         persistence
-            .set_cached_models_at(
-                ProviderKind::Codex,
-                &[model("old-model", "Old")],
-                &stale,
-            )
+            .set_cached_models_at(ProviderKind::Codex, &[model("old-model", "Old")], &stale)
             .await;
 
         let adapter = Arc::new(ModelFetchCountingAdapter {

@@ -11,12 +11,11 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
     CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
-    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
-    ProviderSessionState, ProviderStatus, ProviderTurnEvent,
-    ProviderTurnOutput, RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail, SkillSource,
-    ProbeCliOptions, TokenUsage, TurnEventSink, UserInput, UserInputQuestion, claude_bucket_label,
-    claude_file_change_from_tool_call, parse_options_from_value, probe_cli, session_cwd,
-    skills_disk,
+    ProbeCliOptions, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, RateLimitInfo,
+    RateLimitStatus, ReasoningEffort, SessionDetail, SkillSource, TokenUsage, TurnEventSink,
+    UserInput, UserInputQuestion, claude_bucket_label, claude_file_change_from_tool_call,
+    parse_options_from_value, probe_cli, session_cwd, skills_disk,
 };
 
 const TURN_TIMEOUT_SECS: u64 = 600;
@@ -178,10 +177,7 @@ enum CliEvent {
     },
     /// New-style control channel request (Claude CLI ≥ 1.x).
     /// `request.subtype == "can_use_tool"` is the tool-permission variant.
-    ControlRequest {
-        request_id: String,
-        request: Value,
-    },
+    ControlRequest { request_id: String, request: Value },
     /// Rate-limit / plan-usage snapshot.
     RateLimitEvent {
         #[serde(default)]
@@ -428,7 +424,11 @@ impl ClaudeCliAdapter {
 
                 // Token-by-token streaming — text and reasoning deltas.
                 // Only emitted when the CLI runs with partial-message support.
-                CliEvent::StreamEvent { event: raw, session_id: sid, .. } => {
+                CliEvent::StreamEvent {
+                    event: raw,
+                    session_id: sid,
+                    ..
+                } => {
                     if let Some(id) = sid {
                         cli_session_id = Some(id);
                     }
@@ -437,9 +437,7 @@ impl ClaudeCliAdapter {
                             let dtype = delta.get("type").and_then(Value::as_str);
                             match dtype {
                                 Some("text_delta") => {
-                                    if let Some(text) =
-                                        delta.get("text").and_then(Value::as_str)
-                                    {
+                                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
                                         if !text.is_empty() {
                                             has_stream_events = true;
                                             accumulated_output.push_str(text);
@@ -476,7 +474,10 @@ impl ClaudeCliAdapter {
                 //   streamed — skip them to avoid duplication, process tool_use only.
                 // • When no stream_events (raw CLI without partial-messages):
                 //   emit text blocks as a single delta so the UI always gets content.
-                CliEvent::Assistant { message, session_id: sid } => {
+                CliEvent::Assistant {
+                    message,
+                    session_id: sid,
+                } => {
                     if let Some(id) = sid {
                         cli_session_id = Some(id);
                     }
@@ -540,7 +541,10 @@ impl ClaudeCliAdapter {
                     }
                 }
 
-                CliEvent::User { message, session_id: sid } => {
+                CliEvent::User {
+                    message,
+                    session_id: sid,
+                } => {
                     if let Some(id) = sid {
                         cli_session_id = Some(id);
                     }
@@ -586,9 +590,15 @@ impl ClaudeCliAdapter {
                     // yes/no permission dialog, then embed the answers back in the
                     // permission response as `updated_input` (matches the SDK contract).
                     if tool_name == "AskUserQuestion" {
-                        warn!("AskUserQuestion permission_request received, tool_input: {}", tool_input);
+                        warn!(
+                            "AskUserQuestion permission_request received, tool_input: {}",
+                            tool_input
+                        );
                         let questions = parse_ask_user_questions(&tool_input);
-                        warn!("AskUserQuestion: parsed {} questions, showing dialog", questions.len());
+                        warn!(
+                            "AskUserQuestion: parsed {} questions, showing dialog",
+                            questions.len()
+                        );
                         let response = match events.ask_user(questions.clone()).await {
                             Some(answers) => {
                                 let updated = build_updated_input(&questions, &answers);
@@ -616,11 +626,7 @@ impl ClaudeCliAdapter {
                         // carry a mode switch; drop the mode_override half of
                         // the tuple.
                         let (decision, _mode_override) = events
-                            .request_permission(
-                                tool_name,
-                                tool_input,
-                                PermissionDecision::Allow,
-                            )
+                            .request_permission(tool_name, tool_input, PermissionDecision::Allow)
                             .await;
                         let granted = matches!(
                             decision,
@@ -639,11 +645,11 @@ impl ClaudeCliAdapter {
 
                 // New-style control channel: `can_use_tool` replaces `permission_request`
                 // in Claude CLI ≥ 1.x when running in stream-json mode.
-                CliEvent::ControlRequest { request_id, request } => {
-                    let subtype = request
-                        .get("subtype")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                CliEvent::ControlRequest {
+                    request_id,
+                    request,
+                } => {
+                    let subtype = request.get("subtype").and_then(Value::as_str).unwrap_or("");
 
                     match subtype {
                         "can_use_tool" => {
@@ -657,28 +663,25 @@ impl ClaudeCliAdapter {
                                 .cloned()
                                 .unwrap_or(Value::Object(Default::default()));
 
-                            info!("control_request can_use_tool: {tool_name} request_id={request_id}");
+                            info!(
+                                "control_request can_use_tool: {tool_name} request_id={request_id}"
+                            );
 
                             if tool_name == "AskUserQuestion" {
                                 warn!("AskUserQuestion control_request received, showing dialog");
                                 let questions = parse_ask_user_questions(&tool_input);
                                 warn!("AskUserQuestion: parsed {} questions", questions.len());
 
-                                let response =
-                                    match events.ask_user(questions.clone()).await {
-                                        Some(answers) => {
-                                            let updated =
-                                                build_updated_input(&questions, &answers);
-                                            control_success(&request_id, updated)
-                                        }
-                                        None => control_error(
-                                            &request_id,
-                                            "User dismissed the question",
-                                        ),
-                                    };
-                                if let Err(e) =
-                                    write_line(&proc.stdin, &response).await
-                                {
+                                let response = match events.ask_user(questions.clone()).await {
+                                    Some(answers) => {
+                                        let updated = build_updated_input(&questions, &answers);
+                                        control_success(&request_id, updated)
+                                    }
+                                    None => {
+                                        control_error(&request_id, "User dismissed the question")
+                                    }
+                                };
+                                if let Err(e) = write_line(&proc.stdin, &response).await {
                                     warn!("Failed to write AskUserQuestion control_response: {e}");
                                 }
                             } else {
@@ -693,8 +696,7 @@ impl ClaudeCliAdapter {
                                     .await;
                                 let response = if matches!(
                                     decision,
-                                    PermissionDecision::Allow
-                                        | PermissionDecision::AllowAlways
+                                    PermissionDecision::Allow | PermissionDecision::AllowAlways
                                 ) {
                                     // Echo the original tool_input back as
                                     // updatedInput. The Claude CLI replaces
@@ -712,9 +714,7 @@ impl ClaudeCliAdapter {
                                 } else {
                                     control_error(&request_id, "User denied")
                                 };
-                                if let Err(e) =
-                                    write_line(&proc.stdin, &response).await
-                                {
+                                if let Err(e) = write_line(&proc.stdin, &response).await {
                                     warn!("Failed to write control_response: {e}");
                                 }
                             }
@@ -844,7 +844,10 @@ impl ClaudeCliAdapter {
                 CliEvent::ToolProgress {} | CliEvent::AuthStatus {} => {}
                 CliEvent::Unknown => {
                     // Log the raw line so we can identify event types we're missing.
-                    warn!("claude-cli: unknown event type in line (ignored): {}", trimmed);
+                    warn!(
+                        "claude-cli: unknown event type in line (ignored): {}",
+                        trimmed
+                    );
                 }
             }
         };
@@ -933,12 +936,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
 
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
         let session_id = &session.summary.session_id;
-        let process = self
-            .active_processes
-            .lock()
-            .await
-            .get(session_id)
-            .cloned();
+        let process = self.active_processes.lock().await.get(session_id).cloned();
 
         if let Some(process) = process {
             let proc = process.lock().await;
@@ -953,11 +951,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
 
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
         let session_id = &session.summary.session_id;
-        let process = self
-            .active_processes
-            .lock()
-            .await
-            .remove(session_id);
+        let process = self.active_processes.lock().await.remove(session_id);
 
         if let Some(process) = process {
             let mut proc = process.lock().await;
@@ -1081,10 +1075,7 @@ fn tag_for_kind(kind: CommandKind) -> &'static str {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-async fn write_line(
-    stdin: &Arc<Mutex<ChildStdin>>,
-    value: &Value,
-) -> Result<(), String> {
+async fn write_line(stdin: &Arc<Mutex<ChildStdin>>, value: &Value) -> Result<(), String> {
     let mut guard = stdin.lock().await;
     zenui_provider_api::write_json_line(&mut *guard, value, "claude CLI").await
 }
@@ -1180,10 +1171,7 @@ fn parse_single_question(q: &Value, qi: usize) -> UserInputQuestion {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let header = q
-        .get("header")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let header = q.get("header").and_then(Value::as_str).map(str::to_string);
     let multi_select = q
         .get("multiSelect")
         .and_then(Value::as_bool)

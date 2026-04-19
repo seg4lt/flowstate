@@ -67,7 +67,6 @@ impl UsageRange {
         };
         (start, end)
     }
-
 }
 
 /// Axis of the dashboard's breakdown. Passed through to SQL
@@ -802,9 +801,7 @@ fn read_daily_points(
         .iter()
         .map(|day| UsageTimeseriesPoint {
             bucket_start: day.clone(),
-            totals: totals_by_day
-                .remove(day)
-                .unwrap_or_else(|| empty_totals()),
+            totals: totals_by_day.remove(day).unwrap_or_else(|| empty_totals()),
         })
         .collect();
     Ok(points)
@@ -900,11 +897,7 @@ fn read_daily_series(
                     .unwrap_or_else(|| empty_totals()),
             })
             .collect();
-        out.push(UsageSeries {
-            key,
-            label,
-            points,
-        });
+        out.push(UsageSeries { key, label, points });
     }
     Ok(out)
 }
@@ -1014,7 +1007,10 @@ mod tests {
                         },
                     )
                     .expect("rollup row missing for events key");
-            assert_eq!(rc_count, count, "turn_count mismatch for ({day}, {provider}, {model})");
+            assert_eq!(
+                rc_count, count,
+                "turn_count mismatch for ({day}, {provider}, {model})"
+            );
             assert_eq!(rc_input, input, "input_tokens mismatch");
             assert_eq!(rc_output, output, "output_tokens mismatch");
             assert!(
@@ -1030,20 +1026,44 @@ mod tests {
         let store = UsageStore::in_memory().unwrap();
         let events = [
             sample_event(
-                "t1", "s1", ProviderKind::Claude, Some("claude-sonnet"),
-                "2026-04-15T12:00:00Z", 100, 200, Some(0.01),
+                "t1",
+                "s1",
+                ProviderKind::Claude,
+                Some("claude-sonnet"),
+                "2026-04-15T12:00:00Z",
+                100,
+                200,
+                Some(0.01),
             ),
             sample_event(
-                "t2", "s1", ProviderKind::Claude, Some("claude-sonnet"),
-                "2026-04-15T13:00:00Z", 150, 250, Some(0.02),
+                "t2",
+                "s1",
+                ProviderKind::Claude,
+                Some("claude-sonnet"),
+                "2026-04-15T13:00:00Z",
+                150,
+                250,
+                Some(0.02),
             ),
             sample_event(
-                "t3", "s2", ProviderKind::Codex, Some("gpt-5"),
-                "2026-04-15T14:00:00Z", 80, 120, None,
+                "t3",
+                "s2",
+                ProviderKind::Codex,
+                Some("gpt-5"),
+                "2026-04-15T14:00:00Z",
+                80,
+                120,
+                None,
             ),
             sample_event(
-                "t4", "s3", ProviderKind::Claude, Some("claude-opus"),
-                "2026-04-16T10:00:00Z", 200, 300, Some(0.10),
+                "t4",
+                "s3",
+                ProviderKind::Claude,
+                Some("claude-opus"),
+                "2026-04-16T10:00:00Z",
+                200,
+                300,
+                Some(0.10),
             ),
         ];
         for e in events.iter() {
@@ -1056,8 +1076,14 @@ mod tests {
     fn duplicate_turn_ids_are_no_ops() {
         let store = UsageStore::in_memory().unwrap();
         let event = sample_event(
-            "t1", "s1", ProviderKind::Claude, Some("claude-sonnet"),
-            "2026-04-15T12:00:00Z", 100, 200, Some(0.01),
+            "t1",
+            "s1",
+            ProviderKind::Claude,
+            Some("claude-sonnet"),
+            "2026-04-15T12:00:00Z",
+            100,
+            200,
+            Some(0.01),
         );
         store.record_turn(&event).unwrap();
         // Replay the same turn_id. Both event and rollup counts
@@ -1089,12 +1115,26 @@ mod tests {
             .to_string();
         store
             .record_turn(&sample_event(
-                "inside", "s1", ProviderKind::Claude, Some("m"), &inside, 10, 20, Some(0.01),
+                "inside",
+                "s1",
+                ProviderKind::Claude,
+                Some("m"),
+                &inside,
+                10,
+                20,
+                Some(0.01),
             ))
             .unwrap();
         store
             .record_turn(&sample_event(
-                "outside", "s2", ProviderKind::Claude, Some("m"), &outside, 10, 20, Some(0.01),
+                "outside",
+                "s2",
+                ProviderKind::Claude,
+                Some("m"),
+                &outside,
+                10,
+                20,
+                Some(0.01),
             ))
             .unwrap();
 
@@ -1124,18 +1164,21 @@ mod tests {
             .to_string();
         store
             .record_turn(&sample_event(
-                "t1", "s1", ProviderKind::Claude, Some("m"), &three_days_ago, 10, 20, Some(0.01),
+                "t1",
+                "s1",
+                ProviderKind::Claude,
+                Some("m"),
+                &three_days_ago,
+                10,
+                20,
+                Some(0.01),
             ))
             .unwrap();
         let ts = store
             .timeseries(UsageRange::Last7Days, UsageBucket::Daily, None)
             .unwrap();
         assert_eq!(ts.points.len(), 7);
-        let non_zero = ts
-            .points
-            .iter()
-            .filter(|p| p.totals.turn_count > 0)
-            .count();
+        let non_zero = ts.points.iter().filter(|p| p.totals.turn_count > 0).count();
         assert_eq!(non_zero, 1);
         let total_turns: u64 = ts.points.iter().map(|p| p.totals.turn_count).sum();
         assert_eq!(total_turns, 1);
@@ -1144,17 +1187,29 @@ mod tests {
     #[test]
     fn cost_has_unknowns_propagates() {
         let store = UsageStore::in_memory().unwrap();
-        let now_ish = Utc::now()
-            .format("%Y-%m-%dT12:00:00Z")
-            .to_string();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
         store
             .record_turn(&sample_event(
-                "known", "s1", ProviderKind::Claude, Some("m"), &now_ish, 10, 20, Some(0.01),
+                "known",
+                "s1",
+                ProviderKind::Claude,
+                Some("m"),
+                &now_ish,
+                10,
+                20,
+                Some(0.01),
             ))
             .unwrap();
         store
             .record_turn(&sample_event(
-                "unknown", "s1", ProviderKind::Claude, Some("m"), &now_ish, 10, 20, None,
+                "unknown",
+                "s1",
+                ProviderKind::Claude,
+                Some("m"),
+                &now_ish,
+                10,
+                20,
+                None,
             ))
             .unwrap();
         let summary = store
@@ -1168,22 +1223,41 @@ mod tests {
     #[test]
     fn group_by_model_aggregates_correctly() {
         let store = UsageStore::in_memory().unwrap();
-        let now_ish = Utc::now()
-            .format("%Y-%m-%dT12:00:00Z")
-            .to_string();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
         store
             .record_turn(&sample_event(
-                "t1", "s1", ProviderKind::Claude, Some("sonnet"), &now_ish, 100, 200, Some(0.01),
+                "t1",
+                "s1",
+                ProviderKind::Claude,
+                Some("sonnet"),
+                &now_ish,
+                100,
+                200,
+                Some(0.01),
             ))
             .unwrap();
         store
             .record_turn(&sample_event(
-                "t2", "s2", ProviderKind::Claude, Some("opus"), &now_ish, 100, 200, Some(0.10),
+                "t2",
+                "s2",
+                ProviderKind::Claude,
+                Some("opus"),
+                &now_ish,
+                100,
+                200,
+                Some(0.10),
             ))
             .unwrap();
         store
             .record_turn(&sample_event(
-                "t3", "s3", ProviderKind::Claude, Some("sonnet"), &now_ish, 50, 100, Some(0.005),
+                "t3",
+                "s3",
+                ProviderKind::Claude,
+                Some("sonnet"),
+                &now_ish,
+                50,
+                100,
+                Some(0.005),
             ))
             .unwrap();
         let summary = store
@@ -1200,9 +1274,7 @@ mod tests {
     #[test]
     fn top_sessions_ranks_by_cost() {
         let store = UsageStore::in_memory().unwrap();
-        let now_ish = Utc::now()
-            .format("%Y-%m-%dT12:00:00Z")
-            .to_string();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
         for (tid, sid, cost) in [
             ("t1", "cheap", 0.001),
             ("t2", "expensive", 0.50),
@@ -1234,12 +1306,17 @@ mod tests {
     #[test]
     fn limit_is_clamped() {
         let store = UsageStore::in_memory().unwrap();
-        let now_ish = Utc::now()
-            .format("%Y-%m-%dT12:00:00Z")
-            .to_string();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
         store
             .record_turn(&sample_event(
-                "t1", "s1", ProviderKind::Claude, Some("m"), &now_ish, 10, 20, Some(0.01),
+                "t1",
+                "s1",
+                ProviderKind::Claude,
+                Some("m"),
+                &now_ish,
+                10,
+                20,
+                Some(0.01),
             ))
             .unwrap();
         // limit=0 clamps to 1.

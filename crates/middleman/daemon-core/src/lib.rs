@@ -255,8 +255,8 @@ pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -
         bound_transports.push(b);
     }
 
-    let ready = ReadyFile::for_project(&config.project_root)
-        .context("resolve daemon ready file")?;
+    let ready =
+        ReadyFile::for_project(&config.project_root).context("resolve daemon ready file")?;
     let shutdown_grace = config.shutdown_grace;
 
     let result: Result<()> = {
@@ -292,8 +292,7 @@ pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -
             // transport is accepting connections.
             let address_infos: Vec<TransportAddressInfo> =
                 handles.iter().map(|h| h.address_info()).collect();
-            let ready_content =
-                ReadyFileContent::new(project_root_str, address_infos.clone());
+            let ready_content = ReadyFileContent::new(project_root_str, address_infos.clone());
             if let Err(e) = ready_inner.write_atomic(&ready_content) {
                 for h in handles.into_iter().rev() {
                     h.shutdown().await;

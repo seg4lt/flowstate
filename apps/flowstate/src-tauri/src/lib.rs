@@ -6,16 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::Manager;
 use tauri::ipc::Channel;
+use tauri::Manager;
 use tauri::State;
 use tracing_subscriber::EnvFilter;
+use transport_tauri::TauriTransport;
 use zenui_daemon_core::{
-    DaemonConfig, DaemonLifecycle, Transport, bootstrap_core_async, graceful_shutdown,
-    transport_tauri,
+    bootstrap_core_async, graceful_shutdown, transport_tauri, DaemonConfig, DaemonLifecycle,
+    Transport,
 };
 use zenui_runtime_core::ConnectionObserver;
-use transport_tauri::TauriTransport;
 
 mod pty;
 use pty::{PtyId, PtyManager};
@@ -28,6 +28,7 @@ mod user_config;
 use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
 mod usage;
+use tokio::sync::broadcast::error::RecvError;
 use usage::{
     TopSessionRow, UsageBucket, UsageEvent, UsageGroupBy, UsageRange, UsageStore,
     UsageSummaryPayload, UsageTimeseriesPayload,
@@ -38,7 +39,6 @@ use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
 use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
-use tokio::sync::broadcast::error::RecvError;
 
 use std::collections::HashMap;
 
@@ -76,7 +76,11 @@ fn resolve_git_root_sync(path: &str) -> Option<String> {
         return None;
     }
     let root = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if root.is_empty() { None } else { Some(root) }
+    if root.is_empty() {
+        None
+    } else {
+        Some(root)
+    }
 }
 
 /// When git reports a worktree path inside a `.git/` directory
@@ -117,7 +121,11 @@ fn get_git_branch_sync(path: String) -> Option<String> {
         return None;
     }
     let branch = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if branch.is_empty() { None } else { Some(branch) }
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
+    }
 }
 
 #[derive(Serialize)]
@@ -160,13 +168,16 @@ fn list_git_branches_sync(path: String) -> Result<GitBranchList, String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
-            format!("git for-each-ref failed (status {:?})", output.status.code())
+            format!(
+                "git for-each-ref failed (status {:?})",
+                output.status.code()
+            )
         } else {
             stderr
         });
     }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|e| format!("git output not utf-8: {e}"))?;
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|e| format!("git output not utf-8: {e}"))?;
 
     let mut current: Option<String> = None;
     let mut local: Vec<String> = Vec::new();
@@ -248,8 +259,8 @@ fn list_git_worktrees_sync(path: String) -> Result<Vec<GitWorktree>, String> {
             stderr
         });
     }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|e| format!("git output not utf-8: {e}"))?;
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|e| format!("git output not utf-8: {e}"))?;
 
     let mut worktrees: Vec<GitWorktree> = Vec::new();
     let mut current_path: Option<String> = None;
@@ -303,9 +314,7 @@ fn list_git_worktrees_sync(path: String) -> Result<Vec<GitWorktree>, String> {
         } else if let Some(rest) = line.strip_prefix("HEAD ") {
             current_head = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("branch ") {
-            current_branch = Some(
-                rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string(),
-            );
+            current_branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
         } else if line == "bare" {
             current_bare = true;
         }
@@ -469,17 +478,12 @@ fn create_git_worktree(
     // Resolve the git root first — when the project path is a
     // submodule directory git may report worktree paths relative to
     // the resolved repo root rather than the raw project path.
-    let effective_path = resolve_git_root_sync(&project_path)
-        .unwrap_or(project_path);
+    let effective_path = resolve_git_root_sync(&project_path).unwrap_or(project_path);
     let all = list_git_worktrees_sync(effective_path)?;
     all.into_iter()
-        .find(|w| {
-            w.path.trim_end_matches('/') == worktree_path.trim_end_matches('/')
-        })
+        .find(|w| w.path.trim_end_matches('/') == worktree_path.trim_end_matches('/'))
         .ok_or_else(|| {
-            format!(
-                "worktree add succeeded but {worktree_path} not found in subsequent list"
-            )
+            format!("worktree add succeeded but {worktree_path} not found in subsequent list")
         })
 }
 
@@ -534,11 +538,7 @@ fn remove_git_worktree(
 /// tree, merge conflict, nonexistent branch, etc.) rather than a
 /// generic "checkout failed" message.
 #[tauri::command]
-fn git_checkout(
-    path: String,
-    branch: String,
-    create_track: Option<String>,
-) -> Result<(), String> {
+fn git_checkout(path: String, branch: String, create_track: Option<String>) -> Result<(), String> {
     if branch.trim().is_empty() {
         return Err("empty branch name".into());
     }
@@ -601,10 +601,7 @@ const GIT_DIFF_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 fn read_file_capped(abs: &Path) -> String {
     if let Ok(meta) = std::fs::metadata(abs) {
         if meta.len() > GIT_DIFF_MAX_FILE_BYTES {
-            return format!(
-                "<file too large to inline: {} bytes>",
-                meta.len()
-            );
+            return format!("<file too large to inline: {} bytes>", meta.len());
         }
     }
     std::fs::read_to_string(abs).unwrap_or_default()
@@ -621,10 +618,7 @@ fn git_show_head(repo: &str, file: &str) -> String {
         return String::new();
     }
     if output.stdout.len() as u64 > GIT_DIFF_MAX_FILE_BYTES {
-        return format!(
-            "<file too large to inline: {} bytes>",
-            output.stdout.len()
-        );
+        return format!("<file too large to inline: {} bytes>", output.stdout.len());
     }
     String::from_utf8(output.stdout).unwrap_or_default()
 }
@@ -1134,12 +1128,7 @@ async fn watch_git_diff_summary(
     // subscription runs until it completes or is cancelled; all
     // cleanup is self-contained inside the closure.
     drop(tauri::async_runtime::spawn_blocking(move || {
-        let result = run_watch_diff(
-            &path,
-            &on_event,
-            cancelled_for_thread,
-            child_for_thread,
-        );
+        let result = run_watch_diff(&path, &on_event, cancelled_for_thread, child_for_thread);
         if let Some(tasks) = app_for_thread.try_state::<DiffTasks>() {
             tasks.tasks.lock().unwrap().remove(&token);
         }
@@ -1213,14 +1202,11 @@ fn read_project_file(path: String, file: String) -> Result<String, String> {
     let project_canon = project_path
         .canonicalize()
         .map_err(|e| format!("project path: {e}"))?;
-    let abs_canon = abs
-        .canonicalize()
-        .map_err(|e| format!("file path: {e}"))?;
+    let abs_canon = abs.canonicalize().map_err(|e| format!("file path: {e}"))?;
     if !abs_canon.starts_with(&project_canon) {
         return Err("file is outside the project root".into());
     }
-    let meta = std::fs::metadata(&abs_canon)
-        .map_err(|e| format!("metadata: {e}"))?;
+    let meta = std::fs::metadata(&abs_canon).map_err(|e| format!("metadata: {e}"))?;
     if meta.len() > CODE_VIEW_MAX_FILE_BYTES {
         return Err(format!(
             "file too large to inline: {} bytes (max {})",
@@ -1290,13 +1276,8 @@ fn search_file_contents(
     token: Option<u64>,
 ) -> Result<Vec<file_index::ContentBlock>, String> {
     let cancel = token.map(|t| search_tasks.register(t));
-    let result = file_index::search_file_contents(
-        &registry,
-        &path,
-        &query,
-        &options,
-        cancel.as_deref(),
-    );
+    let result =
+        file_index::search_file_contents(&registry, &path, &query, &options, cancel.as_deref());
     if let Some(t) = token {
         search_tasks.unregister(t);
     }
@@ -1382,7 +1363,12 @@ fn pty_write(manager: State<'_, PtyManager>, id: PtyId, data: Vec<u8>) -> Result
 }
 
 #[tauri::command]
-fn pty_resize(manager: State<'_, PtyManager>, id: PtyId, cols: u16, rows: u16) -> Result<(), String> {
+fn pty_resize(
+    manager: State<'_, PtyManager>,
+    id: PtyId,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
     manager.resize(id, cols, rows)
 }
 
@@ -1631,8 +1617,7 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .expect("failed to resolve app data dir");
-            std::fs::create_dir_all(&flowstate_root)
-                .expect("failed to create app data dir");
+            std::fs::create_dir_all(&flowstate_root).expect("failed to create app data dir");
             std::fs::create_dir_all(flowstate_root.join("threads")).ok();
 
             // Open the flowstate-app-owned user config store. Lives in
@@ -1640,8 +1625,8 @@ pub fn run() {
             // separate database from the daemon's. SDK and app each
             // own their own SQLite; nothing about app-level UI config
             // belongs in the daemon's schema.
-            let user_config_store = UserConfigStore::open(&flowstate_root)
-                .expect("failed to open user_config store");
+            let user_config_store =
+                UserConfigStore::open(&flowstate_root).expect("failed to open user_config store");
             app.manage(user_config_store);
 
             // Open the usage analytics store — a *third* sqlite file

@@ -12,7 +12,6 @@ use tokio::sync::{Mutex, oneshot};
 // growing hand-curated use list.
 use crate::*;
 
-
 /// Events that a provider adapter can push during a turn for streaming display.
 #[derive(Debug, Clone)]
 pub enum ProviderTurnEvent {
@@ -245,9 +244,8 @@ pub struct TurnEventSink {
     /// internal `perm-N` id. The payload is `(decision, mode_override)`
     /// so "approve and switch mode" is delivered atomically with the
     /// decision itself — no side channel, no id-lookup mistakes.
-    permission_pending: Arc<
-        Mutex<HashMap<String, oneshot::Sender<(PermissionDecision, Option<PermissionMode>)>>>,
-    >,
+    permission_pending:
+        Arc<Mutex<HashMap<String, oneshot::Sender<(PermissionDecision, Option<PermissionMode>)>>>>,
     question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
     /// Session-scoped persistent permission decisions. Shared across turns.
     policy: PermissionPolicy,
@@ -493,4 +491,3 @@ fn next_request_id(prefix: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{nanos:x}-{n:x}")
 }
-

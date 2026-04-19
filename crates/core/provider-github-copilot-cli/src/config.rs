@@ -125,7 +125,8 @@ pub(crate) fn parse_plan_steps(raw: &str) -> Vec<zenui_provider_api::PlanStep> {
                 .or_else(|| {
                     // numbered: "1. ", "12. ", etc.
                     let mut chars = trimmed.chars();
-                    let digits: String = chars.by_ref().take_while(|c| c.is_ascii_digit()).collect();
+                    let digits: String =
+                        chars.by_ref().take_while(|c| c.is_ascii_digit()).collect();
                     if !digits.is_empty() && chars.next() == Some('.') {
                         Some(trimmed[digits.len() + 1..].trim())
                     } else {

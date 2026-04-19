@@ -67,14 +67,11 @@ impl CopilotCliProcess {
         }
         let msg = make_request(id, method, params);
         write_rpc_frame(&self.stdin, &msg).await?;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(TURN_TIMEOUT_SECS),
-            rx,
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(TURN_TIMEOUT_SECS), rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(format!("RPC channel closed waiting for '{method}' response")),
+            Ok(Err(_)) => Err(format!(
+                "RPC channel closed waiting for '{method}' response"
+            )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
                 Err(format!("RPC timeout waiting for '{method}' response"))
@@ -107,7 +104,10 @@ pub(crate) async fn run_dispatcher(
 
         // Classify the message.
         let has_id = msg.get("id").is_some();
-        let method = msg.get("method").and_then(Value::as_str).map(str::to_string);
+        let method = msg
+            .get("method")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         if let Some(method_str) = method {
             if has_id {
@@ -125,7 +125,9 @@ pub(crate) async fn run_dispatcher(
                     let guard = callback_tx.lock().await;
                     if let Some(tx) = guard.as_ref() {
                         if tx.send(cb).is_err() {
-                            debug!("copilot CLI: callback channel closed, auto-denying '{method_str}'");
+                            debug!(
+                                "copilot CLI: callback channel closed, auto-denying '{method_str}'"
+                            );
                             // No turn loop listening — write an error response so the
                             // copilot binary doesn't block indefinitely.
                             let err_resp = make_error_response(&rpc_id, -32603, "no handler");

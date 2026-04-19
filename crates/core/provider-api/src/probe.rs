@@ -97,9 +97,9 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
                     .or_else(|| first_non_empty_line(&auth_output.stdout))
                     .or_else(|| {
                         Some(match auth_hint {
-                            Some(hint) => format!(
-                                "{label} CLI is installed but not authenticated. {hint}"
-                            ),
+                            Some(hint) => {
+                                format!("{label} CLI is installed but not authenticated. {hint}")
+                            }
                             None => format!("{label} CLI is installed but not authenticated."),
                         })
                     })
