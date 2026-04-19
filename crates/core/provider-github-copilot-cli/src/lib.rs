@@ -292,8 +292,8 @@ impl GitHubCopilotCliAdapter {
 
         let mut accumulated_output = String::new();
         let mut has_deltas = false;
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(TURN_TIMEOUT_SECS);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(TURN_TIMEOUT_SECS);
 
         let turn_result: Result<(), String> = loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -467,11 +467,7 @@ async fn handle_session_event(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let error = if success {
-                None
-            } else {
-                Some(output.clone())
-            };
+            let error = if success { None } else { Some(output.clone()) };
             events
                 .send(ProviderTurnEvent::ToolCallCompleted {
                     call_id,
@@ -533,7 +529,11 @@ async fn handle_callback(
 ) {
     match cb.method.as_str() {
         "permission.request" => {
-            let perm_req = cb.params.get("permissionRequest").cloned().unwrap_or(cb.params.clone());
+            let perm_req = cb
+                .params
+                .get("permissionRequest")
+                .cloned()
+                .unwrap_or(cb.params.clone());
             let kind = perm_req
                 .get("kind")
                 .and_then(Value::as_str)
@@ -742,7 +742,10 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         let (ping_raw, status_raw, auth_raw) = tokio::join!(
             tokio::time::timeout(timeout, process.call("ping", serde_json::json!({}))),
             tokio::time::timeout(timeout, process.call("status.get", serde_json::json!({}))),
-            tokio::time::timeout(timeout, process.call("auth.getStatus", serde_json::json!({}))),
+            tokio::time::timeout(
+                timeout,
+                process.call("auth.getStatus", serde_json::json!({}))
+            ),
         );
 
         let ping_ok = ping_raw.ok().and_then(|r| r.ok()).is_some();
@@ -956,7 +959,10 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
 
             let proc = cached.inner().lock().await;
             if let Err(e) = proc
-                .call("session.abort", serde_json::json!({ "sessionId": native_id }))
+                .call(
+                    "session.abort",
+                    serde_json::json!({ "sessionId": native_id }),
+                )
                 .await
             {
                 warn!("copilot CLI: interrupt failed: {e}");
@@ -967,7 +973,10 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     }
 
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
-        let cached = self.active_processes.remove(&session.summary.session_id).await;
+        let cached = self
+            .active_processes
+            .remove(&session.summary.session_id)
+            .await;
 
         if let Some(cached) = cached {
             let native_id = session
@@ -980,7 +989,10 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             let proc = cached.inner().lock().await;
             // Best-effort destroy then kill.
             let _ = proc
-                .call("session.destroy", serde_json::json!({ "sessionId": native_id }))
+                .call(
+                    "session.destroy",
+                    serde_json::json!({ "sessionId": native_id }),
+                )
                 .await;
             drop(proc);
 
@@ -1059,10 +1071,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         let mcp_servers = sdk_mcp
             .into_iter()
             .map(|m| McpServerInfo {
-                enabled: matches!(
-                    m.status.as_deref(),
-                    Some("connected") | Some("pending")
-                ),
+                enabled: matches!(m.status.as_deref(), Some("connected") | Some("pending")),
                 id: format!("github_copilot_cli:mcp:{}", m.name),
                 name: m.name,
             })
@@ -1083,10 +1092,7 @@ impl GitHubCopilotCliAdapter {
     async fn fetch_capabilities(
         &self,
         session: &SessionDetail,
-    ) -> Result<
-        (Vec<CliSkill>, Vec<CliAgent>, Vec<CliMcpServer>),
-        String,
-    > {
+    ) -> Result<(Vec<CliSkill>, Vec<CliAgent>, Vec<CliMcpServer>), String> {
         let cached = self.ensure_session_process(session).await?;
         let _guard = cached.activity_guard();
         let process = cached.inner().lock().await;
@@ -1107,14 +1113,17 @@ impl GitHubCopilotCliAdapter {
             ),
         )?;
 
-        let parsed_skills: SkillsList = serde_json::from_value(skills)
-            .map_err(|e| format!("parse skills.list: {e}"))?;
-        let parsed_agents: AgentsList = serde_json::from_value(agents)
-            .map_err(|e| format!("parse agent.list: {e}"))?;
-        let parsed_mcp: McpList = serde_json::from_value(mcp)
-            .map_err(|e| format!("parse mcp.list: {e}"))?;
+        let parsed_skills: SkillsList =
+            serde_json::from_value(skills).map_err(|e| format!("parse skills.list: {e}"))?;
+        let parsed_agents: AgentsList =
+            serde_json::from_value(agents).map_err(|e| format!("parse agent.list: {e}"))?;
+        let parsed_mcp: McpList =
+            serde_json::from_value(mcp).map_err(|e| format!("parse mcp.list: {e}"))?;
 
-        Ok((parsed_skills.skills, parsed_agents.agents, parsed_mcp.servers))
+        Ok((
+            parsed_skills.skills,
+            parsed_agents.agents,
+            parsed_mcp.servers,
+        ))
     }
 }
-

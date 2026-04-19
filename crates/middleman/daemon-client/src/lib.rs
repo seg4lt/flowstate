@@ -70,10 +70,9 @@ impl DaemonHandle {
     /// for any other transport. Lets the tao-web-shell stay compact.
     pub fn as_http(&self) -> Option<HttpEndpoints<'_>> {
         match &self.address {
-            TransportAddressInfo::Http { http_base, ws_url } => Some(HttpEndpoints {
-                http_base,
-                ws_url,
-            }),
+            TransportAddressInfo::Http { http_base, ws_url } => {
+                Some(HttpEndpoints { http_base, ws_url })
+            }
             _ => None,
         }
     }
@@ -181,10 +180,7 @@ pub fn connect_or_spawn(config: &ClientConfig) -> Result<DaemonHandle> {
 /// ready file doesn't offer a matching transport OR when the transport
 /// fails its health check (in which case the caller should treat the
 /// ready file as stale).
-fn try_attach(
-    content: &ReadyFileContent,
-    config: &ClientConfig,
-) -> Result<Option<DaemonHandle>> {
+fn try_attach(content: &ReadyFileContent, config: &ClientConfig) -> Result<Option<DaemonHandle>> {
     // Find first transport that matches the caller's preference.
     let Some(address) = content
         .transports
@@ -197,8 +193,7 @@ fn try_attach(
         // not a stale-file situation. We bubble it as an error instead
         // of returning None because we don't want the caller to spawn a
         // new daemon on top of the existing one.
-        let kinds: Vec<&'static str> =
-            content.transports.iter().map(|t| t.kind()).collect();
+        let kinds: Vec<&'static str> = content.transports.iter().map(|t| t.kind()).collect();
         bail!(
             "zenui-server is running for this project but offers {:?}; \
              client wants {:?}. Stop the daemon (`zenui-server stop`) and \
@@ -225,7 +220,9 @@ fn try_attach(
 /// if the probe succeeds. Used to detect stale ready files.
 fn probe_live(address: &TransportAddressInfo, timeout: Duration) -> bool {
     match address {
-        TransportAddressInfo::Http { http_base, .. } => http_health_check(http_base, timeout).is_ok(),
+        TransportAddressInfo::Http { http_base, .. } => {
+            http_health_check(http_base, timeout).is_ok()
+        }
         // Non-HTTP transports don't yet have defined liveness probes;
         // assume live until their transports implement something.
         TransportAddressInfo::UnixSocket { .. }

@@ -43,12 +43,8 @@ pub const ATTACHMENT_MAX_BYTES: usize = 5 * 1024 * 1024;
 
 /// Allowed image MIME types. Anything else is rejected at the runtime
 /// boundary so the on-disk file extension is always one of these.
-pub const ATTACHMENT_ALLOWED_MEDIA_TYPES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-];
+pub const ATTACHMENT_ALLOWED_MEDIA_TYPES: &[&str] =
+    &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 mod codecs;
 
@@ -100,8 +96,8 @@ impl PersistenceService {
         // Tests don't typically exercise the file-backed attachment
         // path; give them a unique tempdir so any test that does write
         // an attachment doesn't collide with sibling tests.
-        let attachments_dir = std::env::temp_dir()
-            .join(format!("zenui-test-attachments-{}", Uuid::new_v4()));
+        let attachments_dir =
+            std::env::temp_dir().join(format!("zenui-test-attachments-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&attachments_dir)
             .context("failed to create in-memory attachments directory")?;
         let connection = Connection::open_in_memory().context("failed to open in-memory sqlite")?;
@@ -310,7 +306,10 @@ impl PersistenceService {
         self.delete_attachments_for_session_blocking(session_id);
         let connection = self.connection.lock();
         connection
-            .execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])
+            .execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                params![session_id],
+            )
             .map(|affected| affected > 0)
             .unwrap_or(false)
     }
@@ -334,11 +333,7 @@ impl PersistenceService {
             )
             .map(|affected| affected > 0)
             .unwrap_or(false);
-        if removed {
-            tx.commit().is_ok()
-        } else {
-            false
-        }
+        if removed { tx.commit().is_ok() } else { false }
     }
 
     /// Persist a single image attachment to disk and record its
@@ -407,12 +402,7 @@ impl PersistenceService {
                 .query_row(
                     "SELECT media_type, name FROM turn_attachments WHERE id = ?1",
                     params![attachment_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, Option<String>>(1)?,
-                        ))
-                    },
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
                 .optional()
                 .map_err(|e| format!("failed to look up attachment: {e}"))?
@@ -465,9 +455,9 @@ impl PersistenceService {
     fn delete_attachments_for_session_blocking(&self, session_id: &str) {
         let rows: Vec<(String, String)> = {
             let connection = self.connection.lock();
-            let mut stmt = match connection.prepare(
-                "SELECT id, media_type FROM turn_attachments WHERE session_id = ?1",
-            ) {
+            let mut stmt = match connection
+                .prepare("SELECT id, media_type FROM turn_attachments WHERE session_id = ?1")
+            {
                 Ok(stmt) => stmt,
                 Err(_) => return,
             };
@@ -561,10 +551,7 @@ impl PersistenceService {
     /// The `features` field on the returned status is always overwritten
     /// from `zenui_provider_api::features_for_kind` — it is not a
     /// persisted value. See `set_cached_health` for the rationale.
-    pub async fn get_cached_health(
-        &self,
-        kind: ProviderKind,
-    ) -> Option<(String, ProviderStatus)> {
+    pub async fn get_cached_health(&self, kind: ProviderKind) -> Option<(String, ProviderStatus)> {
         let connection = self.connection.lock();
         connection
             .query_row(
@@ -589,8 +576,7 @@ impl PersistenceService {
                         // any flag added since, and `#[serde(default)]`
                         // silently defaults it to `false`. Recomputing
                         // here makes that impossible.
-                        status.features =
-                            zenui_provider_api::features_for_kind(status.kind);
+                        status.features = zenui_provider_api::features_for_kind(status.kind);
                         (checked_at, status)
                     })
             })
@@ -601,12 +587,11 @@ impl PersistenceService {
     /// as enabled by the caller (runtime-core defaults to `true` on miss).
     pub async fn get_provider_enablement(&self) -> HashMap<ProviderKind, bool> {
         let connection = self.connection.lock();
-        let mut statement = match connection
-            .prepare("SELECT provider, enabled FROM provider_enablement")
-        {
-            Ok(s) => s,
-            Err(_) => return HashMap::new(),
-        };
+        let mut statement =
+            match connection.prepare("SELECT provider, enabled FROM provider_enablement") {
+                Ok(s) => s,
+                Err(_) => return HashMap::new(),
+            };
         let rows = statement.query_map([], |row| {
             let provider: String = row.get(0)?;
             let enabled: i64 = row.get(1)?;
@@ -728,12 +713,7 @@ impl PersistenceService {
                      WHERE path = ?1 AND deleted_at IS NOT NULL
                      ORDER BY deleted_at DESC LIMIT 1",
                     params![p],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                        ))
-                    },
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()
                 .ok()
@@ -908,7 +888,10 @@ impl PersistenceService {
             .context("failed to run sqlite migrations")?;
 
         // Idempotent column additions — ignore errors if the column already exists.
-        let _ = connection.execute("ALTER TABLE sessions ADD COLUMN provider_state_json TEXT", []);
+        let _ = connection.execute(
+            "ALTER TABLE sessions ADD COLUMN provider_state_json TEXT",
+            [],
+        );
         let _ = connection.execute("ALTER TABLE sessions ADD COLUMN model TEXT", []);
         let _ = connection.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_json TEXT", []);
@@ -1000,8 +983,14 @@ impl PersistenceService {
              FROM turns WHERE session_id = ?1",
             params![session_id],
         );
-        let _ = tx.execute("DELETE FROM turns WHERE session_id = ?1", params![session_id]);
-        let _ = tx.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id]);
+        let _ = tx.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            params![session_id],
+        );
+        let _ = tx.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        );
         let _ = tx.commit();
         true
     }
@@ -1041,8 +1030,14 @@ impl PersistenceService {
                  FROM archived_turns WHERE session_id = ?1",
                 params![session_id],
             );
-            let _ = tx.execute("DELETE FROM archived_turns WHERE session_id = ?1", params![session_id]);
-            let _ = tx.execute("DELETE FROM archived_sessions WHERE session_id = ?1", params![session_id]);
+            let _ = tx.execute(
+                "DELETE FROM archived_turns WHERE session_id = ?1",
+                params![session_id],
+            );
+            let _ = tx.execute(
+                "DELETE FROM archived_sessions WHERE session_id = ?1",
+                params![session_id],
+            );
             tx.commit().is_ok()
         }; // connection + tx dropped here
 
@@ -1370,7 +1365,9 @@ mod tests {
             enabled: true,
             features: bogus_features,
         };
-        service.set_cached_health(ProviderKind::Claude, &status).await;
+        service
+            .set_cached_health(ProviderKind::Claude, &status)
+            .await;
 
         // Confirm the persisted JSON carries default features
         // (stripped on write), proving the on-disk row never

@@ -141,11 +141,7 @@ pub fn claude_file_change_from_tool_call(
 /// Caller owns the lock: pass `&mut *guard` when writing through
 /// `Arc<Mutex<ChildStdin>>`. That keeps the helper agnostic to whether
 /// the writer is shared or owned exclusively.
-pub async fn write_json_line<W, T>(
-    writer: &mut W,
-    value: &T,
-    describe: &str,
-) -> Result<(), String>
+pub async fn write_json_line<W, T>(writer: &mut W, value: &T, describe: &str) -> Result<(), String>
 where
     W: AsyncWrite + Unpin + ?Sized,
     T: Serialize + ?Sized,

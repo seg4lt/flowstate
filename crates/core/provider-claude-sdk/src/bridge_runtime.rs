@@ -115,13 +115,8 @@ fn extract_once() -> Result<BridgeRuntime> {
     if let Some(parent) = cache_root.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::rename(&staging, &cache_root).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            staging.display(),
-            cache_root.display()
-        )
-    })?;
+    fs::rename(&staging, &cache_root)
+        .with_context(|| format!("rename {} -> {}", staging.display(), cache_root.display()))?;
 
     if !script.exists() {
         anyhow::bail!(
@@ -142,10 +137,7 @@ fn extract_once() -> Result<BridgeRuntime> {
 /// `@anthropic-ai/claude-agent-sdk` under `vendor/ripgrep/<target>/rg`.
 fn is_vendored_binary(path: &str) -> bool {
     path.contains("/vendor/ripgrep/")
-        && matches!(
-            path.rsplit('/').next(),
-            Some("rg") | Some("rg.exe")
-        )
+        && matches!(path.rsplit('/').next(), Some("rg") | Some("rg.exe"))
 }
 
 /// Deterministic fingerprint of the embedded bridge assets. Used as a

@@ -61,8 +61,7 @@ impl ReadyFile {
             .with_context(|| format!("failed to canonicalize {}", project_root.display()))?;
         let digest = short_hash(canonical.to_string_lossy().as_bytes());
         let dir = runtime_dir()?.join("zenui");
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         Ok(Self {
             path: dir.join(format!("daemon-{digest}.json")),
         })
@@ -77,8 +76,8 @@ impl ReadyFile {
         let tmp = self.path.with_extension("json.tmp");
         let json = serde_json::to_vec_pretty(content).context("serialize ready file")?;
         {
-            let mut f = fs::File::create(&tmp)
-                .with_context(|| format!("create {}", tmp.display()))?;
+            let mut f =
+                fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
             f.write_all(&json).context("write ready file bytes")?;
             f.sync_all().context("fsync ready file")?;
         }
@@ -148,8 +147,7 @@ mod tests {
             http_base: "http://127.0.0.1:12345".to_string(),
             ws_url: "ws://127.0.0.1:12345/ws".to_string(),
         }];
-        let content =
-            ReadyFileContent::new(tmp.path().to_string_lossy().into_owned(), transports);
+        let content = ReadyFileContent::new(tmp.path().to_string_lossy().into_owned(), transports);
         let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
         rf.write_atomic(&content).expect("write");
         let read = rf.read().expect("read").expect("present");
@@ -177,8 +175,7 @@ mod tests {
                 path: "/tmp/zenui-test.sock".to_string(),
             },
         ];
-        let content =
-            ReadyFileContent::new(tmp.path().to_string_lossy().into_owned(), transports);
+        let content = ReadyFileContent::new(tmp.path().to_string_lossy().into_owned(), transports);
         let rf = ReadyFile::for_project(tmp.path()).expect("ready file");
         rf.write_atomic(&content).expect("write");
         let read = rf.read().expect("read").expect("present");

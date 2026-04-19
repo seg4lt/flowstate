@@ -134,13 +134,8 @@ fn extract_once() -> Result<NodeRuntime> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create cache parent {}", parent.display()))?;
     }
-    fs::rename(&top, &cache_root).with_context(|| {
-        format!(
-            "rename {} -> {}",
-            top.display(),
-            cache_root.display()
-        )
-    })?;
+    fs::rename(&top, &cache_root)
+        .with_context(|| format!("rename {} -> {}", top.display(), cache_root.display()))?;
 
     // Clean up the staging shell (now empty after the rename).
     fs::remove_dir_all(&staging).ok();
@@ -207,8 +202,7 @@ fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
     use std::io::Cursor;
 
     let reader = Cursor::new(bytes);
-    let mut archive = zip::ZipArchive::new(reader)
-        .context("failed to open Node.js zip archive")?;
+    let mut archive = zip::ZipArchive::new(reader).context("failed to open Node.js zip archive")?;
     archive
         .extract(dest)
         .with_context(|| format!("unpack Node.js zip into {}", dest.display()))?;
@@ -217,9 +211,7 @@ fn unpack_archive(bytes: &[u8], dest: &Path) -> Result<()> {
 
 fn find_single_subdir(parent: &Path) -> Result<PathBuf> {
     let mut found: Option<PathBuf> = None;
-    for entry in fs::read_dir(parent)
-        .with_context(|| format!("read_dir {}", parent.display()))?
-    {
+    for entry in fs::read_dir(parent).with_context(|| format!("read_dir {}", parent.display()))? {
         let entry = entry?;
         let ty = entry.file_type()?;
         if ty.is_dir() {

@@ -87,4 +87,3 @@ pub(crate) async fn write_request(
     let mut guard = stdin.lock().await;
     zenui_provider_api::write_json_line(&mut *guard, request, "bridge").await
 }
-

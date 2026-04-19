@@ -43,10 +43,7 @@ pub async fn connect(
     loop {
         match rx.recv().await {
             Ok(event) => {
-                if on_event
-                    .send(ServerMessage::Event { event })
-                    .is_err()
-                {
+                if on_event.send(ServerMessage::Event { event }).is_err() {
                     break;
                 }
             }
@@ -55,10 +52,7 @@ pub async fn connect(
                     "streaming channel lagged by {n} events; sending snapshot + active session reseed"
                 );
                 let snapshot = state.runtime.snapshot().await;
-                if on_event
-                    .send(ServerMessage::Snapshot { snapshot })
-                    .is_err()
-                {
+                if on_event.send(ServerMessage::Snapshot { snapshot }).is_err() {
                     break;
                 }
                 // Snapshot only carries summaries — chat-view needs the

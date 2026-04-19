@@ -305,11 +305,8 @@ impl ClaudeSdkAdapter {
         };
 
         debug!("Waiting for bridge ready signal...");
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            process.read_response(),
-        )
-        .await
+        match tokio::time::timeout(std::time::Duration::from_secs(15), process.read_response())
+            .await
         {
             Ok(Ok(BridgeResponse::Ready)) => {
                 info!("Claude SDK bridge is ready");
@@ -356,13 +353,11 @@ impl ClaudeSdkAdapter {
         };
         write_request(&bridge.stdin, &request).await?;
 
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            bridge.read_response(),
-        )
-        .await
-        .map_err(|_| "Timeout creating Claude SDK session".to_string())?
-        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), bridge.read_response())
+                .await
+                .map_err(|_| "Timeout creating Claude SDK session".to_string())?
+                .map_err(|e| format!("Bridge read error: {e}"))?;
 
         match response {
             BridgeResponse::SessionCreated { session_id } => {
@@ -619,265 +614,263 @@ impl ClaudeSdkAdapter {
                         info!(event = %event, "bridge stream event");
                     }
                     match event.as_str() {
-                    "permission_request" => {
-                        let request_id = request_id.unwrap_or_default();
-                        let tool_name = tool_name.unwrap_or_default();
-                        let input = input.unwrap_or(Value::Null);
-                        let suggested = suggested
-                            .as_deref()
-                            .map(parse_decision)
-                            .unwrap_or(PermissionDecision::Allow);
+                        "permission_request" => {
+                            let request_id = request_id.unwrap_or_default();
+                            let tool_name = tool_name.unwrap_or_default();
+                            let input = input.unwrap_or(Value::Null);
+                            let suggested = suggested
+                                .as_deref()
+                                .map(parse_decision)
+                                .unwrap_or(PermissionDecision::Allow);
 
-                        // request_permission() emits its own PermissionRequest event
-                        // with an internal `perm-...` id; do NOT duplicate it here. The
-                        // writer task still uses the bridge's request_id (`request_id`)
-                        // when forwarding the decision back to the bridge, because the
-                        // bridge keeps its own pending-permissions map keyed by that id.
-                        //
-                        // The optional PermissionMode override rides atomically
-                        // with the decision through the oneshot in provider-api,
-                        // so there is no side channel to read here — the
-                        // plan-exit "Approve & Auto-edit" flow Just Works.
-                        let events_clone = events.clone();
-                        let perm_tx = perm_tx.clone();
-                        let req_id_for_writer = request_id;
-                        tokio::spawn(async move {
-                            let (decision, mode_override) = events_clone
-                                .request_permission(tool_name, input, suggested)
-                                .await;
-                            tracing::info!(
-                                bridge_request_id = %req_id_for_writer,
-                                ?decision,
-                                has_mode_override = mode_override.is_some(),
-                                "claude-sdk adapter: forwarding permission answer to writer"
-                            );
-                            let _ = perm_tx.send((req_id_for_writer, decision, mode_override));
-                        });
-                    }
-                    "user_question" => {
-                        let request_id = request_id.unwrap_or_default();
-                        let structured = parse_claude_questions(questions.as_ref());
+                            // request_permission() emits its own PermissionRequest event
+                            // with an internal `perm-...` id; do NOT duplicate it here. The
+                            // writer task still uses the bridge's request_id (`request_id`)
+                            // when forwarding the decision back to the bridge, because the
+                            // bridge keeps its own pending-permissions map keyed by that id.
+                            //
+                            // The optional PermissionMode override rides atomically
+                            // with the decision through the oneshot in provider-api,
+                            // so there is no side channel to read here — the
+                            // plan-exit "Approve & Auto-edit" flow Just Works.
+                            let events_clone = events.clone();
+                            let perm_tx = perm_tx.clone();
+                            let req_id_for_writer = request_id;
+                            tokio::spawn(async move {
+                                let (decision, mode_override) = events_clone
+                                    .request_permission(tool_name, input, suggested)
+                                    .await;
+                                tracing::info!(
+                                    bridge_request_id = %req_id_for_writer,
+                                    ?decision,
+                                    has_mode_override = mode_override.is_some(),
+                                    "claude-sdk adapter: forwarding permission answer to writer"
+                                );
+                                let _ = perm_tx.send((req_id_for_writer, decision, mode_override));
+                            });
+                        }
+                        "user_question" => {
+                            let request_id = request_id.unwrap_or_default();
+                            let structured = parse_claude_questions(questions.as_ref());
 
-                        // ask_user() emits its own UserQuestion event with an
-                        // internal `q-...` id; do NOT duplicate it here. The
-                        // writer task still uses the bridge's `request_id` when
-                        // forwarding the answer because the bridge keeps its own
-                        // pendingQuestions map keyed by that id.
-                        let events_clone = events.clone();
-                        let q_tx = q_tx.clone();
-                        let req_id_for_writer = request_id;
-                        tokio::spawn(async move {
-                            let outcome = match events_clone.ask_user(structured).await {
-                                Some(answers) => QuestionOutcome::Answered(answers),
-                                None => QuestionOutcome::Cancelled,
-                            };
-                            let _ = q_tx.send((req_id_for_writer, outcome));
-                        });
-                    }
-                    "turn_usage" => {
-                        if let Some(u) = usage
-                            .and_then(|v| serde_json::from_value::<zenui_provider_api::TokenUsage>(v).ok())
-                        {
-                            events.send(ProviderTurnEvent::TurnUsage { usage: u }).await;
+                            // ask_user() emits its own UserQuestion event with an
+                            // internal `q-...` id; do NOT duplicate it here. The
+                            // writer task still uses the bridge's `request_id` when
+                            // forwarding the answer because the bridge keeps its own
+                            // pendingQuestions map keyed by that id.
+                            let events_clone = events.clone();
+                            let q_tx = q_tx.clone();
+                            let req_id_for_writer = request_id;
+                            tokio::spawn(async move {
+                                let outcome = match events_clone.ask_user(structured).await {
+                                    Some(answers) => QuestionOutcome::Answered(answers),
+                                    None => QuestionOutcome::Cancelled,
+                                };
+                                let _ = q_tx.send((req_id_for_writer, outcome));
+                            });
                         }
-                    }
-                    "rate_limit_update" => {
-                        if let Some(mut info) = rate_limit_info
-                            .and_then(|v| serde_json::from_value::<zenui_provider_api::RateLimitInfo>(v).ok())
-                        {
-                            // Canonicalize the label against the shared
-                            // Rust table so the two Claude adapters always
-                            // agree on phrasing, even if the bridge's
-                            // fallback copy ever drifts (see
-                            // `claude_bucket_label`).
-                            info.label = zenui_provider_api::claude_bucket_label(&info.bucket);
-                            events
-                                .send(ProviderTurnEvent::RateLimitUpdated { info })
-                                .await;
+                        "turn_usage" => {
+                            if let Some(u) = usage.and_then(|v| {
+                                serde_json::from_value::<zenui_provider_api::TokenUsage>(v).ok()
+                            }) {
+                                events.send(ProviderTurnEvent::TurnUsage { usage: u }).await;
+                            }
                         }
-                    }
-                    "model_resolved" => {
-                        // The bridge surfaces the SDK's resolved model
-                        // from `system.init`. Forward to runtime-core so
-                        // `session.summary.model` can be upgraded from an
-                        // alias (e.g. `sonnet`) to the pinned id the SDK
-                        // actually ran with — the model-selector dropdown
-                        // matches on the pinned value and otherwise fails
-                        // to highlight the active entry.
-                        if let Some(m) = model {
-                            if !m.is_empty() {
+                        "rate_limit_update" => {
+                            if let Some(mut info) = rate_limit_info.and_then(|v| {
+                                serde_json::from_value::<zenui_provider_api::RateLimitInfo>(v).ok()
+                            }) {
+                                // Canonicalize the label against the shared
+                                // Rust table so the two Claude adapters always
+                                // agree on phrasing, even if the bridge's
+                                // fallback copy ever drifts (see
+                                // `claude_bucket_label`).
+                                info.label = zenui_provider_api::claude_bucket_label(&info.bucket);
                                 events
-                                    .send(ProviderTurnEvent::ModelResolved { model: m })
+                                    .send(ProviderTurnEvent::RateLimitUpdated { info })
                                     .await;
                             }
                         }
-                    }
-                    "compact_boundary" => {
-                        // SDK is compressing older turns. Metrics
-                        // arrive here; the paired summary text lands
-                        // separately via the PostCompact hook
-                        // (`compact_summary` event). Runtime-core
-                        // merges the pair into one ContentBlock.
-                        let trig = parse_compact_trigger(trigger.as_deref());
-                        events
-                            .send(ProviderTurnEvent::CompactBoundary {
-                                trigger: trig,
-                                pre_tokens,
-                                post_tokens,
-                                duration_ms,
-                            })
-                            .await;
-                    }
-                    "compact_summary" => {
-                        let trig = parse_compact_trigger(trigger.as_deref());
-                        let text = summary.unwrap_or_default();
-                        events
-                            .send(ProviderTurnEvent::CompactSummary {
-                                trigger: trig,
-                                summary: text,
-                            })
-                            .await;
-                    }
-                    "memory_recall" => {
-                        use zenui_provider_api::{
-                            MemoryRecallItem, MemoryRecallMode, MemoryRecallScope,
-                        };
-                        let parsed_mode = match mode.as_deref() {
-                            Some("synthesize") => MemoryRecallMode::Synthesize,
-                            _ => MemoryRecallMode::Select,
-                        };
-                        let items: Vec<MemoryRecallItem> = memories
-                            .as_ref()
-                            .and_then(Value::as_array)
-                            .map(|arr| {
-                                arr.iter()
-                                    .map(|v| {
-                                        let path = v
-                                            .get("path")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let scope = match v
-                                            .get("scope")
-                                            .and_then(Value::as_str)
-                                        {
-                                            Some("team") => MemoryRecallScope::Team,
-                                            _ => MemoryRecallScope::Personal,
-                                        };
-                                        let content = v
-                                            .get("content")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_string);
-                                        MemoryRecallItem {
-                                            path,
-                                            scope,
-                                            content,
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        events
-                            .send(ProviderTurnEvent::MemoryRecall {
-                                mode: parsed_mode,
-                                memories: items,
-                            })
-                            .await;
-                    }
-                    "turn_status" => {
-                        use zenui_provider_api::TurnPhase;
-                        let parsed_phase = match phase.as_deref() {
-                            Some("requesting") => TurnPhase::Requesting,
-                            Some("streaming") => TurnPhase::Streaming,
-                            Some("compacting") => TurnPhase::Compacting,
-                            Some("awaiting_input") => TurnPhase::AwaitingInput,
-                            _ => TurnPhase::Idle,
-                        };
-                        events
-                            .send(ProviderTurnEvent::StatusChanged {
-                                phase: parsed_phase,
-                            })
-                            .await;
-                    }
-                    "api_retry" => {
-                        events
-                            .send(ProviderTurnEvent::TurnRetrying {
-                                attempt: attempt.unwrap_or(1),
-                                max_retries: max_retries.unwrap_or(0),
-                                retry_delay_ms: retry_delay_ms.unwrap_or(0),
-                                error_status,
-                                error: error.unwrap_or_default(),
-                            })
-                            .await;
-                    }
-                    "prompt_suggestion" => {
-                        if let Some(text) = suggestion {
-                            if !text.is_empty() {
-                                events
-                                    .send(ProviderTurnEvent::PromptSuggestion {
-                                        suggestion: text,
-                                    })
-                                    .await;
+                        "model_resolved" => {
+                            // The bridge surfaces the SDK's resolved model
+                            // from `system.init`. Forward to runtime-core so
+                            // `session.summary.model` can be upgraded from an
+                            // alias (e.g. `sonnet`) to the pinned id the SDK
+                            // actually ran with — the model-selector dropdown
+                            // matches on the pinned value and otherwise fails
+                            // to highlight the active entry.
+                            if let Some(m) = model {
+                                if !m.is_empty() {
+                                    events
+                                        .send(ProviderTurnEvent::ModelResolved { model: m })
+                                        .await;
+                                }
                             }
                         }
-                    }
-                    "tool_progress" => {
-                        // Per-tool heartbeat from the SDK. Drives the
-                        // stalled-tool pip on the frontend (a per-tool
-                        // affordance that's strictly more useful than
-                        // the existing 45s session-wide stuck banner).
-                        // We require call_id since it's the join key
-                        // against the live ToolCall; missing call_id
-                        // means we can't attach the heartbeat to a
-                        // tool, so drop the event.
-                        if let Some(cid) = call_id {
-                            // The bridge always stamps `occurred_at`
-                            // before emitting (see the
-                            // `tool_progress` case in
-                            // bridge/src/index.ts), so the
-                            // `unwrap_or_default()` is just a JSON-
-                            // safety net — runtime-core treats an
-                            // empty string the same as no heartbeat
-                            // (the staleness check is `!is_empty()`
-                            // first, then a parse).
+                        "compact_boundary" => {
+                            // SDK is compressing older turns. Metrics
+                            // arrive here; the paired summary text lands
+                            // separately via the PostCompact hook
+                            // (`compact_summary` event). Runtime-core
+                            // merges the pair into one ContentBlock.
+                            let trig = parse_compact_trigger(trigger.as_deref());
                             events
-                                .send(ProviderTurnEvent::ToolProgress {
-                                    call_id: cid,
-                                    tool_name: tool_name.unwrap_or_default(),
-                                    parent_call_id,
-                                    occurred_at: occurred_at.unwrap_or_default(),
+                                .send(ProviderTurnEvent::CompactBoundary {
+                                    trigger: trig,
+                                    pre_tokens,
+                                    post_tokens,
+                                    duration_ms,
                                 })
                                 .await;
                         }
-                    }
-                    other_event => {
-                        forward_stream(
-                            &events,
-                            other_event,
-                            delta,
-                            call_id,
-                            name,
-                            args,
-                            output,
-                            error,
-                            message,
-                            path,
-                            operation,
-                            before,
-                            after,
-                            parent_call_id,
-                            agent_id,
-                            agent_type,
-                            subagent_prompt,
-                            plan_id,
-                            title,
-                            steps,
-                            raw,
-                            nested_event,
-                            model,
-                        )
-                        .await;
-                    }
+                        "compact_summary" => {
+                            let trig = parse_compact_trigger(trigger.as_deref());
+                            let text = summary.unwrap_or_default();
+                            events
+                                .send(ProviderTurnEvent::CompactSummary {
+                                    trigger: trig,
+                                    summary: text,
+                                })
+                                .await;
+                        }
+                        "memory_recall" => {
+                            use zenui_provider_api::{
+                                MemoryRecallItem, MemoryRecallMode, MemoryRecallScope,
+                            };
+                            let parsed_mode = match mode.as_deref() {
+                                Some("synthesize") => MemoryRecallMode::Synthesize,
+                                _ => MemoryRecallMode::Select,
+                            };
+                            let items: Vec<MemoryRecallItem> = memories
+                                .as_ref()
+                                .and_then(Value::as_array)
+                                .map(|arr| {
+                                    arr.iter()
+                                        .map(|v| {
+                                            let path = v
+                                                .get("path")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string();
+                                            let scope = match v.get("scope").and_then(Value::as_str)
+                                            {
+                                                Some("team") => MemoryRecallScope::Team,
+                                                _ => MemoryRecallScope::Personal,
+                                            };
+                                            let content = v
+                                                .get("content")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string);
+                                            MemoryRecallItem {
+                                                path,
+                                                scope,
+                                                content,
+                                            }
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            events
+                                .send(ProviderTurnEvent::MemoryRecall {
+                                    mode: parsed_mode,
+                                    memories: items,
+                                })
+                                .await;
+                        }
+                        "turn_status" => {
+                            use zenui_provider_api::TurnPhase;
+                            let parsed_phase = match phase.as_deref() {
+                                Some("requesting") => TurnPhase::Requesting,
+                                Some("streaming") => TurnPhase::Streaming,
+                                Some("compacting") => TurnPhase::Compacting,
+                                Some("awaiting_input") => TurnPhase::AwaitingInput,
+                                _ => TurnPhase::Idle,
+                            };
+                            events
+                                .send(ProviderTurnEvent::StatusChanged {
+                                    phase: parsed_phase,
+                                })
+                                .await;
+                        }
+                        "api_retry" => {
+                            events
+                                .send(ProviderTurnEvent::TurnRetrying {
+                                    attempt: attempt.unwrap_or(1),
+                                    max_retries: max_retries.unwrap_or(0),
+                                    retry_delay_ms: retry_delay_ms.unwrap_or(0),
+                                    error_status,
+                                    error: error.unwrap_or_default(),
+                                })
+                                .await;
+                        }
+                        "prompt_suggestion" => {
+                            if let Some(text) = suggestion {
+                                if !text.is_empty() {
+                                    events
+                                        .send(ProviderTurnEvent::PromptSuggestion {
+                                            suggestion: text,
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        "tool_progress" => {
+                            // Per-tool heartbeat from the SDK. Drives the
+                            // stalled-tool pip on the frontend (a per-tool
+                            // affordance that's strictly more useful than
+                            // the existing 45s session-wide stuck banner).
+                            // We require call_id since it's the join key
+                            // against the live ToolCall; missing call_id
+                            // means we can't attach the heartbeat to a
+                            // tool, so drop the event.
+                            if let Some(cid) = call_id {
+                                // The bridge always stamps `occurred_at`
+                                // before emitting (see the
+                                // `tool_progress` case in
+                                // bridge/src/index.ts), so the
+                                // `unwrap_or_default()` is just a JSON-
+                                // safety net — runtime-core treats an
+                                // empty string the same as no heartbeat
+                                // (the staleness check is `!is_empty()`
+                                // first, then a parse).
+                                events
+                                    .send(ProviderTurnEvent::ToolProgress {
+                                        call_id: cid,
+                                        tool_name: tool_name.unwrap_or_default(),
+                                        parent_call_id,
+                                        occurred_at: occurred_at.unwrap_or_default(),
+                                    })
+                                    .await;
+                            }
+                        }
+                        other_event => {
+                            forward_stream(
+                                &events,
+                                other_event,
+                                delta,
+                                call_id,
+                                name,
+                                args,
+                                output,
+                                error,
+                                message,
+                                path,
+                                operation,
+                                before,
+                                after,
+                                parent_call_id,
+                                agent_id,
+                                agent_type,
+                                subagent_prompt,
+                                plan_id,
+                                title,
+                                steps,
+                                raw,
+                                nested_event,
+                                model,
+                            )
+                            .await;
+                        }
                     }
                 }
                 BridgeResponse::RpcResponse {
@@ -903,18 +896,14 @@ impl ClaudeSdkAdapter {
                     let payload = match (payload, error) {
                         (_, Some(err)) => Err(err),
                         (Some(value), None) => Ok(value),
-                        (None, None) => Err(
-                            "bridge rpc_response had neither payload nor error"
-                                .to_string(),
-                        ),
+                        (None, None) => {
+                            Err("bridge rpc_response had neither payload nor error".to_string())
+                        }
                     };
                     if let Some(sender) = sender_opt {
-                        let _ =
-                            sender.send(BridgeRpcResponse { kind, payload });
+                        let _ = sender.send(BridgeRpcResponse { kind, payload });
                     } else {
-                        debug!(
-                            "bridge rpc_response for unknown request_id: {request_id}"
-                        );
+                        debug!("bridge rpc_response for unknown request_id: {request_id}");
                     }
                 }
                 other => {
@@ -1038,9 +1027,8 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         // collapse to None so the bridge falls back to the SDK's
         // default Claude Code preset (no `append`). The metadata key
         // is camelCase to match `ProviderSessionState`'s serde shape.
-        let compact_custom_instructions = read_compact_custom_instructions(
-            session.provider_state.as_ref(),
-        );
+        let compact_custom_instructions =
+            read_compact_custom_instructions(session.provider_state.as_ref());
         let result = self
             .run_turn(
                 cached,
@@ -1201,10 +1189,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         // only pick up what our UI surfaces today (totals +
         // category list). Extra fields we ignore flow through
         // untouched for providers that want them later.
-        let total_tokens = raw
-            .get("totalTokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let total_tokens = raw.get("totalTokens").and_then(Value::as_u64).unwrap_or(0);
         let max_tokens = raw.get("maxTokens").and_then(Value::as_u64).unwrap_or(0);
         let categories: Vec<zenui_provider_api::ContextCategory> = raw
             .get("categories")
@@ -1217,14 +1202,8 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                        tokens: c
-                            .get("tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        color: c
-                            .get("color")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
+                        tokens: c.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                        color: c.get("color").and_then(Value::as_str).map(str::to_string),
                     })
                     .collect()
             })
@@ -1243,13 +1222,11 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         // off the init response — no actual SDK call is made.
         let mut bridge = self.spawn_bridge().await?;
         write_request(&bridge.stdin, &BridgeRequest::ListModels).await?;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            bridge.read_response(),
-        )
-        .await
-        .map_err(|_| "Timeout fetching Claude models".to_string())?
-        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), bridge.read_response())
+                .await
+                .map_err(|_| "Timeout fetching Claude models".to_string())?
+                .map_err(|e| format!("Bridge read error: {e}"))?;
         let _ = bridge.child.start_kill();
 
         match response {
@@ -1267,13 +1244,9 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                     let enriched: Vec<ProviderModel> = models
                         .into_iter()
                         .map(|m| {
-                            if let Some(cap) =
-                                capabilities.iter().find(|c| c.value == m.value)
-                            {
+                            if let Some(cap) = capabilities.iter().find(|c| c.value == m.value) {
                                 ProviderModel {
-                                    context_window: m
-                                        .context_window
-                                        .or(cap.context_window),
+                                    context_window: m.context_window.or(cap.context_window),
                                     max_output_tokens: m
                                         .max_output_tokens
                                         .or(cap.max_output_tokens),
@@ -1318,10 +1291,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         // response) fall back to disk-only — the popup is a UX
         // affordance, not something a failure should propagate.
         let capabilities = self
-            .fetch_capabilities(
-                session.cwd.clone(),
-                session.summary.model.clone(),
-            )
+            .fetch_capabilities(session.cwd.clone(), session.summary.model.clone())
             .await;
         let (sdk_commands, sdk_agents, sdk_mcp) = match capabilities {
             Ok(c) => c,
@@ -1362,10 +1332,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         let mcp_servers = sdk_mcp
             .into_iter()
             .map(|m| McpServerInfo {
-                enabled: matches!(
-                    m.status.as_deref(),
-                    Some("connected") | Some("pending")
-                ),
+                enabled: matches!(m.status.as_deref(), Some("connected") | Some("pending")),
                 id: format!("claude:mcp:{}", m.name),
                 name: m.name,
             })
@@ -1388,23 +1355,18 @@ impl ClaudeSdkAdapter {
         &self,
         cwd: Option<String>,
         model: Option<String>,
-    ) -> Result<
-        (Vec<BridgeCommand>, Vec<BridgeAgent>, Vec<BridgeMcpServer>),
-        String,
-    > {
+    ) -> Result<(Vec<BridgeCommand>, Vec<BridgeAgent>, Vec<BridgeMcpServer>), String> {
         let mut bridge = self.spawn_bridge().await?;
         write_request(
             &bridge.stdin,
             &BridgeRequest::ListCapabilities { cwd, model },
         )
         .await?;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            bridge.read_response(),
-        )
-        .await
-        .map_err(|_| "Timeout listing Claude capabilities".to_string())?
-        .map_err(|e| format!("Bridge read error: {e}"))?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), bridge.read_response())
+                .await
+                .map_err(|_| "Timeout listing Claude capabilities".to_string())?
+                .map_err(|e| format!("Bridge read error: {e}"))?;
         let _ = bridge.child.start_kill();
 
         match response {

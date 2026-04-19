@@ -98,8 +98,8 @@ impl Bound for HttpBound {
             .std_listener
             .take()
             .expect("HttpBound::serve called twice");
-        let listener = TcpListener::from_std(std_listener)
-            .context("failed to move listener into tokio")?;
+        let listener =
+            TcpListener::from_std(std_listener).context("failed to move listener into tokio")?;
 
         let address = self.address;
         let ws_url = format!("ws://{address}/ws");
@@ -321,7 +321,10 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
                     }
                     let mut send_failed = false;
                     for session in sub_runtime.active_session_details().await {
-                        if sub_tx.send(ServerMessage::SessionLoaded { session }).is_err() {
+                        if sub_tx
+                            .send(ServerMessage::SessionLoaded { session })
+                            .is_err()
+                        {
                             send_failed = true;
                             break;
                         }
@@ -342,7 +345,8 @@ async fn handle_socket(socket: WebSocket, state: ApiState) {
                     let runtime = state.runtime.clone();
                     let tx = out_tx.clone();
                     tokio::spawn(async move {
-                        if let Some(response) = runtime.handle_client_message(client_message).await {
+                        if let Some(response) = runtime.handle_client_message(client_message).await
+                        {
                             let _ = tx.send(response);
                         }
                     });

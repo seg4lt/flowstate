@@ -81,8 +81,8 @@ fn walk_path_for_binary(name: &str) -> Option<PathBuf> {
 /// Linux and macOS don't decorate executables with suffixes.
 fn executable_extensions() -> Vec<String> {
     if cfg!(windows) {
-        let pathext = std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
         let mut exts: Vec<String> = pathext
             .split(';')
             .filter(|e| !e.is_empty())
@@ -110,18 +110,32 @@ fn platform_fallbacks(name: &str) -> Vec<PathBuf> {
             );
         }
         if let Some(app_data) = std::env::var_os("APPDATA") {
-            paths.push(PathBuf::from(&app_data).join("npm").join(format!("{name}.cmd")));
-            paths.push(PathBuf::from(&app_data).join("npm").join(format!("{name}.exe")));
+            paths.push(
+                PathBuf::from(&app_data)
+                    .join("npm")
+                    .join(format!("{name}.cmd")),
+            );
+            paths.push(
+                PathBuf::from(&app_data)
+                    .join("npm")
+                    .join(format!("{name}.exe")),
+            );
         }
-        paths.push(PathBuf::from(format!("C:\\Program Files\\{name}\\{name}.exe")));
-        paths.push(PathBuf::from(format!("C:\\Program Files (x86)\\{name}\\{name}.exe")));
+        paths.push(PathBuf::from(format!(
+            "C:\\Program Files\\{name}\\{name}.exe"
+        )));
+        paths.push(PathBuf::from(format!(
+            "C:\\Program Files (x86)\\{name}\\{name}.exe"
+        )));
     } else {
         if let Some(home) = std::env::var_os("HOME") {
             paths.push(PathBuf::from(&home).join(".local").join("bin").join(name));
         }
         paths.push(PathBuf::from(format!("/opt/homebrew/bin/{name}")));
         paths.push(PathBuf::from(format!("/usr/local/bin/{name}")));
-        paths.push(PathBuf::from(format!("/home/linuxbrew/.linuxbrew/bin/{name}")));
+        paths.push(PathBuf::from(format!(
+            "/home/linuxbrew/.linuxbrew/bin/{name}"
+        )));
         paths.push(PathBuf::from(format!("/usr/bin/{name}")));
     }
 
@@ -144,8 +158,14 @@ mod tests {
             "expected to resolve `{name}` via PATH walk"
         );
         let path = resolved.unwrap();
-        assert!(path.is_absolute(), "resolved path must be absolute: {path:?}");
-        assert!(path.is_file(), "resolved path must point to a file: {path:?}");
+        assert!(
+            path.is_absolute(),
+            "resolved path must be absolute: {path:?}"
+        );
+        assert!(
+            path.is_file(),
+            "resolved path must point to a file: {path:?}"
+        );
     }
 
     #[test]

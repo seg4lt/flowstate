@@ -67,8 +67,7 @@ impl ReadyFile {
             .with_context(|| format!("canonicalize {}", project_root.display()))?;
         let digest = short_hash(canonical.to_string_lossy().as_bytes());
         let dir = runtime_dir()?.join("zenui");
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         Ok(Self {
             path: dir.join(format!("daemon-{digest}.json")),
         })

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use fff_search::file_picker::{FFFMode, FilePicker, FilePickerOptions};
-use fff_search::grep::{GrepMode, GrepResult, GrepSearchOptions, grep_search};
+use fff_search::grep::{grep_search, GrepMode, GrepResult, GrepSearchOptions};
 use fff_search::types::{ContentCacheBudget, FileItem};
 use fff_search::{GrepConfig, QueryParser, SharedFrecency, SharedPicker};
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -213,9 +213,7 @@ impl FileIndexRegistry {
             .map_err(|e| format!("FilePicker init for {}: {e}", canon.display()))?;
 
         let scan_signal = {
-            let g = picker
-                .read()
-                .map_err(|e| format!("picker read: {e}"))?;
+            let g = picker.read().map_err(|e| format!("picker read: {e}"))?;
             match g.as_ref() {
                 Some(p) => p.scan_signal(),
                 None => Arc::new(AtomicBool::new(false)),
@@ -315,7 +313,10 @@ pub fn search_file_contents(
     let handle = registry.get_or_init(project_path)?;
     let _ = handle.wait_for_scan(SEARCH_WAIT_MS);
 
-    let guard = handle.picker.read().map_err(|e| format!("picker read: {e}"))?;
+    let guard = handle
+        .picker
+        .read()
+        .map_err(|e| format!("picker read: {e}"))?;
     let picker = guard.as_ref().ok_or("picker not ready")?;
     let files_slice = picker.get_files();
 
@@ -704,13 +705,21 @@ impl SearchTasks {
 
     /// Deregister a token (call on completion).
     pub fn unregister(&self, token: u64) {
-        self.tasks.lock().expect("SearchTasks poisoned").remove(&token);
+        self.tasks
+            .lock()
+            .expect("SearchTasks poisoned")
+            .remove(&token);
     }
 
     /// Signal cancellation for `token`. Idempotent and lock-free
     /// after the take.
     pub fn cancel(&self, token: u64) {
-        if let Some(flag) = self.tasks.lock().expect("SearchTasks poisoned").remove(&token) {
+        if let Some(flag) = self
+            .tasks
+            .lock()
+            .expect("SearchTasks poisoned")
+            .remove(&token)
+        {
             flag.store(true, Ordering::SeqCst);
         }
     }
@@ -732,10 +741,10 @@ mod tests {
     use super::*;
 
     fn block_opts(inc: Vec<&str>, exc: Vec<&str>) -> (Option<GlobSet>, Option<GlobSet>) {
-        let inc = build_globset(&inc.into_iter().map(|s| s.to_string()).collect::<Vec<_>>())
-            .unwrap();
-        let exc = build_globset(&exc.into_iter().map(|s| s.to_string()).collect::<Vec<_>>())
-            .unwrap();
+        let inc =
+            build_globset(&inc.into_iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
+        let exc =
+            build_globset(&exc.into_iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap();
         (inc, exc)
     }
 

@@ -22,8 +22,7 @@ pub struct SpawnLock {
 pub fn acquire_spawn_lock(project_root: &Path) -> Result<SpawnLock> {
     let lock_path = spawn_lock_path(project_root)?;
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let file = OpenOptions::new()
         .create(true)
@@ -47,10 +46,8 @@ pub fn acquire_spawn_lock(project_root: &Path) -> Result<SpawnLock> {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(err) => {
-                return Err(err).context(format!(
-                    "advisory lock on {} failed",
-                    lock_path.display()
-                ));
+                return Err(err)
+                    .context(format!("advisory lock on {} failed", lock_path.display()));
             }
         }
     }

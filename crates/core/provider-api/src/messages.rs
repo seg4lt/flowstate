@@ -484,18 +484,36 @@ pub enum ClientMessage {
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    Welcome { bootstrap: BootstrapPayload },
-    Snapshot { snapshot: AppSnapshot },
-    SessionLoaded { session: SessionDetail },
-    SessionCreated { session: SessionSummary },
+    Welcome {
+        bootstrap: BootstrapPayload,
+    },
+    Snapshot {
+        snapshot: AppSnapshot,
+    },
+    SessionLoaded {
+        session: SessionDetail,
+    },
+    SessionCreated {
+        session: SessionSummary,
+    },
     Pong,
-    Ack { message: String },
-    Event { event: RuntimeEvent },
-    Error { message: String },
-    ArchivedSessionsList { sessions: Vec<SessionSummary> },
+    Ack {
+        message: String,
+    },
+    Event {
+        event: RuntimeEvent,
+    },
+    Error {
+        message: String,
+    },
+    ArchivedSessionsList {
+        sessions: Vec<SessionSummary>,
+    },
     /// Response to `ClientMessage::GetAttachment`. Carries the full
     /// bytes of a persisted image.
-    Attachment { data: AttachmentData },
+    Attachment {
+        data: AttachmentData,
+    },
     /// Response to `ClientMessage::GetContextUsage`. `breakdown` is
     /// `None` when the provider doesn't support the RPC (default
     /// `Ok(None)` from the adapter), which the frontend treats as

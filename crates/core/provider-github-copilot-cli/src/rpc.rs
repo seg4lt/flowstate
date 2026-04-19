@@ -17,10 +17,7 @@ pub(crate) async fn write_rpc_frame(stdin: &Mutex<ChildStdin>, msg: &Value) -> R
         .write_all(frame.as_bytes())
         .await
         .map_err(|e| format!("rpc write: {e}"))?;
-    guard
-        .flush()
-        .await
-        .map_err(|e| format!("rpc flush: {e}"))
+    guard.flush().await.map_err(|e| format!("rpc flush: {e}"))
 }
 
 /// Read one Content-Length-framed JSON-RPC message from the reader.
