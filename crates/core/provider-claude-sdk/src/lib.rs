@@ -906,6 +906,43 @@ impl ClaudeSdkAdapter {
                         debug!("bridge rpc_response for unknown request_id: {request_id}");
                     }
                 }
+                BridgeResponse::RuntimeCallRequest {
+                    request_id,
+                    tool_name,
+                    args,
+                } => {
+                    // The agent called a flowstate_* capability tool.
+                    // Parse into a typed RuntimeCall, dispatch through
+                    // the sink (which routes to runtime-core), then
+                    // write the encoded result back to the bridge so
+                    // its pending MCP tool promise resolves. All the
+                    // round-trip plumbing lives in `TurnEventSink::runtime_call`
+                    // and the bridge RPC — orchestration dispatch is
+                    // provider-agnostic by design.
+                    let sink = events.clone();
+                    let stdin = process.stdin.clone();
+                    tokio::spawn(async move {
+                        let result = match zenui_provider_api::parse_runtime_call(&tool_name, &args)
+                        {
+                            Ok(call) => sink.runtime_call(call).await,
+                            Err(message) => {
+                                Err(zenui_provider_api::RuntimeCallError::Internal { message })
+                            }
+                        };
+                        let (payload, error) = match result {
+                            Ok(r) => (Some(zenui_provider_api::encode_runtime_result(&r)), None),
+                            Err(e) => (None, Some(zenui_provider_api::encode_runtime_error(&e))),
+                        };
+                        let resp = BridgeRequest::RuntimeCallResponse {
+                            request_id,
+                            payload,
+                            error,
+                        };
+                        if let Err(err) = write_request(&stdin, &resp).await {
+                            warn!(%err, "failed to write runtime_call_response to bridge");
+                        }
+                    });
+                }
                 other => {
                     debug!("Unexpected mid-stream bridge message: {:?}", other);
                 }

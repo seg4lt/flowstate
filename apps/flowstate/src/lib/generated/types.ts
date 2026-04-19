@@ -38,6 +38,8 @@ export type RateLimitStatus = "allowed" | "allowed_warning" | "rejected";
 
 export type TurnPhase = "idle" | "requesting" | "streaming" | "compacting" | "awaiting_input";
 
+export type SessionLinkReason = "spawn" | "send";
+
 export type PlanStep = { title: string, detail?: string, };
 
 export type PlanRecord = { planId: string, title: string, steps: Array<PlanStep>, raw: string, status: PlanStatus, };
@@ -99,6 +101,22 @@ startedAt?: string,
  */
 lastProgressAt?: string, };
 
+export type AgentUsage = { 
+/**
+ * SDK tool-use id of the Task/Agent that spawned this sub-agent.
+ * `None` identifies the main (parent) agent bucket.
+ */
+agentId?: string, 
+/**
+ * Sub-agent catalog type, e.g. `"Explore"`, `"general-purpose"`.
+ * `None` for the main agent.
+ */
+agentType?: string, 
+/**
+ * Model the provider actually ran this agent on, when known.
+ */
+model?: string, inputTokens: number, outputTokens: number, cacheReadTokens: number, cacheWriteTokens: number, };
+
 export type TokenUsage = { inputTokens: number, outputTokens: number, 
 /**
  * Tokens written to the provider's prompt cache this turn.
@@ -126,7 +144,17 @@ contextWindow?: number,
  * inflation bug). Absent on providers that don't expose per-call
  * usage; consumers fall back to the aggregate sum in that case.
  */
-liveContextTokens?: number, totalCostUsd?: number, durationMs?: number, model?: string, };
+liveContextTokens?: number, totalCostUsd?: number, durationMs?: number, model?: string, 
+/**
+ * Per-agent token breakdown within this turn. When present, the
+ * sum of every entry's token fields equals the turn-level
+ * `input_tokens` / `output_tokens` / `cache_*` totals above, so
+ * dashboards can allocate `total_cost_usd` across agents
+ * proportionally without double-counting. Absent for providers
+ * that can't attribute per-agent tokens, in which case consumers
+ * treat the whole turn as one "main agent" bucket.
+ */
+agents?: Array<AgentUsage>, };
 
 export type RateLimitInfo = { 
 /**
@@ -378,7 +406,7 @@ export type RuntimeEvent = { "type": "runtime_ready", message: string, } | { "ty
  * they clicked). Frontend uses this to scroll / focus the
  * originating user message.
  */
-turn_id: string, paths_restored: Array<string>, paths_deleted: Array<string>, } | { "type": "turn_completed", session_id: string, session: SessionSummary, turn: TurnRecord, } | { "type": "session_interrupted", session: SessionSummary, message: string, } | { "type": "session_deleted", session_id: string, } | { "type": "permission_requested", session_id: string, turn_id: string, request_id: string, tool_name: string, input: JsonValue, suggested: PermissionDecision, } | { "type": "user_question_asked", session_id: string, turn_id: string, request_id: string, questions: Array<UserInputQuestion>, } | { "type": "file_changed", session_id: string, turn_id: string, call_id: string, path: string, operation: FileOperation, before?: string, after?: string, } | { "type": "subagent_started", session_id: string, turn_id: string, parent_call_id: string, agent_id: string, agent_type: string, prompt: string, model?: string, } | { "type": "subagent_event", session_id: string, turn_id: string, agent_id: string, event: JsonValue, } | { "type": "subagent_completed", session_id: string, turn_id: string, agent_id: string, output: string, error?: string, } | { "type": "subagent_model_observed", session_id: string, turn_id: string, agent_id: string, model: string, } | { "type": "plan_proposed", session_id: string, turn_id: string, plan_id: string, title: string, steps: Array<PlanStep>, raw: string, } | { "type": "compact_updated", session_id: string, turn_id: string, trigger: CompactTrigger, pre_tokens?: number, post_tokens?: number, duration_ms?: number, summary?: string, } | { "type": "memory_recalled", session_id: string, turn_id: string, mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, } | { "type": "turn_status_changed", session_id: string, turn_id: string, phase: TurnPhase, } | { "type": "turn_usage_updated", session_id: string, turn_id: string, usage: TokenUsage, } | { "type": "turn_retrying", session_id: string, turn_id: string, attempt: number, max_retries: number, retry_delay_ms: number, error_status?: number, error: string, } | { "type": "prompt_suggested", session_id: string, turn_id: string, suggestion: string, } | { "type": "error", message: string, } | { "type": "info", message: string, } | { "type": "provider_models_updated", provider: ProviderKind, models: Array<ProviderModel>, } | { "type": "provider_health_updated", status: ProviderStatus, } | { "type": "rate_limit_updated", info: RateLimitInfo, } | { "type": "project_created", project: ProjectRecord, } | { "type": "project_deleted", project_id: string, reassigned_session_ids: Array<string>, } | { "type": "session_project_assigned", session_id: string, project_id?: string, } | { "type": "session_model_updated", session_id: string, model: string, } | { "type": "session_archived", session_id: string, } | { "type": "session_unarchived", session: SessionSummary, } | { "type": "session_command_catalog_updated", session_id: string, catalog: CommandCatalog, };
+turn_id: string, paths_restored: Array<string>, paths_deleted: Array<string>, } | { "type": "turn_completed", session_id: string, session: SessionSummary, turn: TurnRecord, } | { "type": "session_interrupted", session: SessionSummary, message: string, } | { "type": "session_deleted", session_id: string, } | { "type": "permission_requested", session_id: string, turn_id: string, request_id: string, tool_name: string, input: JsonValue, suggested: PermissionDecision, } | { "type": "user_question_asked", session_id: string, turn_id: string, request_id: string, questions: Array<UserInputQuestion>, } | { "type": "file_changed", session_id: string, turn_id: string, call_id: string, path: string, operation: FileOperation, before?: string, after?: string, } | { "type": "subagent_started", session_id: string, turn_id: string, parent_call_id: string, agent_id: string, agent_type: string, prompt: string, model?: string, } | { "type": "subagent_event", session_id: string, turn_id: string, agent_id: string, event: JsonValue, } | { "type": "subagent_completed", session_id: string, turn_id: string, agent_id: string, output: string, error?: string, } | { "type": "subagent_model_observed", session_id: string, turn_id: string, agent_id: string, model: string, } | { "type": "plan_proposed", session_id: string, turn_id: string, plan_id: string, title: string, steps: Array<PlanStep>, raw: string, } | { "type": "compact_updated", session_id: string, turn_id: string, trigger: CompactTrigger, pre_tokens?: number, post_tokens?: number, duration_ms?: number, summary?: string, } | { "type": "memory_recalled", session_id: string, turn_id: string, mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, } | { "type": "turn_status_changed", session_id: string, turn_id: string, phase: TurnPhase, } | { "type": "turn_usage_updated", session_id: string, turn_id: string, usage: TokenUsage, } | { "type": "turn_retrying", session_id: string, turn_id: string, attempt: number, max_retries: number, retry_delay_ms: number, error_status?: number, error: string, } | { "type": "prompt_suggested", session_id: string, turn_id: string, suggestion: string, } | { "type": "error", message: string, } | { "type": "info", message: string, } | { "type": "provider_models_updated", provider: ProviderKind, models: Array<ProviderModel>, } | { "type": "provider_health_updated", status: ProviderStatus, } | { "type": "rate_limit_updated", info: RateLimitInfo, } | { "type": "project_created", project: ProjectRecord, } | { "type": "project_deleted", project_id: string, reassigned_session_ids: Array<string>, } | { "type": "session_project_assigned", session_id: string, project_id?: string, } | { "type": "session_model_updated", session_id: string, model: string, } | { "type": "session_archived", session_id: string, } | { "type": "session_unarchived", session: SessionSummary, } | { "type": "session_command_catalog_updated", session_id: string, catalog: CommandCatalog, } | { "type": "session_linked", from_session_id: string, to_session_id: string, reason: SessionLinkReason, };
 
 export type ClientMessage = { "type": "ping" } | { "type": "load_snapshot" } | { "type": "load_session", session_id: string, 
 /**

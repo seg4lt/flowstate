@@ -46,17 +46,11 @@ import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { readDefaultProvider, DEFAULT_PROVIDER } from "@/lib/defaults-settings";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import { useTerminal } from "@/stores/terminal-store";
+import { normPath } from "@/lib/worktree-utils";
 import type {
   AggregatedFileDiff,
 } from "@/lib/git-diff-stream";
 import type { ProviderKind, SessionSummary } from "@/lib/types";
-
-/** Strip trailing slash for path comparison — git's porcelain output
- * and the file picker may disagree on a trailing `/`. */
-function normPath(p: string | null): string {
-  if (!p) return "";
-  return p.endsWith("/") ? p.slice(0, -1) : p;
-}
 
 interface EditorChoice {
   id: string;
@@ -315,15 +309,31 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
         const isMain =
           normPath(wt.path) === normPath(projectPath) ||
           normPath(wt.path) === normPath(gitRoot);
+        // Compare with normalized paths so a trailing-slash mismatch
+        // between git's porcelain and the project record doesn't
+        // cause us to double-create a project for the same worktree.
+        const wtNorm = normPath(wt.path);
         let wtProjectId =
-          state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
+          state.projects.find((p) => normPath(p.path) === wtNorm)
+            ?.projectId ?? null;
         if (!wtProjectId) {
           const name = wt.branch ?? "(worktree)";
-          wtProjectId = await createProject(wt.path, name);
-          if (!isMain) {
-            await linkProjectWorktree(wtProjectId, projectId, wt.branch);
-          }
-        } else if (!isMain && !state.projectWorktrees.has(wtProjectId)) {
+          // Atomic create+link: dispatch project_created, display name,
+          // and the parent-worktree link together so the sidebar never
+          // renders an intermediate "Untitled project" at the top level
+          // while Tauri persistence catches up.
+          wtProjectId = await createProject(
+            wt.path,
+            name,
+            isMain ? undefined : { parentProjectId: projectId, branch: wt.branch },
+          );
+        } else if (
+          !isMain &&
+          wtProjectId !== projectId &&
+          !state.projectWorktrees.has(wtProjectId)
+        ) {
+          // Existing project recovered from a prior partial failure —
+          // re-link it so it groups under the parent again.
           await linkProjectWorktree(wtProjectId, projectId, wt.branch);
         }
 

@@ -30,6 +30,7 @@ import { gitBranchListQueryOptions } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import { useApp } from "@/stores/app-store";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
+import { samePath } from "@/lib/worktree-utils";
 import type { ProviderKind } from "@/lib/types";
 
 interface BranchSwitcherProps {
@@ -215,15 +216,30 @@ export function BranchSwitcher({
   // group worktree threads under the main repo's project header.
   const openWorktreeSession = React.useCallback(
     async (wt: GitWorktree) => {
+      // Normalize path comparisons — git porcelain and the file picker
+      // can disagree on trailing slashes, and a mismatch here means we
+      // double-create a project for the same worktree path and/or skip
+      // the parent-link, which leaves the worktree thread as a
+      // top-level project in the sidebar instead of grouped under the
+      // main repo.
       let wtProjectId =
-        state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
+        state.projects.find((p) => samePath(p.path, wt.path))?.projectId ??
+        null;
 
-      const isParent = wtProjectId === parentProjectId;
       if (!wtProjectId) {
         const displayName = wt.branch ?? "(worktree)";
-        wtProjectId = await createProject(wt.path, displayName);
-        await linkProjectWorktree(wtProjectId, parentProjectId, wt.branch);
-      } else if (!isParent && !state.projectWorktrees.has(wtProjectId)) {
+        // Create + link in one flow so the parent link lands in the
+        // same render as project_created — avoids a top-level
+        // "Untitled project" flash before the worktree regroups.
+        wtProjectId = await createProject(wt.path, displayName, {
+          parentProjectId,
+          branch: wt.branch,
+        });
+      } else if (
+        wtProjectId !== parentProjectId &&
+        !state.projectWorktrees.has(wtProjectId)
+      ) {
+        // Existing project that somehow lost its parent row — relink.
         await linkProjectWorktree(wtProjectId, parentProjectId, wt.branch);
       }
 

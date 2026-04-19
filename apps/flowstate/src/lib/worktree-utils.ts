@@ -2,6 +2,26 @@
 // branch-switcher.tsx so both the BranchSwitcher popover and the
 // project-home CreateWorktreeDialog can reuse the same logic.
 
+/** Strip trailing slash so paths coming from git porcelain, the
+ *  file picker, and our own state all compare equal. Used by every
+ *  "is this worktree the main project?" and "do we already have a
+ *  project for this worktree path?" check — without this the sidebar
+ *  can double-create projects and fail to group worktree threads
+ *  under their parent project. */
+export function normPath(p: string | null | undefined): string {
+  if (!p) return "";
+  return p.endsWith("/") ? p.slice(0, -1) : p;
+}
+
+/** True when two filesystem paths refer to the same folder, tolerating
+ *  trailing-slash differences. */
+export function samePath(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  return normPath(a) === normPath(b);
+}
+
 // Derive the on-disk folder path for a new worktree. Convention:
 // `<base>/<project-name>-worktrees/<project-name>-<sanitized>`
 // where `<base>` is either the user's configured worktree base path

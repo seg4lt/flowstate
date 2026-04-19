@@ -1,7 +1,9 @@
 mod internals;
+pub mod orchestration;
 pub mod session_ops;
 pub mod transport;
 
+pub use orchestration::OrchestrationState;
 pub use session_ops::OrchestrationService;
 
 use internals::{
@@ -17,11 +19,16 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use zenui_persistence::{FileCheckpointStore, PersistenceService};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
-    ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, ProviderAdapter,
-    ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent, ReasoningEffort,
-    RuntimeEvent, ServerMessage, SessionDetail, SessionStatus, SubagentRecord, SubagentStatus,
-    TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput,
-    UserInputAnswer,
+    ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, PollOutcome,
+    ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
+    ReasoningEffort, RuntimeCall, RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult,
+    RuntimeEvent, ServerMessage, SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord,
+    SubagentStatus, TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus,
+    UserInput, UserInputAnswer,
+};
+
+use crate::orchestration::{
+    PendingReply, clamp_timeout, poll_result_from_turn, resolve_pending_reply,
 };
 
 const MODEL_CACHE_TTL_HOURS: i64 = 24;
@@ -56,6 +63,99 @@ pub trait ConnectionObserver: Send + Sync {
     /// `daemon-core` instead of leaking into the shared runtime.
     fn status(&self) -> Option<serde_json::Value> {
         None
+    }
+}
+
+/// Read-side hook that lets the host app inject display-layer metadata
+/// — session titles, project names — into the orchestration dispatcher.
+///
+/// runtime-core's persistence only stores SDK-level state (session_id,
+/// provider, status, ...); user-facing titles and names live in the
+/// host app's own store (flowstate's `session_display` /
+/// `project_display` tables). Rather than duplicating that data or
+/// moving it into runtime-core, we accept a lazy resolver — the
+/// dispatcher calls into it when building tool responses. An agent
+/// running `list_sessions` then sees the same titles a human sees in
+/// the sidebar.
+///
+/// Default (no provider installed): titles and names are `None` and
+/// agents fall back to `firstInputPreview` for disambiguation.
+#[async_trait::async_trait]
+pub trait AppMetadataProvider: Send + Sync {
+    async fn session_title(&self, session_id: &str) -> Option<String>;
+    async fn project_name(&self, project_id: &str) -> Option<String>;
+}
+
+/// Host-provided git worktree creator. Runtime-core has no git
+/// knowledge — this trait lets the Tauri app layer (which already
+/// owns `create_git_worktree` / `list_git_worktrees` commands) expose
+/// that capability to the orchestration dispatcher so agents can spawn
+/// a session directly into a new worktree.
+///
+/// Implementations are responsible for the full round-trip:
+/// 1. Run `git worktree add …` at a path derived from the parent.
+/// 2. Create an SDK project row for the new worktree via persistence.
+/// 3. Link it to the parent in whatever host-side table tracks
+///    worktree ancestry (flowstate's `project_worktree`).
+/// 4. Return a `WorktreeBlueprint` describing the new state.
+///
+/// Missing implementation = `RuntimeCall::CreateWorktree` /
+/// `SpawnInWorktree` / `ListWorktrees` return `Internal` errors with
+/// a "worktree support not available" message.
+#[async_trait::async_trait]
+pub trait WorktreeProvisioner: Send + Sync {
+    /// Create a new git worktree off `base_project_id` and an SDK
+    /// project row to go with it. Returns the new project id + path +
+    /// branch info.
+    ///
+    /// - `branch` — the branch the worktree will check out. If
+    ///   `create_branch` is true, git creates it from `base_ref`
+    ///   (default: HEAD of the base project).
+    /// - `base_ref` — ignored when `create_branch` is false.
+    /// - `create_branch` — true: `git worktree add -b <branch>`;
+    ///   false: `git worktree add <path> <branch>` (checks out
+    ///   existing branch).
+    async fn create_worktree(
+        &self,
+        base_project_id: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        create_branch: bool,
+    ) -> Result<WorktreeBlueprint, String>;
+
+    /// List worktrees. If `base_project_id` is `Some(pid)`, restrict to
+    /// worktrees whose parent is `pid`; otherwise return every known
+    /// worktree.
+    async fn list_worktrees(
+        &self,
+        base_project_id: Option<&str>,
+    ) -> Result<Vec<WorktreeBlueprint>, String>;
+}
+
+/// Description of a git worktree as the runtime sees it — the new
+/// SDK project id, its on-disk path, the branch, and the parent
+/// project it descends from. Returned by [`WorktreeProvisioner`] and
+/// carried in [`zenui_provider_api::RuntimeCallResult::Worktree`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeBlueprint {
+    pub project_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_project_id: Option<String>,
+}
+
+/// Translate the runtime-core blueprint into the provider-api wire
+/// shape the dispatcher returns. Keeps the provider-api crate free of
+/// a runtime-core dependency.
+fn blueprint_to_summary(bp: WorktreeBlueprint) -> zenui_provider_api::WorktreeSummary {
+    zenui_provider_api::WorktreeSummary {
+        project_id: bp.project_id,
+        path: bp.path,
+        branch: bp.branch,
+        parent_project_id: bp.parent_project_id,
     }
 }
 
@@ -161,6 +261,29 @@ pub struct RuntimeCore {
     /// is steering.
     turn_finalized_notifiers: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
+    /// Cross-session orchestration state: pending reply oneshots,
+    /// async-message mailboxes, awaiting-graph for cycle detection,
+    /// per-turn budget counter. See `orchestration.rs` for the full
+    /// lifecycle. Always `Some` after construction; wrapped in Arc so
+    /// spawned tasks can clone it cheaply.
+    orchestration_state: Arc<OrchestrationState>,
+    /// Back-reference used by the drain-loop hook to spawn dispatcher
+    /// tasks that outlive the originating `send_turn` call (e.g. a
+    /// `SpawnAndAwait` that blocks until the target session's turn
+    /// completes). Installed by `install_self_ref` right after
+    /// `Arc::new(RuntimeCore::new(...))`; left as `None` on pure
+    /// unit-test builds that never spawn cross-session work.
+    self_weak: std::sync::RwLock<Option<std::sync::Weak<RuntimeCore>>>,
+    /// Optional host-app metadata resolver — supplies session titles
+    /// and project names to the orchestration dispatcher. Installed
+    /// via `install_metadata_provider` from the app layer. `None`
+    /// means agents see no titles / names (they fall back to
+    /// `firstInputPreview` for disambiguation).
+    metadata_provider: std::sync::RwLock<Option<Arc<dyn AppMetadataProvider>>>,
+    /// Optional host-app worktree provisioner. Installed via
+    /// `install_worktree_provisioner`. `None` means worktree
+    /// orchestration tools return a structured "not available" error.
+    worktree_provisioner: std::sync::RwLock<Option<Arc<dyn WorktreeProvisioner>>>,
 }
 
 impl RuntimeCore {
@@ -210,7 +333,91 @@ impl RuntimeCore {
             in_flight_permission_mode: Arc::new(RwLock::new(HashMap::new())),
             turn_finalized_notifiers: Arc::new(Mutex::new(HashMap::new())),
             turn_observer,
+            orchestration_state: OrchestrationState::new(),
+            self_weak: std::sync::RwLock::new(None),
+            metadata_provider: std::sync::RwLock::new(None),
+            worktree_provisioner: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Wire a host-app metadata resolver. Call once after construction
+    /// before serving traffic. Safe to call repeatedly; the last caller
+    /// wins (useful for tests that swap a fake in and out).
+    pub fn install_metadata_provider(&self, provider: Arc<dyn AppMetadataProvider>) {
+        if let Ok(mut slot) = self.metadata_provider.write() {
+            *slot = Some(provider);
+        }
+    }
+
+    /// Wire a host-app worktree provisioner. Call once after
+    /// construction; leave unset on platforms / host apps that don't
+    /// support git worktrees.
+    pub fn install_worktree_provisioner(&self, provisioner: Arc<dyn WorktreeProvisioner>) {
+        if let Ok(mut slot) = self.worktree_provisioner.write() {
+            *slot = Some(provisioner);
+        }
+    }
+
+    fn metadata_provider(&self) -> Option<Arc<dyn AppMetadataProvider>> {
+        self.metadata_provider.read().ok()?.clone()
+    }
+
+    fn worktree_provisioner(&self) -> Option<Arc<dyn WorktreeProvisioner>> {
+        self.worktree_provisioner.read().ok()?.clone()
+    }
+
+    /// Create a flowstate project row for the given on-disk path and
+    /// publish `ProjectCreated`. Provided so the app-layer
+    /// `WorktreeProvisioner` can register a project for a freshly-
+    /// created worktree without duplicating persistence plumbing.
+    pub async fn create_project_for_path(
+        &self,
+        path: String,
+    ) -> Result<zenui_provider_api::ProjectRecord, String> {
+        let project = self.persist_project_for_path(path).await?;
+        self.publish(RuntimeEvent::ProjectCreated {
+            project: project.clone(),
+        });
+        Ok(project)
+    }
+
+    /// Persist a project row without broadcasting `ProjectCreated`.
+    /// The caller is responsible for firing the event (via `publish`)
+    /// once any app-layer companion state (e.g. the `project_worktree`
+    /// link) has also been written. Splitting the create and the
+    /// publish lets the frontend see both rows in the same `listX()`
+    /// hydration read when it reacts to the event — otherwise the
+    /// sidebar briefly paints the new worktree project as an
+    /// ungrouped, unnamed top-level entry before the link lands.
+    pub async fn persist_project_for_path(
+        &self,
+        path: String,
+    ) -> Result<zenui_provider_api::ProjectRecord, String> {
+        self.persistence
+            .create_project(Some(path))
+            .await
+            .ok_or_else(|| "persistence.create_project returned None".to_string())
+    }
+
+    /// Install a Weak back-reference to the owning Arc. Called once by
+    /// the daemon bootstrap right after `Arc::new(RuntimeCore::new(...))`.
+    /// The orchestration dispatcher uses this to spawn tasks that need
+    /// the full runtime (e.g. scheduling a turn on a peer session) from
+    /// inside another turn's drain loop.
+    pub fn install_self_ref(self: &Arc<Self>) {
+        if let Ok(mut slot) = self.self_weak.write() {
+            *slot = Some(Arc::downgrade(self));
+        }
+    }
+
+    /// Upgrade the back-reference into a live Arc. Returns `None` if
+    /// the runtime has been dropped (shouldn't happen in practice, but
+    /// the dispatcher code handles it defensively).
+    fn self_arc(&self) -> Option<Arc<RuntimeCore>> {
+        self.self_weak
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|w| w.upgrade()))
     }
 
     /// Populate `provider_enablement` from the persistence table. Called
@@ -1241,7 +1448,7 @@ impl RuntimeCore {
         Ok(session)
     }
 
-    async fn send_turn(
+    pub(crate) async fn send_turn(
         &self,
         session_id: String,
         input: String,
@@ -1964,6 +2171,53 @@ impl RuntimeCore {
                         suggestion,
                     });
                 }
+                ProviderTurnEvent::RuntimeCall { request_id, call } => {
+                    // Cross-session orchestration: the agent invoked a
+                    // flowstate_* capability tool. Dispatch on a separate
+                    // task so the drain loop keeps receiving events for
+                    // the current turn while the peer work runs. The
+                    // spawned task resolves the sink's runtime_pending
+                    // oneshot when the dispatcher returns.
+                    //
+                    // We need a live `Arc<RuntimeCore>` to outlive the
+                    // drain loop — `self_arc()` upgrades the back-ref.
+                    // Missing ref = install_self_ref was never called
+                    // (test harness); fail-close with Cancelled.
+                    let Some(rc) = self.self_arc() else {
+                        tracing::warn!(
+                            "runtime_call arrived but self_weak not installed; rejecting"
+                        );
+                        let sink_for_err = {
+                            let guard = self.active_sinks.lock().await;
+                            guard.get(&sid).cloned()
+                        };
+                        if let Some(sink) = sink_for_err {
+                            sink.resolve_runtime_call(
+                                &request_id,
+                                Err(RuntimeCallError::Internal {
+                                    message: "runtime back-reference not installed".to_string(),
+                                }),
+                            )
+                            .await;
+                        }
+                        continue;
+                    };
+                    let origin = RuntimeCallOrigin {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                    };
+                    let sink_for_resolve = {
+                        let guard = self.active_sinks.lock().await;
+                        guard.get(&sid).cloned()
+                    };
+                    crate::orchestration::spawn_dispatch(
+                        rc,
+                        origin,
+                        call,
+                        request_id,
+                        sink_for_resolve,
+                    );
+                }
             }
             // Refresh the live in-flight snapshot after every event so a
             // client recovering from broadcast lag gets the authoritative
@@ -2112,11 +2366,57 @@ impl RuntimeCore {
                 message: merged_turn.output.clone(),
             });
         }
+
+        // Capture the final canonical output BEFORE moving `merged_turn`
+        // into the `TurnCompleted` event — the orchestration dispatcher
+        // uses it to resolve pending replies below.
+        let final_output_for_orch = merged_turn.output.clone();
+        let finished_turn_id = merged_turn.turn_id.clone();
+
         self.publish(RuntimeEvent::TurnCompleted {
             session_id: session.summary.session_id.clone(),
             session: session.summary.clone(),
             turn: merged_turn,
         });
+
+        // Cross-session orchestration: deliver this turn's final output
+        // to any peers awaiting a reply from this session. Fan out to
+        // every registered awaiter in one pass — they can't affect
+        // each other (oneshot senders are independent).
+        let pending = self
+            .orchestration_state
+            .drain_replies_for(&session.summary.session_id)
+            .await;
+        for awaiter in pending {
+            resolve_pending_reply(awaiter, &finished_turn_id, &final_output_for_orch, status);
+        }
+        // Release this turn's orchestration budget. Per-turn counter,
+        // so a new turn starts fresh.
+        self.orchestration_state
+            .release_budget(&finished_turn_id)
+            .await;
+
+        // If the just-finished session has queued async messages in its
+        // mailbox (from a peer's `flowstate_send`), drain the next one
+        // and schedule a fresh turn. Fire-and-forget — we don't await
+        // the new turn here; it runs like any user-initiated one.
+        if status == TurnStatus::Completed {
+            if let Some(next) = self
+                .orchestration_state
+                .pop_message(&session.summary.session_id)
+                .await
+            {
+                if let Some(rc) = self.self_arc() {
+                    let target = session.summary.session_id.clone();
+                    crate::orchestration::spawn_peer_turn(
+                        rc,
+                        target,
+                        next.message,
+                        "mailbox_drain",
+                    );
+                }
+            }
+        }
 
         // Wake any `steer_turn` awaiting the turn's post-interrupt
         // unwind. `notify_waiters()` is a no-op when nobody is waiting,
@@ -2134,6 +2434,635 @@ impl RuntimeCore {
         }
 
         result
+    }
+
+    // ============================================================
+    // Cross-session orchestration dispatcher
+    // ============================================================
+
+    /// Entry point for every `RuntimeCall` produced by an agent. The
+    /// drain loop in `send_turn` spawns a task that calls into here.
+    /// All variants share the same budget + cycle-guard rails before
+    /// branching to their specific handler.
+    pub(crate) async fn dispatch_runtime_call(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        call: RuntimeCall,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        // Reserve budget first — stops fan-out storms at the door.
+        self.orchestration_state
+            .reserve_budget(&origin.turn_id)
+            .await?;
+
+        match call {
+            RuntimeCall::SpawnAndAwait {
+                project_id,
+                provider,
+                model,
+                initial_message,
+                timeout_secs,
+            } => {
+                self.dispatch_spawn_and_await(
+                    origin,
+                    project_id,
+                    provider,
+                    model,
+                    initial_message,
+                    timeout_secs,
+                )
+                .await
+            }
+            RuntimeCall::Spawn {
+                project_id,
+                provider,
+                model,
+                initial_message,
+            } => {
+                self.dispatch_spawn(origin, project_id, provider, model, initial_message)
+                    .await
+            }
+            RuntimeCall::SendAndAwait {
+                session_id,
+                message,
+                timeout_secs,
+            } => {
+                self.dispatch_send_and_await(origin, session_id, message, timeout_secs)
+                    .await
+            }
+            RuntimeCall::Send {
+                session_id,
+                message,
+            } => self.dispatch_send(origin, session_id, message).await,
+            RuntimeCall::Poll {
+                session_id,
+                since_turn_id,
+            } => self.dispatch_poll(session_id, since_turn_id).await,
+            RuntimeCall::ReadSession {
+                session_id,
+                last_turns,
+            } => self.dispatch_read_session(session_id, last_turns).await,
+            RuntimeCall::ListSessions { project_id } => {
+                self.dispatch_list_sessions(origin, project_id).await
+            }
+            RuntimeCall::ListProjects => self.dispatch_list_projects().await,
+            RuntimeCall::CreateWorktree {
+                base_project_id,
+                branch,
+                base_ref,
+                create_branch,
+            } => {
+                self.dispatch_create_worktree(
+                    &base_project_id,
+                    &branch,
+                    base_ref.as_deref(),
+                    create_branch.unwrap_or(true),
+                )
+                .await
+            }
+            RuntimeCall::ListWorktrees { base_project_id } => {
+                self.dispatch_list_worktrees(base_project_id.as_deref())
+                    .await
+            }
+            RuntimeCall::SpawnInWorktree {
+                base_project_id,
+                branch,
+                base_ref,
+                create_branch,
+                initial_message,
+                provider,
+                model,
+                await_reply,
+                timeout_secs,
+            } => {
+                self.dispatch_spawn_in_worktree(
+                    origin,
+                    base_project_id,
+                    branch,
+                    base_ref,
+                    create_branch.unwrap_or(true),
+                    initial_message,
+                    provider,
+                    model,
+                    await_reply.unwrap_or(false),
+                    timeout_secs,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Inherit provider / model from the caller's session if the
+    /// RuntimeCall didn't specify one. Keeps the agent from having to
+    /// remember what it is just to spawn a like-for-like peer.
+    async fn resolve_spawn_defaults(
+        &self,
+        origin: &RuntimeCallOrigin,
+        provider: Option<ProviderKind>,
+        model: Option<String>,
+    ) -> Result<(ProviderKind, Option<String>), RuntimeCallError> {
+        if let (Some(p), m) = (provider, model.clone()) {
+            return Ok((p, m));
+        }
+        let caller = self
+            .persistence
+            .get_session(&origin.session_id)
+            .await
+            .ok_or_else(|| RuntimeCallError::SessionNotFound {
+                session_id: origin.session_id.clone(),
+            })?;
+        Ok((
+            provider.unwrap_or(caller.summary.provider),
+            model.or(caller.summary.model),
+        ))
+    }
+
+    async fn dispatch_spawn_and_await(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        project_id: Option<String>,
+        provider: Option<ProviderKind>,
+        model: Option<String>,
+        initial_message: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let (provider, model) = self
+            .resolve_spawn_defaults(&origin, provider, model)
+            .await?;
+        if !self.is_provider_enabled(provider) {
+            return Err(RuntimeCallError::ProviderDisabled {
+                provider: provider.label().to_string(),
+            });
+        }
+        let new_session = self
+            .start_session(provider, model, project_id.clone())
+            .await
+            .map_err(|e| RuntimeCallError::Internal { message: e })?;
+        let new_sid = new_session.summary.session_id.clone();
+        self.publish(RuntimeEvent::SessionLinked {
+            from_session_id: origin.session_id.clone(),
+            to_session_id: new_sid.clone(),
+            reason: SessionLinkReason::Spawn,
+        });
+
+        // Register the reply awaiter BEFORE scheduling the peer turn —
+        // otherwise the target could finish before we register and the
+        // reply would silently fall on the floor.
+        self.orchestration_state
+            .register_await(&origin.session_id, &new_sid)
+            .await?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.orchestration_state
+            .register_reply(
+                &new_sid,
+                PendingReply {
+                    after_turn_id: None,
+                    sender: reply_tx,
+                },
+            )
+            .await;
+
+        let rc_for_turn = self.clone();
+        let peer_sid = new_sid.clone();
+        crate::orchestration::spawn_peer_turn(
+            rc_for_turn,
+            peer_sid,
+            initial_message,
+            "spawn_and_await",
+        );
+
+        let timeout = clamp_timeout(timeout_secs);
+        let outcome = tokio::time::timeout(timeout, reply_rx).await;
+        self.orchestration_state
+            .unregister_await(&origin.session_id, &new_sid)
+            .await;
+
+        match outcome {
+            Ok(Ok((_turn_id, reply))) => Ok(RuntimeCallResult::Spawned {
+                session_id: new_sid,
+                reply: Some(reply),
+            }),
+            Ok(Err(_)) => Err(RuntimeCallError::Cancelled),
+            Err(_) => Err(RuntimeCallError::Timeout {
+                session_id: new_sid,
+            }),
+        }
+    }
+
+    async fn dispatch_spawn(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        project_id: Option<String>,
+        provider: Option<ProviderKind>,
+        model: Option<String>,
+        initial_message: String,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let (provider, model) = self
+            .resolve_spawn_defaults(&origin, provider, model)
+            .await?;
+        if !self.is_provider_enabled(provider) {
+            return Err(RuntimeCallError::ProviderDisabled {
+                provider: provider.label().to_string(),
+            });
+        }
+        let new_session = self
+            .start_session(provider, model, project_id)
+            .await
+            .map_err(|e| RuntimeCallError::Internal { message: e })?;
+        let new_sid = new_session.summary.session_id.clone();
+        self.publish(RuntimeEvent::SessionLinked {
+            from_session_id: origin.session_id.clone(),
+            to_session_id: new_sid.clone(),
+            reason: SessionLinkReason::Spawn,
+        });
+
+        let rc_for_turn = self.clone();
+        let peer_sid = new_sid.clone();
+        crate::orchestration::spawn_peer_turn(rc_for_turn, peer_sid, initial_message, "spawn");
+
+        Ok(RuntimeCallResult::SpawnedAsync {
+            session_id: new_sid,
+        })
+    }
+
+    async fn dispatch_send_and_await(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        target_session_id: String,
+        message: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        // Target must exist.
+        let _ = self
+            .persistence
+            .get_session(&target_session_id)
+            .await
+            .ok_or(RuntimeCallError::SessionNotFound {
+                session_id: target_session_id.clone(),
+            })?;
+
+        self.orchestration_state
+            .register_await(&origin.session_id, &target_session_id)
+            .await?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.orchestration_state
+            .register_reply(
+                &target_session_id,
+                PendingReply {
+                    after_turn_id: None,
+                    sender: reply_tx,
+                },
+            )
+            .await;
+
+        self.publish(RuntimeEvent::SessionLinked {
+            from_session_id: origin.session_id.clone(),
+            to_session_id: target_session_id.clone(),
+            reason: SessionLinkReason::Send,
+        });
+
+        // Decide: target idle → deliver immediately; target busy → queue
+        // on the mailbox and rely on the completion hook to drain.
+        let target_busy = {
+            let guard = self.active_sinks.lock().await;
+            guard.contains_key(&target_session_id)
+        };
+        if target_busy {
+            self.orchestration_state
+                .enqueue_message(&target_session_id, &origin.session_id, message)
+                .await;
+        } else {
+            let rc_for_turn = self.clone();
+            let target = target_session_id.clone();
+            crate::orchestration::spawn_peer_turn(rc_for_turn, target, message, "send_and_await");
+        }
+
+        let timeout = clamp_timeout(timeout_secs);
+        let outcome = tokio::time::timeout(timeout, reply_rx).await;
+        self.orchestration_state
+            .unregister_await(&origin.session_id, &target_session_id)
+            .await;
+
+        match outcome {
+            Ok(Ok((_turn_id, reply))) => Ok(RuntimeCallResult::Sent { reply: Some(reply) }),
+            Ok(Err(_)) => Err(RuntimeCallError::Cancelled),
+            Err(_) => Err(RuntimeCallError::Timeout {
+                session_id: target_session_id,
+            }),
+        }
+    }
+
+    async fn dispatch_send(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        target_session_id: String,
+        message: String,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let _ = self
+            .persistence
+            .get_session(&target_session_id)
+            .await
+            .ok_or(RuntimeCallError::SessionNotFound {
+                session_id: target_session_id.clone(),
+            })?;
+        self.publish(RuntimeEvent::SessionLinked {
+            from_session_id: origin.session_id.clone(),
+            to_session_id: target_session_id.clone(),
+            reason: SessionLinkReason::Send,
+        });
+
+        let target_busy = {
+            let guard = self.active_sinks.lock().await;
+            guard.contains_key(&target_session_id)
+        };
+        if target_busy {
+            self.orchestration_state
+                .enqueue_message(&target_session_id, &origin.session_id, message)
+                .await;
+        } else {
+            let rc_for_turn = self.clone();
+            let target = target_session_id.clone();
+            crate::orchestration::spawn_peer_turn(rc_for_turn, target, message, "send");
+        }
+
+        Ok(RuntimeCallResult::SentAsync)
+    }
+
+    async fn dispatch_poll(
+        self: Arc<Self>,
+        session_id: String,
+        since_turn_id: Option<String>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let detail = self
+            .persistence
+            .get_session(&session_id)
+            .await
+            .ok_or_else(|| RuntimeCallError::SessionNotFound {
+                session_id: session_id.clone(),
+            })?;
+
+        // Find the most-recent completed turn after the cursor (or the
+        // most recent overall if there's no cursor).
+        let newest_after: Option<&TurnRecord> = detail
+            .turns
+            .iter()
+            .rev()
+            .filter(|t| t.status == TurnStatus::Completed)
+            .find(|t| match &since_turn_id {
+                Some(cursor) => t.turn_id != *cursor,
+                None => true,
+            });
+
+        match newest_after {
+            Some(turn) => Ok(poll_result_from_turn(&turn.turn_id, &turn.output)),
+            None => Ok(RuntimeCallResult::Poll(PollOutcome::Pending)),
+        }
+    }
+
+    async fn dispatch_read_session(
+        self: Arc<Self>,
+        session_id: String,
+        last_turns: Option<u32>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let detail = self
+            .live_session_detail_limited(&session_id, last_turns.map(|n| n as usize))
+            .await
+            .ok_or_else(|| RuntimeCallError::SessionNotFound {
+                session_id: session_id.clone(),
+            })?;
+        Ok(RuntimeCallResult::Session(detail))
+    }
+
+    async fn dispatch_list_sessions(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        project_id: Option<String>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let summaries = self.persistence.list_session_summaries().await;
+        // Pre-load the projects table once so we can attach
+        // `project_path` to each digest without O(n) lookups.
+        let projects = self.persistence.list_projects().await;
+        let project_paths: std::collections::HashMap<String, String> = projects
+            .into_iter()
+            .filter_map(|p| p.path.map(|path| (p.project_id, path)))
+            .collect();
+
+        let filtered: Vec<_> = summaries
+            .into_iter()
+            .filter(|s| s.session_id != origin.session_id)
+            .filter(|s| match &project_id {
+                Some(pid) => s.project_id.as_ref() == Some(pid),
+                None => true,
+            })
+            .collect();
+
+        let metadata = self.metadata_provider();
+        let mut digests = Vec::with_capacity(filtered.len());
+        for summary in filtered {
+            // Cheap read: pull the first and last turn from persistence
+            // and peek at their input/output. We cap `last_turns` at 1
+            // for the head and reach for the newest completed turn for
+            // the tail. Keeps the digest query lightweight even when
+            // there are many sessions.
+            let (first_input, last_output) =
+                match self.persistence.get_session(&summary.session_id).await {
+                    Some(detail) => {
+                        let first = detail.turns.first().map(|t| t.input.clone());
+                        let last = detail
+                            .turns
+                            .iter()
+                            .rev()
+                            .find(|t| t.status == TurnStatus::Completed)
+                            .map(|t| t.output.clone());
+                        (first, last)
+                    }
+                    None => (None, None),
+                };
+            let project_path = summary
+                .project_id
+                .as_ref()
+                .and_then(|pid| project_paths.get(pid).cloned());
+
+            // Resolve host-layer metadata (sidebar titles, project
+            // names). Absent provider = None for both; agents fall
+            // back to `firstInputPreview`.
+            let (title, project_name) = match metadata.as_ref() {
+                Some(m) => {
+                    let title = m.session_title(&summary.session_id).await;
+                    let project_name = match summary.project_id.as_ref() {
+                        Some(pid) => m.project_name(pid).await,
+                        None => None,
+                    };
+                    (title, project_name)
+                }
+                None => (None, None),
+            };
+
+            digests.push(zenui_provider_api::SessionDigest::from_parts(
+                summary,
+                title,
+                project_name,
+                project_path,
+                first_input.as_deref(),
+                last_output.as_deref(),
+            ));
+        }
+        Ok(RuntimeCallResult::Sessions { sessions: digests })
+    }
+
+    async fn dispatch_list_projects(
+        self: Arc<Self>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let projects = self.persistence.list_projects().await;
+        Ok(RuntimeCallResult::Projects { projects })
+    }
+
+    async fn dispatch_create_worktree(
+        self: Arc<Self>,
+        base_project_id: &str,
+        branch: &str,
+        base_ref: Option<&str>,
+        create_branch: bool,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let provisioner =
+            self.worktree_provisioner()
+                .ok_or_else(|| RuntimeCallError::Internal {
+                    message: "worktree support not available on this host".to_string(),
+                })?;
+        let bp = provisioner
+            .create_worktree(base_project_id, branch, base_ref, create_branch)
+            .await
+            .map_err(|message| RuntimeCallError::Internal { message })?;
+        Ok(RuntimeCallResult::Worktree(blueprint_to_summary(bp)))
+    }
+
+    async fn dispatch_list_worktrees(
+        self: Arc<Self>,
+        base_project_id: Option<&str>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let provisioner =
+            self.worktree_provisioner()
+                .ok_or_else(|| RuntimeCallError::Internal {
+                    message: "worktree support not available on this host".to_string(),
+                })?;
+        let list = provisioner
+            .list_worktrees(base_project_id)
+            .await
+            .map_err(|message| RuntimeCallError::Internal { message })?;
+        Ok(RuntimeCallResult::Worktrees {
+            worktrees: list.into_iter().map(blueprint_to_summary).collect(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_spawn_in_worktree(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        base_project_id: String,
+        branch: String,
+        base_ref: Option<String>,
+        create_branch: bool,
+        initial_message: String,
+        provider: Option<ProviderKind>,
+        model: Option<String>,
+        await_reply: bool,
+        timeout_secs: Option<u64>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let provisioner =
+            self.worktree_provisioner()
+                .ok_or_else(|| RuntimeCallError::Internal {
+                    message: "worktree support not available on this host".to_string(),
+                })?;
+        let bp = provisioner
+            .create_worktree(
+                &base_project_id,
+                &branch,
+                base_ref.as_deref(),
+                create_branch,
+            )
+            .await
+            .map_err(|message| RuntimeCallError::Internal { message })?;
+
+        // Spawn a session in the new worktree's project. We route
+        // through the existing spawn path (`start_session` + scheduled
+        // `send_turn`) so permissions, events, and the SessionLinked
+        // badge all behave the same as a bare `spawn`/`spawn_and_await`.
+        let (resolved_provider, resolved_model) = self
+            .clone()
+            .resolve_spawn_defaults(&origin, provider, model)
+            .await?;
+        if !self.is_provider_enabled(resolved_provider) {
+            return Err(RuntimeCallError::ProviderDisabled {
+                provider: resolved_provider.label().to_string(),
+            });
+        }
+        let new_session = self
+            .start_session(
+                resolved_provider,
+                resolved_model,
+                Some(bp.project_id.clone()),
+            )
+            .await
+            .map_err(|e| RuntimeCallError::Internal { message: e })?;
+        let new_sid = new_session.summary.session_id.clone();
+        self.publish(RuntimeEvent::SessionLinked {
+            from_session_id: origin.session_id.clone(),
+            to_session_id: new_sid.clone(),
+            reason: SessionLinkReason::Spawn,
+        });
+
+        let summary = blueprint_to_summary(bp);
+
+        if await_reply {
+            self.orchestration_state
+                .register_await(&origin.session_id, &new_sid)
+                .await?;
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            self.orchestration_state
+                .register_reply(
+                    &new_sid,
+                    PendingReply {
+                        after_turn_id: None,
+                        sender: reply_tx,
+                    },
+                )
+                .await;
+
+            crate::orchestration::spawn_peer_turn(
+                self.clone(),
+                new_sid.clone(),
+                initial_message,
+                "spawn_in_worktree",
+            );
+
+            let timeout = clamp_timeout(timeout_secs);
+            let outcome = tokio::time::timeout(timeout, reply_rx).await;
+            self.orchestration_state
+                .unregister_await(&origin.session_id, &new_sid)
+                .await;
+            match outcome {
+                Ok(Ok((_turn_id, reply))) => Ok(RuntimeCallResult::SpawnedInWorktree {
+                    worktree: summary,
+                    session_id: new_sid,
+                    reply: Some(reply),
+                }),
+                Ok(Err(_)) => Err(RuntimeCallError::Cancelled),
+                Err(_) => Err(RuntimeCallError::Timeout {
+                    session_id: new_sid,
+                }),
+            }
+        } else {
+            crate::orchestration::spawn_peer_turn(
+                self.clone(),
+                new_sid.clone(),
+                initial_message,
+                "spawn_in_worktree",
+            );
+            Ok(RuntimeCallResult::SpawnedInWorktree {
+                worktree: summary,
+                session_id: new_sid,
+                reply: None,
+            })
+        }
     }
 
     /// Walk this session's turns from `turn_id` forward, restore

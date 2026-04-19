@@ -27,6 +27,7 @@ import {
   gitBranchQueryOptions,
 } from "@/lib/queries";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
+import { samePath } from "@/lib/worktree-utils";
 import { toast } from "@/hooks/use-toast";
 import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constants";
 import { ProviderDropdown } from "./provider-dropdown";
@@ -175,17 +176,36 @@ function WorktreeDropdownInner({
     async (wt: GitWorktree, provider: ProviderKind, model?: string) => {
       try {
         refreshBranchAsync(wt.path);
-        const isMain = wt.path === projectPath;
+        // Normalize trailing slashes when deciding whether this is the
+        // main project vs. a secondary worktree. Git porcelain and the
+        // file-picker disagree on trailing `/`, and a false negative
+        // here leads to the main project being linked as a worktree of
+        // itself (or a secondary worktree never getting linked at all,
+        // which is why it would then appear as a separate top-level
+        // project in the sidebar instead of grouped under its parent).
+        const isMain = samePath(wt.path, projectPath);
         let wtProjectId =
-          state.projects.find((p) => p.path === wt.path)?.projectId ?? null;
+          state.projects.find((p) => samePath(p.path, wt.path))?.projectId ??
+          null;
 
         if (!wtProjectId) {
           const name = wt.branch ?? "(worktree)";
-          wtProjectId = await createProject(wt.path, name);
-          if (!isMain) {
-            await linkProjectWorktree(wtProjectId, projectId, wt.branch);
-          }
-        } else if (!isMain && !state.projectWorktrees.has(wtProjectId)) {
+          // Pass worktreeOf so the parent link is dispatched atomically
+          // with project_created — no "Untitled project" flash at the
+          // top of the sidebar while the worktree metadata settles.
+          wtProjectId = await createProject(
+            wt.path,
+            name,
+            isMain ? undefined : { parentProjectId: projectId, branch: wt.branch },
+          );
+        } else if (
+          !isMain &&
+          wtProjectId !== projectId &&
+          !state.projectWorktrees.has(wtProjectId)
+        ) {
+          // Existing project but no parent link (e.g. recovered after a
+          // partial failure). Re-link it so it regroups under the main
+          // project. Guarded against self-parenting.
           await linkProjectWorktree(wtProjectId, projectId, wt.branch);
         }
 

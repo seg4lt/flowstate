@@ -8,6 +8,8 @@
 
 import {
   query,
+  createSdkMcpServer,
+  tool,
   type SDKMessage,
   type SDKUserMessage,
   type Options,
@@ -17,6 +19,7 @@ import {
   type PermissionMode as SdkPermissionMode,
   type EffortLevel,
 } from '@anthropic-ai/claude-agent-sdk';
+import { z } from 'zod';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
@@ -183,6 +186,20 @@ if (RESOLVED_LOCAL_CLAUDE_PATH) {
 const pendingPermissions = new Map<string, PendingPermission>();
 const pendingQuestions = new Map<string, PendingQuestion>();
 
+/**
+ * Bridge → Rust cross-session orchestration request round-trip. Each
+ * invocation of a flowstate_* MCP tool registers a resolver here
+ * keyed by a fresh UUID; when the Rust adapter writes back a
+ * `runtime_call_response` with the same request_id, the resolver
+ * fires with either the payload (success) or error (failure).
+ */
+interface PendingRuntimeCall {
+  resolve: (
+    result: { ok: true; payload: unknown } | { ok: false; error: unknown },
+  ) => void;
+}
+const pendingRuntimeCalls = new Map<string, PendingRuntimeCall>();
+
 /// Resolve every in-flight permission and question with a denial /
 /// dismissal so the SDK's canUseTool callbacks unwind. Called when the
 /// turn aborts — without this, awaiting Promises leak forever.
@@ -195,6 +212,10 @@ function drainPendingOnAbort(): void {
     q.resolve({ behavior: 'deny', message: 'Turn aborted' });
   }
   pendingQuestions.clear();
+  for (const [, r] of pendingRuntimeCalls) {
+    r.resolve({ ok: false, error: { code: 'cancelled', message: 'Turn aborted' } });
+  }
+  pendingRuntimeCalls.clear();
 }
 
 function writeJson(payload: Record<string, unknown>): void {
@@ -271,6 +292,199 @@ class PushableAsyncIterable<T> implements AsyncIterable<T> {
     };
   }
 }
+
+/**
+ * Forward a flowstate_* capability tool invocation to the Rust runtime
+ * and return the dispatcher's result as the tool's output. Every tool
+ * goes through the same round-trip — args get posted verbatim, the
+ * runtime parses + dispatches + encodes the result, and the response
+ * comes back via the `runtime_call_response` stdin message.
+ *
+ * Tool handlers return content in Claude Agent SDK's expected shape:
+ * `{ content: [{ type: 'text', text: <json> }] }` on success,
+ * `{ content: [{ type: 'text', text: <json> }], isError: true }` on
+ * failure. The model sees a structured JSON payload it can reason
+ * about (e.g. `{"kind":"spawned","session_id":"...","reply":"..."}`).
+ */
+async function dispatchRuntimeCall(
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<{
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+}> {
+  const requestId = randomUUID();
+  writeJson({
+    type: 'runtime_call_request',
+    request_id: requestId,
+    tool_name: toolName,
+    args,
+  });
+  const outcome = await new Promise<
+    { ok: true; payload: unknown } | { ok: false; error: unknown }
+  >((resolve) => {
+    pendingRuntimeCalls.set(requestId, { resolve });
+  });
+  if (outcome.ok) {
+    return {
+      content: [{ type: 'text', text: JSON.stringify(outcome.payload) }],
+    };
+  }
+  return {
+    content: [{ type: 'text', text: JSON.stringify(outcome.error) }],
+    isError: true,
+  };
+}
+
+/**
+ * In-process MCP server exposing the flowstate orchestration tool
+ * surface to the Claude Agent SDK. Tool names match the canonical
+ * catalog in `zenui_provider_api::capabilities` — if you add a new
+ * variant there, add a matching `tool(...)` here.
+ *
+ * Tools show up to the model as `mcp__flowstate__<name>` in the
+ * SDK's tool registry; their handlers are thin adapters that call
+ * `dispatchRuntimeCall` with the name and args verbatim.
+ */
+const flowstateOrchestrationServer = createSdkMcpServer({
+  name: 'flowstate',
+  version: '0.1.0',
+  tools: [
+    tool(
+      'spawn_and_await',
+      'Create a brand-new flowstate session (optionally in a different project) with an initial user message, and block until that session produces its next assistant reply. Returns the new session id and the reply text.',
+      {
+        project_id: z.string().optional(),
+        provider: z
+          .enum([
+            'claude',
+            'codex',
+            'github_copilot',
+            'claude_cli',
+            'github_copilot_cli',
+          ])
+          .optional(),
+        model: z.string().optional(),
+        initial_message: z.string(),
+        timeout_secs: z.number().int().min(1).max(600).optional(),
+      },
+      async (args) => dispatchRuntimeCall('spawn_and_await', args),
+    ),
+    tool(
+      'spawn',
+      'Create a brand-new flowstate session with an initial user message, and return its session id immediately without waiting for a reply.',
+      {
+        project_id: z.string().optional(),
+        provider: z
+          .enum([
+            'claude',
+            'codex',
+            'github_copilot',
+            'claude_cli',
+            'github_copilot_cli',
+          ])
+          .optional(),
+        model: z.string().optional(),
+        initial_message: z.string(),
+      },
+      async (args) => dispatchRuntimeCall('spawn', args),
+    ),
+    tool(
+      'send_and_await',
+      'Deliver a message to an existing flowstate session and block until that session produces its next assistant reply.',
+      {
+        session_id: z.string(),
+        message: z.string(),
+        timeout_secs: z.number().int().min(1).max(600).optional(),
+      },
+      async (args) => dispatchRuntimeCall('send_and_await', args),
+    ),
+    tool(
+      'send',
+      'Deliver a message to an existing flowstate session without blocking.',
+      {
+        session_id: z.string(),
+        message: z.string(),
+      },
+      async (args) => dispatchRuntimeCall('send', args),
+    ),
+    tool(
+      'poll',
+      'Return the most recent completed reply from the target session, optionally after a specific turn id.',
+      {
+        session_id: z.string(),
+        since_turn_id: z.string().optional(),
+      },
+      async (args) => dispatchRuntimeCall('poll', args),
+    ),
+    tool(
+      'read_session',
+      "Read a session's summary and most-recent turns.",
+      {
+        session_id: z.string(),
+        last_turns: z.number().int().min(1).max(100).optional(),
+      },
+      async (args) => dispatchRuntimeCall('read_session', args),
+    ),
+    tool(
+      'list_sessions',
+      'List sessions you can message. Each entry includes a preview of the first user message and last assistant reply, so you can match "the UI refactor thread" without reading each session. Optional project_id filter.',
+      {
+        project_id: z.string().optional(),
+      },
+      async (args) => dispatchRuntimeCall('list_sessions', args),
+    ),
+    tool(
+      'list_projects',
+      'List every project the runtime knows about. Use this to look up a project_id when the user mentions a project by name — match the returned `path` against their words.',
+      {},
+      async (args) => dispatchRuntimeCall('list_projects', args),
+    ),
+    tool(
+      'create_worktree',
+      'Create a git worktree off an existing project and register a flowstate project for it. Returns { projectId, path, branch, parentProjectId }. Set create_branch=true (default) to make a new branch from base_ref, or false to check out an existing branch.',
+      {
+        base_project_id: z.string(),
+        branch: z.string(),
+        base_ref: z.string().optional(),
+        create_branch: z.boolean().optional(),
+      },
+      async (args) => dispatchRuntimeCall('create_worktree', args),
+    ),
+    tool(
+      'list_worktrees',
+      'List worktrees the runtime knows about. Pass base_project_id to restrict to worktrees rooted at one project.',
+      {
+        base_project_id: z.string().optional(),
+      },
+      async (args) => dispatchRuntimeCall('list_worktrees', args),
+    ),
+    tool(
+      'spawn_in_worktree',
+      'Create a worktree for `branch` off `base_project_id` and spawn a session inside it with `initial_message`. Set await_reply=true to block until the session produces its first assistant reply.',
+      {
+        base_project_id: z.string(),
+        branch: z.string(),
+        base_ref: z.string().optional(),
+        create_branch: z.boolean().optional(),
+        initial_message: z.string(),
+        provider: z
+          .enum([
+            'claude',
+            'codex',
+            'github_copilot',
+            'claude_cli',
+            'github_copilot_cli',
+          ])
+          .optional(),
+        model: z.string().optional(),
+        await_reply: z.boolean().optional(),
+        timeout_secs: z.number().int().min(1).max(600).optional(),
+      },
+      async (args) => dispatchRuntimeCall('spawn_in_worktree', args),
+    ),
+  ],
+});
 
 class ClaudeBridge {
   private cwd: string = process.cwd();
@@ -756,6 +970,13 @@ class ClaudeBridge {
       canUseTool,
       includePartialMessages: true,
       promptSuggestions: true,
+      // In-process MCP server exposing flowstate's cross-session
+      // orchestration tools (flowstate_spawn, flowstate_send, ...).
+      // Tool calls are routed through `dispatchRuntimeCall` → Rust
+      // runtime dispatcher → back through the same stdin channel.
+      mcpServers: {
+        flowstate: flowstateOrchestrationServer,
+      },
       hooks: {
         PostCompact: [
           {
@@ -2311,6 +2532,29 @@ async function main(): Promise<void> {
             });
           }
         })();
+        break;
+      }
+
+      case 'runtime_call_response': {
+        // Rust → bridge: the orchestration dispatcher resolved a
+        // cross-session call. Fire the matching pending resolver so
+        // the MCP tool handler returns its output to the model.
+        const requestId = msg.request_id as string;
+        const entry = pendingRuntimeCalls.get(requestId);
+        if (!entry) {
+          console.error(
+            `[claude-bridge] runtime_call_response for unknown request_id ${requestId}`,
+          );
+          break;
+        }
+        pendingRuntimeCalls.delete(requestId);
+        const payload = msg.payload as unknown;
+        const error = msg.error as unknown;
+        if (error !== undefined && error !== null) {
+          entry.resolve({ ok: false, error });
+        } else {
+          entry.resolve({ ok: true, payload: payload ?? null });
+        }
         break;
       }
 

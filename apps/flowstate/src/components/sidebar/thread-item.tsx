@@ -4,6 +4,7 @@ import {
   Archive,
   EllipsisVertical,
   GitBranch,
+  Sparkles,
   Trash2,
 } from "lucide-react";
 import {
@@ -182,6 +183,40 @@ export function ThreadItem({
               label="Running"
               className="shrink-0 text-sm"
             />
+          )}
+          {state.sessionLinks.get(sessionId) && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span
+                  className="inline-flex shrink-0 items-center text-purple-500"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <Sparkles className="h-3 w-3" />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent side="right" className="max-w-xs">
+                {(() => {
+                  const link = state.sessionLinks.get(sessionId)!;
+                  const parent = state.sessions.get(link.fromSessionId);
+                  const parentLabel =
+                    state.sessionDisplay.get(link.fromSessionId)?.title ||
+                    parent?.sessionId.slice(0, 8) ||
+                    "another session";
+                  return (
+                    <div className="space-y-0.5">
+                      <div className="font-medium">
+                        {link.reason === "spawn"
+                          ? "Spawned by agent"
+                          : "Message from agent"}
+                      </div>
+                      <div className="text-[10px] opacity-80">
+                        from {parentLabel}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </TooltipContent>
+            </Tooltip>
           )}
           {worktreePath && (
             <Tooltip>

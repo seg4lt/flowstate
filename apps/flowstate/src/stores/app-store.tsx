@@ -4,6 +4,7 @@ import {
   deleteProjectDisplay,
   deleteProjectWorktree,
   deleteSessionDisplay,
+  getProjectWorktree,
   listProjectDisplay,
   listProjectWorktree,
   listSessionDisplay,
@@ -27,6 +28,7 @@ import type {
   RateLimitInfo,
   RuntimeEvent,
   ServerMessage,
+  SessionLinkReason,
   SessionSummary,
   UserInputQuestion,
 } from "@/lib/types";
@@ -109,6 +111,12 @@ interface AppState {
    *  matches the cached one, so the slash-popup memo stays stable
    *  across no-op refreshes. */
   sessionCommands: Map<string, CommandCatalog>;
+  /** Cross-session orchestration links, keyed by the child (spawned
+   *  or messaged) session_id. Value is the origin session that
+   *  issued the `flowstate_spawn*` / `flowstate_send*` call. Populated
+   *  by `session_linked` events; purely local state (not persisted).
+   *  Drives the "spawned by agent" chip on the sidebar row. */
+  sessionLinks: Map<string, { fromSessionId: string; reason: SessionLinkReason }>;
   /** Whether the OS thinks our window has focus. Distinct from
    *  `activeSessionId` (which tracks the thread the user last
    *  opened, even after they alt-tab to another app). Updated by a
@@ -192,6 +200,42 @@ function recomputeAwaiting(
   const next = new Set(awaiting);
   next.delete(sessionId);
   return next;
+}
+
+/** Metadata registered by `createProject` BEFORE sending the SDK
+ *  message, keyed by filesystem path. When the corresponding
+ *  `project_created` event lands in the reducer, the handler reads
+ *  this entry and folds the display name + (optional) worktree link
+ *  into the SAME state transition.
+ *
+ *  Without this coordination the sequence is:
+ *    1. Tauri event fires → reducer adds bare project → React renders
+ *       an unlabeled, ungrouped entry at the top of the sidebar
+ *       ("Untitled project").
+ *    2. Caller's polling loop wakes, dispatches display + worktree
+ *       link → React re-renders, the entry re-parents under the
+ *       parent project.
+ *  The flash in step 1 is what the user sees.
+ *
+ *  Using a module-level Map lets the reducer — which is a pure
+ *  function with no access to hooks or refs — find the pending
+ *  metadata keyed by the project's path (paths are stable, ids
+ *  aren't known until after `project_created` arrives). The entry is
+ *  deleted as soon as it's consumed.
+ *
+ *  Trailing-slash normalization (`normPath`) is applied on both write
+ *  and read so git's porcelain output vs. the file picker can't miss
+ *  each other. */
+const pendingProjectCreates = new Map<
+  string,
+  {
+    display: ProjectDisplay;
+    worktreeOf?: { parentProjectId: string; branch: string | null };
+  }
+>();
+
+function pendingKey(path: string): string {
+  return path.endsWith("/") ? path.slice(0, -1) : path;
 }
 
 function appReducer(state: AppState, action: AppAction): AppState {
@@ -593,11 +637,46 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
     case "project_created": {
       // Dedupe by id — the runtime publishes this event AND includes
       // it (indirectly) in the Ack response, so we may receive it
-      // twice in rapid succession.
+      // twice in rapid succession. (Also: StrictMode in dev invokes
+      // reducers twice; if we got past this check on the second
+      // invocation we'd duplicate the project in the list.)
       if (state.projects.some((p) => p.projectId === event.project.projectId)) {
         return state;
       }
-      return { ...state, projects: [...state.projects, event.project] };
+      // If `createProject` pre-registered display/worktree metadata
+      // for this path, fold it into the SAME state transition so the
+      // sidebar never paints a bare "Untitled project" at the top
+      // level while Tauri persistence round-trips.
+      //
+      // IMPORTANT: read but don't mutate the pending map here —
+      // React StrictMode runs this reducer twice in dev, and a
+      // mutation would make the second invocation see empty state
+      // and commit an un-enriched return. The caller deletes the
+      // entry from the polling loop instead.
+      const key = pendingKey(event.project.path ?? "");
+      const pending = key ? pendingProjectCreates.get(key) : undefined;
+
+      let projectDisplay = state.projectDisplay;
+      let projectWorktrees = state.projectWorktrees;
+      if (pending) {
+        projectDisplay = new Map(projectDisplay);
+        projectDisplay.set(event.project.projectId, pending.display);
+        if (pending.worktreeOf) {
+          projectWorktrees = new Map(projectWorktrees);
+          projectWorktrees.set(event.project.projectId, {
+            projectId: event.project.projectId,
+            parentProjectId: pending.worktreeOf.parentProjectId,
+            branch: pending.worktreeOf.branch,
+          });
+        }
+      }
+
+      return {
+        ...state,
+        projects: [...state.projects, event.project],
+        projectDisplay,
+        projectWorktrees,
+      };
     }
 
     case "project_deleted": {
@@ -714,6 +793,20 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "session_linked": {
+      // Record who spawned or messaged which session. The entry is
+      // keyed by the child (the session being acted on) so a sidebar
+      // row lookup is O(1). `spawn` events may arrive before the
+      // child's `session_started` fan-out; that's fine — the lookup
+      // happens at render time.
+      const sessionLinks = new Map(state.sessionLinks);
+      sessionLinks.set(event.to_session_id, {
+        fromSessionId: event.from_session_id,
+        reason: event.reason,
+      });
+      return { ...state, sessionLinks };
+    }
+
     case "session_command_catalog_updated": {
       // id-equality short-circuit: if every command in the new payload
       // matches the cached id (same length, same order), skip the
@@ -759,6 +852,7 @@ const initialState: AppState = {
   permissionModeBySession: new Map(),
   rateLimits: {},
   sessionCommands: new Map(),
+  sessionLinks: new Map(),
   // Default to focused: the first focus event only fires on the NEXT
   // focus change, so initialising false would incorrectly treat the
   // first turn as "user isn't watching" until they alt-tabbed.
@@ -792,8 +886,18 @@ interface AppContextValue {
   /** Create a project via the SDK (path only) and immediately write
    *  the display name into the app-side store. Resolves once both
    *  the SDK row and the app-side display row exist; returns the
-   *  new project_id. */
-  createProject: (path: string, name: string) => Promise<string>;
+   *  new project_id.
+   *
+   *  `worktreeOf`, when supplied, ties the new project to a parent as
+   *  a git worktree link AT THE SAME INSTANT the project_created event
+   *  lands in state — so the sidebar never renders it as an unlinked
+   *  top-level "Untitled project" while the worktree metadata catches
+   *  up asynchronously. Skip it for plain (non-worktree) projects. */
+  createProject: (
+    path: string,
+    name: string,
+    worktreeOf?: { parentProjectId: string; branch: string | null },
+  ) => Promise<string>;
   /** Update a session's preview locally (e.g. on first turn). */
   updateSessionPreview: (sessionId: string, preview: string) => Promise<void>;
   /** Clear display rows when a session/project is deleted by the SDK. */
@@ -917,6 +1021,41 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             projectId: message.event.project_id,
             display: null,
           });
+        } else if (message.event.type === "project_created") {
+          // Backend-initiated creates (e.g. an agent used a worktree
+          // tool — see WorktreeProvisionerImpl in src-tauri) don't go
+          // through the frontend's `createProject` wrapper, so the
+          // `pendingProjectCreates` map has no entry to fold into the
+          // reducer. Without hydrating here, the sidebar paints the
+          // new project as an un-grouped "Untitled project" at the
+          // top level until the next app restart rereads
+          // `listProjectWorktree`.
+          //
+          // The Rust provisioner persists the `project_worktree` link
+          // BEFORE firing the event, so by the time we land here the
+          // row is guaranteed to be available on disk — we just need
+          // to pull it into in-memory state.
+          const ev = message.event;
+          const project = ev.project;
+          const key = pendingKey(project.path ?? "");
+          if (!pendingProjectCreates.has(key)) {
+            void getProjectWorktree(project.projectId)
+              .then((record) => {
+                if (!active || !record) return;
+                dispatchRef.current({
+                  type: "set_project_worktree",
+                  projectId: project.projectId,
+                  record,
+                });
+              })
+              .catch((err) => {
+                console.debug(
+                  "[app-store] getProjectWorktree failed for",
+                  project.projectId,
+                  err,
+                );
+              });
+          }
         }
       }
       // Fan out to registered listeners AFTER the reducer and the
@@ -1037,21 +1176,45 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
 
   const createProject = React.useCallback(
-    async (path: string, name: string): Promise<string> => {
-      // Snapshot what's currently in the store so we can detect the
-      // new project_id when it lands. The SDK's response is an Ack; the
-      // authoritative `ProjectCreated` event is delivered via the
-      // Tauri channel and processed by the reducer. We wait briefly
-      // for the event to show up, then write the display name.
+    async (
+      path: string,
+      name: string,
+      worktreeOf?: { parentProjectId: string; branch: string | null },
+    ): Promise<string> => {
+      const trimmed = name.trim();
+      const display: ProjectDisplay = {
+        name: trimmed.length > 0 ? trimmed : null,
+        sortOrder: null,
+      };
+
+      // Register display + worktree metadata BEFORE sending the SDK
+      // message. The reducer's `project_created` handler reads this
+      // map (keyed by path) when the event lands and folds everything
+      // into the SAME state transition — so React renders the new
+      // project with its final name and parent link in a single paint,
+      // with no "Untitled project" flash at the top of the sidebar.
+      const key = pendingKey(path);
+      pendingProjectCreates.set(key, { display, worktreeOf });
+
+      // Snapshot existing ids so we can identify the new project when
+      // it lands in state (polling below).
       const beforeIds = new Set(
         stateRef.current.projects.map((p) => p.projectId),
       );
-      await sendMessage({ type: "create_project", path });
 
+      try {
+        await sendMessage({ type: "create_project", path });
+      } catch (err) {
+        pendingProjectCreates.delete(key);
+        throw err;
+      }
+
+      // Poll for the project_created event to land in state.
       let projectId: string | null = null;
       for (let i = 0; i < 40; i++) {
         const match = stateRef.current.projects.find(
-          (p) => !beforeIds.has(p.projectId) && p.path === path,
+          (p) =>
+            !beforeIds.has(p.projectId) && pendingKey(p.path ?? "") === key,
         );
         if (match) {
           projectId = match.projectId;
@@ -1059,21 +1222,63 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         }
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
+      // Pending entry has done its job (or never will). Delete here,
+      // OUTSIDE the reducer, so StrictMode's double-invocation of the
+      // reducer doesn't lose the metadata between the two calls.
+      pendingProjectCreates.delete(key);
       if (!projectId) {
         throw new Error("create_project: project_created event never arrived");
       }
 
-      const trimmed = name.trim();
-      const display: ProjectDisplay = {
-        name: trimmed.length > 0 ? trimmed : null,
-        sortOrder: null,
-      };
-      await setProjectDisplay(projectId, display);
-      dispatchRef.current({
-        type: "set_project_display",
-        projectId,
-        display,
-      });
+      // Fallback dispatch: if the reducer somehow missed the pending
+      // entry (e.g. the path in the event differs from what we sent,
+      // or the entry was already consumed by a duplicate event), make
+      // sure the in-memory state still has the right display + link
+      // before we persist. These dispatches are no-ops when the
+      // reducer already applied them.
+      const applied = stateRef.current;
+      if (!applied.projectDisplay.has(projectId)) {
+        dispatchRef.current({
+          type: "set_project_display",
+          projectId,
+          display,
+        });
+      }
+      if (worktreeOf && !applied.projectWorktrees.has(projectId)) {
+        dispatchRef.current({
+          type: "set_project_worktree",
+          projectId,
+          record: {
+            projectId,
+            parentProjectId: worktreeOf.parentProjectId,
+            branch: worktreeOf.branch,
+          },
+        });
+      }
+
+      // Persist to SQLite — on failure roll back any worktree link
+      // dispatch so the UI doesn't claim state that never landed on
+      // disk. Display name is idempotent enough that a failed write is
+      // fine to leave in memory.
+      try {
+        await setProjectDisplay(projectId, display);
+        if (worktreeOf) {
+          await setProjectWorktree(
+            projectId,
+            worktreeOf.parentProjectId,
+            worktreeOf.branch,
+          );
+        }
+      } catch (err) {
+        if (worktreeOf) {
+          dispatchRef.current({
+            type: "set_project_worktree",
+            projectId,
+            record: null,
+          });
+        }
+        throw err;
+      }
       return projectId;
     },
     [],
@@ -1126,12 +1331,30 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       parentProjectId: string,
       branch: string | null,
     ) => {
-      await setProjectWorktree(projectId, parentProjectId, branch);
+      // Optimistic dispatch — happens in the same tick as the caller's
+      // post-createProject code, so React batches it with the
+      // project_created render. Without this the sidebar briefly shows
+      // the freshly-created worktree project as a separate top-level
+      // entry (with name "Untitled project" until display lands) until
+      // the Tauri `set_project_worktree` write round-trips and the
+      // grouping kicks in. On persistence failure we roll back so the
+      // UI doesn't silently claim a link that was never saved.
+      const record = { projectId, parentProjectId, branch };
       dispatchRef.current({
         type: "set_project_worktree",
         projectId,
-        record: { projectId, parentProjectId, branch },
+        record,
       });
+      try {
+        await setProjectWorktree(projectId, parentProjectId, branch);
+      } catch (err) {
+        dispatchRef.current({
+          type: "set_project_worktree",
+          projectId,
+          record: null,
+        });
+        throw err;
+      }
     },
     [],
   );
