@@ -13,7 +13,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { workspace = true, features = [] }
+tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # Auto-updater. Pulls signed manifests from the URL configured in
@@ -24,20 +24,9 @@ tauri-plugin-dialog = "2"
 # ship updates to existing installs.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
-dirs.workspace = true
+dirs = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# ripgrep's gitignore-aware walker — used by the /code editor view
-# to list project files for the Cmd+P-style picker. Respects
-# .gitignore automatically so we don't walk into node_modules/
-# target/ etc.
-ignore = "0.4"
-# ripgrep's matcher + line searcher. Same lineage as `ignore`,
-# powers the editor view's content-search command. Pure library,
-# no `rg` binary or subprocess.
-grep-regex = "0.1"
-grep-searcher = "0.1"
-grep-matcher = "0.1"
 
 # Daemon core with just the Tauri transport. Providers are no longer
 # a daemon-core concern — flowstate constructs its own adapter vector
@@ -58,13 +47,6 @@ zenui-provider-github-copilot-cli = { path = "../../../crates/core/provider-gith
 zenui-provider-api = { path = "../../../crates/core/provider-api" }
 zenui-runtime-core = { path = "../../../crates/core/runtime-core" }
 
-# Flowstate-app-owned analytics store. Per-turn token/cost rollups
-# for the in-app Usage dashboard. Moved out of src-tauri in Phase 4:
-# the analytics ORM is not a Tauri-lifetime concern and now lives in
-# its own core crate, with src-tauri keeping only the thin Tauri
-# command forwarders + the subscriber wiring.
-zenui-usage-store = { path = "../../../crates/core/usage-store" }
-
 # Async
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
@@ -83,5 +65,16 @@ portable-pty = "0.9"
 # what the SDK uses transitively so libsqlite3-sys can be shared
 # across the dependency graph (Cargo refuses two crates linking to
 # the same native `sqlite3` library at different versions).
-rusqlite.workspace = true
+rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# File-finder + grep SDK backing the /code view's picker and content
+# search. Replaces the old ripgrep-stack (`ignore` + `grep-regex` +
+# `grep-searcher`). `fff-search` maintains a live, fs-watched,
+# bigram-indexed file list in the background so indexing cost is paid
+# once per worktree and amortised across every search. See
+# `src/file_index.rs` for the integration.
+fff-search = "0.5.2"
+# Compile user-supplied include/exclude globs (`*.rs`, `target/*`) for
+# pre-filtering the indexed file list before content search.
+globset = "0.4.18"

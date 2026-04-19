@@ -25,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use tauri::State;
 use tauri::ipc::Channel;
 
 pub type PtyId = u64;
@@ -121,7 +120,7 @@ impl PtyManager {
             paused: paused.clone(),
         });
 
-        crate::lock::lock_ok(&self.sessions).insert(id, session);
+        self.sessions.lock().unwrap().insert(id, session);
 
         let paused_for_thread = paused;
         std::thread::Builder::new()
@@ -136,14 +135,14 @@ impl PtyManager {
 
     pub fn write(&self, id: PtyId, data: &[u8]) -> Result<(), String> {
         let session = self.get(id)?;
-        let mut w = crate::lock::lock_ok(&session.writer);
+        let mut w = session.writer.lock().unwrap();
         w.write_all(data).map_err(|e| format!("write: {e}"))?;
         w.flush().map_err(|e| format!("flush: {e}"))
     }
 
     pub fn resize(&self, id: PtyId, cols: u16, rows: u16) -> Result<(), String> {
         let session = self.get(id)?;
-        let master = crate::lock::lock_ok(&session.master);
+        let master = session.master.lock().unwrap();
         master
             .resize(PtySize {
                 rows,
@@ -167,11 +166,11 @@ impl PtyManager {
     }
 
     pub fn kill(&self, id: PtyId) -> Result<(), String> {
-        let removed = crate::lock::lock_ok(&self.sessions).remove(&id);
+        let removed = self.sessions.lock().unwrap().remove(&id);
         if let Some(session) = removed {
             // Best-effort SIGKILL. The reader thread will hit EOF and
             // exit on its own once the child's slave fd closes.
-            let _ = crate::lock::lock_ok(&session.child).kill();
+            let _ = session.child.lock().unwrap().kill();
         }
         Ok(())
     }
@@ -180,16 +179,18 @@ impl PtyManager {
     /// don't leave orphan shells behind when the user quits.
     pub fn kill_all(&self) {
         let sessions: Vec<_> = {
-            let mut map = crate::lock::lock_ok(&self.sessions);
+            let mut map = self.sessions.lock().unwrap();
             map.drain().map(|(_, s)| s).collect()
         };
         for session in sessions {
-            let _ = crate::lock::lock_ok(&session.child).kill();
+            let _ = session.child.lock().unwrap().kill();
         }
     }
 
     fn get(&self, id: PtyId) -> Result<Arc<PtySession>, String> {
-        crate::lock::lock_ok(&self.sessions)
+        self.sessions
+            .lock()
+            .unwrap()
             .get(&id)
             .cloned()
             .ok_or_else(|| format!("unknown pty `{id}`"))
@@ -223,43 +224,6 @@ fn which_in_path(binary: &str) -> bool {
         }
     }
     false
-}
-
-#[tauri::command]
-pub fn pty_open(
-    manager: State<'_, PtyManager>,
-    cols: u16,
-    rows: u16,
-    cwd: Option<String>,
-    shell: Option<String>,
-    on_data: Channel<Vec<u8>>,
-) -> Result<PtyId, String> {
-    manager.open(cols, rows, cwd, shell, on_data)
-}
-
-#[tauri::command]
-pub fn pty_write(manager: State<'_, PtyManager>, id: PtyId, data: Vec<u8>) -> Result<(), String> {
-    manager.write(id, &data)
-}
-
-#[tauri::command]
-pub fn pty_resize(manager: State<'_, PtyManager>, id: PtyId, cols: u16, rows: u16) -> Result<(), String> {
-    manager.resize(id, cols, rows)
-}
-
-#[tauri::command]
-pub fn pty_pause(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
-    manager.pause(id)
-}
-
-#[tauri::command]
-pub fn pty_resume(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
-    manager.resume(id)
-}
-
-#[tauri::command]
-pub fn pty_kill(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
-    manager.kill(id)
 }
 
 fn reader_loop(mut reader: Box<dyn Read + Send>, channel: Channel<Vec<u8>>, paused: Arc<AtomicBool>) {

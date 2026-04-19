@@ -7,16 +7,16 @@ import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
   AttachmentRef,
+  ContentBlock,
   PermissionDecision,
   PermissionMode,
   ReasoningEffort,
-  RetryState,
-  TurnPhase,
+  RuntimeEvent,
   TurnRecord,
   UserInputAnswer,
   UserInputQuestion,
 } from "@/lib/types";
-import { sendMessage } from "@/lib/api";
+import { connectStream, sendMessage } from "@/lib/api";
 import {
   gitBranchQueryOptions,
   gitRootQueryOptions,
@@ -24,7 +24,11 @@ import {
   pathExistsQueryOptions,
   sessionQueryKey,
   sessionQueryOptions,
+  type SessionPage,
 } from "@/lib/queries";
+import { useStreamedGitDiffSummary } from "@/lib/git-diff-stream";
+import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
+import { toneForMode } from "@/lib/mode-tone";
 import {
   readDefaultEffort,
   readDefaultPermissionMode,
@@ -39,14 +43,8 @@ import { PLAN_MODE_MUTATING_TOOLS } from "@/lib/tool-policy";
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
-import { useModeCycleShortcut } from "@/hooks/useModeCycleShortcut";
-import { useDoubleEscInterrupt } from "@/hooks/useDoubleEscInterrupt";
-import { useStuckWatchdog } from "@/hooks/useStuckWatchdog";
-import { useSessionStreamSubscription } from "@/hooks/useSessionStreamSubscription";
-import { useSessionRestoration } from "@/hooks/useSessionRestoration";
-import { sessionTransient } from "@/stores/session-transient-store";
 import { MessageList } from "./messages/message-list";
-import { ChatInput } from "./chat-input";
+import { ChatInput, type QueuedMessage } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
@@ -56,16 +54,54 @@ import { RevertFilesDialog } from "./messages/revert-files-dialog";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
 import { ApiRetryBanner } from "./api-retry-banner";
-import { toneForMode } from "@/lib/mode-tone";
+import { AgentContextPanel } from "./agent-context-panel";
 import {
   findLatestMainTodoWrite,
   parseTodoProgress,
 } from "@/lib/todo-extract";
 import { StuckBanner } from "./stuck-banner";
+import { DiffPanel, type DiffStyle } from "./diff-panel";
 import { ImageLightbox } from "./image-lightbox";
-import { DiffPanelHost, type DiffPanelHostApi } from "./diff-panel-host";
-import { AgentContextPanelHost } from "./agent-context-panel-host";
-import { SessionProvider } from "./session-context";
+import type { AggregatedFileDiff } from "@/lib/session-diff";
+
+// Per-session draft text. Module-level so it survives ChatView
+// re-renders and ChatInput remounts (keyed by sessionId). Cleared
+// on send so completed messages don't linger as stale drafts.
+const sessionDrafts = new Map<string, string>();
+
+// Per-session message queue. Module-level so it survives ChatInput
+// remounts (keyed by sessionId). Same pattern as sessionDrafts —
+// preserves queued messages when the user switches threads mid-turn.
+const sessionQueues = new Map<string, QueuedMessage[]>();
+
+// Per-session diff / context panel open flags. Module-level so they
+// survive thread switches (ChatView does NOT remount on sessionId
+// change — sessionId is a prop, not a key). Lost on reload, which is
+// intentional: "did I leave the diff open" is transient UI state, not
+// a persisted preference. Width / style live in localStorage below
+// because those ARE preferences. Fullscreen is deliberately NOT
+// per-thread (plain useState) — it's a momentary intent.
+const sessionDiffOpen = new Map<string, boolean>();
+const sessionContextOpen = new Map<string, boolean>();
+
+// Trip the watchdog after this many seconds of silence while a tool
+// call is pending. Picked to be well past a normal tool round-trip
+// (even a slow Bash / Git command rarely exceeds 15–20s) but short
+// enough that a user who just clicked Allow doesn't sit for a minute
+// wondering if anything is happening.
+const STUCK_TIMEOUT_MS = 45_000;
+
+// Diff-panel sizing. Clamped so neither the chat column nor the diff
+// pane can collapse to nothing when the user drags the handle.
+const DIFF_WIDTH_KEY = "flowstate:diff-width";
+const DIFF_STYLE_KEY = "flowstate:diff-style";
+const DIFF_MIN_WIDTH = 360;
+const DIFF_DEFAULT_WIDTH = 560;
+const DIFF_CHAT_MIN_WIDTH = 420;
+
+const CONTEXT_WIDTH_KEY = "flowstate:context-width";
+const CONTEXT_MIN_WIDTH = 320;
+const CONTEXT_DEFAULT_WIDTH = 440;
 
 interface PermissionRequest {
   requestId: string;
@@ -77,6 +113,384 @@ interface PermissionRequest {
 interface QuestionRequest {
   requestId: string;
   questions: UserInputQuestion[];
+}
+
+// Stream-order block accumulators. Adjacent text deltas coalesce into
+// the trailing text block; a non-text block (e.g. a tool call) closes
+// the run so the next text delta opens a new block. Always returns a
+// new array so React.memo / reference equality picks up the change.
+function appendTextDelta(
+  blocks: ContentBlock[] | undefined,
+  delta: string,
+): ContentBlock[] {
+  const list = blocks ?? [];
+  const last = list[list.length - 1];
+  if (last && last.kind === "text") {
+    return [...list.slice(0, -1), { kind: "text", text: last.text + delta }];
+  }
+  return [...list, { kind: "text", text: delta }];
+}
+
+function appendReasoningDelta(
+  blocks: ContentBlock[] | undefined,
+  delta: string,
+): ContentBlock[] {
+  const list = blocks ?? [];
+  const last = list[list.length - 1];
+  if (last && last.kind === "reasoning") {
+    return [
+      ...list.slice(0, -1),
+      { kind: "reasoning", text: last.text + delta },
+    ];
+  }
+  return [...list, { kind: "reasoning", text: delta }];
+}
+
+// Merge-or-append for compaction blocks. Runtime-core already pairs
+// up `compact_boundary` + `compact_summary` into one block, but the
+// frontend receives incremental updates as either event arrives. If
+// the last block is a Compact whose payload is compatible (same
+// trigger, no newer-than-stream regressions) we fold the fresh
+// fields in; otherwise we append a new block. Two compactions in
+// one turn (rare, but possible on very long turns) show as two
+// separate blocks.
+function applyCompactUpdate(
+  blocks: ContentBlock[] | undefined,
+  update: {
+    trigger: "auto" | "manual";
+    preTokens?: number;
+    postTokens?: number;
+    durationMs?: number;
+    summary?: string;
+  },
+): ContentBlock[] {
+  const list = blocks ?? [];
+  const last = list[list.length - 1];
+  if (last && last.kind === "compact") {
+    const merged: ContentBlock = {
+      kind: "compact",
+      trigger: update.trigger,
+      preTokens: update.preTokens ?? last.preTokens,
+      postTokens: update.postTokens ?? last.postTokens,
+      durationMs: update.durationMs ?? last.durationMs,
+      summary: update.summary ?? last.summary,
+    };
+    return [...list.slice(0, -1), merged];
+  }
+  return [
+    ...list,
+    {
+      kind: "compact",
+      trigger: update.trigger,
+      preTokens: update.preTokens,
+      postTokens: update.postTokens,
+      durationMs: update.durationMs,
+      summary: update.summary,
+    },
+  ];
+}
+
+// Apply a single runtime event to a turns array and return the
+// next-state turns. Used by the stream handler to update the
+// query cache entry for the event's session — because this is a
+// pure function over `prev`, we can run it inside a
+// `queryClient.setQueryData` updater and route every event
+// directly to the right session's cache entry without any
+// cross-session state leakage. Returns the same array reference
+// when the event doesn't apply to any known turn, so the
+// updater can bail out and avoid a wasted re-render.
+function applyEventToTurns(
+  prev: TurnRecord[],
+  event: RuntimeEvent,
+): TurnRecord[] {
+  switch (event.type) {
+    case "turn_started":
+    case "turn_completed": {
+      const exists = prev.some((t) => t.turnId === event.turn.turnId);
+      if (exists) {
+        return prev.map((t) =>
+          t.turnId === event.turn.turnId ? event.turn : t,
+        );
+      }
+      return [...prev, event.turn];
+    }
+    case "content_delta":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              output: event.accumulated_output,
+              blocks: appendTextDelta(t.blocks, event.delta),
+            }
+          : t,
+      );
+    case "reasoning_delta":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              reasoning: (t.reasoning ?? "") + event.delta,
+              blocks: appendReasoningDelta(t.blocks, event.delta),
+            }
+          : t,
+      );
+    case "compact_updated":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              blocks: applyCompactUpdate(t.blocks, {
+                trigger: event.trigger,
+                preTokens: event.pre_tokens,
+                postTokens: event.post_tokens,
+                durationMs: event.duration_ms,
+                summary: event.summary,
+              }),
+            }
+          : t,
+      );
+    case "memory_recalled":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              blocks: [
+                ...(t.blocks ?? []),
+                {
+                  kind: "memory_recall",
+                  mode: event.mode,
+                  memories: event.memories,
+                },
+              ],
+            }
+          : t,
+      );
+    case "tool_call_started":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              toolCalls: [
+                ...(t.toolCalls ?? []),
+                {
+                  callId: event.call_id,
+                  name: event.name,
+                  args: event.args,
+                  status: "pending" as const,
+                  parentCallId: event.parent_call_id,
+                },
+              ],
+              blocks: [
+                ...(t.blocks ?? []),
+                { kind: "tool_call", callId: event.call_id },
+              ],
+            }
+          : t,
+      );
+    case "tool_call_completed":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.toolCalls) return t;
+        return {
+          ...t,
+          toolCalls: t.toolCalls.map((tc) =>
+            tc.callId === event.call_id
+              ? {
+                  ...tc,
+                  output: event.output,
+                  error: event.error,
+                  status: event.error
+                    ? ("failed" as const)
+                    : ("completed" as const),
+                }
+              : tc,
+          ),
+        };
+      });
+    // Per-tool heartbeat from a provider that opted into
+    // ProviderFeatures.toolProgress (Claude SDK today). We just
+    // stamp lastProgressAt on the matching tool call; the
+    // tool-call card watches that field against wall time and
+    // shows a "no progress · Ns" pip when it goes stale, while
+    // the stuck banner stays out of the way for tools that are
+    // still ticking. Unknown call_ids are silently ignored —
+    // usually means the heartbeat raced ahead of
+    // tool_call_started by a frame.
+    case "tool_progress":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.toolCalls) return t;
+        return {
+          ...t,
+          toolCalls: t.toolCalls.map((tc) =>
+            tc.callId === event.call_id
+              ? { ...tc, lastProgressAt: event.occurred_at }
+              : tc,
+          ),
+        };
+      });
+    // Subagent lifecycle. Previously these only landed via the
+    // whole-turn refetch triggered by turn_completed, so the
+    // subagent box stayed empty during long-running dispatches.
+    // Handling them here lets the UI stream the subagent's state
+    // (including its per-agent model, once observed) live.
+    case "subagent_started":
+      return prev.map((t) =>
+        t.turnId === event.turn_id
+          ? {
+              ...t,
+              subagents: [
+                ...(t.subagents ?? []),
+                {
+                  agentId: event.agent_id,
+                  parentCallId: event.parent_call_id,
+                  agentType: event.agent_type,
+                  prompt: event.prompt,
+                  model: event.model,
+                  events: [],
+                  status: "running" as const,
+                },
+              ],
+            }
+          : t,
+      );
+    case "subagent_event":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.subagents) return t;
+        return {
+          ...t,
+          subagents: t.subagents.map((s) =>
+            s.agentId === event.agent_id
+              ? { ...s, events: [...s.events, event.event] }
+              : s,
+          ),
+        };
+      });
+    case "subagent_completed":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.subagents) return t;
+        return {
+          ...t,
+          subagents: t.subagents.map((s) =>
+            s.agentId === event.agent_id
+              ? {
+                  ...s,
+                  output: event.output,
+                  error: event.error,
+                  status: event.error
+                    ? ("failed" as const)
+                    : ("completed" as const),
+                }
+              : s,
+          ),
+        };
+      });
+    case "subagent_model_observed":
+      return prev.map((t) => {
+        if (t.turnId !== event.turn_id || !t.subagents) return t;
+        return {
+          ...t,
+          subagents: t.subagents.map((s) =>
+            s.agentId === event.agent_id ? { ...s, model: event.model } : s,
+          ),
+        };
+      });
+    // Incremental usage snapshots land on the in-flight turn so the
+    // ContextDisplay popover updates as each API call in the turn's
+    // tool loop completes. Without this, `turn.usage` only gets set
+    // on `turn_completed` — on an 11-minute turn that means 11
+    // minutes of a frozen numerator. See provider-claude-sdk bridge
+    // which now emits `turn_usage` per assistant message carrying
+    // the LATEST call's input/cache (not the aggregated sum that
+    // inflated the display past the window).
+    case "turn_usage_updated":
+      return prev.map((t) =>
+        t.turnId === event.turn_id ? { ...t, usage: event.usage } : t,
+      );
+    default:
+      return prev;
+  }
+}
+
+// Vertical drag handle between the chat column and the diff pane.
+// Mirrors the sidebar DragHandle pattern in router.tsx but measures
+// against the split container's right edge so the panel grows from
+// the right as the mouse moves left. The handle lives inline between
+// the two flex children (not absolutely positioned) to avoid z-index
+// fights with the sidebar handle and other overlays. Generic over
+// storageKey/minWidth so both the diff pane and the agent-context
+// pane can reuse the same primitive with their own persisted width.
+function PanelDragHandle({
+  containerRef,
+  width,
+  onResize,
+  storageKey,
+  minWidth,
+  ariaLabel,
+}: {
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  width: number;
+  onResize: (w: number) => void;
+  storageKey: string;
+  minWidth: number;
+  ariaLabel: string;
+}) {
+  const draggingRef = React.useRef(false);
+  const latestWidthRef = React.useRef(width);
+
+  React.useEffect(() => {
+    latestWidthRef.current = width;
+  }, [width]);
+
+  React.useEffect(() => {
+    function onMove(e: MouseEvent) {
+      if (!draggingRef.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const maxWidth = Math.max(
+        minWidth,
+        Math.floor(rect.width - DIFF_CHAT_MIN_WIDTH),
+      );
+      const next = Math.max(
+        minWidth,
+        Math.min(maxWidth, Math.round(rect.right - e.clientX)),
+      );
+      latestWidthRef.current = next;
+      onResize(next);
+    }
+    function onUp() {
+      if (!draggingRef.current) return;
+      draggingRef.current = false;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      try {
+        window.localStorage.setItem(
+          storageKey,
+          String(latestWidthRef.current),
+        );
+      } catch {
+        /* storage may be unavailable; width is still live in state */
+      }
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [containerRef, onResize, storageKey, minWidth]);
+
+  return (
+    <div
+      role="separator"
+      aria-label={ariaLabel}
+      aria-orientation="vertical"
+      className="w-1 shrink-0 cursor-col-resize bg-border/50 hover:bg-border"
+      onMouseDown={(e) => {
+        e.preventDefault();
+        draggingRef.current = true;
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+      }}
+    />
+  );
 }
 
 // ChatView is stable across thread switches — we deliberately do
@@ -243,22 +657,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [userSendTick, setUserSendTick] = React.useState(0);
   // Watchdog state: `lastEventAt` bumps on every stream event for this
   // session so the 45s inactivity timer resets. `stuckSince` is set
-  // (inside the useStuckWatchdog hook) when the timer fires and a
-  // pending tool call exists.
+  // when the timer fires and a pending tool call exists; rendering the
+  // StuckBanner keys off it.
   const [lastEventAt, setLastEventAt] = React.useState<number>(() =>
     Date.now(),
   );
+  const [stuckSince, setStuckSince] = React.useState<number | null>(null);
   // Coarse turn phase ("requesting" / "compacting" / …). Provider-
   // driven; only Claude SDK emits today. Cleared on turn_completed
   // so the stale label doesn't linger onto the next turn.
-  const [turnPhase, setTurnPhase] = React.useState<TurnPhase | undefined>(
-    undefined,
-  );
+  const [turnPhase, setTurnPhase] = React.useState<
+    import("@/lib/types").TurnPhase | undefined
+  >(undefined);
   // In-flight auto-retry banner state. Set from `turn_retrying`
   // events; cleared on the first subsequent `content_delta` (model
   // started responding, retry succeeded) or `turn_completed` /
   // `session_interrupted`.
-  const [retryState, setRetryState] = React.useState<RetryState | null>(null);
+  const [retryState, setRetryState] = React.useState<
+    import("@/lib/types").RetryState | null
+  >(null);
   // Latest predicted next prompt from `prompt_suggested` events.
   // Rendered as ghost text in the empty composer; any keystroke,
   // new turn start, or turn completion clears it so stale
@@ -269,7 +686,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // Open-state for the per-session settings dialog (gear icon in
   // header). Local to chat-view because dialog content reads from
   // the React Query cache that lives here.
-  const [sessionSettingsOpen, setSessionSettingsOpen] = React.useState(false);
+  const [sessionSettingsOpen, setSessionSettingsOpen] =
+    React.useState(false);
   // Anchor turn for the per-user-message revert dialog. `null`
   // means closed; setting to a turn id opens the dialog with that
   // turn as the rewind target.
@@ -277,20 +695,82 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     string | null
   >(null);
 
-  // Diff panel + agent-context panel state. Open flags live in the
-  // transient session store so they follow the thread across
-  // navigations; ChatView holds mirror state so rendering stays
-  // reactive. Width / style live inside DiffPanelHost (persisted to
-  // localStorage there).
+  // The diff view is sourced directly from `git diff HEAD` against
+  // the project's working tree (plus untracked files). It refreshes
+  // on session load, on every `turn_completed` event, and whenever
+  // the user opens the panel — so each turn shows its cumulative
+  // effect without us instrumenting individual tool calls.
+  // `diffRefreshTick` bumps to restart the streamed subscription
+  // without blowing away the previously-committed file list, so the
+  // Diff button badge stays steady across refreshes.
+  const [diffRefreshTick, setDiffRefreshTick] = React.useState(0);
+  // Latches true the first time the user opens or hovers the diff
+  // panel button for this chat view. Gates the streamed
+  // subscription itself (`enabled`) AND the stream-event refresh
+  // path — before the first interaction we don't run a single git
+  // subprocess for this view. The state flavor drives the hook's
+  // `enabled` prop; the ref flavor is read synchronously from
+  // stream-event handlers whose effect we don't want to re-run on
+  // every flip.
+  const [diffSubscriptionActive, setDiffSubscriptionActive] =
+    React.useState(false);
+  const diffPanelEverOpenedRef = React.useRef(false);
+  // 400ms grace window to collapse back-to-back `refreshDiffs()`
+  // triggers into a single tick bump. `session_loaded` and the first
+  // `turn_completed` can fire within a few hundred ms of each other
+  // on initial load, and rapid multi-turn runs can also storm this
+  // path; either way we don't need more than ~2.5 refetches/sec.
+  // Branch checkout passes `{ force: true }` to bypass — it's a
+  // one-shot gesture that must always reach the subscription even
+  // if a streaming refresh just landed inside the debounce window.
+  const lastRefreshAtRef = React.useRef(0);
+  const refreshDiffs = React.useCallback((opts?: { force?: boolean }) => {
+    const now = Date.now();
+    if (!opts?.force && now - lastRefreshAtRef.current < 400) return;
+    lastRefreshAtRef.current = now;
+    setDiffRefreshTick((t) => t + 1);
+  }, []);
+
+  // Arm the diff subscription. Called on Diff-button hover/focus
+  // AND on first panel open. Unlike the old hover prefetch this
+  // does NOT bump the refresh tick on every call — flipping
+  // `diffSubscriptionActive` from false → true starts the
+  // subscription exactly once, and subsequent calls are React
+  // no-ops (setState bails when the value didn't change). The
+  // streamed hook keeps previous diffs visible across any future
+  // refresh-tick bumps, so the Diff button badge never flickers
+  // empty on hover the way it did with the tanstack-query version.
+  const activateDiffSubscription = React.useCallback(() => {
+    diffPanelEverOpenedRef.current = true;
+    setDiffSubscriptionActive(true);
+  }, []);
+
+  // Diff panel state. Closed by default — open it from the chat
+  // header's "Show diff" button when you want to see what the
+  // session changed. `diffWidth` and `diffStyle` are user
+  // preferences persisted to localStorage so they survive
+  // restarts.
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
-  const [diffOpen, setDiffOpenState] = React.useState<boolean>(() =>
-    sessionTransient.getDiffOpen(sessionId),
+  const [diffOpen, setDiffOpenState] = React.useState<boolean>(
+    () => sessionDiffOpen.get(sessionId) ?? false,
   );
   const [diffFullscreen, setDiffFullscreen] = React.useState(false);
-  const setDiffOpen = React.useCallback(
-    (value: boolean) => {
-      setDiffOpenState(value);
-      sessionTransient.setDiffOpen(sessionId, value);
+  // Write-through wrapper: every update also records the session's
+  // new open flag in the module-level map so it's still there when
+  // the user returns to this thread after visiting another.
+  const setDiffOpen = React.useCallback<
+    React.Dispatch<React.SetStateAction<boolean>>
+  >(
+    (value) => {
+      setDiffOpenState((prev) => {
+        const next =
+          typeof value === "function"
+            ? (value as (p: boolean) => boolean)(prev)
+            : value;
+        if (next) sessionDiffOpen.set(sessionId, true);
+        else sessionDiffOpen.delete(sessionId);
+        return next;
+      });
     },
     [sessionId],
   );
@@ -303,21 +783,75 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     (attachment: AttachmentRef) => setPersistedLightboxRef(attachment),
     [],
   );
+  const [diffWidth, setDiffWidth] = React.useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem(DIFF_WIDTH_KEY);
+      if (saved) {
+        const parsed = Number.parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= DIFF_MIN_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      /* storage may be unavailable */
+    }
+    return DIFF_DEFAULT_WIDTH;
+  });
+  const [diffStyle, setDiffStyleState] = React.useState<DiffStyle>(() => {
+    try {
+      const saved = window.localStorage.getItem(DIFF_STYLE_KEY);
+      if (saved === "split" || saved === "unified") return saved;
+    } catch {
+      /* storage may be unavailable */
+    }
+    return "split";
+  });
+  const setDiffStyle = React.useCallback((s: DiffStyle) => {
+    setDiffStyleState(s);
+    try {
+      window.localStorage.setItem(DIFF_STYLE_KEY, s);
+    } catch {
+      /* storage may be unavailable */
+    }
+  }, []);
 
   // Agent-context pane state — mirrors the diff pane state. The two
   // panes are mutually exclusive (enforced in the toggle handlers
   // below); they share the split-right slot inside splitContainerRef.
-  const [contextOpen, setContextOpenState] = React.useState<boolean>(() =>
-    sessionTransient.getContextOpen(sessionId),
+  const [contextOpen, setContextOpenState] = React.useState<boolean>(
+    () => sessionContextOpen.get(sessionId) ?? false,
   );
   const [contextFullscreen, setContextFullscreen] = React.useState(false);
-  const setContextOpen = React.useCallback(
-    (value: boolean) => {
-      setContextOpenState(value);
-      sessionTransient.setContextOpen(sessionId, value);
+  const setContextOpen = React.useCallback<
+    React.Dispatch<React.SetStateAction<boolean>>
+  >(
+    (value) => {
+      setContextOpenState((prev) => {
+        const next =
+          typeof value === "function"
+            ? (value as (p: boolean) => boolean)(prev)
+            : value;
+        if (next) sessionContextOpen.set(sessionId, true);
+        else sessionContextOpen.delete(sessionId);
+        return next;
+      });
     },
     [sessionId],
   );
+  const [contextWidth, setContextWidth] = React.useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem(CONTEXT_WIDTH_KEY);
+      if (saved) {
+        const parsed = Number.parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= CONTEXT_MIN_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      /* storage may be unavailable */
+    }
+    return CONTEXT_DEFAULT_WIDTH;
+  });
 
   // Look up the active session first, then fall back to the archived
   // list so the chat view can render read-only history for an archived
@@ -389,11 +923,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // operations (create/remove/list) need the resolved root.
   const parentGitRootQuery = useQuery(gitRootQueryOptions(parentProjectPath));
   const parentGitRoot = parentGitRootQuery.data ?? parentProjectPath;
-  // Branch fetched via project-scoped queries, so switching between
-  // threads in the same project reuses the cached values rather than
-  // re-shelling out to git on every navigation.
+  // Branch + diff summary are fetched via project-scoped queries,
+  // so switching between threads in the same project reuses the
+  // cached values rather than re-shelling out to git on every
+  // navigation. Both queries sit behind `enabled: !!path`, so the
+  // cache read is a no-op for folder-less (null-project) sessions
+  // where there's nothing to diff against.
   const gitBranchQuery = useQuery(gitBranchQueryOptions(projectPath));
   const gitBranch = gitBranchQuery.data ?? null;
+  // Streamed replacement for the old useQuery(gitDiffSummaryQueryOptions)
+  // call. The hook handles phase-1/phase-2 streaming, cancellation on
+  // unmount, and keep-previous-data across refresh-tick bumps so the
+  // Diff button badge doesn't flash empty when we restart the
+  // subscription (turn_completed, session_loaded, branch checkout).
+  const diffStream = useStreamedGitDiffSummary(
+    projectPath,
+    diffRefreshTick,
+    diffSubscriptionActive,
+  );
   // Worktree threads live under their own SDK project whose path IS
   // the worktree folder. If that folder has been removed on disk —
   // either from the branch-switcher's delete button or out-of-band
@@ -409,32 +956,143 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   });
   const worktreeFolderMissing =
     isWorktreeThread && worktreeFolderQuery.data === false;
-
-  // Expose the diff-panel host's imperative API (refresh / activate
-  // / toggle / close / diffs) so the header button, the hover
-  // prefetch, and the stream subscription can all reach the same
-  // instance without duplicating state.
-  const diffHostRef = React.useRef<DiffPanelHostApi | null>(null);
-  const activateDiffSubscription = React.useCallback(() => {
-    diffHostRef.current?.activate();
-  }, []);
-  const refreshDiffs = React.useCallback((opts?: { force?: boolean }) => {
-    diffHostRef.current?.refresh(opts);
-  }, []);
-  const diffs = diffHostRef.current?.diffs ?? [];
+  const diffs = React.useMemo<AggregatedFileDiff[]>(
+    () => diffStream.diffs,
+    [diffStream.diffs],
+  );
 
   // Keyboard shortcut for mode cycling (Shift+Tab)
-  useModeCycleShortcut({
-    session,
-    sessionId,
-    permissionMode,
-    excludedModes,
-    setPermissionMode,
-  });
+  React.useEffect(() => {
+    if (!session) return; // Only active when session exists
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // Only respond to Shift+Tab
+      if (event.key !== "Tab" || !event.shiftKey) return;
+
+      // Skip when focus is on an INPUT or contenteditable — e.g.
+      // title-rename, branch switcher search, diff style toggles —
+      // where Shift+Tab should keep its default focus-navigation
+      // behavior. The composer <textarea> is the only textarea in
+      // the app and is intentionally NOT skipped: users want the
+      // mode to cycle while typing without losing their cursor.
+      const target = event.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.isContentEditable) {
+        return;
+      }
+
+      // Prevent default Tab behavior (focus navigation)
+      event.preventDefault();
+
+      // Cycle to next mode. Always update local state so the toolbar
+      // reflects the choice and the next `send_turn` sends it. If a
+      // turn is in flight, also push `update_permission_mode` so the
+      // in-flight adapter picks up the change immediately — without
+      // this, toggling bypass mid-turn would still prompt for every
+      // subsequent tool call until the turn ends.
+      const newMode = cycleMode(permissionMode, "forward", excludedModes);
+      setPermissionMode(newMode);
+      if (session?.status === "running") {
+        void sendMessage({
+          type: "update_permission_mode",
+          session_id: sessionId,
+          permission_mode: newMode,
+        });
+      }
+
+      toast({
+        description: `Mode: ${MODE_LABELS[newMode]}`,
+        duration: 2000,
+      });
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [session, permissionMode, excludedModes]);
 
   // Escape interrupts the in-flight turn — but requires a *double* press
-  // within 2s to actually fire.
-  useDoubleEscInterrupt({ session, sessionId });
+  // within 2s to actually fire. A single Esc only "arms" the gesture and
+  // shows a toast hint; the second press inside the window does the
+  // interrupt. This guards against accidental presses (reaching for Esc
+  // to dismiss something else, OS habit, etc.) silently killing a long
+  // agent run. Mouse clicks on the working-indicator button and the
+  // composer stop button stay single-click — clicking a target is
+  // already deliberate. The title-rename Escape handler is scoped to
+  // its own input element, so this window-level listener doesn't
+  // clobber it when a rename is in progress.
+  const escArmedRef = React.useRef(false);
+  const escResetTimerRef = React.useRef<number | null>(null);
+  const escToastDismissRef = React.useRef<(() => void) | null>(null);
+
+  React.useEffect(() => {
+    if (!session) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (session.status !== "running") return;
+      event.preventDefault();
+
+      if (escArmedRef.current) {
+        // Second press within the window — actually interrupt. Disarm
+        // *before* sendMessage so a third press in the same tick can't
+        // double-fire interrupt_turn.
+        escArmedRef.current = false;
+        if (escResetTimerRef.current != null) {
+          clearTimeout(escResetTimerRef.current);
+          escResetTimerRef.current = null;
+        }
+        escToastDismissRef.current?.();
+        escToastDismissRef.current = null;
+        sendMessage({ type: "interrupt_turn", session_id: sessionId }).catch(
+          (err) => {
+            console.error("Failed to interrupt turn", err);
+          },
+        );
+        return;
+      }
+
+      // First press — arm and show the hint. Toast duration matches the
+      // arming window so the visible cue and the keyboard handler's
+      // internal state expire at the same instant.
+      escArmedRef.current = true;
+      escToastDismissRef.current = toast({
+        description: "Press Esc again to interrupt",
+        duration: 2000,
+      }).dismiss;
+      escResetTimerRef.current = window.setTimeout(() => {
+        escArmedRef.current = false;
+        escToastDismissRef.current = null;
+        escResetTimerRef.current = null;
+      }, 2000);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      if (escResetTimerRef.current != null) {
+        clearTimeout(escResetTimerRef.current);
+        escResetTimerRef.current = null;
+      }
+      escToastDismissRef.current?.();
+      escToastDismissRef.current = null;
+      escArmedRef.current = false;
+    };
+  }, [sessionId, session]);
+
+  // If the turn finishes naturally between the first and second Esc
+  // press, the arming state and its toast become misleading ("Press Esc
+  // again to interrupt" when there's nothing to interrupt anymore).
+  // Reactively disarm whenever status leaves "running".
+  const sessionStatus = session?.status;
+  React.useEffect(() => {
+    if (sessionStatus === "running") return;
+    if (escResetTimerRef.current != null) {
+      clearTimeout(escResetTimerRef.current);
+      escResetTimerRef.current = null;
+    }
+    escToastDismissRef.current?.();
+    escToastDismissRef.current = null;
+    escArmedRef.current = false;
+  }, [sessionStatus]);
 
   // Set active session
   React.useEffect(() => {
@@ -444,51 +1102,289 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [sessionId, dispatch]);
 
-  // Collapsed restoration effects — permission-mode replay from last
-  // turn AND per-view transient reset on thread switch.
-  useSessionRestoration({
-    sessionId,
-    permissionStorageKey,
-    sessionQuery,
-    setPermissionMode,
-    setPendingInput,
-    setLastEventAt,
-    setStuckSince: (v) => setStuckSince(v),
-    setDiffOpenState,
-    setContextOpenState,
-    setDiffFullscreen,
-    setContextFullscreen,
-  });
+  // Restore permission mode from the last persisted turn when the
+  // user lands on a session with no sessionStorage entry (a full
+  // page refresh, or the very first visit). Doesn't need to be
+  // synchronous — the toolbar picker tolerates a one-frame delay,
+  // and we don't want to clobber an explicit choice the user made
+  // in sessionStorage by racing them on render.
+  React.useEffect(() => {
+    const data = sessionQuery.data;
+    if (!data || data.detail.turns.length === 0) return;
 
-  // Single stream listener for the lifetime of ChatView. Forwards
-  // handlers to the store's shared subscription rather than opening
-  // its own Tauri channel.
-  useSessionStreamSubscription({
-    sessionId,
-    sessionIdRef,
-    setPendingInput,
-    setLastEventAt,
-    setStuckSince: (v) => setStuckSince(v),
-    setTurnPhase,
-    setRetryState,
-    setPromptSuggestion,
-    setPermissionMode,
-    activateDiffSubscription,
-    refreshDiffs,
-  });
+    // Scan last turn for an unmatched EnterPlanMode (entered plan but
+    // didn't exit). This handles agent-initiated plan mode changes that
+    // happened while the user was viewing a different session — the
+    // tool_call_completed handler only runs for the active session.
+    const lastTurn = data.detail.turns[data.detail.turns.length - 1];
+    const tools = lastTurn.toolCalls ?? [];
+    let planModeActive = false;
+    for (const tc of tools) {
+      if (tc.name === "EnterPlanMode" && !tc.error) planModeActive = true;
+      if (tc.name === "ExitPlanMode" && !tc.error) planModeActive = false;
+    }
+    if (planModeActive) {
+      setPermissionMode("plan");
+      return;
+    }
+
+    // Original: restore from turn's permissionMode when no sessionStorage.
+    if (sessionStorage.getItem(permissionStorageKey)) return;
+    const lastMode = [...data.detail.turns]
+      .reverse()
+      .find((t) => t.permissionMode)?.permissionMode;
+    if (lastMode) {
+      setPermissionMode(lastMode);
+    }
+  }, [sessionQuery.data, permissionStorageKey]);
+
+  // Reset per-view transient UI state on every thread switch.
+  // These are "what the user sees right now" state values — they
+  // don't belong to any specific session long-term, but they must
+  // not leak from the session the user is leaving. (Per-session
+  // *turns* don't need to reset because they live in the query
+  // cache, keyed by sessionId; pending permissions / questions
+  // don't need to reset because they live in the global store
+  // keyed by sessionId — switching threads just reads a different
+  // entry.)
+  React.useEffect(() => {
+    setPendingInput(null);
+    setLastEventAt(Date.now());
+    setStuckSince(null);
+    // Resync per-thread panel open flags from the module-level maps.
+    // ChatView doesn't remount on session switch, so the lazy
+    // useState initializers only ran for the very first session —
+    // this effect brings the mirror state into sync with the map on
+    // every subsequent switch. Fullscreen is intentionally reset
+    // (it's a momentary intent, not a thread preference).
+    setDiffOpenState(sessionDiffOpen.get(sessionId) ?? false);
+    setContextOpenState(sessionContextOpen.get(sessionId) ?? false);
+    setDiffFullscreen(false);
+    setContextFullscreen(false);
+  }, [sessionId]);
+
+  // Single stream listener for the lifetime of ChatView. It
+  // *never* reads sessionId from a closure — turn updates go into
+  // the query cache entry identified by `event.session_id`, and
+  // per-view side effects (pending input, permission prompts)
+  // check against the `sessionIdRef` so only events for the
+  // currently-visible thread touch transient UI state. That's
+  // what makes cross-session isolation structural: a thread-A
+  // content_delta that lands after the user has clicked over to
+  // thread B writes into cache[A], updates exactly nothing on
+  // screen, and silently waits for the user to come back to A.
+  React.useEffect(() => {
+    let active = true;
+
+    connectStream((message) => {
+      if (!active) return;
+
+      if (message.type === "session_loaded") {
+        // Replace the cache entry for the target session outright —
+        // this is the lag-recovery path, where the daemon is telling
+        // us "here is the authoritative state of session X right now".
+        const detail = message.session;
+        const targetId = detail.summary.sessionId;
+        const totalTurns = detail.summary.turnCount ?? detail.turns.length;
+        queryClient.setQueryData<SessionPage>(sessionQueryKey(targetId), {
+          detail,
+          loadedTurns: detail.turns.length,
+          totalTurns,
+          hasMoreOlder: detail.turns.length < totalTurns,
+        });
+        if (targetId === sessionIdRef.current) {
+          setPendingInput(null);
+          setLastEventAt(Date.now());
+          setStuckSince(null);
+          // Activate and refresh the diff subscription so the badge
+          // reflects the current working-tree state after reconnection.
+          activateDiffSubscription();
+          refreshDiffs();
+        }
+        return;
+      }
+
+      if (message.type !== "event") return;
+      const event = message.event;
+      if (!("session_id" in event)) return;
+      const eventSessionId = event.session_id;
+
+      // Route turn mutations to the event's session cache. Events
+      // whose session isn't in the cache (the user has never
+      // visited) silently no-op — when the user eventually opens
+      // that thread, useQuery fetches fresh data from the daemon.
+      queryClient.setQueryData<SessionPage>(
+        sessionQueryKey(eventSessionId),
+        (prev) => {
+          if (!prev) return prev;
+          const nextTurns = applyEventToTurns(prev.detail.turns, event);
+          if (nextTurns === prev.detail.turns) return prev;
+          const total = Math.max(prev.totalTurns, nextTurns.length);
+          return {
+            ...prev,
+            detail: { ...prev.detail, turns: nextTurns },
+            loadedTurns: nextTurns.length,
+            totalTurns: total,
+            hasMoreOlder: nextTurns.length < total,
+          };
+        },
+      );
+
+      // Per-view UI state only moves for events on the currently-
+      // visible session. Everything below here is "reset pending
+      // chrome" / "scroll-to-bottom hints" / "router navigation" —
+      // all current-view concerns.
+      if (eventSessionId !== sessionIdRef.current) return;
+
+      setLastEventAt(Date.now());
+      setStuckSince(null);
+
+      switch (event.type) {
+        case "turn_started":
+          // Clear the optimistic pending row now that the real turn
+          // has been appended to the cache. The store handles
+          // pendingPermissions/pendingQuestion clearing globally
+          // (turn_completed / session_interrupted reducer paths).
+          setPendingInput(null);
+          setTurnPhase(undefined);
+          setRetryState(null);
+          // Clear any stale suggestion from the previous turn —
+          // the new turn will emit its own `prompt_suggested`
+          // if the SDK has a prediction.
+          setPromptSuggestion(null);
+          break;
+
+        case "turn_completed":
+          setPendingInput(null);
+          setTurnPhase(undefined);
+          setRetryState(null);
+          // Every completed turn activates the diff subscription
+          // (idempotent after the first call) and restarts it so
+          // the badge reflects what this turn left on disk. The
+          // git work runs entirely on the Rust side via Tauri IPC
+          // — non-blocking for the UI.
+          activateDiffSubscription();
+          refreshDiffs();
+          break;
+
+        case "files_rewound":
+          // Native rewind just changed files on disk outside the
+          // turn loop. Force the diff subscription open and refresh
+          // so the badge updates to the post-rewind state. Toast
+          // the totals so the user has feedback even if the diff
+          // panel isn't visible. Cap the path-list preview in the
+          // toast so a 200-file rewind doesn't blow it up.
+          activateDiffSubscription();
+          refreshDiffs({ force: true });
+          {
+            const restored = event.paths_restored.length;
+            const deleted = event.paths_deleted.length;
+            toast({
+              description: `Reverted ${restored} restored, ${deleted} deleted.`,
+              duration: 4000,
+            });
+          }
+          break;
+
+        case "content_delta":
+          // First token of the turn clears any in-flight retry
+          // banner — if the provider was retrying and the model
+          // started responding, the retry succeeded. Always
+          // dispatch: React short-circuits a same-value set, so
+          // we don't need to gate on the current retryState.
+          setRetryState(null);
+          break;
+
+        case "turn_status_changed":
+          setTurnPhase(event.phase);
+          break;
+
+        case "turn_retrying":
+          setRetryState({
+            turnId: event.turn_id,
+            attempt: event.attempt,
+            maxRetries: event.max_retries,
+            retryDelayMs: event.retry_delay_ms,
+            errorStatus: event.error_status,
+            error: event.error,
+            startedAt: Date.now(),
+          });
+          break;
+
+        case "prompt_suggested":
+          // Latest prediction wins — the SDK may emit several over
+          // the life of a turn and we only show the freshest.
+          setPromptSuggestion(event.suggestion);
+          break;
+
+        case "tool_call_completed": {
+          // Detect auto-approved EnterPlanMode completing successfully.
+          // When it goes through the permission prompt, PlanEnterPrompt
+          // already sets the mode via modeOverride. This catches the
+          // bypass/allow-always case where no permission_requested fires.
+          if (!event.error) {
+            const cached = queryClient.getQueryData<SessionPage>(
+              sessionQueryKey(sessionIdRef.current),
+            );
+            if (cached) {
+              const turn = cached.detail.turns.find(
+                (t) => t.turnId === event.turn_id,
+              );
+              const tc = turn?.toolCalls?.find(
+                (c) => c.callId === event.call_id,
+              );
+              if (tc?.name === "EnterPlanMode" && !tc.parentCallId) {
+                setPermissionMode("plan");
+                toast({
+                  description: "Agent switched to Plan mode",
+                  duration: 3000,
+                });
+              }
+            }
+          }
+          break;
+        }
+
+        // permission_requested / user_question_asked are handled in
+        // the global store reducer (app-store.tsx). chat-view reads
+        // pendingPermissions / pendingQuestion from the store, so a
+        // prompt that arrives while the user is on a different
+        // thread now lives in the store until they switch over.
+
+        case "session_deleted":
+        case "session_archived":
+          // Active thread deleted / archived from elsewhere — bail
+          // out so the user isn't staring at a title with no data.
+          navigate({ to: "/" });
+          break;
+      }
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [queryClient, navigate, refreshDiffs, activateDiffSubscription]);
 
   // --- Draft persistence callbacks ---
   const handleDraftChange = React.useCallback(
     (draft: string) => {
-      sessionTransient.setDraft(sessionId, draft);
+      if (draft.length > 0) {
+        sessionDrafts.set(sessionId, draft);
+      } else {
+        sessionDrafts.delete(sessionId);
+      }
     },
     [sessionId],
   );
 
   // --- Queue persistence callbacks ---
   const handleQueueChange = React.useCallback(
-    (queue: import("./chat-input").QueuedMessage[]) => {
-      sessionTransient.setQueue(sessionId, queue);
+    (queue: QueuedMessage[]) => {
+      if (queue.length > 0) {
+        sessionQueues.set(sessionId, queue);
+      } else {
+        sessionQueues.delete(sessionId);
+      }
     },
     [sessionId],
   );
@@ -497,8 +1393,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // Clear the persisted draft on send — the message is gone from
     // the composer and we don't want it to reappear if the user
     // navigates away and back before the component remounts.
-    sessionTransient.clearDraft(sessionId);
-    sessionTransient.clearQueue(sessionId);
+    sessionDrafts.delete(sessionId);
+    sessionQueues.delete(sessionId);
     if (isArchived) {
       // Defense in depth — the composer is disabled when archived,
       // but slash-command and keyboard shortcut paths could still
@@ -729,31 +1625,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   }, [turns, runningTurn]);
 
   const handleToggleContext = React.useCallback(() => {
-    // Mutual exclusion with the diff pane: opening context closes
-    // diff so the split-right slot is clean.
-    if (contextOpen) {
-      setContextOpen(false);
-      setContextFullscreen(false);
-    } else {
-      setContextOpen(true);
-      setDiffOpen(false);
-      setDiffFullscreen(false);
-    }
-  }, [contextOpen, setContextOpen, setDiffOpen]);
-
-  const handleToggleDiff = React.useCallback(() => {
-    // Mutual exclusion with the agent-context pane.
-    if (diffOpen) {
-      setDiffOpen(false);
-      setDiffFullscreen(false);
-    } else {
-      setDiffOpen(true);
-      setContextOpen(false);
-      setContextFullscreen(false);
-      diffHostRef.current?.activate();
-      diffHostRef.current?.refresh({ force: true });
-    }
-  }, [diffOpen, setDiffOpen, setContextOpen]);
+    setContextOpen((v) => {
+      const next = !v;
+      if (next) {
+        setDiffOpen(false);
+        setDiffFullscreen(false);
+      } else {
+        setContextFullscreen(false);
+      }
+      return next;
+    });
+  }, []);
 
   // Is there at least one tool call on the running turn still waiting
   // for its completion event? That's the precondition for the
@@ -764,13 +1646,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!runningTurn) return false;
     return (runningTurn.toolCalls ?? []).some((tc) => tc.status === "pending");
   }, [runningTurn]);
-
-  // Arm the stuck-watchdog.
-  const { stuckSince, setStuckSince } = useStuckWatchdog({
-    isRunning,
-    hasPendingToolCall,
-    lastEventAt,
-  });
 
   // Per-session settings affordance gate. Reads the current
   // provider's feature flags; the gear button (and dialog) only
@@ -789,6 +1664,27 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!sessionFeatures.fileCheckpoints) return undefined;
     return (turnId: string) => setRevertAnchorTurnId(turnId);
   }, [sessionFeatures.fileCheckpoints]);
+
+  // Arm the stuck-watchdog. We only trip it when the session is
+  // running *and* at least one tool call is pending, so idle
+  // pre-tool "Thinking…" periods don't falsely flag as stuck. The
+  // timer is rearmed by `lastEventAt` bumping on each event.
+  React.useEffect(() => {
+    if (!isRunning || !hasPendingToolCall) {
+      setStuckSince(null);
+      return;
+    }
+    const now = Date.now();
+    const elapsed = now - lastEventAt;
+    if (elapsed >= STUCK_TIMEOUT_MS) {
+      setStuckSince(lastEventAt);
+      return;
+    }
+    const id = setTimeout(() => {
+      setStuckSince(lastEventAt);
+    }, STUCK_TIMEOUT_MS - elapsed);
+    return () => clearTimeout(id);
+  }, [isRunning, hasPendingToolCall, lastEventAt]);
 
   const title = state.sessionDisplay.get(sessionId)?.title || "New thread";
 
@@ -851,261 +1747,328 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   ) : null;
 
   return (
-    <SessionProvider
-      value={{
-        sessionId,
-        provider: session?.provider,
-        model:
-          sessionQuery.data?.detail.summary.model ?? session?.model ?? undefined,
-      }}
-    >
-      <div className="flex h-svh min-w-0 flex-col overflow-hidden">
-        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
-          <SidebarTrigger />
-          <div className="flex min-w-0 flex-col leading-tight">
-            {editingTitle ? (
-              <input
-                ref={titleInputRef}
-                className="min-w-0 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
-                value={titleDraft}
-                onChange={(e) => setTitleDraft(e.target.value)}
-                onBlur={commitTitleRename}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") commitTitleRename();
-                  if (e.key === "Escape") {
-                    setTitleDraft(title);
-                    setEditingTitle(false);
-                  }
-                }}
+    <div className="flex h-svh min-w-0 flex-col overflow-hidden">
+      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
+        <SidebarTrigger />
+        <div className="flex min-w-0 flex-col leading-tight">
+          {editingTitle ? (
+            <input
+              ref={titleInputRef}
+              className="min-w-0 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
+              value={titleDraft}
+              onChange={(e) => setTitleDraft(e.target.value)}
+              onBlur={commitTitleRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") commitTitleRename();
+                if (e.key === "Escape") {
+                  setTitleDraft(title);
+                  setEditingTitle(false);
+                }
+              }}
+            />
+          ) : (
+            <span
+              className="cursor-pointer truncate font-medium hover:text-muted-foreground"
+              onClick={() => setEditingTitle(true)}
+            >
+              {title}
+            </span>
+          )}
+          <div className="flex items-center gap-2">
+            {gitBranch && projectPath && session && parentProjectId && parentGitRoot && (
+              <BranchSwitcher
+                projectPath={projectPath}
+                currentBranch={gitBranch}
+                parentProjectId={parentProjectId}
+                parentProjectPath={parentGitRoot}
+                provider={session.provider}
+                model={session.model ?? null}
+                onCheckedOut={() => refreshDiffs({ force: true })}
               />
-            ) : (
-              <span
-                className="cursor-pointer truncate font-medium hover:text-muted-foreground"
-                onClick={() => setEditingTitle(true)}
-              >
-                {title}
+            )}
+            {providerDisabled && (
+              <span className="inline-flex shrink-0 items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+                Provider disabled
               </span>
             )}
-            <div className="flex items-center gap-2">
-              {gitBranch && projectPath && session && parentProjectId && parentGitRoot && (
-                <BranchSwitcher
-                  projectPath={projectPath}
-                  currentBranch={gitBranch}
-                  parentProjectId={parentProjectId}
-                  parentProjectPath={parentGitRoot}
-                  provider={session.provider}
-                  model={session.model ?? null}
-                  onCheckedOut={() => refreshDiffs({ force: true })}
-                />
-              )}
-              {providerDisabled && (
-                <span className="inline-flex shrink-0 items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
-                  Provider disabled
-                </span>
-              )}
-            </div>
           </div>
-          <div className="ml-auto flex items-center gap-2">
-            <HeaderActions
-              sessionId={sessionId}
-              projectPath={projectPath}
-              diffs={diffs}
-              diffOpen={diffOpen}
-              contextOpen={contextOpen}
-              todoProgress={todoProgress}
-              onToggleContext={handleToggleContext}
-              // Only show the gear when the current provider has at
-              // least one per-session-settable feature. Today that's
-              // gated on `compact_custom_instructions`; as more
-              // session-scoped fields land, OR them in here.
-              onOpenSessionSettings={
-                hasSessionSettings
-                  ? () => setSessionSettingsOpen(true)
-                  : undefined
-              }
-              onToggleDiff={handleToggleDiff}
-              // Hover arms the subscription (exactly once, via the
-              // React setState bail-out). No tick bump, no refetch —
-              // the subscription fires as soon as it's activated and
-              // subsequent hovers are no-ops.
-              onHoverDiff={diffOpen ? undefined : activateDiffSubscription}
-            />
-          </div>
-        </header>
-
-        {/* Horizontal split: chat column on the left, optional diff pane
-            on the right. min-w-0 on the outer row lets the left column
-            shrink below its content's intrinsic width so wide messages
-            or code blocks don't push the diff pane off-screen. */}
-        <div
-          ref={splitContainerRef}
-          className="flex min-h-0 min-w-0 flex-1"
-        >
-          <div
-            className={cn(
-              "flex min-w-0 flex-col",
-              diffFullscreen || contextFullscreen ? "hidden" : "flex-1",
-            )}
-          >
-            <MessageList
-              sessionId={sessionId}
-              turns={turns}
-              loading={loading}
-              pendingInput={pendingInput}
-              userSendTick={userSendTick}
-              hiddenOlderCount={hiddenOlderCount}
-              loadingOlder={loadingOlder}
-              onLoadOlder={handleLoadOlder}
-              onOpenAttachment={handleOpenPersistedAttachment}
-              sessionModel={sessionQuery.data?.detail.summary.model}
-              onRevertFiles={handleRevertFiles}
-            />
-
-            {isRunning && session && runningTurn && (
-              <WorkingIndicator
-                turnStartedAt={new Date(runningTurn.createdAt).getTime()}
-                lastEventAt={lastEventAt}
-                tone={toneForMode(permissionMode)}
-                phase={turnPhase}
-                onInterrupt={handleInterrupt}
-              />
-            )}
-
-            {isRunning && retryState && <ApiRetryBanner state={retryState} />}
-
-            {pendingQuestion && (
-              <QuestionPrompt
-                questions={pendingQuestion.questions}
-                onSubmit={handleQuestionSubmit}
-                onCancel={handleQuestionCancel}
-              />
-            )}
-
-            {pendingPermissions.length > 0 && (
-              <PermissionPrompt
-                // Head-of-queue. The `key` forces React to remount the
-                // prompt so any local component state (e.g. the plan-exit
-                // mode picker's `pending` flag) resets between queued
-                // prompts and the user can't accidentally double-answer
-                // the next one with stale state.
-                key={pendingPermissions[0].requestId}
-                toolName={pendingPermissions[0].toolName}
-                input={pendingPermissions[0].input}
-                onDecision={handlePermissionDecision}
-                queueDepth={pendingPermissions.length}
-              />
-            )}
-
-            {stuckSince !== null &&
-              pendingPermissions.length === 0 &&
-              !pendingQuestion && (
-                <StuckBanner
-                  elapsedSeconds={Math.floor((Date.now() - stuckSince) / 1000)}
-                  onInterrupt={() => {
-                    setStuckSince(null);
-                    handleInterrupt();
-                  }}
-                  onReload={() => {
-                    setStuckSince(null);
-                    // Invalidate the cache entry and force a refetch so
-                    // the next render re-seeds `turns` with whatever the
-                    // daemon has now. The fetched `SessionPage` replaces
-                    // the cache entry, and the streaming handler picks
-                    // up from there on the next session_loaded reseed.
-                    void queryClient.invalidateQueries({
-                      queryKey: sessionQueryKey(sessionId),
-                      refetchType: "active",
-                    });
-                  }}
-                />
-              )}
-
-            {isArchived && (
-              <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
-                This thread is archived — read-only history. Archived
-                conversations can't receive new messages.
-              </div>
-            )}
-            {!isArchived && worktreeFolderMissing && (
-              <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
-                This worktree's folder no longer exists — read-only
-                history. Recreate the worktree to keep working on it.
-              </div>
-            )}
-            <ChatInput
-              // Remount the composer on every thread switch so its
-              // internal state (pendingSend queue flag, slash-command
-              // popup) resets cleanly. Draft text is now preserved
-              // via initialValue / onDraftChange so the user's
-              // in-progress message survives tab switches.
-              key={sessionId}
-              onSend={handleSend}
-              onInterrupt={handleInterrupt}
-              sessionStatus={session?.status}
-              disabled={loading}
-              providerDisabled={providerDisabled}
-              archived={isArchived || worktreeFolderMissing}
-              toolbar={toolbar}
-              commands={slashCommands}
-              provider={session?.provider}
-              initialValue={sessionTransient.getDraft(sessionId)}
-              onDraftChange={handleDraftChange}
-              initialQueue={sessionTransient.getQueue(sessionId)}
-              onQueueChange={handleQueueChange}
-              permissionMode={permissionMode}
-              promptSuggestion={promptSuggestion}
-              onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
-            />
-          </div>
-
-          <DiffPanelHost
-            ref={diffHostRef}
+        </div>
+        <div className="ml-auto flex items-center gap-2">
+          <HeaderActions
             sessionId={sessionId}
             projectPath={projectPath}
-            containerRef={splitContainerRef}
-            open={diffOpen}
-            onOpenChange={setDiffOpen}
-            fullscreen={diffFullscreen}
-            onFullscreenChange={setDiffFullscreen}
-          />
-
-          <AgentContextPanelHost
-            containerRef={splitContainerRef}
-            open={contextOpen}
-            onOpenChange={setContextOpen}
-            fullscreen={contextFullscreen}
-            onFullscreenChange={setContextFullscreen}
-            turns={turns}
-            runningTurn={runningTurn}
+            diffs={diffs}
+            diffOpen={diffOpen}
+            contextOpen={contextOpen}
+            todoProgress={todoProgress}
+            onToggleContext={handleToggleContext}
+            // Only show the gear when the current provider has at
+            // least one per-session-settable feature. Today that's
+            // gated on `compact_custom_instructions`; as more
+            // session-scoped fields land, OR them in here.
+            onOpenSessionSettings={
+              hasSessionSettings
+                ? () => setSessionSettingsOpen(true)
+                : undefined
+            }
+            onToggleDiff={() => {
+              setDiffOpen((v) => {
+                if (!v) {
+                  // First interaction with the diff button of any
+                  // kind activates the subscription. `refreshDiffs`
+                  // then bumps the tick so the newly-opened panel
+                  // picks up any on-disk changes made outside the
+                  // agent — but unlike the old path this does NOT
+                  // blank out the badge, because the streamed hook
+                  // keeps the previous diffs committed until the
+                  // new subscription's Phase 1 lands.
+                  activateDiffSubscription();
+                  refreshDiffs({ force: true });
+                  // Mutual exclusion with the agent-context pane:
+                  // opening diff closes context and drops its
+                  // fullscreen so the split-right slot is clean.
+                  setContextOpen(false);
+                  setContextFullscreen(false);
+                } else {
+                  setDiffFullscreen(false);
+                }
+                return !v;
+              });
+            }}
+            // Hover arms the subscription (exactly once, via the
+            // React setState bail-out). No tick bump, no refetch —
+            // the subscription fires as soon as it's activated and
+            // subsequent hovers are no-ops. This is the fix for the
+            // old button-badge flicker: hovers never restart the
+            // query, so the `+N/−M` count stays visible.
+            onHoverDiff={diffOpen ? undefined : activateDiffSubscription}
           />
         </div>
-        {persistedLightboxRef && (
-          <ImageLightbox
-            source={{ kind: "persisted", ref: persistedLightboxRef }}
-            onClose={() => setPersistedLightboxRef(null)}
-          />
-        )}
-        {hasSessionSettings && sessionQuery.data?.detail.summary.provider && (
-          <SessionSettingsDialog
-            open={sessionSettingsOpen}
-            onOpenChange={setSessionSettingsOpen}
+      </header>
+
+      {/* Horizontal split: chat column on the left, optional diff pane
+          on the right. min-w-0 on the outer row lets the left column
+          shrink below its content's intrinsic width so wide messages
+          or code blocks don't push the diff pane off-screen. */}
+      <div
+        ref={splitContainerRef}
+        className="flex min-h-0 min-w-0 flex-1"
+      >
+        <div
+          className={cn(
+            "flex min-w-0 flex-col",
+            diffFullscreen || contextFullscreen ? "hidden" : "flex-1",
+          )}
+        >
+          <MessageList
             sessionId={sessionId}
-            provider={sessionQuery.data.detail.summary.provider}
-            session={sessionQuery.data?.detail}
-          />
-        )}
-        {sessionFeatures.fileCheckpoints && (
-          <RevertFilesDialog
-            open={revertAnchorTurnId !== null}
-            onOpenChange={(next) => {
-              if (!next) setRevertAnchorTurnId(null);
-            }}
-            sessionId={sessionId}
-            anchorTurnId={revertAnchorTurnId}
             turns={turns}
+            loading={loading}
+            pendingInput={pendingInput}
+            userSendTick={userSendTick}
+            hiddenOlderCount={hiddenOlderCount}
+            loadingOlder={loadingOlder}
+            onLoadOlder={handleLoadOlder}
+            onOpenAttachment={handleOpenPersistedAttachment}
+            providerKind={sessionQuery.data?.detail.summary.provider}
+            sessionModel={sessionQuery.data?.detail.summary.model}
+            onRevertFiles={handleRevertFiles}
           />
+
+          {isRunning && session && runningTurn && (
+            <WorkingIndicator
+              turnStartedAt={new Date(runningTurn.createdAt).getTime()}
+              lastEventAt={lastEventAt}
+              tone={toneForMode(permissionMode)}
+              phase={turnPhase}
+              onInterrupt={handleInterrupt}
+            />
+          )}
+
+          {isRunning && retryState && <ApiRetryBanner state={retryState} />}
+
+          {pendingQuestion && (
+            <QuestionPrompt
+              questions={pendingQuestion.questions}
+              onSubmit={handleQuestionSubmit}
+              onCancel={handleQuestionCancel}
+            />
+          )}
+
+          {pendingPermissions.length > 0 && (
+            <PermissionPrompt
+              // Head-of-queue. The `key` forces React to remount the
+              // prompt so any local component state (e.g. the plan-exit
+              // mode picker's `pending` flag) resets between queued
+              // prompts and the user can't accidentally double-answer
+              // the next one with stale state.
+              key={pendingPermissions[0].requestId}
+              toolName={pendingPermissions[0].toolName}
+              input={pendingPermissions[0].input}
+              onDecision={handlePermissionDecision}
+              queueDepth={pendingPermissions.length}
+            />
+          )}
+
+          {stuckSince !== null &&
+            pendingPermissions.length === 0 &&
+            !pendingQuestion && (
+              <StuckBanner
+                elapsedSeconds={Math.floor((Date.now() - stuckSince) / 1000)}
+                onInterrupt={() => {
+                  setStuckSince(null);
+                  handleInterrupt();
+                }}
+                onReload={() => {
+                  setStuckSince(null);
+                  // Invalidate the cache entry and force a refetch so
+                  // the next render re-seeds `turns` with whatever the
+                  // daemon has now. The fetched `SessionPage` replaces
+                  // the cache entry, and the streaming handler picks
+                  // up from there on the next session_loaded reseed.
+                  void queryClient.invalidateQueries({
+                    queryKey: sessionQueryKey(sessionId),
+                    refetchType: "active",
+                  });
+                }}
+              />
+            )}
+
+          {isArchived && (
+            <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
+              This thread is archived — read-only history. Archived
+              conversations can't receive new messages.
+            </div>
+          )}
+          {!isArchived && worktreeFolderMissing && (
+            <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
+              This worktree's folder no longer exists — read-only
+              history. Recreate the worktree to keep working on it.
+            </div>
+          )}
+          <ChatInput
+            // Remount the composer on every thread switch so its
+            // internal state (pendingSend queue flag, slash-command
+            // popup) resets cleanly. Draft text is now preserved
+            // via initialValue / onDraftChange so the user's
+            // in-progress message survives tab switches.
+            key={sessionId}
+            onSend={handleSend}
+            onInterrupt={handleInterrupt}
+            sessionStatus={session?.status}
+            disabled={loading}
+            providerDisabled={providerDisabled}
+            archived={isArchived || worktreeFolderMissing}
+            toolbar={toolbar}
+            commands={slashCommands}
+            provider={session?.provider}
+            initialValue={sessionDrafts.get(sessionId) ?? ""}
+            onDraftChange={handleDraftChange}
+            initialQueue={sessionQueues.get(sessionId)}
+            onQueueChange={handleQueueChange}
+            permissionMode={permissionMode}
+            promptSuggestion={promptSuggestion}
+            onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
+            projectPath={projectPath}
+          />
+        </div>
+
+        {diffOpen && (
+          <>
+            {!diffFullscreen && (
+              <PanelDragHandle
+                containerRef={splitContainerRef}
+                width={diffWidth}
+                onResize={setDiffWidth}
+                storageKey={DIFF_WIDTH_KEY}
+                minWidth={DIFF_MIN_WIDTH}
+                ariaLabel="Resize diff panel"
+              />
+            )}
+            <aside
+              className={cn(
+                "border-l border-border bg-background",
+                diffFullscreen ? "flex-1" : "shrink-0",
+              )}
+              style={diffFullscreen ? undefined : { width: diffWidth }}
+            >
+              <DiffPanel
+                projectPath={projectPath}
+                diffs={diffs}
+                refreshKey={diffRefreshTick}
+                streamStatus={diffStream.status}
+                style={diffStyle}
+                onStyleChange={setDiffStyle}
+                onClose={() => {
+                  setDiffOpen(false);
+                  setDiffFullscreen(false);
+                }}
+                isFullscreen={diffFullscreen}
+                onToggleFullscreen={() => setDiffFullscreen((v) => !v)}
+              />
+            </aside>
+          </>
+        )}
+
+        {contextOpen && (
+          <>
+            {!contextFullscreen && (
+              <PanelDragHandle
+                containerRef={splitContainerRef}
+                width={contextWidth}
+                onResize={setContextWidth}
+                storageKey={CONTEXT_WIDTH_KEY}
+                minWidth={CONTEXT_MIN_WIDTH}
+                ariaLabel="Resize agent context panel"
+              />
+            )}
+            <aside
+              className={cn(
+                "border-l border-border bg-background",
+                contextFullscreen ? "flex-1" : "shrink-0",
+              )}
+              style={contextFullscreen ? undefined : { width: contextWidth }}
+            >
+              <AgentContextPanel
+                turns={turns}
+                runningTurn={runningTurn}
+                onClose={() => {
+                  setContextOpen(false);
+                  setContextFullscreen(false);
+                }}
+                isFullscreen={contextFullscreen}
+                onToggleFullscreen={() => setContextFullscreen((v) => !v)}
+              />
+            </aside>
+          </>
         )}
       </div>
-    </SessionProvider>
+      {persistedLightboxRef && (
+        <ImageLightbox
+          source={{ kind: "persisted", ref: persistedLightboxRef }}
+          onClose={() => setPersistedLightboxRef(null)}
+        />
+      )}
+      {hasSessionSettings && sessionQuery.data?.detail.summary.provider && (
+        <SessionSettingsDialog
+          open={sessionSettingsOpen}
+          onOpenChange={setSessionSettingsOpen}
+          sessionId={sessionId}
+          provider={sessionQuery.data.detail.summary.provider}
+          session={sessionQuery.data?.detail}
+        />
+      )}
+      {sessionFeatures.fileCheckpoints && (
+        <RevertFilesDialog
+          open={revertAnchorTurnId !== null}
+          onOpenChange={(next) => {
+            if (!next) setRevertAnchorTurnId(null);
+          }}
+          sessionId={sessionId}
+          anchorTurnId={revertAnchorTurnId}
+          turns={turns}
+        />
+      )}
+    </div>
   );
 }

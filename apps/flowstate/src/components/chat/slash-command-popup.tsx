@@ -15,7 +15,6 @@ function badgeFor(item: SlashCommandItem): string | null {
     return item.source === "disk_project" ? "project" : "global";
   }
   if (item.kind === "builtin") return "built-in";
-  if (item.kind === "tui_only") return "tui";
   if (item.kind === "agent") return "agent";
   return null; // core app command
 }

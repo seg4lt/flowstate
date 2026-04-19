@@ -13,18 +13,12 @@ publish = false
 # layering rule honest.
 default = []
 
-# Sync bootstrap + `run_blocking` entry points. Only makes sense for
-# a standalone daemon binary driven from a plain `main()`. Library
-# embedders (flowstate's Tauri app, tests) go through
-# `bootstrap_core_async` which is always compiled. Feature-gated to
-# keep the ready-file + `run_blocking` plumbing out of everyone
-# else's build (Phase 6.7).
-standalone-binary = []
-
 # Transports. Each concrete transport is an optional dep; daemon-core
 # re-exports it under the matching feature so consumers only need a
 # single `zenui-daemon-core` line in their Cargo.toml.
 transport-tauri = ["dep:zenui-transport-tauri"]
+transport-http = ["dep:zenui-transport-http"]
+all-transports = ["transport-tauri", "transport-http"]
 
 [dependencies]
 anyhow.workspace = true
@@ -40,6 +34,7 @@ zenui-persistence = { path = "../../core/persistence" }
 zenui-provider-api = { path = "../../core/provider-api" }
 zenui-runtime-core = { path = "../../core/runtime-core" }
 zenui-transport-tauri = { path = "../transport-tauri", optional = true }
+zenui-transport-http = { path = "../transport-http", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

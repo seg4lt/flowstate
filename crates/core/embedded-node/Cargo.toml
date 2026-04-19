@@ -7,7 +7,7 @@ build = "build.rs"
 
 [dependencies]
 anyhow.workspace = true
-dirs.workspace = true
+dirs = "5"
 flate2 = "1"
 tar = "0.4"
 zip = "2"

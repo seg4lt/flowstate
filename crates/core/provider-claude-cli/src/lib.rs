@@ -768,6 +768,12 @@ impl ClaudeCliAdapter {
                                     cache_write_tokens: u.cache_creation_input_tokens,
                                     cache_read_tokens: u.cache_read_input_tokens,
                                     context_window: ctx_window,
+                                    // claude-cli's stream-json `result` only
+                                    // exposes the per-turn aggregate; no
+                                    // per-API-call snapshot is available.
+                                    // The live context indicator falls back
+                                    // to the aggregate sum on this provider.
+                                    live_context_tokens: None,
                                     total_cost_usd,
                                     duration_ms,
                                     model,

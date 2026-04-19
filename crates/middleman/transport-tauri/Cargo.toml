@@ -9,6 +9,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tauri.workspace = true
+tauri = "2"
 zenui-provider-api = { path = "../../core/provider-api" }
 zenui-runtime-core = { path = "../../core/runtime-core" }
