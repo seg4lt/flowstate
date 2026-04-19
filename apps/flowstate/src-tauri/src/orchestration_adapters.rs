@@ -238,10 +238,18 @@ impl WorktreeProvisioner for WorktreeProvisionerImpl {
         let canonical_path = git_result.path;
         let canonical_branch = git_result.branch.or(Some(branch.clone()));
 
-        // Create the SDK project row for the new worktree and link it
-        // to the parent via the app-owned `project_worktree` table.
+        // Create the SDK project row first WITHOUT firing the event,
+        // then write the app-side `project_worktree` link, then fire
+        // `ProjectCreated`. Order matters: the frontend treats the
+        // event as its signal to hydrate the project into the sidebar,
+        // so if the link isn't already persisted by the time the event
+        // lands, the new worktree paints briefly as an ungrouped,
+        // unnamed "Untitled project" at the top level — exactly the
+        // flash reported when agents use the worktree tool. With this
+        // ordering, when the frontend receives the event and queries
+        // the app-side store, the link is guaranteed to be there.
         let project = runtime
-            .create_project_for_path(canonical_path.clone())
+            .persist_project_for_path(canonical_path.clone())
             .await?;
         let store = self.store.clone();
         let parent_id = base_project_id.to_string();
@@ -252,6 +260,9 @@ impl WorktreeProvisioner for WorktreeProvisionerImpl {
         })
         .await
         .map_err(|e| format!("spawn_blocking join: {e}"))??;
+        runtime.publish(zenui_provider_api::RuntimeEvent::ProjectCreated {
+            project: project.clone(),
+        });
 
         Ok(WorktreeBlueprint {
             project_id: project.project_id,

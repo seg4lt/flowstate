@@ -374,15 +374,29 @@ impl RuntimeCore {
         &self,
         path: String,
     ) -> Result<zenui_provider_api::ProjectRecord, String> {
-        let project = self
-            .persistence
-            .create_project(Some(path))
-            .await
-            .ok_or_else(|| "persistence.create_project returned None".to_string())?;
+        let project = self.persist_project_for_path(path).await?;
         self.publish(RuntimeEvent::ProjectCreated {
             project: project.clone(),
         });
         Ok(project)
+    }
+
+    /// Persist a project row without broadcasting `ProjectCreated`.
+    /// The caller is responsible for firing the event (via `publish`)
+    /// once any app-layer companion state (e.g. the `project_worktree`
+    /// link) has also been written. Splitting the create and the
+    /// publish lets the frontend see both rows in the same `listX()`
+    /// hydration read when it reacts to the event — otherwise the
+    /// sidebar briefly paints the new worktree project as an
+    /// ungrouped, unnamed top-level entry before the link lands.
+    pub async fn persist_project_for_path(
+        &self,
+        path: String,
+    ) -> Result<zenui_provider_api::ProjectRecord, String> {
+        self.persistence
+            .create_project(Some(path))
+            .await
+            .ok_or_else(|| "persistence.create_project returned None".to_string())
     }
 
     /// Install a Weak back-reference to the owning Arc. Called once by
