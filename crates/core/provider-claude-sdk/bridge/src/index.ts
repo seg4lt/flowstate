@@ -418,6 +418,46 @@ class ClaudeBridge {
     model?: string;
   };
   /**
+   * Per-turn per-agent token accumulator. Keyed by `parent_tool_use_id`
+   * for sub-agents, or the literal string `"main"` for the parent
+   * (top-level assistant messages). Every incoming assistant message's
+   * `usage` is added into the matching bucket at message time — the
+   * final `turn_usage` event surfaces this as `usage.agents[]` so the
+   * host's usage dashboard can attribute cost and tokens per agent
+   * instead of rolling everything into the SDK-aggregate total.
+   *
+   * Why accumulate per message rather than trust a single SDK-level
+   * split: the SDK's `result.modelUsage` is keyed by MODEL, not by
+   * agent. Two Explore subagents running the same model would share
+   * one `modelUsage` bucket, which loses the attribution the user
+   * actually wants ("how much did I spend on Explore runs?"). The
+   * per-message `parent_tool_use_id` is the only signal that cleanly
+   * separates agents, and it's already on every assistant message.
+   *
+   * Reset at the start of every `sendPrompt`.
+   */
+  private agentUsage: Map<
+    string,
+    {
+      agentId: string | null;
+      agentType: string | null;
+      model: string | null;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+    }
+  > = new Map();
+  /**
+   * Map from sub-agent id (the SDK's `Task`/`Agent` tool_use call id,
+   * which becomes `parent_tool_use_id` on every nested message) to the
+   * catalog `subagent_type` the parent spawned it with. Populated when
+   * we forward `subagent_started`; read at message time so each
+   * `agentUsage` bucket can carry the human-readable type label
+   * ("Explore", "Plan", "general-purpose", …). Cleared per turn.
+   */
+  private agentTypeById: Map<string, string> = new Map();
+  /**
    * Last `contextWindow` observed from the SDK's `result.modelUsage`.
    * Cached across turns so mid-turn `turn_usage` events on the next
    * turn can carry the window without waiting for that turn's own
@@ -495,6 +535,8 @@ class ClaudeBridge {
     this.observedSubagentIds.clear();
     this.outputTokensTotal = 0;
     this.lastAssistantUsage = undefined;
+    this.agentUsage.clear();
+    this.agentTypeById.clear();
 
     // Lazy-open the persistent Query on first sendPrompt, or re-open
     // it if a previous pump error tore it down.
@@ -1307,6 +1349,60 @@ class ClaudeBridge {
         // forward from this message so the frontend can group tool calls
         // by the agent that actually ran them.
         const parentToolUseId = m.parent_tool_use_id ?? undefined;
+        // Per-agent token accumulation — runs for BOTH main-agent and
+        // subagent messages. We key the bucket by parent_tool_use_id
+        // (or the literal "main" for top-level messages) and sum the
+        // per-call `message.usage` slice into it. The final `turn_usage`
+        // emitted from the `result` handler surfaces these buckets as
+        // `usage.agents[]`, which the host's usage store persists so
+        // the dashboard can break down cost/tokens per agent rather
+        // than only showing the SDK-aggregate total.
+        //
+        // Summing per-message is the right semantics here (even for
+        // cache_read, which is problematic for the LIVE context-window
+        // indicator): we want billable totals per agent, and the SDK
+        // bills every API call's cache read separately. That matches
+        // the scope of `r.usage.*` at turn end, so the sum across
+        // `agents[]` reconciles with the top-level aggregate and the
+        // dashboard can split `total_cost_usd` proportionally without
+        // drift.
+        const agentMessageUsage = m.message?.usage;
+        if (agentMessageUsage && typeof agentMessageUsage === 'object') {
+          const bucketKey = parentToolUseId ?? 'main';
+          const existing = this.agentUsage.get(bucketKey) ?? {
+            agentId: parentToolUseId ?? null,
+            agentType: parentToolUseId
+              ? this.agentTypeById.get(parentToolUseId) ?? null
+              : null,
+            model: null,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          };
+          existing.inputTokens += agentMessageUsage.input_tokens ?? 0;
+          existing.outputTokens += agentMessageUsage.output_tokens ?? 0;
+          existing.cacheReadTokens +=
+            agentMessageUsage.cache_read_input_tokens ?? 0;
+          existing.cacheWriteTokens +=
+            agentMessageUsage.cache_creation_input_tokens ?? 0;
+          // First non-empty model wins; later messages in the same
+          // agent carry the same value. For subagents this is the
+          // SDK's runtime-resolved model (authoritative). For main it
+          // matches `lastAssistantUsage.model` below.
+          const msgModel = m.message?.model;
+          if (!existing.model && msgModel) {
+            existing.model = msgModel;
+          }
+          // Backfill agent_type when `subagent_started` races after
+          // this message (rare but possible — the order isn't strictly
+          // guaranteed by the SDK).
+          if (!existing.agentType && parentToolUseId) {
+            existing.agentType =
+              this.agentTypeById.get(parentToolUseId) ?? null;
+          }
+          this.agentUsage.set(bucketKey, existing);
+        }
         // Per-call token usage for the MAIN-AGENT context-window
         // indicator only. Only top-level assistant messages count
         // toward the main turn's numerator — subagent calls have
@@ -1460,6 +1556,13 @@ class ClaudeBridge {
               // `subagent_model_observed` from the subagent's first
               // assistant message.
               const plannedModel = this.agentModelByType.get(agentType);
+              // Remember the agent's catalog type so the per-agent
+              // usage accumulator (above, in the assistant handler)
+              // can stamp `agent_type` on this subagent's bucket when
+              // its first assistant message lands. The SDK guarantees
+              // `subagent_started` forwards before any of that
+              // subagent's assistant messages, so the lookup hits.
+              this.agentTypeById.set(callId, agentType);
               writeStream({
                 event: 'subagent_started',
                 parent_call_id: callId,
@@ -1622,6 +1725,31 @@ class ClaudeBridge {
               (last.cacheReadTokens ?? 0) +
               (last.cacheWriteTokens ?? 0)
             : null;
+          // Per-agent token breakdown: ordered so the main (parent)
+          // bucket lands first, then each subagent in dispatch order
+          // (insertion order on `agentUsage` — Map preserves it). The
+          // host store reads this list to persist one row per agent
+          // for the usage dashboard; an empty list means the turn was
+          // all parent-agent with no Task dispatches, which the host
+          // still renders as a single "main" row.
+          const mainBucket = this.agentUsage.get('main');
+          const subagentBuckets: typeof mainBucket[] = [];
+          for (const [key, bucket] of this.agentUsage) {
+            if (key === 'main') continue;
+            subagentBuckets.push(bucket);
+          }
+          const agents = [
+            ...(mainBucket ? [mainBucket] : []),
+            ...subagentBuckets,
+          ].map((b) => ({
+            agentId: b!.agentId,
+            agentType: b!.agentType,
+            model: b!.model,
+            inputTokens: b!.inputTokens,
+            outputTokens: b!.outputTokens,
+            cacheReadTokens: b!.cacheReadTokens,
+            cacheWriteTokens: b!.cacheWriteTokens,
+          }));
           writeStream({
             event: 'turn_usage',
             usage: {
@@ -1636,13 +1764,17 @@ class ClaudeBridge {
               totalCostUsd: r.total_cost_usd ?? null,
               durationMs: r.duration_ms ?? null,
               // Parent model. On Task-heavy turns subagents may have
-              // run different models; we only store one label here
-              // because the per-turn usage row is keyed by the
-              // primary (parent) model for dashboard aggregation.
-              // Per-subagent cost attribution would require a schema
-              // split (TokenUsage.subagents[]) — deliberately out of
-              // scope for this fix.
+              // run different models; the `agents` field carries the
+              // per-agent model so per-subagent cost attribution stays
+              // correct even when this single top-level label doesn't
+              // capture every agent's model.
               model: last?.model ?? modelKey ?? null,
+              // Per-agent breakdown (main + every Task dispatch).
+              // Sums over `agents` equal the turn-level token fields
+              // above, so the host store can allocate
+              // `totalCostUsd` proportionally across agents without
+              // drifting from the SDK-aggregate cost.
+              ...(agents.length > 0 ? { agents } : {}),
             },
           });
         }

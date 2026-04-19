@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   getTopSessions,
+  getUsageByAgent,
   getUsageSummary,
   getUsageTimeseries,
   type TopSessionRow,
+  type UsageAgentPayload,
   type UsageBucket,
   type UsageGroupBy,
   type UsageRange,
@@ -49,6 +51,20 @@ export function useTopSessions(range: UsageRange, limit: number = 10) {
   return useQuery<TopSessionRow[]>({
     queryKey: ["usage", "topSessions", range, limit],
     queryFn: () => getTopSessions(range, limit),
+    staleTime: STALE_MS,
+    gcTime: CACHE_MS,
+  });
+}
+
+// Per-agent (Main + each subagent role) breakdown over the range.
+// Separate query from `useUsageSummary` because it hits a different
+// SQLite table (`usage_event_agents`) and is only rendered in the
+// "By agent" section — keeping it on its own cache key avoids
+// invalidating the top-line cards when this slice refetches.
+export function useUsageByAgent(range: UsageRange) {
+  return useQuery<UsageAgentPayload>({
+    queryKey: ["usage", "byAgent", range],
+    queryFn: () => getUsageByAgent(range),
     staleTime: STALE_MS,
     gcTime: CACHE_MS,
   });

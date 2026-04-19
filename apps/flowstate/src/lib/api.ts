@@ -536,6 +536,37 @@ export function getTopSessions(
   return invoke<TopSessionRow[]>("get_top_sessions", { range, limit });
 }
 
+// Per-agent dashboard breakdown. One row per agent role over the
+// range: the synthetic "main" key for the parent agent plus one row
+// per subagent type ("Explore", "general-purpose", …). Cost is
+// allocated proportionally at insert time (see
+// `insert_agent_rows` in `src-tauri/src/usage.rs`), so totals sum
+// back to the turn-level cost without double-counting.
+export interface UsageAgentGroupRow {
+  key: string;
+  label: string;
+  turnCount: number;
+  invocationCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalCostUsd: number;
+  costHasUnknowns: boolean;
+}
+
+export interface UsageAgentPayload {
+  range: UsageRange;
+  groups: UsageAgentGroupRow[];
+  generatedAt: string;
+}
+
+export function getUsageByAgent(
+  range: UsageRange,
+): Promise<UsageAgentPayload> {
+  return invoke<UsageAgentPayload>("get_usage_by_agent", { range });
+}
+
 // Read a single project file as a UTF-8 string. Rejects on:
 //   * file outside the project root (canonicalisation escape)
 //   * file above CODE_VIEW_MAX_FILE_BYTES (4 MiB)

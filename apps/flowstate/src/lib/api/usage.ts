@@ -108,3 +108,32 @@ export function getTopSessions(
 ): Promise<TopSessionRow[]> {
   return invoke<TopSessionRow[]>("get_top_sessions", { range, limit });
 }
+
+// Per-agent dashboard breakdown. Main (parent) agent is keyed as
+// "main"; sub-agents carry their catalog type ("Explore",
+// "general-purpose", ...). Cost is pre-allocated at insert time so
+// the sum across rows matches the parent turn's `total_cost_usd`.
+export interface UsageAgentGroupRow {
+  key: string;
+  label: string;
+  turnCount: number;
+  invocationCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalCostUsd: number;
+  costHasUnknowns: boolean;
+}
+
+export interface UsageAgentPayload {
+  range: UsageRange;
+  groups: UsageAgentGroupRow[];
+  generatedAt: string;
+}
+
+export function getUsageByAgent(
+  range: UsageRange,
+): Promise<UsageAgentPayload> {
+  return invoke<UsageAgentPayload>("get_usage_by_agent", { range });
+}
