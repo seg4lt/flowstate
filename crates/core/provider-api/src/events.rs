@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, oneshot};
 // and helper modules. Reach for the glob-re-export from the crate
 // root to keep this file readable rather than maintaining an ever-
 // growing hand-curated use list.
+use crate::orchestration::{RuntimeCall, RuntimeCallError, RuntimeCallResult};
 use crate::*;
 
 /// Events that a provider adapter can push during a turn for streaming display.
@@ -194,6 +195,16 @@ pub enum ProviderTurnEvent {
         /// time at our end of the bridge channel.
         occurred_at: String,
     },
+    /// Cross-session orchestration call. Adapters emit this when the
+    /// underlying agent invokes a flowstate_* capability tool; the
+    /// runtime-core drain loop dispatches the call and resolves the
+    /// matching oneshot on the sink's `runtime_pending` map. The shape
+    /// is provider-agnostic — every adapter bridge translates its
+    /// native tool invocation into the same `RuntimeCall`.
+    RuntimeCall {
+        request_id: String,
+        call: crate::RuntimeCall,
+    },
 }
 
 /// Phase of a turn between streams. Deliberately coarse — only
@@ -247,6 +258,12 @@ pub struct TurnEventSink {
     permission_pending:
         Arc<Mutex<HashMap<String, oneshot::Sender<(PermissionDecision, Option<PermissionMode>)>>>>,
     question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
+    /// Oneshot per outstanding orchestration `RuntimeCall`, keyed by
+    /// the internal `run-N` id. Mirrors the permission / question
+    /// pattern — the adapter awaits the receiver; the runtime drain
+    /// loop dispatches the call and resolves the sender.
+    runtime_pending:
+        Arc<Mutex<HashMap<String, oneshot::Sender<Result<RuntimeCallResult, RuntimeCallError>>>>>,
     /// Session-scoped persistent permission decisions. Shared across turns.
     policy: PermissionPolicy,
 }
@@ -270,6 +287,7 @@ impl TurnEventSink {
             tx,
             permission_pending: Arc::new(Mutex::new(HashMap::new())),
             question_pending: Arc::new(Mutex::new(HashMap::new())),
+            runtime_pending: Arc::new(Mutex::new(HashMap::new())),
             policy,
         }
     }
@@ -452,12 +470,71 @@ impl TurnEventSink {
             guard.clear();
             n
         };
-        if drained_perms > 0 || drained_qs > 0 {
+        let drained_runtime = {
+            let mut guard = self.runtime_pending.lock().await;
+            let n = guard.len();
+            guard.clear();
+            n
+        };
+        if drained_perms > 0 || drained_qs > 0 || drained_runtime > 0 {
             tracing::info!(
                 drained_permissions = drained_perms,
                 drained_questions = drained_qs,
+                drained_runtime_calls = drained_runtime,
                 "sink drain_pending: released orphaned oneshots"
             );
+        }
+    }
+
+    /// Adapter-side: ask the runtime to perform a cross-session
+    /// orchestration action (spawn a peer, message an existing session,
+    /// poll for a reply, ...). Mirrors `request_permission` — registers
+    /// a oneshot, emits a `RuntimeCall` event, awaits the dispatcher's
+    /// reply. Returns `Err(Cancelled)` if the sink is drained before
+    /// the dispatcher answers (e.g. the turn is interrupted).
+    pub async fn runtime_call(
+        &self,
+        call: RuntimeCall,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        let request_id = next_request_id("run");
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut guard = self.runtime_pending.lock().await;
+            guard.insert(request_id.clone(), sender);
+        }
+        self.send(ProviderTurnEvent::RuntimeCall {
+            request_id: request_id.clone(),
+            call,
+        })
+        .await;
+        match receiver.await {
+            Ok(result) => result,
+            Err(_) => {
+                let mut guard = self.runtime_pending.lock().await;
+                guard.remove(&request_id);
+                Err(RuntimeCallError::Cancelled)
+            }
+        }
+    }
+
+    /// Host-side: called by the runtime drain loop once the dispatcher
+    /// has produced a result for the matching `RuntimeCall` event.
+    pub async fn resolve_runtime_call(
+        &self,
+        request_id: &str,
+        result: Result<RuntimeCallResult, RuntimeCallError>,
+    ) {
+        let mut guard = self.runtime_pending.lock().await;
+        match guard.remove(request_id) {
+            Some(sender) => {
+                let _ = sender.send(result);
+            }
+            None => {
+                tracing::warn!(
+                    request_id,
+                    "resolve_runtime_call: no pending sender for id — stale dispatch?"
+                );
+            }
         }
     }
 

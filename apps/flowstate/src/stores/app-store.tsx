@@ -27,6 +27,7 @@ import type {
   RateLimitInfo,
   RuntimeEvent,
   ServerMessage,
+  SessionLinkReason,
   SessionSummary,
   UserInputQuestion,
 } from "@/lib/types";
@@ -109,6 +110,12 @@ interface AppState {
    *  matches the cached one, so the slash-popup memo stays stable
    *  across no-op refreshes. */
   sessionCommands: Map<string, CommandCatalog>;
+  /** Cross-session orchestration links, keyed by the child (spawned
+   *  or messaged) session_id. Value is the origin session that
+   *  issued the `flowstate_spawn*` / `flowstate_send*` call. Populated
+   *  by `session_linked` events; purely local state (not persisted).
+   *  Drives the "spawned by agent" chip on the sidebar row. */
+  sessionLinks: Map<string, { fromSessionId: string; reason: SessionLinkReason }>;
   /** Whether the OS thinks our window has focus. Distinct from
    *  `activeSessionId` (which tracks the thread the user last
    *  opened, even after they alt-tab to another app). Updated by a
@@ -714,6 +721,20 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "session_linked": {
+      // Record who spawned or messaged which session. The entry is
+      // keyed by the child (the session being acted on) so a sidebar
+      // row lookup is O(1). `spawn` events may arrive before the
+      // child's `session_started` fan-out; that's fine — the lookup
+      // happens at render time.
+      const sessionLinks = new Map(state.sessionLinks);
+      sessionLinks.set(event.to_session_id, {
+        fromSessionId: event.from_session_id,
+        reason: event.reason,
+      });
+      return { ...state, sessionLinks };
+    }
+
     case "session_command_catalog_updated": {
       // id-equality short-circuit: if every command in the new payload
       // matches the cached id (same length, same order), skip the
@@ -759,6 +780,7 @@ const initialState: AppState = {
   permissionModeBySession: new Map(),
   rateLimits: {},
   sessionCommands: new Map(),
+  sessionLinks: new Map(),
   // Default to focused: the first focus event only fires on the NEXT
   // focus change, so initialising false would incorrectly treat the
   // first turn as "user isn't watching" until they alt-tabbed.

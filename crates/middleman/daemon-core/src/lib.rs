@@ -194,6 +194,11 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
         threads_dir,
         config.app_name.clone(),
     ));
+    // Install the weak self-reference the cross-session orchestration
+    // dispatcher uses to spawn peer turns. Must happen before the
+    // runtime serves any traffic; the RuntimeCall drain-loop branch
+    // fail-closes if this step was skipped.
+    runtime_core.install_self_ref();
 
     // Reclaim any sessions stuck at `Running` from a prior crash, and
     // seed the provider enablement map from persistence, before we

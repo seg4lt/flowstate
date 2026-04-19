@@ -293,6 +293,29 @@ pub enum RuntimeEvent {
         session_id: String,
         catalog: CommandCatalog,
     },
+    /// Cross-session link event. Emitted whenever the orchestration
+    /// dispatcher creates a new session on behalf of an agent, or
+    /// delivers a message from one session to another. The frontend
+    /// uses this to render a "spawned by agent" badge on the child row
+    /// in the sidebar and a "waiting on peer" indicator on the parent's
+    /// in-flight tool call. `reason` is a short machine tag (`spawn`
+    /// / `send`) so the UI can style the two cases differently without
+    /// string-matching.
+    SessionLinked {
+        from_session_id: String,
+        to_session_id: String,
+        reason: SessionLinkReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLinkReason {
+    /// Child session was just created by the parent's agent.
+    Spawn,
+    /// Parent's agent sent a message to an existing child session.
+    Send,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

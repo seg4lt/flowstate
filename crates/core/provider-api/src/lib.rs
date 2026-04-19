@@ -17,9 +17,11 @@
 
 mod adapter;
 mod binary_resolver;
+pub mod capabilities;
 mod events;
 pub mod helpers;
 mod messages;
+pub mod orchestration;
 pub mod probe;
 pub mod process_cache;
 pub mod skills_disk;
@@ -27,12 +29,20 @@ mod types;
 
 pub use adapter::*;
 pub use binary_resolver::find_cli_binary;
+pub use capabilities::{
+    AgentCapabilityTool, capability_tools, encode_runtime_error, encode_runtime_result,
+    parse_runtime_call,
+};
 pub use events::*;
 pub use helpers::{
     claude_bucket_label, claude_file_change_from_tool_call, first_non_empty_line,
     parse_options_from_value, session_cwd, write_json_line,
 };
 pub use messages::*;
+pub use orchestration::{
+    PollOutcome, RuntimeCall, RuntimeCallDispatcher, RuntimeCallError, RuntimeCallOrigin,
+    RuntimeCallResult, SessionCreator, SessionDigest,
+};
 pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
 pub use types::*;

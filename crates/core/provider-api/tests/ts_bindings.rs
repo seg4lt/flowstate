@@ -60,6 +60,7 @@ fn export_ts_bindings() {
     push(&mut out, MemoryRecallScope::decl(&cfg));
     push(&mut out, RateLimitStatus::decl(&cfg));
     push(&mut out, TurnPhase::decl(&cfg));
+    push(&mut out, SessionLinkReason::decl(&cfg));
 
     // ---- leaf structs ---------------------------------------------
     push(&mut out, PlanStep::decl(&cfg));
@@ -70,6 +71,7 @@ fn export_ts_bindings() {
     push(&mut out, ContextCategory::decl(&cfg));
     push(&mut out, ContextBreakdown::decl(&cfg));
     push(&mut out, ToolCall::decl(&cfg));
+    push(&mut out, AgentUsage::decl(&cfg));
     push(&mut out, TokenUsage::decl(&cfg));
     push(&mut out, RateLimitInfo::decl(&cfg));
 

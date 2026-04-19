@@ -19,6 +19,7 @@ ts-bindings = ["dep:ts-rs"]
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror = "1"
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true

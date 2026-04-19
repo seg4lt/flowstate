@@ -171,6 +171,20 @@ pub(crate) enum BridgeRequest {
     /// RPCs are interleaved with the turn's stream events.
     #[serde(rename = "get_context_usage")]
     GetContextUsage { request_id: String },
+    /// Rust → bridge: the runtime dispatcher resolved a cross-session
+    /// orchestration call the bridge had forwarded. Exactly one of
+    /// `payload` / `error` is populated. The bridge's MCP tool handler
+    /// resolves its pending promise with this payload, and the
+    /// underlying Claude SDK returns the result to the model as the
+    /// tool's output.
+    #[serde(rename = "runtime_call_response")]
+    RuntimeCallResponse {
+        request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        payload: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<Value>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +241,20 @@ pub(crate) enum BridgeResponse {
         payload: Option<Value>,
         #[serde(default)]
         error: Option<String>,
+    },
+    /// Bridge → Rust: the agent invoked a flowstate_* MCP tool and the
+    /// bridge needs the runtime to dispatch the orchestration call.
+    /// The adapter forwards the call through its `TurnEventSink`,
+    /// awaits the dispatcher, and writes back a
+    /// `BridgeRequest::RuntimeCallResponse` with the result. Bridge-
+    /// generated UUID so the bridge can match the response to the
+    /// originating tool call promise.
+    #[serde(rename = "runtime_call_request")]
+    RuntimeCallRequest {
+        request_id: String,
+        tool_name: String,
+        #[serde(default)]
+        args: Value,
     },
     #[serde(rename = "error")]
     Error { error: String },
