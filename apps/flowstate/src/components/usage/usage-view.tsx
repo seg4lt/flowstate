@@ -4,11 +4,13 @@ import { UsageCostChart } from "./usage-cost-chart";
 import { UsageTokensChart } from "./usage-tokens-chart";
 import { UsageBreakdownTable } from "./usage-breakdown-table";
 import { UsageAgentsTable } from "./usage-agents-table";
+import { UsageAgentRoleTable } from "./usage-agent-role-table";
 import { UsageTopSessionsTable } from "./usage-top-sessions-table";
 import { UsageRangePicker, useUsageRange } from "./usage-range-picker";
 import {
   useTopSessions,
   useUsageByAgent,
+  useUsageByAgentRole,
   useUsageSummary,
   useUsageTimeseries,
 } from "./hooks/use-usage";
@@ -64,6 +66,9 @@ export function UsageView() {
   // Per-agent breakdown (Main + each subagent role). Distinct query
   // from summary so a refetch doesn't invalidate the top-line cards.
   const agentsQuery = useUsageByAgent(range);
+  // Main-vs-subagents two-row rollup. Separate cache key from
+  // `agentsQuery` so the two tables refetch independently.
+  const agentRoleQuery = useUsageByAgentRole(range);
 
   // First-load gating: show the big "no usage yet" message only
   // when every query has resolved and the grand totals are empty.
@@ -125,6 +130,9 @@ export function UsageView() {
                   title="By model"
                   keyColumnLabel="Model"
                   rows={modelsQuery.data?.groups ?? []}
+                />
+                <UsageAgentRoleTable
+                  rows={agentRoleQuery.data?.groups ?? []}
                 />
                 <UsageAgentsTable rows={agentsQuery.data?.groups ?? []} />
               </div>

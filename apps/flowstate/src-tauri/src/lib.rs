@@ -1576,6 +1576,18 @@ fn get_usage_by_agent(
     store.summary_by_agent(range)
 }
 
+/// Two-row rollup of `usage_event_agents`: one row for the main
+/// (parent) agent, one row aggregating every subagent invocation.
+/// Same payload shape as `get_usage_by_agent` but the SQL collapses
+/// all non-NULL `agent_type` values into a single `"subagent"` key.
+#[tauri::command]
+fn get_usage_by_agent_role(
+    store: State<'_, UsageStore>,
+    range: UsageRange,
+) -> Result<UsageAgentPayload, String> {
+    store.summary_by_agent_role(range)
+}
+
 /// Resolved cross-platform app data dir for Flowstate — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
@@ -1822,6 +1834,7 @@ pub fn run() {
             get_usage_timeseries,
             get_top_sessions,
             get_usage_by_agent,
+            get_usage_by_agent_role,
             get_app_data_dir,
         ])
         .on_window_event(|window, event| {

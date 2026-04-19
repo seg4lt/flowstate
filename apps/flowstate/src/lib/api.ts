@@ -567,6 +567,16 @@ export function getUsageByAgent(
   return invoke<UsageAgentPayload>("get_usage_by_agent", { range });
 }
 
+// Two-row Main-vs-Subagents rollup. Shares the `UsageAgentPayload`
+// shape with `getUsageByAgent` — `groups` is just always capped at
+// two rows (`key = "main"` / `key = "subagent"`), missing when that
+// bucket had no activity in the range.
+export function getUsageByAgentRole(
+  range: UsageRange,
+): Promise<UsageAgentPayload> {
+  return invoke<UsageAgentPayload>("get_usage_by_agent_role", { range });
+}
+
 // Read a single project file as a UTF-8 string. Rejects on:
 //   * file outside the project root (canonicalisation escape)
 //   * file above CODE_VIEW_MAX_FILE_BYTES (4 MiB)

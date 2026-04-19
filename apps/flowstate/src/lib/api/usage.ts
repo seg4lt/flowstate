@@ -137,3 +137,13 @@ export function getUsageByAgent(
 ): Promise<UsageAgentPayload> {
   return invoke<UsageAgentPayload>("get_usage_by_agent", { range });
 }
+
+// Main-vs-Subagents rollup. Same payload shape, but the SQL CASE
+// collapses every non-NULL `agent_type` into a single `"subagent"`
+// row so the dashboard can answer the binary "how much is going to
+// subagent dispatches?" question without scanning the detailed table.
+export function getUsageByAgentRole(
+  range: UsageRange,
+): Promise<UsageAgentPayload> {
+  return invoke<UsageAgentPayload>("get_usage_by_agent_role", { range });
+}

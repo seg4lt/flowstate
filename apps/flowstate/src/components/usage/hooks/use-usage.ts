@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   getTopSessions,
   getUsageByAgent,
+  getUsageByAgentRole,
   getUsageSummary,
   getUsageTimeseries,
   type TopSessionRow,
@@ -65,6 +66,19 @@ export function useUsageByAgent(range: UsageRange) {
   return useQuery<UsageAgentPayload>({
     queryKey: ["usage", "byAgent", range],
     queryFn: () => getUsageByAgent(range),
+    staleTime: STALE_MS,
+    gcTime: CACHE_MS,
+  });
+}
+
+// Main-vs-Subagents two-row rollup over the range. Kept on its own
+// cache key (separate from `useUsageByAgent`) so the two tables
+// refetch independently — each hits a different SQL aggregation
+// shape and the 2-row query is near-free.
+export function useUsageByAgentRole(range: UsageRange) {
+  return useQuery<UsageAgentPayload>({
+    queryKey: ["usage", "byAgentRole", range],
+    queryFn: () => getUsageByAgentRole(range),
     staleTime: STALE_MS,
     gcTime: CACHE_MS,
   });

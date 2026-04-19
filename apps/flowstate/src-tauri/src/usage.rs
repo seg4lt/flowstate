@@ -751,6 +751,93 @@ impl UsageStore {
         })
     }
 
+    /// Two-row rollup of `usage_event_agents` over the range: one row
+    /// for the main (parent) agent, one row aggregating every subagent
+    /// invocation. Lets the dashboard answer "how much of my spend is
+    /// actually going to Task/Agent dispatches?" at a glance without
+    /// the user having to eyeball the per-type table.
+    ///
+    /// Semantics match `summary_by_agent`:
+    ///   * `turn_count` counts distinct turns where the bucket did any
+    ///     work. A turn that dispatched three Explore subagents
+    ///     contributes 1 to BOTH `main` (the parent ran) and
+    ///     `subagent` (at least one subagent ran).
+    ///   * `invocation_count` counts individual agent invocations. The
+    ///     same three-Explore turn contributes 1 to `main` and 3 to
+    ///     `subagent`.
+    ///
+    /// Returns the same payload type as `summary_by_agent` so the
+    /// frontend can share types; `groups` is just always ≤ 2 rows
+    /// (missing when the range has no activity of that kind).
+    pub fn summary_by_agent_role(&self, range: UsageRange) -> Result<UsageAgentPayload, String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Utc::now();
+        let (from, to) = range.to_day_bounds(now);
+
+        // Stable 2-key GROUP BY: `agent_type IS NULL` identifies the
+        // main bucket (see `insert_agent_rows` where parent rows are
+        // inserted with `agent_type = NULL`), and every non-NULL row
+        // rolls up into the `subagent` bucket. Friendly labels are
+        // assigned when we materialise the row — keeping labels
+        // out of the SQL means the CASE only mentions the stable
+        // keys, which is what the UI persists as the sort anchor.
+        let mut stmt = connection
+            .prepare(
+                "SELECT CASE WHEN agent_type IS NULL
+                             THEN 'main'
+                             ELSE 'subagent'
+                        END                        AS agent_key,
+                        COUNT(DISTINCT turn_id)    AS turn_count,
+                        COUNT(*)                   AS invocation_count,
+                        COALESCE(SUM(input_tokens), 0),
+                        COALESCE(SUM(output_tokens), 0),
+                        COALESCE(SUM(cache_read_tokens), 0),
+                        COALESCE(SUM(cache_write_tokens), 0),
+                        COALESCE(SUM(cost_usd), 0.0),
+                        MAX(CASE WHEN has_cost = 0 THEN 1 ELSE 0 END)
+                 FROM usage_event_agents
+                 WHERE occurred_day_utc >= ?1 AND occurred_day_utc <= ?2
+                 GROUP BY agent_key
+                 ORDER BY SUM(cost_usd) DESC, COUNT(*) DESC",
+            )
+            .map_err(|e| format!("prepare by_agent_role: {e}"))?;
+
+        let rows = stmt
+            .query_map(params![from, to], |row| {
+                let key: String = row.get(0)?;
+                let label = if key == "main" {
+                    "Main agent".to_string()
+                } else {
+                    "Subagents".to_string()
+                };
+                Ok(UsageAgentGroupRow {
+                    key,
+                    label,
+                    turn_count: row.get::<_, i64>(1)? as u64,
+                    invocation_count: row.get::<_, i64>(2)? as u64,
+                    input_tokens: row.get::<_, i64>(3)? as u64,
+                    output_tokens: row.get::<_, i64>(4)? as u64,
+                    cache_read_tokens: row.get::<_, i64>(5)? as u64,
+                    cache_write_tokens: row.get::<_, i64>(6)? as u64,
+                    total_cost_usd: row.get(7)?,
+                    cost_has_unknowns: row.get::<_, i64>(8)? != 0,
+                })
+            })
+            .map_err(|e| format!("query by_agent_role: {e}"))?;
+        let mut groups = Vec::new();
+        for r in rows {
+            groups.push(r.map_err(|e| format!("row by_agent_role: {e}"))?);
+        }
+        Ok(UsageAgentPayload {
+            range,
+            groups,
+            generated_at: now.to_rfc3339(),
+        })
+    }
+
     /// Top sessions by total cost over the range. Uses `ORDER BY
     /// total_cost_usd DESC` with a secondary order on turn_count so
     /// free-tier sessions (cost = 0) still have a stable ranking by
@@ -1800,6 +1887,31 @@ mod tests {
         // SUM invariant holds exactly (last-bucket absorbs rounding).
         let sum: f64 = payload.groups.iter().map(|r| r.total_cost_usd).sum();
         assert!((sum - 0.70).abs() < 1e-9);
+
+        // Same turn, rolled up by role: exactly two rows, and the
+        // subagent bucket folds both Explore invocations together
+        // ($0.20 each → $0.40 total) while main's $0.30 is preserved.
+        // Counts: main = 1 invocation / 1 turn; subagent = 2 invocations / 1 turn.
+        let roles = store
+            .summary_by_agent_role(UsageRange::Last7Days)
+            .unwrap();
+        assert_eq!(roles.groups.len(), 2);
+        let role_sub = roles
+            .groups
+            .iter()
+            .find(|r| r.key == "subagent")
+            .unwrap();
+        let role_main = roles.groups.iter().find(|r| r.key == "main").unwrap();
+        assert_eq!(role_sub.label, "Subagents");
+        assert_eq!(role_main.label, "Main agent");
+        assert_eq!(role_sub.invocation_count, 2);
+        assert_eq!(role_sub.turn_count, 1);
+        assert_eq!(role_main.invocation_count, 1);
+        assert_eq!(role_main.turn_count, 1);
+        assert!((role_sub.total_cost_usd - 0.40).abs() < 1e-9);
+        assert!((role_main.total_cost_usd - 0.30).abs() < 1e-9);
+        let role_sum: f64 = roles.groups.iter().map(|r| r.total_cost_usd).sum();
+        assert!((role_sum - 0.70).abs() < 1e-9);
     }
 
     /// Replay of the same turn_id must not double-insert agent rows.
