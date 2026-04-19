@@ -1318,8 +1318,18 @@ struct AppLifecycle {
 /// surfaces logs in the terminal; release builds keep writing to a log
 /// file alongside the daemon log.
 fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("flowstate=info,zenui=info,warn"));
+    // `fff_search::file_picker=off` suppresses a known false-positive
+    // ERROR in fff-search 0.5.2: its filesystem walker filters out
+    // binary files (icons, build artifacts) from the in-memory index,
+    // but a parallel `git status --include-untracked` thread returns
+    // every tracked path regardless. When the status applier can't
+    // find the filtered-out entry it logs ERROR per file, spamming
+    // hundreds of lines on every refresh in a repo with many icon
+    // assets. Demote to `off` until either an .fffignore mechanism
+    // ships upstream or we patch the crate. See file_index.rs.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("flowstate=info,zenui=info,fff_search::file_picker=off,warn")
+    });
 
     if cfg!(debug_assertions) {
         let _ = tracing_subscriber::fmt()
