@@ -105,7 +105,12 @@ export function UsageView() {
                 )}
               </div>
 
-              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+              {/* Tables stack vertically — each has 10 columns
+                  (Turns / In / Out / Cache R / Cache W / Hit / Avg
+                  dur / Cost / Share) and squeezing two side-by-side
+                  forces unreadable horizontal scrolling at typical
+                  desktop widths. */}
+              <div className="space-y-4">
                 <UsageBreakdownTable
                   title="By provider"
                   keyColumnLabel="Provider"

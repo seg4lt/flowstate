@@ -4,22 +4,45 @@ import type { UsageGroupRow, UsageTotals } from "@/lib/api";
 import { estimateCacheReadSavingsUsd } from "@/lib/pricing";
 
 // KPI card grid that sits above the fold of the Usage dashboard.
-// Plain Tailwind — no shadcn Card primitive is installed in this
-// project so we keep the markup inline with the same
-// border-border / bg-background / muted-foreground tokens used
-// across the rest of the app.
+//
+// Layout: 4-col × 2-row grid.
+//
+//   Row 1 (cost / activity):
+//     Spend │ Turns │ Avg turn duration │ Cache hit %
+//
+//   Row 2 (token breakdown — what the model saw vs. produced):
+//     Tokens in │ Tokens out │ Cache read │ Cache write
+//
+// All numbers come from `usage_events.total_cost_usd / *_tokens /
+// duration_ms`, which the Claude Agent SDK reports as the *aggregate
+// across the whole turn including subagent Task calls* (see bridge
+// comment at provider-claude-sdk/bridge/src/index.ts ~L1576). So
+// these totals already roll subagent activity in — there is no
+// double-counting, and there is no missing subagent slice.
+//
+// Naming rationale: the Anthropic API field `input_tokens` does NOT
+// mean "fresh content the user sent". With cache_control on the
+// latest message (which the SDK does by default), the user's new
+// content lands in `cache_creation_input_tokens` (= cache write),
+// and `input_tokens` is just the trailing scaffold bytes after the
+// last cache breakpoint — typically 1–100 tokens per turn even on
+// hour-long sessions. We surface it as "Uncached" with a tooltip
+// instead of the misleading "new", which historically led people to
+// think the dashboard was undercounting.
 
 function formatCost(cost: number): string {
   if (cost === 0) return "$0.00";
   if (cost < 0.01) return "<$0.01";
-  return `$${cost.toFixed(2)}`;
+  if (cost < 1) return `$${cost.toFixed(3)}`;
+  if (cost < 100) return `$${cost.toFixed(2)}`;
+  return `$${cost.toFixed(0)}`;
 }
 
 function formatCompact(n: number): string {
   if (n < 1_000) return n.toString();
   if (n < 1_000_000) return `${(n / 1_000).toFixed(1)}k`;
   if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
-  return `${(n / 1_000_000_000).toFixed(1)}b`;
+  return `${(n / 1_000_000_000).toFixed(2)}b`;
 }
 
 function formatDuration(ms: number): string {
@@ -32,23 +55,23 @@ function formatDuration(ms: number): string {
   return `${(minutes / 60).toFixed(1)}h`;
 }
 
-// Cache hit rate uses the *standard* denominator: every input
-// token the API saw, whether it was new, written to cache, or
-// served from cache. The pre-fix formula omitted cache writes,
-// which inflated the apparent hit rate on bursty days that wrote
-// fresh prefixes mid-session.
+// Cache hit rate denominator is the *total prompt volume the API
+// processed* — every input-side token whether new, written to cache,
+// or served from cache. Excluding cache writes here would inflate
+// the apparent hit rate on bursty days that wrote fresh prefixes
+// mid-session.
 function cacheHitRatio(totals: UsageTotals): number | null {
-  const totalInput =
+  const denom =
     totals.inputTokens + totals.cacheReadTokens + totals.cacheWriteTokens;
-  if (totalInput === 0) return null;
-  return totals.cacheReadTokens / totalInput;
+  if (denom === 0) return null;
+  return totals.cacheReadTokens / denom;
 }
 
-// What the dashboard *should* call "input": the full prompt volume
-// the API processed, not just the new-tokens slice that the
-// Anthropic SDK reports as `input_tokens`. Without this, the card
-// reads "6.2k in" when the actual processed prompt was 1.2M+
-// tokens — a 200× understatement on cache-heavy workloads.
+// Total prompt volume the model actually received — sum of every
+// input-side token the API processed, regardless of caching tier.
+// The Anthropic SDK's `input_tokens` is *only* the post-breakpoint
+// uncached tail; on cache-heavy workloads (the default for the
+// Agent SDK) it's typically <1% of the real input volume.
 function totalProcessedInput(totals: UsageTotals): number {
   return totals.inputTokens + totals.cacheReadTokens + totals.cacheWriteTokens;
 }
@@ -68,10 +91,12 @@ function Card({
   title,
   children,
   className,
+  titleHint,
 }: {
   title: string;
   children: React.ReactNode;
   className?: string;
+  titleHint?: string;
 }) {
   return (
     <div
@@ -81,7 +106,10 @@ function Card({
         className,
       )}
     >
-      <div className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+      <div
+        className="text-xs font-medium tracking-wide text-muted-foreground uppercase"
+        title={titleHint}
+      >
         {title}
       </div>
       <div className="mt-2 space-y-1">{children}</div>
@@ -137,87 +165,67 @@ export function UsageKpiCards({ totals, modelGroups }: UsageKpiCardsProps) {
     totals.turnCount === 0
       ? 0
       : Math.round(totals.totalDurationMs / totals.turnCount);
+  const avgCostPerTurn =
+    totals.turnCount === 0 ? 0 : totals.totalCostUsd / totals.turnCount;
   const { savedUsd, unknownGroupCount } = aggregateCacheSavings(modelGroups);
   const hasAnyCache = totals.cacheReadTokens > 0 || totals.cacheWriteTokens > 0;
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-      <Card title="Total spend">
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      {/* ─── Row 1: cost / activity ───────────────────────── */}
+
+      <Card
+        title="Total spend"
+        titleHint="Sum of total_cost_usd from every turn in the selected range. Includes subagent Task-tool cost (the SDK aggregates it into the parent turn's cost)."
+      >
         <div className="flex items-baseline">
           <div className="text-2xl font-semibold tabular-nums">
             {formatCost(totals.totalCostUsd)}
           </div>
           {totals.costHasUnknowns ? <PartialBadge /> : null}
         </div>
-        <div className="text-xs text-muted-foreground">
-          across {totals.distinctModels} model
+        <div className="text-xs text-muted-foreground tabular-nums">
+          {formatCost(avgCostPerTurn)} / turn ·{" "}
+          {totals.distinctModels} model
           {totals.distinctModels === 1 ? "" : "s"}
         </div>
       </Card>
 
-      <Card title="Turns">
+      <Card
+        title="Turns"
+        titleHint="Number of completed agent turns recorded in usage_events. One turn = one user message → final assistant response, including any subagent calls within."
+      >
         <div className="text-2xl font-semibold tabular-nums">
           {formatCompact(totals.turnCount)}
         </div>
-        <div className="text-xs text-muted-foreground">
-          across {totals.distinctSessions} session
+        <div className="text-xs text-muted-foreground tabular-nums">
+          {totals.distinctSessions} session
           {totals.distinctSessions === 1 ? "" : "s"}
         </div>
       </Card>
 
-      <Card title="Tokens">
-        <div
-          className="flex items-baseline gap-2 text-lg font-semibold tabular-nums"
-          title={
-            "Total prompt tokens the API processed (new + cached reads + cache writes), " +
-            "vs total tokens the model generated."
-          }
-        >
-          <span>{formatCompact(processedIn)}</span>
-          <span className="text-muted-foreground">/</span>
-          <span>{formatCompact(totals.outputTokens)}</span>
+      <Card
+        title="Avg turn duration"
+        titleHint="Wall-clock time from turn start to final result, including time spent in subagent Task calls and tool execution. Mean across all turns in the range."
+      >
+        <div className="text-2xl font-semibold tabular-nums">
+          {formatDuration(avgDurationMs)}
         </div>
-        <div className="text-xs text-muted-foreground">
-          in / out
-        </div>
-        <div
-          className="text-xs text-muted-foreground tabular-nums"
-          title={
-            "New: first-time tokens billed at 1×.\n" +
-            "Cached: read from prompt cache, billed at ~0.1×.\n" +
-            "Writes: first-time tokens written to the cache, billed at ~1.25×."
-          }
-        >
-          <span>{formatCompact(totals.inputTokens)} new</span>
-          <span className="px-1">·</span>
-          <span>{formatCompact(totals.cacheReadTokens)} cached</span>
-          <span className="px-1">·</span>
-          <span>{formatCompact(totals.cacheWriteTokens)} writes</span>
+        <div className="text-xs text-muted-foreground tabular-nums">
+          total {formatDuration(totals.totalDurationMs)}
         </div>
       </Card>
 
-      <Card title="Cache">
+      <Card
+        title="Cache hit"
+        titleHint={
+          "cache_read ÷ (uncached + cache_read + cache_write).\n\n" +
+          "On the Agent SDK with default cache_control breakpoints, " +
+          "this should sit above ~95% on any session past its first turn."
+        }
+      >
         <div className="text-2xl font-semibold tabular-nums">
           {hitRatio === null ? "—" : `${Math.round(hitRatio * 100)}%`}
-          <span className="ml-1 text-xs font-normal text-muted-foreground">
-            hit
-          </span>
-        </div>
-        <div
-          className="text-xs text-muted-foreground tabular-nums"
-          title={
-            "Cache hit rate = cache_read / (input + cache_read + cache_write)."
-          }
-        >
-          {hasAnyCache ? (
-            <>
-              <span>{formatCompact(totals.cacheReadTokens)} read</span>
-              <span className="px-1">·</span>
-              <span>{formatCompact(totals.cacheWriteTokens)} write</span>
-            </>
-          ) : (
-            <span>no cache activity</span>
-          )}
         </div>
         <div
           className="text-xs text-muted-foreground"
@@ -232,17 +240,85 @@ export function UsageKpiCards({ totals, modelGroups }: UsageKpiCardsProps) {
           {savedUsd === null
             ? hasAnyCache
               ? "savings: —"
-              : "savings: $0"
+              : "no cache activity"
             : `~${formatCost(savedUsd)}${unknownGroupCount > 0 ? "+" : ""} saved`}
         </div>
       </Card>
 
-      <Card title="Avg turn duration">
+      {/* ─── Row 2: token volumes ─────────────────────────── */}
+
+      <Card
+        title="Tokens in"
+        titleHint={
+          "Total prompt-side tokens the model received this range.\n\n" +
+          "  = uncached + cache read + cache write\n\n" +
+          "i.e. every input token the API processed, regardless of " +
+          "whether it was billed at the new (1×), cache-read (0.1×), " +
+          "or cache-write (1.25×) tier."
+        }
+      >
         <div className="text-2xl font-semibold tabular-nums">
-          {formatDuration(avgDurationMs)}
+          {formatCompact(processedIn)}
         </div>
-        <div className="text-xs text-muted-foreground">
-          total {formatDuration(totals.totalDurationMs)}
+        <div
+          className="text-xs text-muted-foreground tabular-nums"
+          title={
+            "Uncached: bytes after the last cache_control breakpoint " +
+            "(typically a few tokens of scaffold per turn — NOT 'new content you sent', " +
+            "which lands in cache write).\n\n" +
+            "Cached: read from prompt cache (~0.1× input price).\n" +
+            "Writes: new content folded into cache (~1.25× input price)."
+          }
+        >
+          <span>{formatCompact(totals.inputTokens)} uncached</span>
+        </div>
+      </Card>
+
+      <Card
+        title="Tokens out"
+        titleHint="Tokens the model generated (assistant output, including tool-call args). Billed at the model's output rate."
+      >
+        <div className="text-2xl font-semibold tabular-nums">
+          {formatCompact(totals.outputTokens)}
+        </div>
+        <div className="text-xs text-muted-foreground tabular-nums">
+          {processedIn === 0
+            ? "—"
+            : `${(totals.outputTokens / processedIn).toFixed(2)}× of input`}
+        </div>
+      </Card>
+
+      <Card
+        title="Cache read"
+        titleHint="Tokens served from the prompt cache, billed at ~0.1× the input rate. This is where steady-state agent traffic lives — the bigger this is, the less you pay per turn."
+      >
+        <div className="text-2xl font-semibold tabular-nums">
+          {formatCompact(totals.cacheReadTokens)}
+        </div>
+        <div className="text-xs text-muted-foreground tabular-nums">
+          {totals.turnCount === 0
+            ? "—"
+            : `${formatCompact(Math.round(totals.cacheReadTokens / totals.turnCount))} / turn`}
+        </div>
+      </Card>
+
+      <Card
+        title="Cache write"
+        titleHint={
+          "Tokens written to the prompt cache, billed at ~1.25× the " +
+          "input rate.\n\n" +
+          "This is the *real* 'new content per turn' signal: your " +
+          "message + tool results that the SDK is folding into the " +
+          "cache prefix for the next turn to read."
+        }
+      >
+        <div className="text-2xl font-semibold tabular-nums">
+          {formatCompact(totals.cacheWriteTokens)}
+        </div>
+        <div className="text-xs text-muted-foreground tabular-nums">
+          {totals.turnCount === 0
+            ? "—"
+            : `${formatCompact(Math.round(totals.cacheWriteTokens / totals.turnCount))} / turn`}
         </div>
       </Card>
     </div>
