@@ -59,7 +59,7 @@ import {
   findLatestMainTodoWrite,
   parseTodoProgress,
 } from "@/lib/todo-extract";
-import { StuckBanner } from "./stuck-banner";
+// import { StuckBanner } from "./stuck-banner"; // commented: stuck banner disabled for now
 import { DiffPanel, type DiffStyle } from "./diff-panel";
 import { ImageLightbox } from "./image-lightbox";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
@@ -720,7 +720,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [lastEventAt, setLastEventAt] = React.useState<number>(() =>
     Date.now(),
   );
-  const [stuckSince, setStuckSince] = React.useState<number | null>(null);
+  // `stuckSince` is still driven by the watchdog but unread while the
+  // StuckBanner is disabled — prefix with _ so tsc doesn't complain.
+  const [_stuckSince, setStuckSince] = React.useState<number | null>(null);
   // Coarse turn phase ("requesting" / "compacting" / …). Provider-
   // driven; only Claude SDK emits today. Cleared on turn_completed
   // so the stale label doesn't linger onto the next turn.
@@ -2027,6 +2029,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             />
           )}
 
+          {/* "Session may be stuck" warning — commented out for now.
+              The watchdog still runs and sets `stuckSince`, but we don't
+              surface the banner until we're confident about the
+              heuristic's false-positive rate.
           {stuckSince !== null &&
             pendingPermissions.length === 0 &&
             !pendingQuestion && (
@@ -2050,6 +2056,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 }}
               />
             )}
+          */}
 
           {isArchived && (
             <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
