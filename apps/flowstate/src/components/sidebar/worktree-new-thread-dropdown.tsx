@@ -28,6 +28,7 @@ import { samePath } from "@/lib/worktree-utils";
 import { toast } from "@/hooks/use-toast";
 import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constants";
 import { ProviderDropdown } from "./provider-dropdown";
+import { useSuppressSidebarDrag } from "./drag-suppression";
 
 interface WorktreeAwareNewThreadProps {
   projectId: string;
@@ -69,6 +70,10 @@ function WorktreeDropdownInner({
 }) {
   const [open, setOpen] = React.useState(false);
   const [createWtOpen, setCreateWtOpen] = React.useState(false);
+  // Disable sidebar drag sensors while this dialog is open. Without
+  // this, Space/Enter inside the dialog can re-fire on a still-
+  // focused sortable project row and start a keyboard drag.
+  useSuppressSidebarDrag(createWtOpen);
 
   const { state, send, createProject, linkProjectWorktree } = useApp();
   const { isProviderEnabled } = useProviderEnabled();

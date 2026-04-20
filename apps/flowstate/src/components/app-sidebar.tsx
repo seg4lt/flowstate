@@ -66,6 +66,10 @@ import { cn } from "@/lib/utils";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
+import {
+  SidebarDragSuppressionProvider,
+  useSidebarDragSuppressed,
+} from "@/components/sidebar/drag-suppression";
 import type { SessionSummary } from "@/lib/types";
 
 /**
@@ -134,6 +138,17 @@ function SortableProject({
 }
 
 export function AppSidebar() {
+  // The provider lives at the AppSidebar root so any dialog opened from
+  // inside the sidebar tree (worktree new-thread, rename, etc.) can
+  // temporarily disable drag sensors via `useSuppressSidebarDrag`.
+  return (
+    <SidebarDragSuppressionProvider>
+      <AppSidebarBody />
+    </SidebarDragSuppressionProvider>
+  );
+}
+
+function AppSidebarBody() {
   const { state, send, createProject, reorderProjects } = useApp();
   const navigate = useNavigate();
   const location = useLocation();
@@ -153,6 +168,13 @@ export function AppSidebar() {
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
+  // When a sidebar-owned modal (e.g. CreateWorktreeDialog) is open,
+  // suppress drag activation entirely. Otherwise Space/Enter inside
+  // the dialog can re-fire on a still-focused sortable and pick up
+  // a project for reorder. Empty array = neither pointer nor keyboard
+  // can start a drag until the modal closes.
+  const dragSuppressed = useSidebarDragSuppressed();
+  const activeSensors = dragSuppressed ? [] : sensors;
 
   // Active projects sorted by user-chosen sort_order. Projects with
   // sortOrder === null (newly created / never manually reordered)
@@ -444,7 +466,7 @@ export function AppSidebar() {
               </Collapsible>
 
               <DndContext
-                sensors={sensors}
+                sensors={activeSensors}
                 collisionDetection={closestCenter}
                 onDragStart={(event) =>
                   setActiveProjectId(String(event.active.id))
