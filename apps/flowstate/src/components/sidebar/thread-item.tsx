@@ -2,6 +2,8 @@ import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
+  Check,
+  Copy,
   EllipsisVertical,
   GitBranch,
   Sparkles,
@@ -27,6 +29,7 @@ import { prefetchSession } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 import { BrailleSpinner } from "../chat/braille-spinner";
 import { toneForMode } from "@/lib/mode-tone";
+import { toast } from "@/hooks/use-toast";
 
 function formatTimeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime();
@@ -229,14 +232,26 @@ export function ThreadItem({
                 </span>
               </TooltipTrigger>
               <TooltipContent side="right" className="max-w-xs">
-                <div className="space-y-0.5">
-                  <div className="font-medium">
-                    Worktree
-                    {worktreeBranch ? `: ${worktreeBranch}` : ""}
+                {/* Radix Tooltip content is hoverable by default
+                 *  (TooltipProvider.disableHoverableContent is false),
+                 *  so the nested copy button actually survives the
+                 *  move from trigger → content. stopPropagation on the
+                 *  button prevents the underlying thread row's
+                 *  navigation click from firing when the user clicks
+                 *  Copy. */}
+                <div className="flex items-start gap-2">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="font-medium">
+                      Worktree
+                      {worktreeBranch ? `: ${worktreeBranch}` : ""}
+                    </div>
+                    <div className="truncate font-mono text-[10px] opacity-80">
+                      {worktreePath}
+                    </div>
                   </div>
-                  <div className="font-mono text-[10px] opacity-80">
-                    {worktreePath}
-                  </div>
+                  {worktreeBranch && (
+                    <CopyBranchButton branch={worktreeBranch} />
+                  )}
                 </div>
               </TooltipContent>
             </Tooltip>
@@ -317,5 +332,60 @@ export function ThreadItem({
         </div>
       )}
     </SidebarMenuSubItem>
+  );
+}
+
+/**
+ * Small copy affordance rendered inside the branch tooltip. Writes the
+ * branch name to the clipboard and briefly swaps the icon to a check
+ * so the user gets immediate confirmation — the toast is a secondary
+ * cue in case the tooltip is already dismissed by the time they look.
+ *
+ * stopPropagation on pointer + click keeps the surrounding thread row
+ * from firing its navigation handler when the user clicks Copy.
+ */
+function CopyBranchButton({ branch }: { branch: string }) {
+  const [copied, setCopied] = React.useState(false);
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  React.useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, []);
+  return (
+    <button
+      type="button"
+      aria-label="Copy branch name"
+      title="Copy branch name"
+      className="-mr-1 -mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-background/80 outline-none hover:bg-background/10 hover:text-background focus-visible:ring-1 focus-visible:ring-background/40"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        void navigator.clipboard
+          .writeText(branch)
+          .then(() => {
+            setCopied(true);
+            if (timerRef.current) clearTimeout(timerRef.current);
+            timerRef.current = setTimeout(() => setCopied(false), 1200);
+            toast({
+              description: `Copied branch "${branch}"`,
+              duration: 1500,
+            });
+          })
+          .catch(() => {
+            toast({
+              description: "Couldn't copy branch name",
+              duration: 1500,
+            });
+          });
+      }}
+    >
+      {copied ? (
+        <Check className="h-3 w-3" />
+      ) : (
+        <Copy className="h-3 w-3" />
+      )}
+    </button>
   );
 }
