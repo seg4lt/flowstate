@@ -921,6 +921,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
         input: &UserInput,
         permission_mode: PermissionMode,
         _reasoning_effort: Option<ReasoningEffort>,
+        _thinking_mode: Option<zenui_provider_api::ThinkingMode>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         if !input.images.is_empty() {

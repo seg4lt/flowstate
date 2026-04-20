@@ -22,8 +22,8 @@ use zenui_provider_api::{
     CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
     ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, session_cwd,
-    skills_disk,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, ThinkingMode, TurnEventSink, UserInput,
+    session_cwd, skills_disk,
 };
 
 use crate::config::{claude_models, read_compact_custom_instructions};
@@ -428,6 +428,7 @@ impl ClaudeSdkAdapter {
         input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        thinking_mode: Option<ThinkingMode>,
         compact_custom_instructions: Option<String>,
         events: TurnEventSink,
     ) -> Result<(String, Option<String>), String> {
@@ -450,6 +451,7 @@ impl ClaudeSdkAdapter {
             prompt: input.text.clone(),
             permission_mode: mode_str.to_string(),
             reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
+            thinking_mode: thinking_mode.map(|m| m.as_str().to_string()),
             images: bridge_images,
             compact_custom_instructions,
         };
@@ -1056,6 +1058,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        thinking_mode: Option<ThinkingMode>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         let cached = self.ensure_session_process(session).await?;
@@ -1072,6 +1075,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 input,
                 permission_mode,
                 reasoning_effort,
+                thinking_mode,
                 compact_custom_instructions,
                 events,
             )

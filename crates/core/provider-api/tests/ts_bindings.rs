@@ -51,6 +51,7 @@ fn export_ts_bindings() {
     push(&mut out, PermissionDecision::decl(&cfg));
     push(&mut out, PermissionMode::decl(&cfg));
     push(&mut out, ReasoningEffort::decl(&cfg));
+    push(&mut out, ThinkingMode::decl(&cfg));
     push(&mut out, FileOperation::decl(&cfg));
     push(&mut out, SubagentStatus::decl(&cfg));
     push(&mut out, PlanStatus::decl(&cfg));

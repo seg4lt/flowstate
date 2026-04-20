@@ -78,6 +78,7 @@ impl ProviderAdapter for FsWritingAdapter {
         input: &UserInput,
         _permission_mode: PermissionMode,
         _reasoning_effort: Option<ReasoningEffort>,
+        _thinking_mode: Option<zenui_provider_api::ThinkingMode>,
         _events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         // Pretend the agent ran a bash command or external tool: no
@@ -186,6 +187,7 @@ async fn send_turn_and_wait(
             images: vec![],
             permission_mode: None,
             reasoning_effort: None,
+            thinking_mode: None,
         })
         .await;
 
