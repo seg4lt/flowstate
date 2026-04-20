@@ -44,6 +44,7 @@ import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
 import { MessageList } from "./messages/message-list";
+import { SessionProvider } from "./session-context";
 import { ChatInput, type QueuedMessage } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
@@ -1871,19 +1872,27 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             diffFullscreen || contextFullscreen ? "hidden" : "flex-1",
           )}
         >
-          <MessageList
-            sessionId={sessionId}
-            turns={turns}
-            loading={loading}
-            pendingInput={pendingInput}
-            userSendTick={userSendTick}
-            hiddenOlderCount={hiddenOlderCount}
-            loadingOlder={loadingOlder}
-            onLoadOlder={handleLoadOlder}
-            onOpenAttachment={handleOpenPersistedAttachment}
-            providerKind={sessionQuery.data?.detail.summary.provider}
-            sessionModel={sessionQuery.data?.detail.summary.model}
-          />
+          <SessionProvider
+            value={{
+              sessionId,
+              provider: sessionQuery.data?.detail.summary.provider,
+              model: sessionQuery.data?.detail.summary.model,
+            }}
+          >
+            <MessageList
+              sessionId={sessionId}
+              turns={turns}
+              loading={loading}
+              pendingInput={pendingInput}
+              userSendTick={userSendTick}
+              hiddenOlderCount={hiddenOlderCount}
+              loadingOlder={loadingOlder}
+              onLoadOlder={handleLoadOlder}
+              onOpenAttachment={handleOpenPersistedAttachment}
+              providerKind={sessionQuery.data?.detail.summary.provider}
+              sessionModel={sessionQuery.data?.detail.summary.model}
+            />
+          </SessionProvider>
 
           {isRunning && session && runningTurn && (
             <WorkingIndicator
