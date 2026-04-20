@@ -427,12 +427,9 @@ function formatTurnDuration(ms: number): string {
 interface TurnViewProps {
   item: MessageItem;
   onOpenAttachment?: (attachment: AttachmentRef) => void;
-  /** Forwarded to the per-user-message hover button. See
-   *  MessageListProps.onRevertFiles for the gating story. */
-  onRevertFiles?: (turnId: string) => void;
 }
 
-function TurnViewInner({ item, onOpenAttachment, onRevertFiles }: TurnViewProps) {
+function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
   const callsById = React.useMemo(() => {
     const map = new Map<string, ToolCall>();
     for (const tc of item.toolCalls ?? []) map.set(tc.callId, tc);
@@ -473,9 +470,6 @@ function TurnViewInner({ item, onOpenAttachment, onRevertFiles }: TurnViewProps)
           input={item.input}
           attachments={item.inputAttachments}
           onOpenAttachment={onOpenAttachment}
-          onRevert={
-            onRevertFiles ? () => onRevertFiles(item.turnId) : undefined
-          }
         />
       )}
 

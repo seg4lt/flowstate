@@ -42,12 +42,6 @@ interface MessageListProps {
    *  fallback when `turn.usage.model` hasn't been populated yet
    *  (happens mid-stream and on very old rows). */
   sessionModel?: string;
-  /** Click handler for the per-user-message "Revert file changes
-   *  since here" button. Receives the `turn_id` of the user
-   *  message that was clicked. Optional — chat-view passes a
-   *  handler only when the current provider has
-   *  `features.fileCheckpoints` true; absence hides the button. */
-  onRevertFiles?: (turnId: string) => void;
 }
 
 const PENDING_KEY = "__pending__";
@@ -112,7 +106,6 @@ export function MessageList({
   userSendTick,
   providerKind,
   sessionModel,
-  onRevertFiles,
 }: MessageListProps) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
@@ -257,7 +250,6 @@ export function MessageList({
             <TurnView
               item={item}
               onOpenAttachment={onOpenAttachment}
-              onRevertFiles={onRevertFiles}
             />
           </div>
         )}

@@ -21,17 +21,6 @@ use zenui_provider_api::{
 
 use crate::{MODEL_CACHE_TTL_HOURS, TurnLifecycleObserver};
 
-/// Internal result of `RuntimeCore::rewind_files`. Not exported to
-/// transports or the wire — `handle_client_message` decomposes it
-/// into a `RuntimeEvent::FilesRewound` broadcast plus an Ack. Kept
-/// as a struct rather than a tuple so the call site reads
-/// self-documentingly when the lists grow more entries (e.g. paths
-/// we *intended* to touch but couldn't).
-pub(crate) struct RewindOutcome {
-    pub(crate) paths_restored: Vec<String>,
-    pub(crate) paths_deleted: Vec<String>,
-}
-
 /// RAII guard that ticks the `TurnLifecycleObserver` counter around the
 /// lifetime of `send_turn`. Drop runs on every exit path (normal return,
 /// early `?` return, panic), so the daemon-side counter cannot leak even if

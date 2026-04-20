@@ -7,7 +7,7 @@ pub use orchestration::OrchestrationState;
 pub use session_ops::OrchestrationService;
 
 use internals::{
-    InFlightPermissionModeGuard, RewindOutcome, TurnCounterGuard, is_cache_stale,
+    InFlightPermissionModeGuard, TurnCounterGuard, is_cache_stale,
     spawn_model_refresh_detached, write_in_flight_snapshot,
 };
 
@@ -16,7 +16,7 @@ use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
 use tokio::sync::{Mutex, Notify, broadcast};
-use zenui_persistence::{FileCheckpointStore, PersistenceService};
+use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
     ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, PollOutcome,
@@ -180,11 +180,6 @@ pub struct RuntimeCore {
     event_tx: broadcast::Sender<RuntimeEvent>,
     orchestration: Arc<OrchestrationService>,
     persistence: Arc<PersistenceService>,
-    /// File I/O for the rewind / file-checkpoint flow. Kept as a trait
-    /// object so `runtime-core` doesn't need `tokio::fs` itself; the
-    /// default wiring points at the `PersistenceService` impl and tests
-    /// can swap in a mock without touching the filesystem.
-    file_checkpoints: Arc<dyn FileCheckpointStore>,
     active_sinks: Arc<Mutex<HashMap<String, TurnEventSink>>>,
     /// Per-session permission policy memory. Keyed by session_id; the inner
     /// map remembers tools the user answered AllowAlways/DenyAlways for, so
@@ -312,14 +307,12 @@ impl RuntimeCore {
         let registered: Vec<_> = adapters.keys().map(|k| k.label()).collect();
         tracing::info!(?registered, "Registered provider adapters");
 
-        let file_checkpoints: Arc<dyn FileCheckpointStore> = persistence.clone();
         Self {
             adapters,
             app_name,
             event_tx,
             orchestration,
             persistence,
-            file_checkpoints,
             active_sinks: Arc::new(Mutex::new(HashMap::new())),
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             default_threads_dir,
@@ -1001,33 +994,6 @@ impl RuntimeCore {
                     Ok(()) => Some(ServerMessage::Ack {
                         message: "Session settings updated.".to_string(),
                     }),
-                    Err(error) => Some(ServerMessage::Error { message: error }),
-                }
-            }
-            ClientMessage::RewindFiles {
-                session_id,
-                turn_id,
-            } => {
-                match self.rewind_files(&session_id, &turn_id).await {
-                    Ok(outcome) => {
-                        let restored = outcome.paths_restored.len();
-                        let deleted = outcome.paths_deleted.len();
-                        // Broadcast so the diff panel and any
-                        // listening surface refresh against the new
-                        // on-disk state. Errors here are recorded
-                        // but don't change the Ack — the rewind has
-                        // already happened on disk by the time we
-                        // get here.
-                        self.publish(RuntimeEvent::FilesRewound {
-                            session_id: session_id.clone(),
-                            turn_id: turn_id.clone(),
-                            paths_restored: outcome.paths_restored,
-                            paths_deleted: outcome.paths_deleted,
-                        });
-                        Some(ServerMessage::Ack {
-                            message: format!("Rewound {restored} restored, {deleted} deleted."),
-                        })
-                    }
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
@@ -3063,92 +3029,6 @@ impl RuntimeCore {
                 reply: None,
             })
         }
-    }
-
-    /// Walk this session's turns from `turn_id` forward, restore
-    /// each touched file's earliest `before` snapshot back to disk,
-    /// and delete files that were created in the rewound span.
-    /// Native — does not depend on the provider's SDK lifecycle, so
-    /// it works between turns and after a restart.
-    ///
-    /// Returns the lists of paths actually written and deleted so
-    /// the handler can include them in the `FilesRewound` broadcast
-    /// (the diff panel and toasts read both). Errors surface as
-    /// strings, mirroring the rest of this module's `Result<_, String>`
-    /// discipline.
-    async fn rewind_files(&self, session_id: &str, turn_id: &str) -> Result<RewindOutcome, String> {
-        let session = self
-            .live_session_detail(session_id)
-            .await
-            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
-
-        // Locate the anchor turn. We match on turn_id rather than
-        // index because the user-facing UI knows turn_ids and the
-        // session's turns vector may be paginated in the future.
-        let anchor_index = session
-            .turns
-            .iter()
-            .position(|t| t.turn_id == turn_id)
-            .ok_or_else(|| format!("Turn `{turn_id}` not found in session `{session_id}`."))?;
-        let span = &session.turns[anchor_index..];
-
-        // Walk in chronological order. The FIRST FileChangeRecord we
-        // see for a path holds the canonical pre-rewind state — its
-        // `before` is the value to restore (or None if the file was
-        // created in this span and should therefore be deleted).
-        // Later records on the same path are intermediate states the
-        // user wants undone, so they're ignored.
-        let mut earliest_before: BTreeMap<String, Option<String>> = BTreeMap::new();
-        for turn in span {
-            for change in &turn.file_changes {
-                earliest_before
-                    .entry(change.path.clone())
-                    .or_insert_with(|| change.before.clone());
-            }
-        }
-
-        // Apply. Best-effort per path: a partial failure surfaces as
-        // an error toast but doesn't roll back the paths we already
-        // touched (that would require a transactional FS, which we
-        // don't have). Order is sorted alphabetically purely for
-        // deterministic event/log output.
-        let mut paths_restored = Vec::new();
-        let mut paths_deleted = Vec::new();
-        for (path, before) in earliest_before {
-            let fs_path = std::path::Path::new(&path);
-            match before {
-                Some(content) => {
-                    if let Err(e) = self
-                        .file_checkpoints
-                        .write_file(fs_path, content.as_bytes())
-                        .await
-                    {
-                        return Err(format!("Failed to restore `{path}`: {e}"));
-                    }
-                    paths_restored.push(path);
-                }
-                None => {
-                    // File was created during the rewound span. If
-                    // it's already gone (user / another tool deleted
-                    // it), treat that as success — the desired
-                    // post-condition is "the file does not exist".
-                    match self.file_checkpoints.remove_file(fs_path).await {
-                        Ok(()) => paths_deleted.push(path),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            paths_deleted.push(path);
-                        }
-                        Err(e) => {
-                            return Err(format!("Failed to delete `{path}`: {e}"));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(RewindOutcome {
-            paths_restored,
-            paths_deleted,
-        })
     }
 
     /// Persist per-session settings into

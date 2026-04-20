@@ -50,7 +50,6 @@ import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
 import { SessionSettingsDialog } from "./session-settings-dialog";
-import { RevertFilesDialog } from "./messages/revert-files-dialog";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
 import { ApiRetryBanner } from "./api-retry-banner";
@@ -698,12 +697,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // the React Query cache that lives here.
   const [sessionSettingsOpen, setSessionSettingsOpen] =
     React.useState(false);
-  // Anchor turn for the per-user-message revert dialog. `null`
-  // means closed; setting to a turn id opens the dialog with that
-  // turn as the rewind target.
-  const [revertAnchorTurnId, setRevertAnchorTurnId] = React.useState<
-    string | null
-  >(null);
 
   // The diff view is sourced directly from `git diff HEAD` against
   // the project's working tree (plus untracked files). It refreshes
@@ -1277,25 +1270,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           refreshDiffs();
           break;
 
-        case "files_rewound":
-          // Native rewind just changed files on disk outside the
-          // turn loop. Force the diff subscription open and refresh
-          // so the badge updates to the post-rewind state. Toast
-          // the totals so the user has feedback even if the diff
-          // panel isn't visible. Cap the path-list preview in the
-          // toast so a 200-file rewind doesn't blow it up.
-          activateDiffSubscription();
-          refreshDiffs({ force: true });
-          {
-            const restored = event.paths_restored.length;
-            const deleted = event.paths_deleted.length;
-            toast({
-              description: `Reverted ${restored} restored, ${deleted} deleted.`,
-              duration: 4000,
-            });
-          }
-          break;
-
         case "content_delta":
           // First token of the turn clears any in-flight retry
           // banner — if the provider was retrying and the model
@@ -1701,15 +1675,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     sessionQuery.data?.detail.summary.provider,
   );
   const hasSessionSettings = !!sessionFeatures.compactCustomInstructions;
-  // Per-user-message revert affordance — gated on the same
-  // ProviderFeatures lookup; only surfaces a click handler when
-  // the provider opted in. Undefined here propagates through
-  // MessageList → TurnView → UserMessage and the button stays
-  // hidden.
-  const handleRevertFiles = React.useMemo(() => {
-    if (!sessionFeatures.fileCheckpoints) return undefined;
-    return (turnId: string) => setRevertAnchorTurnId(turnId);
-  }, [sessionFeatures.fileCheckpoints]);
 
   // Arm the stuck-watchdog. We only trip it when the session is
   // running *and* at least one tool call is pending, so idle
@@ -1918,7 +1883,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             onOpenAttachment={handleOpenPersistedAttachment}
             providerKind={sessionQuery.data?.detail.summary.provider}
             sessionModel={sessionQuery.data?.detail.summary.model}
-            onRevertFiles={handleRevertFiles}
           />
 
           {isRunning && session && runningTurn && (
@@ -2103,17 +2067,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           sessionId={sessionId}
           provider={sessionQuery.data.detail.summary.provider}
           session={sessionQuery.data?.detail}
-        />
-      )}
-      {sessionFeatures.fileCheckpoints && (
-        <RevertFilesDialog
-          open={revertAnchorTurnId !== null}
-          onOpenChange={(next) => {
-            if (!next) setRevertAnchorTurnId(null);
-          }}
-          sessionId={sessionId}
-          anchorTurnId={revertAnchorTurnId}
-          turns={turns}
         />
       )}
     </div>

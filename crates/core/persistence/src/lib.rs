@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Utc;
@@ -21,20 +20,6 @@ use zenui_provider_api::{
     ProjectRecord, ProviderKind, ProviderModel, ProviderStatus, ReasoningEffort, SessionDetail,
     SessionSummary, SubagentRecord, ToolCall, TurnRecord,
 };
-
-/// Runtime-scoped file I/O used by the rewind / file-checkpoint flow.
-///
-/// Extracted as a trait so `runtime-core` can express the intent
-/// ("restore this file to its earlier contents") without depending on
-/// `tokio::fs` directly. The concrete impl on [`PersistenceService`]
-/// is the only consumer today; tests can plug in a mock to assert
-/// which paths would have been written without actually touching the
-/// filesystem.
-#[async_trait]
-pub trait FileCheckpointStore: Send + Sync {
-    async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()>;
-    async fn remove_file(&self, path: &Path) -> std::io::Result<()>;
-}
 
 /// Hard cap on the size of a single image attachment, in bytes. Mirrors
 /// the frontend cap so an oversized payload is rejected before we touch
@@ -58,17 +43,6 @@ use codecs::{
 pub struct PersistenceService {
     connection: Mutex<Connection>,
     attachments_dir: PathBuf,
-}
-
-#[async_trait]
-impl FileCheckpointStore for PersistenceService {
-    async fn write_file(&self, path: &Path, contents: &[u8]) -> std::io::Result<()> {
-        tokio::fs::write(path, contents).await
-    }
-
-    async fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        tokio::fs::remove_file(path).await
-    }
 }
 
 impl PersistenceService {

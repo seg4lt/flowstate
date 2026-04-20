@@ -72,30 +72,6 @@ export async function updateSessionSettings(
   throw new Error("unexpected response to update_session_settings");
 }
 
-/**
- * Revert all on-disk file changes made by `turnId` and every later
- * turn back to their pre-turn state. Best-effort and partial — a
- * single bad path errors the whole call; previously-touched paths
- * are NOT rolled back (no transactional FS). Throws on
- * `ServerMessage::Error`. The runtime broadcasts a
- * `RuntimeEvent::FilesRewound` after success which carries the
- * detailed lists; this call's resolved Ack is just a "request
- * accepted" signal.
- */
-export async function rewindFiles(
-  sessionId: string,
-  turnId: string,
-): Promise<void> {
-  const resp = await sendMessage({
-    type: "rewind_files",
-    session_id: sessionId,
-    turn_id: turnId,
-  });
-  if (resp?.type === "ack") return;
-  if (resp?.type === "error") throw new Error(resp.message);
-  throw new Error("unexpected response to rewind_files");
-}
-
 export function connectStream(
   onMessage: (message: ServerMessage) => void,
 ): Promise<void> {

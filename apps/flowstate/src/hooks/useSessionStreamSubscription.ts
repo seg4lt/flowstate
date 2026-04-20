@@ -140,25 +140,6 @@ export function useSessionStreamSubscription(
           h.refreshDiffs();
           break;
 
-        case "files_rewound":
-          // Native rewind just changed files on disk outside the
-          // turn loop. Force the diff subscription open and refresh
-          // so the badge updates to the post-rewind state. Toast
-          // the totals so the user has feedback even if the diff
-          // panel isn't visible. Cap the path-list preview in the
-          // toast so a 200-file rewind doesn't blow it up.
-          h.activateDiffSubscription();
-          h.refreshDiffs({ force: true });
-          {
-            const restored = event.paths_restored.length;
-            const deleted = event.paths_deleted.length;
-            toast({
-              description: `Reverted ${restored} restored, ${deleted} deleted.`,
-              duration: 4000,
-            });
-          }
-          break;
-
         case "content_delta":
           // First token of the turn clears any in-flight retry
           // banner — if the provider was retrying and the model

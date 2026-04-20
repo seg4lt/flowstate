@@ -67,20 +67,6 @@ pub enum RuntimeEvent {
         parent_call_id: Option<String>,
         occurred_at: String,
     },
-    /// File rewind completed. Carries the lists of paths the
-    /// runtime restored (had captured `before` snapshots) and
-    /// deleted (created in the rewound span). Diff panel keys off
-    /// this to refresh; toasts can read the totals to surface a
-    /// "Reverted N files" message.
-    FilesRewound {
-        session_id: String,
-        /// `turn_id` of the turn the user rewound to (the anchor
-        /// they clicked). Frontend uses this to scroll / focus the
-        /// originating user message.
-        turn_id: String,
-        paths_restored: Vec<String>,
-        paths_deleted: Vec<String>,
-    },
     TurnCompleted {
         session_id: String,
         session: SessionSummary,
@@ -415,23 +401,6 @@ pub enum ClientMessage {
         /// compaction prompt" signal.
         #[serde(default)]
         compact_custom_instructions: Option<String>,
-    },
-    /// Revert all on-disk file changes made by the chosen turn and
-    /// every subsequent turn back to their pre-turn state. Uses the
-    /// snapshots persistence already captures in
-    /// `FileChangeRecord.before` — no SDK round-trip required, so
-    /// the action works between turns and after a daemon restart.
-    /// On success the runtime broadcasts a `FilesRewound` event;
-    /// the diff panel listens for it and refreshes.
-    RewindFiles {
-        session_id: String,
-        /// `turn_id` of the turn the user wants to "rewind to".
-        /// Every file change recorded by THIS turn and any later
-        /// turn is undone; the file's earliest captured `before`
-        /// across that span wins. Files whose first record in the
-        /// span has `before = None` (newly created in the span) are
-        /// deleted instead of restored.
-        turn_id: String,
     },
     DeleteSession {
         session_id: String,
