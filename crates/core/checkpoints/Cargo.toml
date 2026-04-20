@@ -1,0 +1,19 @@
+[package]
+name = "zenui-checkpoints"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror = "1"
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

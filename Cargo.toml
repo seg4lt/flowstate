@@ -4,6 +4,7 @@ members = [
   "crates/core/runtime-core",
   "crates/core/provider-api",
   "crates/core/persistence",
+  "crates/core/checkpoints",
   "crates/core/embedded-node",
   "crates/core/provider-claude-sdk",
   "crates/core/provider-claude-cli",
