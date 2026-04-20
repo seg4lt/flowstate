@@ -21,10 +21,10 @@ use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
     ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, PollOutcome,
     ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
-    ReasoningEffort, RuntimeCall, RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult,
-    RuntimeEvent, ServerMessage, SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord,
-    SubagentStatus, TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus,
-    UserInput, UserInputAnswer,
+    ReasoningEffort, RewindConflictWire, RewindOutcomeWire, RewindUnavailableReason, RuntimeCall,
+    RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult, RuntimeEvent, ServerMessage,
+    SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord, SubagentStatus, TokenUsage,
+    ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
 };
 
 use crate::orchestration::{
@@ -1128,6 +1128,97 @@ impl RuntimeCore {
                         provider.label(),
                         if enabled { "enabled" } else { "disabled" }
                     ),
+                })
+            }
+            ClientMessage::RewindFiles {
+                session_id,
+                turn_id,
+                dry_run,
+                confirm_conflicts,
+            } => {
+                // The handler maps `CheckpointStore` outcomes and error
+                // variants onto the wire `RewindOutcomeWire` shape. See
+                // the checkpoints crate for the full semantics
+                // (diff-driven restore, conflict detection, dry-run
+                // preview). Infrastructure errors (IO, sqlite) surface
+                // as `ServerMessage::Error`; everything else — including
+                // "no checkpoint for this turn" and "session has no
+                // cwd" — is a clean outcome on the RewindFilesResult.
+                let session = match self.live_session_detail(&session_id).await {
+                    Some(s) => s,
+                    None => {
+                        return Some(ServerMessage::RewindFilesResult {
+                            session_id,
+                            turn_id,
+                            outcome: RewindOutcomeWire::Unavailable {
+                                reason: RewindUnavailableReason::SessionNotFound,
+                            },
+                        });
+                    }
+                };
+                let Some(cwd) = session.cwd.as_deref() else {
+                    return Some(ServerMessage::RewindFilesResult {
+                        session_id,
+                        turn_id,
+                        outcome: RewindOutcomeWire::Unavailable {
+                            reason: RewindUnavailableReason::NoWorkspace,
+                        },
+                    });
+                };
+
+                let opts = zenui_checkpoints::RestoreOptions {
+                    dry_run,
+                    confirm_conflicts,
+                };
+                let outcome = match self
+                    .checkpoints
+                    .restore(&session_id, &turn_id, std::path::Path::new(cwd), opts)
+                    .await
+                {
+                    Ok(zenui_checkpoints::RestoreResult::Applied(o)) => {
+                        RewindOutcomeWire::Applied {
+                            paths_restored: o.paths_restored,
+                            paths_deleted: o.paths_deleted,
+                            paths_skipped: o.paths_skipped,
+                            dry_run: o.dry_run,
+                        }
+                    }
+                    Ok(zenui_checkpoints::RestoreResult::NeedsConfirmation(report)) => {
+                        RewindOutcomeWire::NeedsConfirmation {
+                            conflicts: report
+                                .conflicts
+                                .into_iter()
+                                .map(|c| RewindConflictWire {
+                                    path: c.path,
+                                    session_last_seen_hash: c
+                                        .session_last_seen_hash
+                                        .map(|h| h.as_str().to_string()),
+                                    disk_current_hash: c
+                                        .disk_current_hash
+                                        .map(|h| h.as_str().to_string()),
+                                })
+                                .collect(),
+                        }
+                    }
+                    Err(zenui_checkpoints::CheckpointError::NoCheckpoint { .. }) => {
+                        RewindOutcomeWire::Unavailable {
+                            reason: RewindUnavailableReason::NoCheckpoint,
+                        }
+                    }
+                    Err(e) => {
+                        // Actual failure (IO, sqlite, corrupt manifest).
+                        // Surface as Error so clients can distinguish
+                        // "feature can't run right now" from "rewind is
+                        // semantically unavailable".
+                        return Some(ServerMessage::Error {
+                            message: format!("rewind failed: {e}"),
+                        });
+                    }
+                };
+                Some(ServerMessage::RewindFilesResult {
+                    session_id,
+                    turn_id,
+                    outcome,
                 })
             }
             ClientMessage::CreateProject { path } => {

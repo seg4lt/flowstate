@@ -497,6 +497,25 @@ pub enum ClientMessage {
     GetContextUsage {
         session_id: String,
     },
+    /// Rewind the session's workspace to its state just before
+    /// `turn_id`. Uses the content-addressed checkpoint store that
+    /// captured a snapshot at each turn's end.
+    ///
+    /// The call is safe (non-destructive) when `dry_run: true` (the
+    /// runtime reports the set of paths it WOULD touch without writing
+    /// anything) or when `confirm_conflicts: false` AND the rewind
+    /// would clobber files this session has seen modified elsewhere
+    /// since (the runtime returns `NeedsConfirmation`). Clients MUST
+    /// surface the conflict list to the user before re-issuing with
+    /// `confirm_conflicts: true`.
+    RewindFiles {
+        session_id: String,
+        turn_id: String,
+        #[serde(default)]
+        dry_run: bool,
+        #[serde(default)]
+        confirm_conflicts: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,4 +561,95 @@ pub enum ServerMessage {
         session_id: String,
         breakdown: Option<ContextBreakdown>,
     },
+    /// Response to `ClientMessage::RewindFiles`. Always echoes back
+    /// the `session_id` and `turn_id` from the request so the frontend
+    /// can match responses to pending requests without a dedicated
+    /// request-id channel. See [`RewindOutcomeWire`] for the three
+    /// possible shapes.
+    ///
+    /// Infrastructure failures (missing session, IO error) surface via
+    /// `ServerMessage::Error` instead — `RewindFilesResult` always
+    /// reflects a clean semantic outcome, never an exception.
+    RewindFilesResult {
+        session_id: String,
+        turn_id: String,
+        outcome: RewindOutcomeWire,
+    },
+}
+
+/// Result of a `RewindFiles` call, in one of three mutually-exclusive
+/// shapes. The frontend does an exhaustive `switch(outcome.kind)` so
+/// TypeScript catches missing cases at compile time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RewindOutcomeWire {
+    /// Rewind applied successfully. When `dry_run: true` was on the
+    /// request, no disk writes happened — this variant reports the
+    /// paths that WOULD change. In both cases the three path lists
+    /// classify what the rewind touched:
+    ///
+    /// - `paths_restored`: files overwritten with their captured
+    ///   pre-turn content.
+    /// - `paths_deleted`: files that were created during the rewound
+    ///   span, deleted here so they no longer exist.
+    /// - `paths_skipped`: files this session touched but for which no
+    ///   pre-turn hash was captured (first-touch with nothing prior).
+    ///   These are left on disk as-is.
+    Applied {
+        paths_restored: Vec<String>,
+        paths_deleted: Vec<String>,
+        paths_skipped: Vec<String>,
+        dry_run: bool,
+    },
+    /// One or more files have been modified outside this session
+    /// since it last observed them. The rewind would clobber those
+    /// changes; the client must prompt the user and re-issue the
+    /// request with `confirm_conflicts: true` to proceed.
+    NeedsConfirmation { conflicts: Vec<RewindConflictWire> },
+    /// No rewind was possible — the client UI should hide or disable
+    /// the affordance. `reason` distinguishes the three cases so the
+    /// UX can tell the user WHY.
+    Unavailable { reason: RewindUnavailableReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum RewindUnavailableReason {
+    /// The target turn has no captured checkpoint. Usually means the
+    /// session predates the checkpoint feature OR the capture failed
+    /// silently at the time (e.g. IO error on the blob store).
+    NoCheckpoint,
+    /// The session has no `cwd` — nothing to snapshot. Pure runtime-
+    /// only threads (no attached project) never get checkpointing.
+    NoWorkspace,
+    /// The requested session id didn't resolve to a live session.
+    /// Could be a race with session delete, or a stale client.
+    SessionNotFound,
+    /// Checkpoints are disabled for this session's scope (global or
+    /// per-project setting, see PR 5.5). Surfacing the reason lets the
+    /// UI nudge the user to the settings toggle.
+    Disabled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct RewindConflictWire {
+    /// Path relative to the session's workspace root.
+    pub path: String,
+    /// Hash this session expected the file to have (its last observed
+    /// `post_hash`). `None` means the session expected the file not
+    /// to exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_last_seen_hash: Option<String>,
+    /// Hash of the current on-disk content. `None` means the file is
+    /// missing from disk right now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_current_hash: Option<String>,
 }

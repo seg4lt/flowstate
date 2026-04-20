@@ -107,6 +107,11 @@ fn export_ts_bindings() {
     // ---- content blocks ------------------------------------------
     push(&mut out, ContentBlock::decl(&cfg));
 
+    // ---- checkpoints ---------------------------------------------
+    push(&mut out, RewindUnavailableReason::decl(&cfg));
+    push(&mut out, RewindConflictWire::decl(&cfg));
+    push(&mut out, RewindOutcomeWire::decl(&cfg));
+
     // ---- wire envelopes ------------------------------------------
     push(&mut out, RuntimeEvent::decl(&cfg));
     push(&mut out, ClientMessage::decl(&cfg));
