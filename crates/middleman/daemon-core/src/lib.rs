@@ -200,6 +200,41 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
             .context("failed to open checkpoint store")?,
     );
 
+    // Background GC task. Runs every 6 hours to reclaim orphan blobs
+    // (referenced by no live manifest and no live cache row), orphan
+    // manifest files, and stale file_state cache rows (>90 days).
+    // An immediate sweep on boot would fight with any session-delete
+    // operations the user might be racing through the UI, so we wait
+    // one interval before the first run. The task is fire-and-forget
+    // — errors are logged but never bubble up to the daemon.
+    {
+        let checkpoints_gc = checkpoints.clone();
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the first immediate tick; `interval` fires one right
+            // at boot which would collide with startup reconciliation.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match checkpoints_gc.collect_garbage().await {
+                    Ok(report) => {
+                        tracing::debug!(
+                            blobs_deleted = report.blobs_deleted,
+                            manifests_deleted = report.manifests_deleted,
+                            cache_rows_deleted = report.cache_rows_deleted,
+                            "checkpoint gc sweep complete",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("checkpoint gc failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     let runtime_core = Arc::new(RuntimeCore::new(
         adapters,
         orchestration,

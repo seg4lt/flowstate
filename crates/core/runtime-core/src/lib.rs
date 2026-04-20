@@ -3549,6 +3549,19 @@ impl RuntimeCore {
             return Err(format!("Unknown session `{session_id}`."));
         }
 
+        // Reclaim checkpoint state associated with this session. Fire-
+        // and-forget semantics on failure: a logged warning is better
+        // than a failed delete when the underlying session rows are
+        // already gone. The GC pass will eventually sweep anything we
+        // miss here.
+        if let Err(e) = self.checkpoints.delete_for_session(&session_id).await {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "checkpoint cleanup for deleted session failed",
+            );
+        }
+
         // Drop the session's permission policy so it doesn't grow forever.
         self.session_policies.lock().await.remove(&session_id);
         // Drop the per-session steer-wakeup notifier. Any `steer_turn`
