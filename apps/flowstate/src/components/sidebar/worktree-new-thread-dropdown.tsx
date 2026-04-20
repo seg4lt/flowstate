@@ -16,12 +16,9 @@ import {
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind } from "@/lib/types";
 import type { GitWorktree } from "@/lib/api";
-import {
-  DEFAULT_PROVIDER,
-  readDefaultModel,
-  readDefaultProvider,
-} from "@/lib/defaults-settings";
+import { readDefaultModel } from "@/lib/defaults-settings";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
+import { useDefaultProvider } from "@/hooks/use-default-provider";
 import {
   gitWorktreeListQueryOptions,
   gitBranchQueryOptions,
@@ -141,34 +138,13 @@ function WorktreeDropdownInner({
   // provider). Used when starting a thread on a freshly-created
   // worktree where we have no ambient session/provider to inherit.
   // Falls back to the first ready enabled provider, then to
-  // `DEFAULT_PROVIDER` — same chain as project-home-view.
-  const [savedProvider, setSavedProvider] = React.useState<ProviderKind | null>(
-    null,
-  );
-  React.useEffect(() => {
-    let cancelled = false;
-    readDefaultProvider().then((saved) => {
-      if (!cancelled) setSavedProvider(saved);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const defaultProvider: ProviderKind = React.useMemo(() => {
-    // Prefer the user's saved choice if it's enabled and ready.
-    if (savedProvider && isProviderEnabled(savedProvider)) {
-      const info = state.providers.find((p) => p.kind === savedProvider);
-      if (info?.status === "ready") return savedProvider;
-    }
-    // Fall back to the first ready enabled provider.
-    const ready = state.providers.find(
-      (p) => isProviderEnabled(p.kind) && p.status === "ready",
-    );
-    if (ready) return ready.kind;
-    // Nothing ready — return the saved choice or the hardcoded default.
-    return savedProvider ?? DEFAULT_PROVIDER;
-  }, [state.providers, isProviderEnabled, savedProvider]);
+  // `DEFAULT_PROVIDER` — see `useDefaultProvider` for the full chain.
+  // `loaded` gates the create-worktree menu item so a fast click
+  // during the async SQLite read can't silently fall back to a
+  // non-preferred provider (see project-home-view for the same
+  // pattern).
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
 
   // ── Thread creation (mirrors project-home-view startThreadOnWorktree) ──
 
@@ -377,6 +353,7 @@ function WorktreeDropdownInner({
                 })}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
+                  disabled={!defaultProviderLoaded}
                   onClick={() => {
                     setOpen(false);
                     setCreateWtOpen(true);
@@ -427,6 +404,7 @@ function WorktreeDropdownInner({
                 })}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
+                  disabled={!defaultProviderLoaded}
                   onClick={() => {
                     setOpen(false);
                     setCreateWtOpen(true);

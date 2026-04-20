@@ -42,8 +42,7 @@ import {
   type GitWorktree,
 } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
-import { useProviderEnabled } from "@/hooks/use-provider-enabled";
-import { readDefaultProvider, DEFAULT_PROVIDER } from "@/lib/defaults-settings";
+import { useDefaultProvider } from "@/hooks/use-default-provider";
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import { useTerminal } from "@/stores/terminal-store";
 import { normPath } from "@/lib/worktree-utils";
@@ -93,7 +92,6 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   const { state, dispatch, send, createProject, linkProjectWorktree } =
     useApp();
   const { dispatch: terminalDispatch } = useTerminal();
-  const { isProviderEnabled } = useProviderEnabled();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -129,32 +127,14 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   // BranchSwitcher starts a new session when the user creates or
   // opens a worktree. From the project page we have no ambient
   // session to inherit from, so use the user's configured default
-  // provider from Settings → Defaults → Default provider. When the
-  // preferred provider isn't ready (or not enabled), fall back to
-  // the first ready enabled provider, then finally to `DEFAULT_PROVIDER`.
-  const [savedProvider, setSavedProvider] = React.useState<ProviderKind | null>(null);
-  React.useEffect(() => {
-    let cancelled = false;
-    readDefaultProvider().then((saved) => {
-      if (!cancelled) setSavedProvider(saved);
-    });
-    return () => { cancelled = true; };
-  }, []);
-
-  const defaultProvider: ProviderKind = React.useMemo(() => {
-    // Prefer the user's saved choice if it's enabled and ready.
-    if (savedProvider && isProviderEnabled(savedProvider)) {
-      const info = state.providers.find((p) => p.kind === savedProvider);
-      if (info?.status === "ready") return savedProvider;
-    }
-    // Fall back to the first ready enabled provider.
-    const ready = state.providers.find(
-      (p) => isProviderEnabled(p.kind) && p.status === "ready",
-    );
-    if (ready) return ready.kind;
-    // Nothing ready — return the saved choice or the hardcoded default.
-    return savedProvider ?? DEFAULT_PROVIDER;
-  }, [state.providers, isProviderEnabled, savedProvider]);
+  // provider from Settings → Defaults → Default provider. `loaded`
+  // distinguishes "still reading the preference from SQLite" from
+  // "loaded, no saved preference" — we gate the create-worktree
+  // handler on `loaded` so a fast click during the async window
+  // can't silently fall back to whichever provider happens to be
+  // first in `state.providers` / first to reach ready.
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
 
   // Threads grouped by the SDK project's filesystem path. Used to
   // render the per-worktree thread chips — each worktree owns its
@@ -539,7 +519,16 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                 <button
                   type="button"
                   onClick={() => setCreateWtOpen(true)}
-                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
+                  disabled={!defaultProviderLoaded}
+                  // Disabled until the saved default provider has been
+                  // read from SQLite — otherwise a fast click could open
+                  // the dialog and complete a worktree before the
+                  // preference loads, and `defaultProvider` would
+                  // resolve to a non-preferred fallback (e.g. GitHub
+                  // Copilot when the user had Claude saved). The read
+                  // is a local SQLite roundtrip — sub-millisecond in
+                  // practice — so the disabled window is invisible.
+                  className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-50 dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
                 >
                   <Plus className="h-3 w-3" />
                   Create worktree

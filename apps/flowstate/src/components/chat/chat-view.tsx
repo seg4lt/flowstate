@@ -569,17 +569,77 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return q ?? null;
   }, [state.pendingQuestionBySession, sessionId]);
   const effortStorageKey = `flowstate:effort:${sessionId}`;
-  const [effort, setEffort] = React.useState<ReasoningEffort>(
+  const [effort, setEffortState] = React.useState<ReasoningEffort>(
     () =>
       (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high",
   );
   const permissionStorageKey = `flowstate:permissionMode:${sessionId}`;
-  const [permissionMode, setPermissionMode] =
+  const [permissionMode, setPermissionModeState] =
     React.useState<PermissionMode>(
       () =>
         (sessionStorage.getItem(permissionStorageKey) as PermissionMode) ??
         "accept_edits",
     );
+
+  // Committed setters — every explicit `setPermissionMode` /
+  // `setEffort` call persists to sessionStorage and (for mode) mirrors
+  // to the app-store so the sidebar stays in sync. The raw useState
+  // setters `setPermissionModeState` / `setEffortState` are reserved
+  // for the session-switch reset below: that re-initializes React
+  // state from the NEW session's sessionStorage, and must not write
+  // (writing would clobber the "never visited" signal that the
+  // fresh-thread-defaults and turn-history-restore effects rely on
+  // via their `if (sessionStorage.getItem(...)) return` guards).
+  const setPermissionMode = React.useCallback(
+    (mode: PermissionMode) => {
+      setPermissionModeState(mode);
+      sessionStorage.setItem(permissionStorageKey, mode);
+      dispatch({
+        type: "set_session_permission_mode",
+        sessionId,
+        mode,
+      });
+    },
+    [dispatch, permissionStorageKey, sessionId],
+  );
+  const setEffort = React.useCallback(
+    (eff: ReasoningEffort) => {
+      setEffortState(eff);
+      sessionStorage.setItem(effortStorageKey, eff);
+    },
+    [effortStorageKey],
+  );
+
+  // Reset composer state when switching threads. `ChatView` doesn't
+  // remount on session-id change (see the sibling reset effect
+  // further down), so without this the `permissionMode` / `effort`
+  // React state leaks from the thread we just left — e.g. leaving
+  // thread A in `plan` mode and clicking into thread B would render
+  // thread B's composer badge as `plan` even though B had nothing to
+  // do with that choice. Re-reading sessionStorage here is
+  // equivalent to what the lazy useState initializer did on first
+  // mount; using the raw setters (not the committed ones) keeps
+  // sessionStorage untouched for the new session so the
+  // fresh-thread-defaults and turn-history-restore effects below can
+  // still detect a never-visited thread. `useLayoutEffect` runs
+  // synchronously before paint so there's no one-frame flash of the
+  // stale badge. The `dispatch` mirrors the resolved mode to the
+  // app-store so the sidebar tint matches the composer on every
+  // thread switch.
+  React.useLayoutEffect(() => {
+    const storedMode =
+      (sessionStorage.getItem(permissionStorageKey) as PermissionMode) ??
+      "accept_edits";
+    const storedEffort =
+      (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high";
+    setPermissionModeState(storedMode);
+    setEffortState(storedEffort);
+    dispatch({
+      type: "set_session_permission_mode",
+      sessionId,
+      mode: storedMode,
+    });
+  }, [sessionId, permissionStorageKey, effortStorageKey, dispatch]);
 
   // Load user-configured defaults from Settings for freshly-created
   // threads only. "Fresh" = session has loaded AND has zero turns yet
@@ -638,25 +698,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, []);
 
-  // Persist effort and permission mode to sessionStorage so they
-  // survive navigation (e.g. Settings → back) without losing the
-  // user's in-session choice.
-  React.useEffect(() => {
-    sessionStorage.setItem(effortStorageKey, effort);
-  }, [effortStorageKey, effort]);
-
-  React.useEffect(() => {
-    sessionStorage.setItem(permissionStorageKey, permissionMode);
-    // Mirror to the app-store so the sidebar thread spinner can tint
-    // by the live composer mode (not the running turn's starting
-    // mode). Reducer short-circuits when unchanged, so firing on
-    // every sessionStorage write is cheap.
-    dispatch({
-      type: "set_session_permission_mode",
-      sessionId,
-      mode: permissionMode,
-    });
-  }, [dispatch, permissionStorageKey, permissionMode, sessionId]);
+  // (Effort / permissionMode are persisted to sessionStorage +
+  // dispatched to the app-store inside their wrapped setters above —
+  // no standalone auto-persist effect. An auto-persist effect here
+  // would race with the session-switch reset: on a sessionId change,
+  // React state still holds the previous thread's value for one
+  // render, and an auto-persist effect would write it to the new
+  // thread's storage key before the reset has a chance to fix it.)
 
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
   // Monotonically-increasing tick bumped each time the user dispatches a
@@ -1151,10 +1199,60 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // don't need to reset because they live in the global store
   // keyed by sessionId — switching threads just reads a different
   // entry.)
+  //
+  // Why this is one big block, not per-field cleanup at the call
+  // site: `ChatView` never remounts on session switch (only its
+  // `sessionId` prop changes — see the `key={sessionId}` on
+  // `<ChatInput>` below for why the composer does remount). So any
+  // useState here is, by default, shared across every thread the
+  // user visits in this ChatView lifetime. The complete-isolation
+  // rule is: if a piece of state was set from a stream event for a
+  // specific `session_id`, or reflects a user gesture made while
+  // looking at thread A, it must be zeroed before the user sees
+  // thread B. Missing even one field means that field bleeds into
+  // every subsequent thread the user switches to.
   React.useEffect(() => {
+    // Watchdog / optimistic composer bookkeeping.
     setPendingInput(null);
     setLastEventAt(Date.now());
     setStuckSince(null);
+    // Running-turn chrome that's driven by stream events gated on
+    // the active sessionId — without resetting, thread A's phase
+    // label or retry banner keeps rendering over thread B's
+    // composer until a new event happens to fire and overwrite it.
+    setTurnPhase(undefined);
+    setRetryState(null);
+    // Ghost text from `prompt_suggested` is the source of the
+    // "Tab-complete bleeds across tabs" bug: the composer remounts
+    // via `key={sessionId}` but still receives `promptSuggestion`
+    // as a prop from here, so thread A's predicted prompt would
+    // render as ghost text on thread B and Tab would insert it.
+    setPromptSuggestion(null);
+    // Open-on-top-of-everything overlay for a persisted attachment.
+    // If thread A had the lightbox open, switching to B would keep
+    // A's image pinned over B's entire view.
+    setPersistedLightboxRef(null);
+    // Inline title editor — if the user had opened the rename input
+    // on A's header and switched away, B's header would mount with
+    // an open editor bound to A's draft.
+    setEditingTitle(false);
+    // Async "Load older" spinner — belongs to the in-flight request
+    // for the thread we're leaving; a new thread click wants a
+    // clean slate, and the previous fetch resolves into its own
+    // cache entry regardless.
+    setLoadingOlder(false);
+    // Per-session settings dialog (gear icon). Modal is tied to the
+    // thread whose settings are being edited; carrying it open into
+    // another thread would show the wrong session's data.
+    setSessionSettingsOpen(false);
+    // Diff subscription gate. Opening the diff on thread A latched
+    // the hook's `enabled` and the "ever opened" ref to true — both
+    // are per-ChatView lifetime flags, but ChatView's lifetime
+    // spans every thread the user visits. Reset so thread B
+    // doesn't run `git diff` subscriptions the user never asked
+    // for.
+    setDiffSubscriptionActive(false);
+    diffPanelEverOpenedRef.current = false;
     // Resync per-thread panel open flags from the module-level maps.
     // ChatView doesn't remount on session switch, so the lazy
     // useState initializers only ran for the very first session —
