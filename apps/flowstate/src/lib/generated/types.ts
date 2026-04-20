@@ -301,11 +301,6 @@ contextBreakdown: boolean,
  */
 promptSuggestions: boolean, 
 /**
- * Honours a per-session `compact_custom_instructions` setting
- * that steers what the provider emphasises when compacting.
- */
-compactCustomInstructions: boolean, 
-/**
  * Emits session lifecycle diagnostics (start / end). Surfaced as
  * `Info` events in the daemon log; purely observational today.
  */
@@ -451,14 +446,7 @@ images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effo
  * adapter today; others ignore. Absent = adapter default
  * (`ThinkingMode::Always` for Claude SDK).
  */
-thinking_mode?: ThinkingMode, } | { "type": "get_attachment", attachment_id: string, } | { "type": "interrupt_turn", session_id: string, } | { "type": "steer_turn", session_id: string, input: string, images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effort?: ReasoningEffort, thinking_mode?: ThinkingMode, } | { "type": "update_permission_mode", session_id: string, permission_mode: PermissionMode, } | { "type": "update_session_settings", session_id: string, 
-/**
- * `None` here means "no change to this field". To clear the
- * value, pass `Some("".to_string())` — the empty string is
- * the canonical "no instructions, use the default
- * compaction prompt" signal.
- */
-compact_custom_instructions?: string, } | { "type": "delete_session", session_id: string, } | { "type": "answer_permission", session_id: string, request_id: string, decision: PermissionDecision, 
+thinking_mode?: ThinkingMode, } | { "type": "get_attachment", attachment_id: string, } | { "type": "interrupt_turn", session_id: string, } | { "type": "steer_turn", session_id: string, input: string, images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effort?: ReasoningEffort, thinking_mode?: ThinkingMode, } | { "type": "update_permission_mode", session_id: string, permission_mode: PermissionMode, } | { "type": "delete_session", session_id: string, } | { "type": "answer_permission", session_id: string, request_id: string, decision: PermissionDecision, 
 /**
  * Optional permission-mode change to apply alongside the
  * approval. The Claude SDK adapter forwards this to the

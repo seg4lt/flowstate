@@ -51,7 +51,6 @@ import { PermissionPrompt } from "./permission-prompt";
 import { QuestionPrompt } from "./question-prompt";
 import { ChatToolbar } from "./chat-toolbar";
 import { HeaderActions } from "./header-actions";
-import { SessionSettingsDialog } from "./session-settings-dialog";
 import { BranchSwitcher } from "./branch-switcher";
 import { WorkingIndicator } from "./working-indicator";
 import { ApiRetryBanner } from "./api-retry-banner";
@@ -771,12 +770,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const [promptSuggestion, setPromptSuggestion] = React.useState<string | null>(
     null,
   );
-  // Open-state for the per-session settings dialog (gear icon in
-  // header). Local to chat-view because dialog content reads from
-  // the React Query cache that lives here.
-  const [sessionSettingsOpen, setSessionSettingsOpen] =
-    React.useState(false);
-
   // The diff view is sourced directly from `git diff HEAD` against
   // the project's working tree (plus untracked files). It refreshes
   // on session load, on every `turn_completed` event, and whenever
@@ -1271,10 +1264,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // clean slate, and the previous fetch resolves into its own
     // cache entry regardless.
     setLoadingOlder(false);
-    // Per-session settings dialog (gear icon). Modal is tied to the
-    // thread whose settings are being edited; carrying it open into
-    // another thread would show the wrong session's data.
-    setSessionSettingsOpen(false);
     // Diff subscription gate. Opening the diff on thread A latched
     // the hook's `enabled` and the "ever opened" ref to true — both
     // are per-ChatView lifetime flags, but ChatView's lifetime
@@ -1798,15 +1787,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return (runningTurn.toolCalls ?? []).some((tc) => tc.status === "pending");
   }, [runningTurn]);
 
-  // Per-session settings affordance gate. Reads the current
-  // provider's feature flags; the gear button (and dialog) only
-  // surface when at least one settable field is supported. As
-  // future per-session fields land they should OR-in here.
-  const sessionFeatures = useProviderFeatures(
-    sessionQuery.data?.detail.summary.provider,
-  );
-  const hasSessionSettings = !!sessionFeatures.compactCustomInstructions;
-
   // Arm the stuck-watchdog. We only trip it when the session is
   // running *and* at least one tool call is pending, so idle
   // pre-tool "Thinking…" periods don't falsely flag as stuck. The
@@ -1946,15 +1926,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             contextOpen={contextOpen}
             todoProgress={todoProgress}
             onToggleContext={handleToggleContext}
-            // Only show the gear when the current provider has at
-            // least one per-session-settable feature. Today that's
-            // gated on `compact_custom_instructions`; as more
-            // session-scoped fields land, OR them in here.
-            onOpenSessionSettings={
-              hasSessionSettings
-                ? () => setSessionSettingsOpen(true)
-                : undefined
-            }
             onToggleDiff={() => {
               setDiffOpen((v) => {
                 if (!v) {
@@ -2204,15 +2175,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <ImageLightbox
           source={{ kind: "persisted", ref: persistedLightboxRef }}
           onClose={() => setPersistedLightboxRef(null)}
-        />
-      )}
-      {hasSessionSettings && sessionQuery.data?.detail.summary.provider && (
-        <SessionSettingsDialog
-          open={sessionSettingsOpen}
-          onOpenChange={setSessionSettingsOpen}
-          sessionId={sessionId}
-          provider={sessionQuery.data.detail.summary.provider}
-          session={sessionQuery.data?.detail}
         />
       )}
     </div>

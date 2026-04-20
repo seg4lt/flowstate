@@ -7,9 +7,8 @@
 // generated dir, so a Rust-side field rename that forgets the TS side
 // is caught before it ships.
 //
-// Purely frontend types (`AttachedImage`, `RetryState`,
-// `SessionMetadata`) stay here — they exist only in browser memory and
-// have no Rust counterpart.
+// Purely frontend types (`AttachedImage`, `RetryState`) stay here —
+// they exist only in browser memory and have no Rust counterpart.
 
 export * from "./generated/types";
 
@@ -49,15 +48,3 @@ export interface RetryState {
   startedAt: number;
 }
 
-/** Typed view over `ProviderSessionState.metadata` (a `JsonValue` on
- *  the Rust side). The keys we actively read are listed here so the
- *  session-settings dialog has a handle on them; unknown fields are
- *  preserved round-trip by the runtime's metadata merge.
- *
- *  - `compactCustomInstructions`: per-session text appended to the
- *    Claude SDK system prompt to steer compaction summaries. Empty
- *    string means "clear the setting"; absent means "never set". */
-export interface SessionMetadata {
-  compactCustomInstructions?: string;
-  [key: string]: unknown;
-}

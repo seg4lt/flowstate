@@ -8,7 +8,6 @@ import {
   Diff,
   FolderOpen,
   Search,
-  Settings,
   Terminal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -41,12 +40,6 @@ interface HeaderActionsProps {
   // session's latest main-agent TodoWrite has at least one item.
   // Null hides the badge entirely.
   todoProgress: { completed: number; total: number } | null;
-  // Opens the session-settings dialog. Optional — chat-view passes
-  // a handler when the current session has at least one settable
-  // per-session field exposed by its provider; leaving it
-  // undefined hides the gear button entirely so we don't show a
-  // dialog with nothing inside it.
-  onOpenSessionSettings?: () => void;
 }
 
 // Known editors we offer in the Open dropdown. Each `command` is
@@ -94,7 +87,6 @@ export function HeaderActions({
   contextOpen,
   onToggleContext,
   todoProgress,
-  onOpenSessionSettings,
 }: HeaderActionsProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -272,16 +264,6 @@ export function HeaderActions({
       >
         <Search className="h-3 w-3" />
       </Button>
-      {onOpenSessionSettings && (
-        <Button
-          variant="outline"
-          size="xs"
-          onClick={onOpenSessionSettings}
-          title="Session settings"
-        >
-          <Settings className="h-3 w-3" />
-        </Button>
-      )}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           {/* Native <button> (not the shadcn Button) — matches the

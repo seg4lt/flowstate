@@ -586,8 +586,6 @@ class ClaudeBridge {
   private queryConfig?: {
     reasoningEffort?: ReasoningEffortWire;
     thinkingMode?: ThinkingModeWire;
-    // Trimmed; undefined and empty-string are equivalent (no steering).
-    compactInstructions?: string;
   };
   /**
    * Current effective permission mode for the in-flight turn. Seeded
@@ -746,10 +744,10 @@ class ClaudeBridge {
    * Returns the assistant's final text for this turn (or
    * `'[interrupted]'` if the user steered before completion).
    *
-   * IMPORTANT: `reasoningEffort` and `compactCustomInstructions` take
-   * effect at Query-open time only. Per-turn changes are currently
-   * ignored by the active Query — switching them requires ending the
-   * session. `permissionMode` IS switchable mid-session via the SDK's
+   * IMPORTANT: `reasoningEffort` and `thinkingMode` take effect at
+   * Query-open time only. Per-turn changes are currently ignored by
+   * the active Query — switching them requires ending the session.
+   * `permissionMode` IS switchable mid-session via the SDK's
    * `setPermissionMode` control.
    */
   async sendPrompt(
@@ -758,7 +756,6 @@ class ClaudeBridge {
     reasoningEffort?: ReasoningEffortWire,
     thinkingMode?: ThinkingModeWire,
     images: Array<{ media_type: string; data_base64: string }> = [],
-    compactCustomInstructions?: string,
   ): Promise<string> {
     if (this.turnInProgress) {
       throw new Error('Another turn is already in flight');
@@ -783,16 +780,15 @@ class ClaudeBridge {
         permissionMode,
         reasoningEffort,
         thinkingMode,
-        compactCustomInstructions,
       );
     } else {
-      // Query already live. Three per-turn knobs may have changed:
+      // Query already live. Two per-turn knobs may have changed:
       //
-      //   1. `reasoningEffort`, `thinkingMode`, or
-      //      `compactCustomInstructions` — the SDK has no mid-session
-      //      setter for these, so a change forces a close-and-reopen
-      //      with `resume: resumeSessionId`. Full conversation history
-      //      is preserved; only the SDK-side Query object is recycled.
+      //   1. `reasoningEffort` or `thinkingMode` — the SDK has no
+      //      mid-session setter for these, so a change forces a
+      //      close-and-reopen with `resume: resumeSessionId`. Full
+      //      conversation history is preserved; only the SDK-side
+      //      Query object is recycled.
       //   2. `permissionMode` — has a live SDK setter, apply in
       //      place so we don't pay the reopen cost for the common
       //      case of the user flipping permission mode between turns.
@@ -800,20 +796,15 @@ class ClaudeBridge {
       // If both changed, (1) happens first: the reopen opens the
       // new Query already configured with the requested permission
       // mode, so (2) is skipped.
-      const desiredCompact =
-        compactCustomInstructions?.trim() || undefined;
       const effortChanged =
         this.queryConfig?.reasoningEffort !== reasoningEffort;
       const thinkingModeChanged =
         this.queryConfig?.thinkingMode !== thinkingMode;
-      const compactChanged =
-        this.queryConfig?.compactInstructions !== desiredCompact;
-      if (effortChanged || thinkingModeChanged || compactChanged) {
+      if (effortChanged || thinkingModeChanged) {
         await this.reopenQueryForConfigChange(
           permissionMode,
           reasoningEffort,
           thinkingMode,
-          compactCustomInstructions,
         );
       } else if (this.livePermissionMode !== permissionMode) {
         // Subsequent turn with a different permission mode. Push the
@@ -888,7 +879,6 @@ class ClaudeBridge {
     initialPermissionMode: SdkPermissionMode,
     reasoningEffort?: ReasoningEffortWire,
     thinkingMode?: ThinkingModeWire,
-    compactCustomInstructions?: string,
   ): void {
     this.livePermissionMode = initialPermissionMode;
 
@@ -1000,19 +990,6 @@ class ClaudeBridge {
       'Agent',
     ];
 
-    // Per-session compaction steering. Baked into the Query's
-    // systemPrompt at open time — switching mid-session requires a
-    // new session.
-    const trimmedCompactInstructions = compactCustomInstructions?.trim();
-    const compactSystemPrompt: Options['systemPrompt'] | undefined =
-      trimmedCompactInstructions
-        ? {
-            type: 'preset',
-            preset: 'claude_code',
-            append: `When summarizing prior conversation during compaction, prioritize the following user-supplied guidance: ${trimmedCompactInstructions}`,
-          }
-        : undefined;
-
     const options: Options = {
       cwd: this.cwd,
       permissionMode: initialPermissionMode,
@@ -1088,7 +1065,6 @@ class ClaudeBridge {
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
       ...(effortLevel ? { effort: effortLevel } : {}),
-      ...(compactSystemPrompt ? { systemPrompt: compactSystemPrompt } : {}),
       ...(RESOLVED_LOCAL_CLAUDE_PATH
         ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
         : {}),
@@ -1100,12 +1076,10 @@ class ClaudeBridge {
     this.activeQuery = q;
     // Remember what this Query was opened with so the next
     // `sendPrompt` can detect a per-turn config change and trigger a
-    // reopen. `trimmedCompactInstructions` is already trimmed/empty-
-    // collapsed above, so the stored value compares cleanly.
+    // reopen.
     this.queryConfig = {
       reasoningEffort,
       thinkingMode,
-      compactInstructions: trimmedCompactInstructions || undefined,
     };
 
     // Background pump: drain SDK messages forever. Every `result`
@@ -1225,10 +1199,9 @@ class ClaudeBridge {
 
   /**
    * Close the current persistent Query and reopen a fresh one under
-   * new `reasoningEffort` / `compactCustomInstructions`. Conversation
-   * history is preserved via `resume: this.resumeSessionId` — from
-   * the model's POV nothing happened, only the SDK-side Query object
-   * was recycled.
+   * new `reasoningEffort` / `thinkingMode`. Conversation history is
+   * preserved via `resume: this.resumeSessionId` — from the model's
+   * POV nothing happened, only the SDK-side Query object was recycled.
    *
    * Called from `sendPrompt` when the requested config differs from
    * `this.queryConfig`. Serialised inside sendPrompt's single-turn
@@ -1239,7 +1212,6 @@ class ClaudeBridge {
     permissionMode: SdkPermissionMode,
     reasoningEffort: ReasoningEffortWire | undefined,
     thinkingMode: ThinkingModeWire | undefined,
-    compactCustomInstructions: string | undefined,
   ): Promise<void> {
     const pump = this.pumpPromise;
     const q = this.activeQuery;
@@ -1283,7 +1255,6 @@ class ClaudeBridge {
       permissionMode,
       reasoningEffort,
       thinkingMode,
-      compactCustomInstructions,
     );
   }
 
@@ -2420,14 +2391,6 @@ async function main(): Promise<void> {
         const images = (msg.images as
           | Array<{ media_type: string; data_base64: string }>
           | undefined) ?? [];
-        // Optional per-session compaction steering text. Wraps into
-        // `Options.systemPrompt = { type: 'preset', preset:
-        // 'claude_code', append: ... }` inside sendPrompt. Absent /
-        // empty here means "use the default Claude Code preset, no
-        // append".
-        const compactCustomInstructions = msg.compact_custom_instructions as
-          | string
-          | undefined;
         promptInFlight = (async () => {
           try {
             const output = await bridge.sendPrompt(
@@ -2436,7 +2399,6 @@ async function main(): Promise<void> {
               effort,
               thinkingMode,
               images,
-              compactCustomInstructions,
             );
             writeJson({
               type: 'response',

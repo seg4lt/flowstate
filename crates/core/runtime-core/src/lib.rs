@@ -1078,20 +1078,6 @@ impl RuntimeCore {
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
-            ClientMessage::UpdateSessionSettings {
-                session_id,
-                compact_custom_instructions,
-            } => {
-                match self
-                    .update_session_settings(session_id, compact_custom_instructions)
-                    .await
-                {
-                    Ok(()) => Some(ServerMessage::Ack {
-                        message: "Session settings updated.".to_string(),
-                    }),
-                    Err(error) => Some(ServerMessage::Error { message: error }),
-                }
-            }
             ClientMessage::DeleteSession { session_id } => {
                 match self.delete_session(session_id).await {
                     Ok(message) => Some(ServerMessage::Ack { message }),
@@ -3308,68 +3294,6 @@ impl RuntimeCore {
                 reply: None,
             })
         }
-    }
-
-    /// Persist per-session settings into
-    /// `provider_state.metadata`. Sparse — only fields the caller
-    /// explicitly passed are merged; absent fields keep their prior
-    /// value. Settings take effect on the NEXT turn (reading happens
-    /// inside the adapter's `execute_turn`); this call returns once
-    /// persistence has flushed so a follow-up SendTurn always sees
-    /// the new value.
-    async fn update_session_settings(
-        &self,
-        session_id: String,
-        compact_custom_instructions: Option<String>,
-    ) -> Result<(), String> {
-        let mut session = self
-            .live_session_detail(&session_id)
-            .await
-            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
-
-        // Bump updated_at so list views that sort on it surface the
-        // change. We treat session settings as a session-touch event
-        // even though no turn was issued.
-        session.summary.updated_at = chrono::Utc::now().to_rfc3339();
-
-        // Merge into the existing provider_state, preserving
-        // native_thread_id and any other metadata fields. If no
-        // provider_state exists yet (settings change before the first
-        // turn), seed an empty one so the metadata write has a home.
-        let mut state = session
-            .provider_state
-            .clone()
-            .unwrap_or(ProviderSessionState {
-                native_thread_id: None,
-                metadata: None,
-            });
-        let mut metadata_obj = state
-            .metadata
-            .as_ref()
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        if let Some(text) = compact_custom_instructions {
-            // Trim here so persistence carries the canonical form;
-            // reading code already collapses empty / whitespace
-            // values to `None`. Storing `""` (empty string) is
-            // intentional — it's the user's signal to clear the
-            // setting and it round-trips cleanly through the JSON
-            // blob.
-            let trimmed = text.trim();
-            metadata_obj.insert(
-                "compactCustomInstructions".to_string(),
-                serde_json::Value::String(trimmed.to_string()),
-            );
-        }
-        state.metadata = if metadata_obj.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(metadata_obj))
-        };
-        session.provider_state = Some(state);
-
-        self.persistence.upsert_session(session).await;
-        Ok(())
     }
 
     async fn update_permission_mode(

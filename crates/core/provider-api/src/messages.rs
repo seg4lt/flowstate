@@ -406,26 +406,6 @@ pub enum ClientMessage {
         session_id: String,
         permission_mode: PermissionMode,
     },
-    /// Update per-session settings persisted in
-    /// `sessions.provider_state_json.metadata`. Designed as a sparse
-    /// envelope — only fields the user actually changed are present;
-    /// `None` means "leave existing value untouched". Today the only
-    /// field is `compact_custom_instructions`, but the envelope shape
-    /// keeps this command stable as future per-session settings land.
-    /// Settings take effect on the NEXT turn (the Claude SDK doesn't
-    /// expose a mid-turn handle for system-prompt edits); runtime-core
-    /// reads the metadata when constructing the next `send_prompt`
-    /// call, so a user can edit and immediately fire a turn without
-    /// any reload step.
-    UpdateSessionSettings {
-        session_id: String,
-        /// `None` here means "no change to this field". To clear the
-        /// value, pass `Some("".to_string())` — the empty string is
-        /// the canonical "no instructions, use the default
-        /// compaction prompt" signal.
-        #[serde(default)]
-        compact_custom_instructions: Option<String>,
-    },
     DeleteSession {
         session_id: String,
     },

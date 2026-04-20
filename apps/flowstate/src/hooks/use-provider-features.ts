@@ -16,7 +16,6 @@ const EMPTY_PROVIDER_FEATURES: ProviderFeatures = {
   thinkingEffort: false,
   contextBreakdown: false,
   promptSuggestions: false,
-  compactCustomInstructions: false,
   sessionLifecycleEvents: false,
   supportsAutoPermissionMode: false,
 };

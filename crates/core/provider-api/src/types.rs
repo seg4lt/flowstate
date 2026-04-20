@@ -697,9 +697,6 @@ pub struct ProviderFeatures {
     /// Emits `PromptSuggested` events after each turn. Drives the
     /// ghost-text suggestion overlay in the composer.
     pub prompt_suggestions: bool,
-    /// Honours a per-session `compact_custom_instructions` setting
-    /// that steers what the provider emphasises when compacting.
-    pub compact_custom_instructions: bool,
     /// Emits session lifecycle diagnostics (start / end). Surfaced as
     /// `Info` events in the daemon log; purely observational today.
     pub session_lifecycle_events: bool,
@@ -773,13 +770,6 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
             // leaves `canUseTool` untouched for classifier-escalated
             // calls.
             supports_auto_permission_mode: true,
-
-            // Per-session "Compaction priorities" textarea. Stored
-            // in `provider_state.metadata.compactCustomInstructions`,
-            // wrapped at the bridge into the SDK's
-            // `systemPrompt: { preset: 'claude_code', append: ... }`
-            // shape so the model honors it during compaction.
-            compact_custom_instructions: true,
         },
 
         // Codex CLI adapter has native `reasoning_effort` on its

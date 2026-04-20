@@ -56,29 +56,6 @@ export async function getContextUsage(
   throw new Error("unexpected response to get_context_usage");
 }
 
-/**
- * Persist per-session settings (compaction priorities, future
- * fields) into the runtime's `provider_state.metadata`. Sparse —
- * only fields the caller passes are merged on the Rust side; absent
- * fields keep their prior value. Pass an empty string to clear a
- * field. Throws on `ServerMessage::Error`. Resolves once the
- * runtime has flushed to disk, so the very next turn picks up the
- * new value.
- */
-export async function updateSessionSettings(
-  sessionId: string,
-  settings: { compactCustomInstructions?: string },
-): Promise<void> {
-  const resp = await sendMessage({
-    type: "update_session_settings",
-    session_id: sessionId,
-    compact_custom_instructions: settings.compactCustomInstructions,
-  });
-  if (resp?.type === "ack") return;
-  if (resp?.type === "error") throw new Error(resp.message);
-  throw new Error("unexpected response to update_session_settings");
-}
-
 export function connectStream(
   onMessage: (message: ServerMessage) => void,
 ): Promise<void> {

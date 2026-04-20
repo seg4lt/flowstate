@@ -110,16 +110,6 @@ pub(crate) enum BridgeRequest {
         /// text + base64 image blocks.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<BridgeImageAttachment>,
-        /// Per-session steering text the user wrote in
-        /// "Session settings → Compaction priorities". When present the
-        /// bridge builds the SDK Options' system prompt as
-        /// `{ type: 'preset', preset: 'claude_code', append: <wrapped text> }`
-        /// so the model honors it whenever it summarises older turns
-        /// during compaction. Cleared by an empty string at the
-        /// runtime-core layer; absent here means "use the default
-        /// preset, no append".
-        #[serde(skip_serializing_if = "Option::is_none")]
-        compact_custom_instructions: Option<String>,
     },
     #[serde(rename = "answer_permission")]
     AnswerPermission {

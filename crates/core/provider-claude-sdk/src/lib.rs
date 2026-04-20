@@ -1,5 +1,4 @@
 mod bridge_runtime;
-mod config;
 mod process;
 mod rpc;
 mod stream;
@@ -26,7 +25,6 @@ use zenui_provider_api::{
     session_cwd, skills_disk,
 };
 
-use crate::config::{claude_models, read_compact_custom_instructions};
 use crate::process::{
     BRIDGE_IDLE_TIMEOUT_SECS, BRIDGE_WATCHDOG_INTERVAL_SECS, CachedBridge, ClaudeBridgeProcess,
     write_request,
@@ -429,7 +427,6 @@ impl ClaudeSdkAdapter {
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         thinking_mode: Option<ThinkingMode>,
-        compact_custom_instructions: Option<String>,
         events: TurnEventSink,
     ) -> Result<(String, Option<String>), String> {
         // Held for the entire turn. Drops after `process` is released,
@@ -453,7 +450,6 @@ impl ClaudeSdkAdapter {
             reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
             thinking_mode: thinking_mode.map(|m| m.as_str().to_string()),
             images: bridge_images,
-            compact_custom_instructions,
         };
         write_request(&process.stdin, &request).await?;
 
@@ -1006,7 +1002,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 version: None,
                 status: ProviderStatusLevel::Error,
                 message: Some(format!("embedded Node.js extraction failed: {err:?}")),
-                models: claude_models(),
+                models: Vec::new(),
                 enabled: true,
                 features: features.clone(),
             };
@@ -1020,7 +1016,7 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 version: None,
                 status: ProviderStatusLevel::Error,
                 message: Some(format!("Claude SDK bridge extraction failed: {err:?}")),
-                models: claude_models(),
+                models: Vec::new(),
                 enabled: true,
                 features: features.clone(),
             };
@@ -1034,7 +1030,12 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             version: None,
             status: ProviderStatusLevel::Ready,
             message: Some("Claude Agent SDK bridge ready".to_string()),
-            models: claude_models(),
+            // Left empty on purpose: the runtime triggers `fetch_models()`
+            // shortly after health() and populates the cache from the
+            // installed claude binary's SDK init response. Returning a
+            // hardcoded fallback here would just mask staleness when
+            // Anthropic ships new model slugs.
+            models: Vec::new(),
             enabled: true,
             features,
         }
@@ -1062,13 +1063,6 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         let cached = self.ensure_session_process(session).await?;
-        // Pull per-session compaction steering text out of
-        // `provider_state.metadata`. Empty / whitespace-only values
-        // collapse to None so the bridge falls back to the SDK's
-        // default Claude Code preset (no `append`). The metadata key
-        // is camelCase to match `ProviderSessionState`'s serde shape.
-        let compact_custom_instructions =
-            read_compact_custom_instructions(session.provider_state.as_ref());
         let result = self
             .run_turn(
                 cached,
@@ -1076,7 +1070,6 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 permission_mode,
                 reasoning_effort,
                 thinking_mode,
-                compact_custom_instructions,
                 events,
             )
             .await;
@@ -1089,10 +1082,9 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 // to carry a session_id in this SDK version).
                 //
                 // CAREFUL: when we mint a new ProviderSessionState here we
-                // intentionally preserve any existing `metadata` blob (the
-                // user's compact_custom_instructions live there) — without
-                // this, every successful turn would silently wipe per-
-                // session settings.
+                // intentionally preserve any existing `metadata` blob so
+                // future per-session settings aren't wiped by a successful
+                // turn.
                 let provider_state = session_id
                     .map(|id| ProviderSessionState {
                         native_thread_id: Some(id),
@@ -1275,30 +1267,13 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 if models.is_empty() {
                     Err("Claude bridge returned no models".to_string())
                 } else {
-                    // The SDK's `supportedModels()` returns
-                    // `{value, label}` only — no context window
-                    // metadata. Overlay our declared capabilities
-                    // table so the UI can show an authoritative
-                    // context window regardless of which path
-                    // populated the entry.
-                    let capabilities = claude_models();
-                    let enriched: Vec<ProviderModel> = models
-                        .into_iter()
-                        .map(|m| {
-                            if let Some(cap) = capabilities.iter().find(|c| c.value == m.value) {
-                                ProviderModel {
-                                    context_window: m.context_window.or(cap.context_window),
-                                    max_output_tokens: m
-                                        .max_output_tokens
-                                        .or(cap.max_output_tokens),
-                                    ..m
-                                }
-                            } else {
-                                m
-                            }
-                        })
-                        .collect();
-                    Ok(enriched)
+                    // Forward the installed claude binary's `supportedModels()`
+                    // response verbatim. `context_window` / `max_output_tokens`
+                    // are `None` today because `ModelInfo` in the Claude Agent
+                    // SDK doesn't carry them — if a future SDK release adds
+                    // those fields, the bridge will forward them and this path
+                    // will start populating them for free. No hardcoded fallback.
+                    Ok(models)
                 }
             }
             BridgeResponse::Error { error } => Err(format!("Claude list_models error: {error}")),
