@@ -7063,7 +7063,9 @@ name = "zenui-checkpoints"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
+ "ignore",
  "serde",
  "serde_json",
  "tempfile",
@@ -7071,6 +7073,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zenui-persistence",
 ]
 
 [[package]]

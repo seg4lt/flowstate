@@ -32,14 +32,18 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
+pub mod blob_store;
 pub mod errors;
 pub mod manifest;
+pub mod store;
+pub mod walker;
 
 #[cfg(test)]
 mod noop_tests;
 
 pub use errors::CheckpointError;
 pub use manifest::{BlobHash, Manifest, ManifestEntry, MANIFEST_VERSION};
+pub use store::FsCheckpointStore;
 
 /// Handle returned by a successful [`CheckpointStore::capture`]. Carries
 /// enough metadata for the caller to publish a `CheckpointCaptured` event

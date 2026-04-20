@@ -8,9 +8,11 @@
 //! Manifests are serialized as JSON. Atomic temp-then-rename writes guarantee
 //! that a partial file never survives a crash.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
-use crate::errors::CheckpointError;
+use crate::errors::{io_err, CheckpointError};
 
 /// On-disk format version. Bump when changing the manifest shape in a way
 /// that older daemons can't read. Readers must reject unknown versions
@@ -83,6 +85,14 @@ impl BlobHash {
         Ok(Self(format!("blake3:{}", hex.to_lowercase())))
     }
 
+    /// Hash arbitrary bytes with blake3 and wrap the hex digest.
+    pub fn hash_bytes(bytes: &[u8]) -> Self {
+        let digest = blake3::hash(bytes);
+        // blake3 hex output is lowercase already; safe to wrap without
+        // going through `from_hex`'s validation loop.
+        Self(format!("blake3:{}", digest.to_hex()))
+    }
+
     /// Parse an already-prefixed hash string (`blake3:<hex>`). Used on the
     /// deserialization path.
     pub fn parse(raw: &str) -> Result<Self, CheckpointError> {
@@ -120,6 +130,62 @@ impl<'de> Deserialize<'de> for BlobHash {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
         BlobHash::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Manifest {
+    /// Read a manifest from disk and validate its `version` field
+    /// against [`MANIFEST_VERSION`]. Unknown versions surface as
+    /// [`CheckpointError::ManifestCorrupt`] so callers treat them as
+    /// "this manifest is unreadable" rather than silently accepting
+    /// partial data.
+    pub fn load(path: &Path) -> Result<Self, CheckpointError> {
+        let bytes = std::fs::read(path).map_err(|e| io_err(path.to_path_buf(), e))?;
+        let manifest: Manifest =
+            serde_json::from_slice(&bytes).map_err(|e| CheckpointError::ManifestCorrupt {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(CheckpointError::ManifestCorrupt {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "unsupported manifest version {} (expected {MANIFEST_VERSION})",
+                    manifest.version
+                ),
+            });
+        }
+        Ok(manifest)
+    }
+
+    /// Serialize `self` and write atomically: write to a temp file in
+    /// the same directory, then `rename()` onto `path`. Callers can
+    /// rely on the file either being absent or fully-formed — never
+    /// partially written — even across a daemon crash.
+    pub fn write_atomic(&self, path: &Path) -> Result<(), CheckpointError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| CheckpointError::InvalidRoot {
+                root: path.to_path_buf(),
+                reason: "manifest path has no parent directory".to_string(),
+            })?;
+        std::fs::create_dir_all(parent).map_err(|e| io_err(parent.to_path_buf(), e))?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
+            CheckpointError::ManifestCorrupt {
+                path: path.to_path_buf(),
+                reason: format!("serialize manifest: {e}"),
+            }
+        })?;
+        let tmp_name = format!(
+            ".{}.tmp",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("manifest")
+        );
+        let tmp_path = parent.join(tmp_name);
+        std::fs::write(&tmp_path, &bytes).map_err(|e| io_err(tmp_path.clone(), e))?;
+        std::fs::rename(&tmp_path, path).map_err(|e| io_err(path.to_path_buf(), e))?;
+        Ok(())
     }
 }
 

@@ -6,13 +6,16 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+blake3 = "1.5"
 chrono.workspace = true
+ignore = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "1"
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+zenui-persistence = { path = "../persistence" }
 
 [dev-dependencies]
 tempfile.workspace = true

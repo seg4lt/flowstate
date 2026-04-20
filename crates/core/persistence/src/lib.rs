@@ -45,6 +45,36 @@ pub struct PersistenceService {
     attachments_dir: PathBuf,
 }
 
+/// A row in the `checkpoints` table. Consumed exclusively by the
+/// `zenui-checkpoints` crate; exposed here because that crate doesn't
+/// talk to sqlite directly.
+#[derive(Debug, Clone)]
+pub struct CheckpointRow {
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    /// RFC 3339.
+    pub created_at: String,
+    /// Filename (not full path) relative to
+    /// `<data_dir>/checkpoints/manifests/`. The checkpoints crate
+    /// resolves it against its own base dir.
+    pub manifest_path: String,
+}
+
+/// A row in the `file_state` cache. One per canonicalized absolute path
+/// we've ever captured; updated in place when a file's mtime/size moves.
+#[derive(Debug, Clone)]
+pub struct FileStateRow {
+    pub abs_path: String,
+    pub mtime_ns: i64,
+    pub size_bytes: i64,
+    /// Scheme-prefixed blake3 hash (e.g. `blake3:<hex>`). Stored as a
+    /// string because this crate has no dependency on the checkpoints
+    /// crate's `BlobHash` newtype.
+    pub blob_hash: String,
+    pub updated_at: String,
+}
+
 impl PersistenceService {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let parent = path
@@ -580,6 +610,277 @@ impl PersistenceService {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Checkpoint index and file-state cache.
+    //
+    // The `checkpoints` table tracks which session/turn pairs have an
+    // on-disk manifest. The `file_state` table is a persistent
+    // (path, mtime, size) -> blob_hash cache that powers the
+    // "only hash files that actually changed" fast path at turn end.
+    //
+    // Both tables are consumed exclusively by the `zenui-checkpoints`
+    // crate. This crate owns the SQL because persistence is the one
+    // place that opens the sqlite connection; checkpoints calls typed
+    // methods here to avoid a second connection to the same file.
+    // ------------------------------------------------------------------
+
+    pub async fn insert_checkpoint(&self, row: CheckpointRow) -> Result<()> {
+        let connection = self.connection.lock();
+        // Idempotent on (session_id, turn_id) — capture is called once
+        // per turn-end but a redelivery (daemon restart mid-turn) must
+        // not explode with UNIQUE constraint errors. `INSERT OR IGNORE`
+        // sidesteps both the PK and UNIQUE constraints in one clause.
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO checkpoints
+                    (checkpoint_id, session_id, turn_id, created_at, manifest_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    row.checkpoint_id,
+                    row.session_id,
+                    row.turn_id,
+                    row.created_at,
+                    row.manifest_path,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "insert checkpoint row (session={}, turn={})",
+                    row.session_id, row.turn_id
+                )
+            })?;
+        Ok(())
+    }
+
+    pub async fn get_checkpoint_by_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+    ) -> Option<CheckpointRow> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT checkpoint_id, session_id, turn_id, created_at, manifest_path
+                 FROM checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id, turn_id],
+                |r| {
+                    Ok(CheckpointRow {
+                        checkpoint_id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        turn_id: r.get(2)?,
+                        created_at: r.get(3)?,
+                        manifest_path: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Return all checkpoints for this session whose `created_at` is >=
+    /// the target turn's `created_at`, ordered chronologically (ASC).
+    ///
+    /// The ordering is by `created_at` because capture runs at turn end,
+    /// so that timestamp is an accurate proxy for "turn order."
+    pub async fn list_session_checkpoints_from(
+        &self,
+        session_id: &str,
+        target_turn_id: &str,
+    ) -> Vec<CheckpointRow> {
+        let connection = self.connection.lock();
+        let mut statement = match connection.prepare(
+            "SELECT checkpoint_id, session_id, turn_id, created_at, manifest_path
+             FROM checkpoints
+             WHERE session_id = ?1
+               AND created_at >= (
+                    SELECT created_at FROM checkpoints
+                    WHERE session_id = ?1 AND turn_id = ?2
+               )
+             ORDER BY created_at ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map(params![session_id, target_turn_id], |r| {
+            Ok(CheckpointRow {
+                checkpoint_id: r.get(0)?,
+                session_id: r.get(1)?,
+                turn_id: r.get(2)?,
+                created_at: r.get(3)?,
+                manifest_path: r.get(4)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Delete all checkpoint rows for a session and return the manifest
+    /// paths they pointed at so the caller can remove them from disk.
+    pub async fn delete_checkpoints_for_session(&self, session_id: &str) -> Vec<String> {
+        let connection = self.connection.lock();
+        let manifest_paths: Vec<String> = {
+            let mut statement = match connection
+                .prepare("SELECT manifest_path FROM checkpoints WHERE session_id = ?1")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows = statement.query_map(params![session_id], |r| r.get::<_, String>(0));
+            match rows {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let _ = connection.execute(
+            "DELETE FROM checkpoints WHERE session_id = ?1",
+            params![session_id],
+        );
+        manifest_paths
+    }
+
+    /// Return all checkpoint rows. Used by GC to compute the set of
+    /// "live" manifest paths (every blob referenced by one of these
+    /// manifests is reachable and must not be reclaimed).
+    pub async fn list_all_checkpoints(&self) -> Vec<CheckpointRow> {
+        let connection = self.connection.lock();
+        let mut statement = match connection.prepare(
+            "SELECT checkpoint_id, session_id, turn_id, created_at, manifest_path FROM checkpoints",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map([], |r| {
+            Ok(CheckpointRow {
+                checkpoint_id: r.get(0)?,
+                session_id: r.get(1)?,
+                turn_id: r.get(2)?,
+                created_at: r.get(3)?,
+                manifest_path: r.get(4)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub async fn get_file_state(&self, abs_path: &str) -> Option<FileStateRow> {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT abs_path, mtime_ns, size_bytes, blob_hash, updated_at
+                 FROM file_state WHERE abs_path = ?1",
+                params![abs_path],
+                |r| {
+                    Ok(FileStateRow {
+                        abs_path: r.get(0)?,
+                        mtime_ns: r.get(1)?,
+                        size_bytes: r.get(2)?,
+                        blob_hash: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub async fn upsert_file_state(&self, row: FileStateRow) {
+        let connection = self.connection.lock();
+        let _ = connection.execute(
+            "INSERT INTO file_state (abs_path, mtime_ns, size_bytes, blob_hash, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(abs_path) DO UPDATE SET
+                mtime_ns   = excluded.mtime_ns,
+                size_bytes = excluded.size_bytes,
+                blob_hash  = excluded.blob_hash,
+                updated_at = excluded.updated_at",
+            params![
+                row.abs_path,
+                row.mtime_ns,
+                row.size_bytes,
+                row.blob_hash,
+                row.updated_at,
+            ],
+        );
+    }
+
+    /// Return every file_state row whose `abs_path` starts with
+    /// `prefix`. Used by `FsCheckpointStore::capture` to detect files
+    /// that existed last time we captured but have since disappeared
+    /// from disk. `prefix` must include the trailing path separator so
+    /// a workspace at `/a` doesn't accidentally match `/a-b/foo`.
+    pub async fn list_file_state_under_prefix(&self, prefix: &str) -> Vec<FileStateRow> {
+        let connection = self.connection.lock();
+        // SQLite `LIKE` with an escaped prefix. We don't use user-
+        // provided patterns so no need for parameterized ESCAPE; the
+        // LIKE wildcards (`%`, `_`) aren't present in filesystem paths
+        // on any platform we support.
+        let like = format!("{prefix}%");
+        let mut statement = match connection.prepare(
+            "SELECT abs_path, mtime_ns, size_bytes, blob_hash, updated_at
+             FROM file_state WHERE abs_path LIKE ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map(params![like], |r| {
+            Ok(FileStateRow {
+                abs_path: r.get(0)?,
+                mtime_ns: r.get(1)?,
+                size_bytes: r.get(2)?,
+                blob_hash: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        });
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub async fn delete_file_state(&self, abs_path: &str) {
+        let connection = self.connection.lock();
+        let _ = connection.execute(
+            "DELETE FROM file_state WHERE abs_path = ?1",
+            params![abs_path],
+        );
+    }
+
+    /// Return all file-state rows (path + blob_hash only — GC doesn't
+    /// need mtime/size). Used during GC to build the set of blob hashes
+    /// still referenced by the cache so they're not reclaimed.
+    pub async fn list_file_state_blob_hashes(&self) -> Vec<String> {
+        let connection = self.connection.lock();
+        let mut statement = match connection.prepare("SELECT blob_hash FROM file_state") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map([], |r| r.get::<_, String>(0));
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Delete file-state rows older than `older_than_rfc3339`. Returns
+    /// the count deleted so GC telemetry can report it. LRU policy:
+    /// anything whose `updated_at` predates the cutoff is assumed stale
+    /// (file moved, project deleted, workspace abandoned).
+    pub async fn prune_stale_file_state(&self, older_than_rfc3339: &str) -> usize {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "DELETE FROM file_state WHERE updated_at < ?1",
+                params![older_than_rfc3339],
+            )
+            .unwrap_or(0)
+    }
+
     /// Upsert a provider's runtime-enabled flag. Called from the
     /// `SetProviderEnabled` handler.
     pub async fn set_provider_enabled(&self, kind: ProviderKind, enabled: bool) {
@@ -857,6 +1158,42 @@ impl PersistenceService {
                 ON turn_attachments(turn_id);
             CREATE INDEX IF NOT EXISTS idx_turn_attachments_session_id
                 ON turn_attachments(session_id);
+
+            -- Checkpoint index. One row per captured turn. The runtime's
+            -- DeleteSession handler explicitly calls
+            -- `CheckpointStore::delete_for_session` to reclaim manifests
+            -- on disk + the rows here, so no FOREIGN KEY is declared —
+            -- it would just complicate test setup without adding safety
+            -- (the explicit cleanup is the canonical path). See the
+            -- checkpoints crate for the on-disk format at
+            -- <data_dir>/checkpoints/manifests/<checkpoint_id>.json.
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                session_id    TEXT NOT NULL,
+                turn_id       TEXT NOT NULL,
+                created_at    TEXT NOT NULL,
+                manifest_path TEXT NOT NULL,
+                UNIQUE (session_id, turn_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_session_turn
+                ON checkpoints(session_id, turn_id);
+            CREATE INDEX IF NOT EXISTS idx_checkpoints_session_created
+                ON checkpoints(session_id, created_at);
+
+            -- Persistent (path, mtime, size) -> blob_hash cache. Global
+            -- scope (not session-scoped) because a file exists once on
+            -- disk regardless of which session observed it. `updated_at`
+            -- drives LRU GC so this table doesn't grow unbounded as
+            -- workspaces are opened and forgotten.
+            CREATE TABLE IF NOT EXISTS file_state (
+                abs_path   TEXT PRIMARY KEY,
+                mtime_ns   INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                blob_hash  TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_state_updated
+                ON file_state(updated_at);
             ",
             )
             .context("failed to run sqlite migrations")?;
