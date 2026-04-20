@@ -882,14 +882,11 @@ impl PersistenceService {
     }
 
     // ------------------------------------------------------------------
-    // Checkpoint enablement settings.
+    // Checkpoint enablement setting.
     //
-    // The daemon exposes two knobs: a `global_enabled` default and an
-    // optional per-project override stored on `projects.checkpoints_enabled`.
-    // Both are read by `runtime-core` at boot (see
-    // `seed_checkpoint_enablement`) and on every mutation so the in-
-    // memory state the capture path consults stays consistent with
-    // what's on disk.
+    // Single global flag: disabled → runtime-core skips capture and
+    // rewind surfaces `Disabled`. Read once at boot by
+    // `seed_checkpoint_enablement`, re-read on every mutation.
     // ------------------------------------------------------------------
 
     /// Default value surfaced to the runtime when no row exists yet.
@@ -897,12 +894,12 @@ impl PersistenceService {
     /// database, and any future default-change migration all agree.
     pub const CHECKPOINTS_GLOBAL_DEFAULT: bool = true;
 
-    /// Read the full checkpoint-enablement state: the global default
-    /// plus every project that has an explicit override. Projects
-    /// that inherit the global are omitted from the per-project map.
-    pub async fn get_checkpoint_enablement(&self) -> (bool, HashMap<String, bool>) {
+    /// Read the global checkpoint-enablement flag from
+    /// `runtime_settings["checkpoints.global_enabled"]`, falling back
+    /// to [`Self::CHECKPOINTS_GLOBAL_DEFAULT`] when unset.
+    pub async fn get_checkpoints_global_enabled(&self) -> bool {
         let connection = self.connection.lock();
-        let global = connection
+        connection
             .query_row(
                 "SELECT value FROM runtime_settings WHERE key = 'checkpoints.global_enabled'",
                 [],
@@ -912,23 +909,7 @@ impl PersistenceService {
             .ok()
             .flatten()
             .and_then(|raw| serde_json::from_str::<bool>(&raw).ok())
-            .unwrap_or(Self::CHECKPOINTS_GLOBAL_DEFAULT);
-
-        let mut per_project: HashMap<String, bool> = HashMap::new();
-        if let Ok(mut statement) = connection
-            .prepare("SELECT project_id, checkpoints_enabled FROM projects WHERE checkpoints_enabled IS NOT NULL")
-        {
-            if let Ok(iter) = statement.query_map([], |r| {
-                let id: String = r.get(0)?;
-                let v: i64 = r.get(1)?;
-                Ok((id, v != 0))
-            }) {
-                for row in iter.flatten() {
-                    per_project.insert(row.0, row.1);
-                }
-            }
-        }
-        (global, per_project)
+            .unwrap_or(Self::CHECKPOINTS_GLOBAL_DEFAULT)
     }
 
     pub async fn set_checkpoints_global_enabled(&self, enabled: bool) {
@@ -942,20 +923,6 @@ impl PersistenceService {
                 value      = excluded.value,
                 updated_at = excluded.updated_at",
             params![value, now],
-        );
-    }
-
-    /// Set or clear the per-project override. `None` removes the
-    /// override so the project inherits the global default again.
-    pub async fn set_project_checkpoints_override(
-        &self,
-        project_id: &str,
-        enabled: Option<bool>,
-    ) {
-        let connection = self.connection.lock();
-        let _ = connection.execute(
-            "UPDATE projects SET checkpoints_enabled = ?1 WHERE project_id = ?2",
-            params![enabled.map(|b| b as i64), project_id],
         );
     }
 
@@ -1305,13 +1272,6 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE archived_turns ADD COLUMN blocks_json TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN path TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT", []);
-        // Per-project override for the checkpoints.global_enabled
-        // setting. NULL = inherit the global default; 0/1 = force
-        // disabled/enabled for this project.
-        let _ = connection.execute(
-            "ALTER TABLE projects ADD COLUMN checkpoints_enabled INTEGER",
-            [],
-        );
 
         // Archived session/turn tables — same schema, plus archived_at timestamp.
         let _ = connection.execute_batch(

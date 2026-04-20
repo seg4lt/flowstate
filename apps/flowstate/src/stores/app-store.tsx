@@ -856,10 +856,10 @@ const initialState: AppState = {
   sessions: new Map(),
   archivedSessions: [],
   projects: [],
-  // Safe conservative defaults until Welcome lands: checkpoints
-  // default-on, no project overrides. Matches the runtime default in
+  // Safe conservative default until Welcome lands: checkpoints on.
+  // Matches the runtime default in
   // `PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT`.
-  checkpointSettings: { globalEnabled: true, projectOverrides: [] },
+  checkpointSettings: { globalEnabled: true },
   projectWorktrees: new Map(),
   sessionDisplay: new Map(),
   projectDisplay: new Map(),

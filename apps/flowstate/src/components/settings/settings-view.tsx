@@ -326,14 +326,14 @@ function StrictPlanModeRow() {
 }
 
 function CheckpointsGlobalRow() {
-  const { settings, setGlobalEnabled } = useCheckpointSettings();
+  const { settings, setEnabled } = useCheckpointSettings();
   const [pending, setPending] = React.useState(false);
 
   async function handleChange(next: boolean) {
     if (pending) return;
     setPending(true);
     try {
-      await setGlobalEnabled(next);
+      await setEnabled(next);
     } catch {
       // Hook already toasts the underlying error — swallow here so
       // the row stays in a consistent state. The daemon broadcast
@@ -346,21 +346,19 @@ function CheckpointsGlobalRow() {
   return (
     <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
       <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium">
-          Capture workspace snapshots
-        </div>
+        <div className="text-sm font-medium">Capture workspace snapshots</div>
         <div className="mt-0.5 text-xs text-muted-foreground">
-          Default for new sessions. Checkpoints let you revert the file
-          edits made during and after any message, including changes
-          from bash commands. Per-project overrides can be set from
-          each project's settings.
+          Let Flowstate snapshot the workspace at each message so you
+          can revert file edits from the chat. Turning this off stops
+          new captures immediately; existing snapshots stay on disk
+          until the sessions they belong to are deleted.
         </div>
       </div>
       <Switch
         checked={settings.globalEnabled}
         onCheckedChange={handleChange}
         disabled={pending}
-        aria-label="Capture workspace snapshots by default"
+        aria-label="Capture workspace snapshots"
       />
     </div>
   );
@@ -977,7 +975,7 @@ export function SettingsView() {
           </SettingsGroup>
           <SettingsGroup
             title="File checkpoints"
-            description="Capture a snapshot of each session's workspace at every message so you can revert file edits later. Disk cost is typically a few megabytes per 100 turns on a small project; huge monorepos may want a per-project override."
+            description="Capture a snapshot of each session's workspace at every message so you can revert file edits later. Disk cost is typically a few megabytes per 100 turns on a small project. Turn this off if you'd rather manage rollback with your own git workflow."
           >
             <CheckpointsGlobalRow />
           </SettingsGroup>

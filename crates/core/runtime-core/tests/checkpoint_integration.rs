@@ -336,10 +336,7 @@ async fn rewind_returns_unavailable_for_disabled_checkpoints() {
 
     // Flip global off BEFORE the turn. Capture should be skipped.
     h.runtime
-        .handle_client_message(ClientMessage::SetCheckpointsEnabled {
-            scope: zenui_provider_api::CheckpointEnablementScope::Global,
-            enabled: Some(false),
-        })
+        .handle_client_message(ClientMessage::SetCheckpointsEnabled { enabled: false })
         .await;
 
     h.adapter.queue_write("a.rs", b"v2".to_vec()).await;

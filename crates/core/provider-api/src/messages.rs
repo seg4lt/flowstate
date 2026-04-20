@@ -523,17 +523,11 @@ pub enum ClientMessage {
         #[serde(default)]
         confirm_conflicts: bool,
     },
-    /// Flip the global or per-project checkpoint enablement flag. The
-    /// runtime enforces the resulting effective value at capture time —
-    /// disabled scope skips capture entirely.
-    SetCheckpointsEnabled {
-        scope: CheckpointEnablementScope,
-        /// For [`CheckpointEnablementScope::Global`] this must be
-        /// `Some(bool)` — clearing the global default doesn't make
-        /// sense. For [`CheckpointEnablementScope::Project`], `None`
-        /// clears the override so the project inherits the global.
-        enabled: Option<bool>,
-    },
+    /// Flip the global checkpoint-enablement flag. The runtime
+    /// enforces the new value at capture time; disabled skips
+    /// capture entirely, and `RewindFiles` surfaces `Disabled` so
+    /// the UI can nudge the user back to the settings toggle.
+    SetCheckpointsEnabled { enabled: bool },
     /// Read the current checkpoint-settings snapshot. The same data
     /// ships on the `BootstrapPayload`, so the frontend only needs
     /// this for explicit re-syncs (e.g. after a settings dialog reopens
@@ -541,38 +535,16 @@ pub enum ClientMessage {
     GetCheckpointSettings,
 }
 
-/// Scope for [`ClientMessage::SetCheckpointsEnabled`]. `Global` sets
-/// the default used by every session without a project override;
-/// `Project { project_id }` sets or clears a per-project override.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
-#[serde(tag = "scope", rename_all = "snake_case")]
-pub enum CheckpointEnablementScope {
-    Global,
-    Project { project_id: String },
-}
-
-/// One row describing a project that has an explicit checkpoint
-/// enablement override. Projects inheriting the global default are
-/// omitted from the `CheckpointSettings.project_overrides` list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectCheckpointOverride {
-    pub project_id: String,
-    pub enabled: bool,
-}
-
-/// The full checkpoint-settings snapshot the daemon ships on
+/// The checkpoint-settings snapshot the daemon ships on
 /// `BootstrapPayload` and in response to `GetCheckpointSettings`.
+/// One field today; wrapped in a struct so additive changes
+/// (telemetry opt-outs, per-provider overrides, etc.) land without
+/// breaking the wire contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointSettings {
     pub global_enabled: bool,
-    /// Only projects with an explicit override. Empty when every
-    /// project inherits the global default.
-    pub project_overrides: Vec<ProjectCheckpointOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

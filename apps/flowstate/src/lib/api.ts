@@ -127,7 +127,7 @@ export async function getCheckpointSettings(): Promise<CheckpointSettings> {
 }
 
 /**
- * Flip the global checkpoint-enablement default. Returns the new
+ * Flip the global checkpoint-enablement flag. Returns the new
  * snapshot so callers can update their local cache without waiting
  * for the `CheckpointEnablementChanged` broadcast round-trip.
  */
@@ -136,27 +136,7 @@ export async function setCheckpointsGlobalEnabled(
 ): Promise<CheckpointSettings> {
   const resp = await sendMessage({
     type: "set_checkpoints_enabled",
-    scope: { scope: "global" },
     enabled,
-  });
-  if (resp?.type === "checkpoint_settings_snapshot") return resp.settings;
-  if (resp?.type === "error") throw new Error(resp.message);
-  throw new Error("unexpected response to set_checkpoints_enabled");
-}
-
-/**
- * Set or clear a per-project checkpoint-enablement override.
- * `enabled === null` clears the override so the project inherits
- * the global default.
- */
-export async function setProjectCheckpointsOverride(
-  projectId: string,
-  enabled: boolean | null,
-): Promise<CheckpointSettings> {
-  const resp = await sendMessage({
-    type: "set_checkpoints_enabled",
-    scope: { scope: "project", project_id: projectId },
-    enabled: enabled ?? undefined,
   });
   if (resp?.type === "checkpoint_settings_snapshot") return resp.settings;
   if (resp?.type === "error") throw new Error(resp.message);
