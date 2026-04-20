@@ -470,6 +470,7 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
           input={item.input}
           attachments={item.inputAttachments}
           onOpenAttachment={onOpenAttachment}
+          turnId={item.turnId}
         />
       )}
 

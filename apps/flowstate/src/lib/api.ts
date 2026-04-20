@@ -3,6 +3,7 @@ import type {
   AttachmentData,
   ClientMessage,
   ContextBreakdown,
+  RewindOutcomeWire,
   ServerMessage,
 } from "./types";
 
@@ -70,6 +71,45 @@ export async function updateSessionSettings(
   if (resp?.type === "ack") return;
   if (resp?.type === "error") throw new Error(resp.message);
   throw new Error("unexpected response to update_session_settings");
+}
+
+/**
+ * Rewind the session's workspace to its state just before `turnId`.
+ *
+ * Two flags that are ALWAYS explicit on the wire (the Rust enum has
+ * them as bare `bool` not `Option<bool>` — the TS types reflect that
+ * faithfully):
+ *
+ * - `dryRun` — when true, the runtime reports the paths it WOULD
+ *   touch and leaves disk unchanged. Use this to render the preview
+ *   dialog. Defaults to false.
+ * - `confirmConflicts` — when false (default), any file the session
+ *   has seen modified elsewhere since last observation causes the
+ *   call to halt with `NeedsConfirmation`. Re-issue with `true` to
+ *   proceed and clobber the outside change.
+ *
+ * Returns the structured outcome (applied | needs_confirmation |
+ * unavailable); callers exhaustively switch on `outcome.kind`.
+ * Throws only on transport errors or infrastructure `Error`
+ * responses (IO failure, sqlite, etc) — semantic "unavailable"
+ * states surface as an Applied/Unavailable outcome, not an exception.
+ */
+export async function rewindFiles(params: {
+  sessionId: string;
+  turnId: string;
+  dryRun?: boolean;
+  confirmConflicts?: boolean;
+}): Promise<RewindOutcomeWire> {
+  const resp = await sendMessage({
+    type: "rewind_files",
+    session_id: params.sessionId,
+    turn_id: params.turnId,
+    dry_run: params.dryRun ?? false,
+    confirm_conflicts: params.confirmConflicts ?? false,
+  });
+  if (resp?.type === "rewind_files_result") return resp.outcome;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to rewind_files");
 }
 
 export function connectStream(
