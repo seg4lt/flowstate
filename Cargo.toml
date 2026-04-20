@@ -12,7 +12,6 @@ members = [
   "crates/core/provider-github-copilot-cli",
   "crates/middleman/transport-http",
   "crates/middleman/daemon-core",
-  "crates/middleman/daemon-client",
   "crates/middleman/transport-tauri",
 ]
 resolver = "2"

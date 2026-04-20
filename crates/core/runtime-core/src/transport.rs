@@ -145,8 +145,8 @@ pub enum TransportAddressInfo {
 
 impl TransportAddressInfo {
     /// Short static string for the kind of address this is, matching the
-    /// serde tag. Useful for filtering in `daemon-client` when a caller
-    /// specifies a `TransportPreference`.
+    /// serde tag. Useful for filtering by clients that specify a
+    /// `TransportPreference`.
     pub fn kind(&self) -> &'static str {
         match self {
             TransportAddressInfo::Http { .. } => "http",
