@@ -1226,7 +1226,7 @@ impl RuntimeCore {
                 // as `ServerMessage::Error`; everything else — including
                 // "no checkpoint for this turn" and "session has no
                 // cwd" — is a clean outcome on the RewindFilesResult.
-                let session = match self.live_session_detail(&session_id).await {
+                let mut session = match self.live_session_detail(&session_id).await {
                     Some(s) => s,
                     None => {
                         return Some(ServerMessage::RewindFilesResult {
@@ -1238,6 +1238,13 @@ impl RuntimeCore {
                         });
                     }
                 };
+                // Resolve the session's cwd from its project_id;
+                // `live_session_detail` returns the raw persisted row
+                // which has `cwd` as None. Without this call the
+                // handler would always short-circuit to
+                // `Unavailable { NoWorkspace }` even when the session
+                // has a valid project.
+                self.resolve_session_cwd(&mut session).await;
                 let Some(cwd) = session.cwd.as_deref() else {
                     return Some(ServerMessage::RewindFilesResult {
                         session_id,

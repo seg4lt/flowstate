@@ -678,7 +678,7 @@ pub enum RewindOutcomeWire {
     Unavailable { reason: RewindUnavailableReason },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
