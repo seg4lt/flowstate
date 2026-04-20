@@ -111,6 +111,13 @@ pub enum RuntimeEvent {
         session_id: String,
         turn_id: String,
     },
+    /// Emitted after `SetCheckpointsEnabled` mutates the settings so
+    /// every connected client refreshes in lockstep — the daemon is
+    /// the single source of truth and the store-sourced cache on each
+    /// client would otherwise drift across app windows.
+    CheckpointEnablementChanged {
+        settings: CheckpointSettings,
+    },
     SubagentStarted {
         session_id: String,
         turn_id: String,
@@ -516,6 +523,56 @@ pub enum ClientMessage {
         #[serde(default)]
         confirm_conflicts: bool,
     },
+    /// Flip the global or per-project checkpoint enablement flag. The
+    /// runtime enforces the resulting effective value at capture time —
+    /// disabled scope skips capture entirely.
+    SetCheckpointsEnabled {
+        scope: CheckpointEnablementScope,
+        /// For [`CheckpointEnablementScope::Global`] this must be
+        /// `Some(bool)` — clearing the global default doesn't make
+        /// sense. For [`CheckpointEnablementScope::Project`], `None`
+        /// clears the override so the project inherits the global.
+        enabled: Option<bool>,
+    },
+    /// Read the current checkpoint-settings snapshot. The same data
+    /// ships on the `BootstrapPayload`, so the frontend only needs
+    /// this for explicit re-syncs (e.g. after a settings dialog reopens
+    /// and the app wants to confirm its cache is still accurate).
+    GetCheckpointSettings,
+}
+
+/// Scope for [`ClientMessage::SetCheckpointsEnabled`]. `Global` sets
+/// the default used by every session without a project override;
+/// `Project { project_id }` sets or clears a per-project override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum CheckpointEnablementScope {
+    Global,
+    Project { project_id: String },
+}
+
+/// One row describing a project that has an explicit checkpoint
+/// enablement override. Projects inheriting the global default are
+/// omitted from the `CheckpointSettings.project_overrides` list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCheckpointOverride {
+    pub project_id: String,
+    pub enabled: bool,
+}
+
+/// The full checkpoint-settings snapshot the daemon ships on
+/// `BootstrapPayload` and in response to `GetCheckpointSettings`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointSettings {
+    pub global_enabled: bool,
+    /// Only projects with an explicit override. Empty when every
+    /// project inherits the global default.
+    pub project_overrides: Vec<ProjectCheckpointOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -574,6 +631,12 @@ pub enum ServerMessage {
         session_id: String,
         turn_id: String,
         outcome: RewindOutcomeWire,
+    },
+    /// Response to `ClientMessage::GetCheckpointSettings` and to
+    /// `SetCheckpointsEnabled`. Carries the full current snapshot so
+    /// the UI doesn't have to recompute inheritance.
+    CheckpointSettingsSnapshot {
+        settings: CheckpointSettings,
     },
 }
 

@@ -19,6 +19,7 @@ import {
 import { useDockBadge } from "@/hooks/use-dock-badge";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type {
+  CheckpointSettings,
   ClientMessage,
   CommandCatalog,
   PermissionDecision,
@@ -53,6 +54,11 @@ interface AppState {
   sessions: Map<string, SessionSummary>;
   archivedSessions: SessionSummary[];
   projects: ProjectRecord[];
+  /** Checkpoint-enablement snapshot (global default + per-project
+   *  overrides). Seeded from `BootstrapPayload.checkpoint_settings`
+   *  and refreshed live via `RuntimeEvent::CheckpointEnablementChanged`.
+   *  See `useCheckpointSettings` for the consumer-facing hook. */
+  checkpointSettings: CheckpointSettings;
   /** App-side display metadata: titles, names, previews, ordering.
    *  Hydrated on boot from `user_config.sqlite`. The SDK snapshot
    *  above only has ids + runtime state; anything a user sees as a
@@ -378,6 +384,7 @@ function handleServerMessage(
         providers: message.bootstrap.providers,
         sessions,
         projects: message.bootstrap.snapshot.projects,
+        checkpointSettings: message.bootstrap.checkpointSettings,
         ready: true,
       };
     }
@@ -831,6 +838,14 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       return { ...state, sessionCommands };
     }
 
+    case "checkpoint_enablement_changed": {
+      // Daemon is the source of truth — replace the local snapshot
+      // wholesale rather than trying to diff. The settings struct
+      // stays tiny (one bool + per-project overrides) so this is
+      // cheap even for projects with dozens of overrides.
+      return { ...state, checkpointSettings: event.settings };
+    }
+
     default:
       return state;
   }
@@ -841,6 +856,10 @@ const initialState: AppState = {
   sessions: new Map(),
   archivedSessions: [],
   projects: [],
+  // Safe conservative defaults until Welcome lands: checkpoints
+  // default-on, no project overrides. Matches the runtime default in
+  // `PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT`.
+  checkpointSettings: { globalEnabled: true, projectOverrides: [] },
   projectWorktrees: new Map(),
   sessionDisplay: new Map(),
   projectDisplay: new Map(),

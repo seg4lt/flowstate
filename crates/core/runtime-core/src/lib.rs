@@ -18,13 +18,14 @@ use chrono::Utc;
 use tokio::sync::{Mutex, Notify, broadcast};
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
-    AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
-    ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, PollOutcome,
-    ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
-    ReasoningEffort, RewindConflictWire, RewindOutcomeWire, RewindUnavailableReason, RuntimeCall,
-    RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult, RuntimeEvent, ServerMessage,
-    SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord, SubagentStatus, TokenUsage,
-    ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
+    AppSnapshot, BootstrapPayload, CheckpointEnablementScope, ClientMessage, CommandCatalog,
+    ContentBlock, FileChangeRecord, ImageAttachment, PermissionDecision, PermissionMode,
+    PlanRecord, PlanStatus, PollOutcome, ProviderAdapter, ProviderKind, ProviderSessionState,
+    ProviderStatus, ProviderTurnEvent, ReasoningEffort, RewindConflictWire, RewindOutcomeWire,
+    RewindUnavailableReason, RuntimeCall, RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult,
+    RuntimeEvent, ServerMessage, SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord,
+    SubagentStatus, TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus,
+    UserInput, UserInputAnswer,
 };
 
 use crate::orchestration::{
@@ -285,6 +286,18 @@ pub struct RuntimeCore {
     /// real `FsCheckpointStore`, while unit tests pass `NoopCheckpointStore`.
     /// See the `zenui-checkpoints` crate for details.
     checkpoints: Arc<dyn zenui_checkpoints::CheckpointStore>,
+    /// Global default for the "capture checkpoints" flag. `true` means
+    /// capture for sessions whose project has no explicit override and
+    /// for sessions without a project. Seeded from
+    /// `runtime_settings["checkpoints.global_enabled"]` on boot via
+    /// `seed_checkpoint_enablement`, mutated by `SetCheckpointsEnabled`.
+    /// Read on every turn-end by `checkpoints_enabled_for_session`.
+    global_checkpoints_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-project checkpoint-enablement overrides. Keys are project
+    /// ids; presence means "use this value instead of the global".
+    /// Empty = no project has an override; absence of a key for a
+    /// given project means "inherit the global".
+    project_checkpoints_override: Arc<RwLock<HashMap<String, bool>>>,
 }
 
 impl RuntimeCore {
@@ -338,6 +351,17 @@ impl RuntimeCore {
             metadata_provider: std::sync::RwLock::new(None),
             worktree_provisioner: std::sync::RwLock::new(None),
             checkpoints,
+            // Seeded from persistence by `seed_checkpoint_enablement`
+            // after construction; the boot default matches
+            // `PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT` so the
+            // brief window between `new` and `seed` doesn't silently
+            // skip captures.
+            global_checkpoints_enabled: Arc::new(
+                std::sync::atomic::AtomicBool::new(
+                    zenui_persistence::PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT,
+                ),
+            ),
+            project_checkpoints_override: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -430,6 +454,63 @@ impl RuntimeCore {
         let map = self.persistence.get_provider_enablement().await;
         if let Ok(mut lock) = self.provider_enablement.write() {
             *lock = map;
+        }
+    }
+
+    /// Seed the in-memory checkpoint-enablement mirrors from the
+    /// persistence-backed settings. Mirrors `seed_provider_enablement`
+    /// — call once at daemon bootstrap after `RuntimeCore::new`. Safe
+    /// to call more than once.
+    pub async fn seed_checkpoint_enablement(&self) {
+        let (global, per_project) = self.persistence.get_checkpoint_enablement().await;
+        self.global_checkpoints_enabled
+            .store(global, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut lock) = self.project_checkpoints_override.write() {
+            *lock = per_project;
+        }
+    }
+
+    /// Effective "capture checkpoints?" answer for a given session.
+    /// Resolves the per-project override when one is set, otherwise
+    /// falls back to the global default. See the capture call site in
+    /// `send_turn` for the consumer and the README-as-CLAUDE.md rules
+    /// in the persistence crate for why these settings live in the
+    /// SDK layer.
+    fn checkpoints_enabled_for_session(&self, session: &SessionDetail) -> bool {
+        if let Some(project_id) = &session.summary.project_id {
+            if let Ok(lock) = self.project_checkpoints_override.read() {
+                if let Some(value) = lock.get(project_id) {
+                    return *value;
+                }
+            }
+        }
+        self.global_checkpoints_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Build the `CheckpointSettings` snapshot shipped on
+    /// `BootstrapPayload` and in `CheckpointSettingsSnapshot`
+    /// responses. Reads the in-memory state rather than the DB so the
+    /// very first call after `seed_checkpoint_enablement` is cheap.
+    pub fn current_checkpoint_settings(&self) -> zenui_provider_api::CheckpointSettings {
+        let global_enabled = self
+            .global_checkpoints_enabled
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut project_overrides = Vec::new();
+        if let Ok(lock) = self.project_checkpoints_override.read() {
+            for (project_id, enabled) in lock.iter() {
+                project_overrides.push(zenui_provider_api::ProjectCheckpointOverride {
+                    project_id: project_id.clone(),
+                    enabled: *enabled,
+                });
+            }
+        }
+        // Sort so the bootstrap payload is deterministic (nice for
+        // tests + diffing); the set is tiny so sort cost is trivial.
+        project_overrides.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+        zenui_provider_api::CheckpointSettings {
+            global_enabled,
+            project_overrides,
         }
     }
 
@@ -704,6 +785,7 @@ impl RuntimeCore {
             ws_url,
             providers: cached_providers,
             snapshot: self.snapshot().await,
+            checkpoint_settings: self.current_checkpoint_settings(),
         }
     }
 
@@ -1166,6 +1248,22 @@ impl RuntimeCore {
                     });
                 };
 
+                // Respect the enablement flag. A disabled session may
+                // still have captured checkpoints from a prior-enabled
+                // period, but we surface "Disabled" so the UI can nudge
+                // the user to the settings toggle rather than confusing
+                // them with a working rewind on a feature that's
+                // ostensibly off.
+                if !self.checkpoints_enabled_for_session(&session) {
+                    return Some(ServerMessage::RewindFilesResult {
+                        session_id,
+                        turn_id,
+                        outcome: RewindOutcomeWire::Unavailable {
+                            reason: RewindUnavailableReason::Disabled,
+                        },
+                    });
+                }
+
                 let opts = zenui_checkpoints::RestoreOptions {
                     dry_run,
                     confirm_conflicts,
@@ -1220,6 +1318,53 @@ impl RuntimeCore {
                     turn_id,
                     outcome,
                 })
+            }
+            ClientMessage::GetCheckpointSettings => Some(ServerMessage::CheckpointSettingsSnapshot {
+                settings: self.current_checkpoint_settings(),
+            }),
+            ClientMessage::SetCheckpointsEnabled { scope, enabled } => {
+                match scope {
+                    CheckpointEnablementScope::Global => {
+                        // Global expects an explicit bool. `None` here
+                        // is user-side bug territory (the wrapper on
+                        // the frontend should always pass Some); we
+                        // surface it as an Error rather than silently
+                        // no-op so callers notice.
+                        let Some(value) = enabled else {
+                            return Some(ServerMessage::Error {
+                                message: "SetCheckpointsEnabled { scope: Global } requires `enabled: Some(bool)`"
+                                    .to_string(),
+                            });
+                        };
+                        self.persistence.set_checkpoints_global_enabled(value).await;
+                        self.global_checkpoints_enabled
+                            .store(value, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    CheckpointEnablementScope::Project { project_id } => {
+                        self.persistence
+                            .set_project_checkpoints_override(&project_id, enabled)
+                            .await;
+                        if let Ok(mut lock) = self.project_checkpoints_override.write() {
+                            match enabled {
+                                Some(v) => {
+                                    lock.insert(project_id, v);
+                                }
+                                None => {
+                                    lock.remove(&project_id);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Broadcast the new snapshot so every connected client
+                // (and every window of the same app) re-renders its
+                // settings UI in lockstep without an extra RPC.
+                let settings = self.current_checkpoint_settings();
+                self.publish(RuntimeEvent::CheckpointEnablementChanged {
+                    settings: settings.clone(),
+                });
+                Some(ServerMessage::CheckpointSettingsSnapshot { settings })
             }
             ClientMessage::CreateProject { path } => {
                 match self.persistence.create_project(path).await {
@@ -2431,16 +2576,22 @@ impl RuntimeCore {
         // persistence so the turn is durable regardless of capture
         // outcome. Fire-and-forget semantics — capture failures never
         // bubble up to the turn; the user just sees "revert unavailable
-        // for this turn" if they later try to rewind here. Gated on
-        // `session.cwd` because checkpointing requires a workspace to
-        // snapshot; pure SDK sessions without a project go unchecked.
+        // for this turn" if they later try to rewind here. Three gates
+        // must all pass: the session has a `cwd` (something to snapshot),
+        // the global checkpoint-enablement flag is on, and any project
+        // override for this session's project also allows it. See
+        // `checkpoints_enabled_for_session` for the precedence rule.
         //
         // The separate `CheckpointCaptured` event is what the frontend
         // uses to light up the per-turn "Revert since here" affordance,
         // so we publish it only on success — turns where capture failed
         // get no affordance, which is the correct behavior (pretending
         // to offer rewind when no checkpoint exists would be worse).
-        if let Some(cwd) = session.cwd.as_deref() {
+        if let Some(cwd) = session
+            .cwd
+            .as_deref()
+            .filter(|_| self.checkpoints_enabled_for_session(&session))
+        {
             match self
                 .checkpoints
                 .capture(

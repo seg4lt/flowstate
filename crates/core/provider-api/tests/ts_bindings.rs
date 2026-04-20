@@ -111,6 +111,9 @@ fn export_ts_bindings() {
     push(&mut out, RewindUnavailableReason::decl(&cfg));
     push(&mut out, RewindConflictWire::decl(&cfg));
     push(&mut out, RewindOutcomeWire::decl(&cfg));
+    push(&mut out, CheckpointEnablementScope::decl(&cfg));
+    push(&mut out, ProjectCheckpointOverride::decl(&cfg));
+    push(&mut out, CheckpointSettings::decl(&cfg));
 
     // ---- wire envelopes ------------------------------------------
     push(&mut out, RuntimeEvent::decl(&cfg));

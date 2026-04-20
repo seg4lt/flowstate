@@ -1196,6 +1196,11 @@ pub struct BootstrapPayload {
     pub ws_url: Option<String>,
     pub providers: Vec<ProviderStatus>,
     pub snapshot: AppSnapshot,
+    /// Current checkpoint-enablement snapshot — the global default +
+    /// every project override. Shipped on bootstrap so the frontend
+    /// renders settings UI without a second round-trip, and refreshed
+    /// via `RuntimeEvent::CheckpointEnablementChanged`.
+    pub checkpoint_settings: crate::messages::CheckpointSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

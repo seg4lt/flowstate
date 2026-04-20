@@ -881,6 +881,84 @@ impl PersistenceService {
             .unwrap_or(0)
     }
 
+    // ------------------------------------------------------------------
+    // Checkpoint enablement settings.
+    //
+    // The daemon exposes two knobs: a `global_enabled` default and an
+    // optional per-project override stored on `projects.checkpoints_enabled`.
+    // Both are read by `runtime-core` at boot (see
+    // `seed_checkpoint_enablement`) and on every mutation so the in-
+    // memory state the capture path consults stays consistent with
+    // what's on disk.
+    // ------------------------------------------------------------------
+
+    /// Default value surfaced to the runtime when no row exists yet.
+    /// Kept in one place so `seed_checkpoint_enablement`, a brand-new
+    /// database, and any future default-change migration all agree.
+    pub const CHECKPOINTS_GLOBAL_DEFAULT: bool = true;
+
+    /// Read the full checkpoint-enablement state: the global default
+    /// plus every project that has an explicit override. Projects
+    /// that inherit the global are omitted from the per-project map.
+    pub async fn get_checkpoint_enablement(&self) -> (bool, HashMap<String, bool>) {
+        let connection = self.connection.lock();
+        let global = connection
+            .query_row(
+                "SELECT value FROM runtime_settings WHERE key = 'checkpoints.global_enabled'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str::<bool>(&raw).ok())
+            .unwrap_or(Self::CHECKPOINTS_GLOBAL_DEFAULT);
+
+        let mut per_project: HashMap<String, bool> = HashMap::new();
+        if let Ok(mut statement) = connection
+            .prepare("SELECT project_id, checkpoints_enabled FROM projects WHERE checkpoints_enabled IS NOT NULL")
+        {
+            if let Ok(iter) = statement.query_map([], |r| {
+                let id: String = r.get(0)?;
+                let v: i64 = r.get(1)?;
+                Ok((id, v != 0))
+            }) {
+                for row in iter.flatten() {
+                    per_project.insert(row.0, row.1);
+                }
+            }
+        }
+        (global, per_project)
+    }
+
+    pub async fn set_checkpoints_global_enabled(&self, enabled: bool) {
+        let now = chrono::Utc::now().to_rfc3339();
+        let value = if enabled { "true" } else { "false" };
+        let connection = self.connection.lock();
+        let _ = connection.execute(
+            "INSERT INTO runtime_settings (key, value, updated_at)
+             VALUES ('checkpoints.global_enabled', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                value      = excluded.value,
+                updated_at = excluded.updated_at",
+            params![value, now],
+        );
+    }
+
+    /// Set or clear the per-project override. `None` removes the
+    /// override so the project inherits the global default again.
+    pub async fn set_project_checkpoints_override(
+        &self,
+        project_id: &str,
+        enabled: Option<bool>,
+    ) {
+        let connection = self.connection.lock();
+        let _ = connection.execute(
+            "UPDATE projects SET checkpoints_enabled = ?1 WHERE project_id = ?2",
+            params![enabled.map(|b| b as i64), project_id],
+        );
+    }
+
     /// Upsert a provider's runtime-enabled flag. Called from the
     /// `SetProviderEnabled` handler.
     pub async fn set_provider_enabled(&self, kind: ProviderKind, enabled: bool) {
@@ -1194,6 +1272,17 @@ impl PersistenceService {
             );
             CREATE INDEX IF NOT EXISTS idx_file_state_updated
                 ON file_state(updated_at);
+
+            -- Generic key/value settings owned by the runtime. Uses a
+            -- JSON-encoded value column so future toggles (telemetry,
+            -- etc.) can reuse the same table without another
+            -- migration. Current keys:
+            --   * checkpoints.global_enabled -> bool (default true)
+            CREATE TABLE IF NOT EXISTS runtime_settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             ",
             )
             .context("failed to run sqlite migrations")?;
@@ -1216,6 +1305,13 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE archived_turns ADD COLUMN blocks_json TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN path TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT", []);
+        // Per-project override for the checkpoints.global_enabled
+        // setting. NULL = inherit the global default; 0/1 = force
+        // disabled/enabled for this project.
+        let _ = connection.execute(
+            "ALTER TABLE projects ADD COLUMN checkpoints_enabled INTEGER",
+            [],
+        );
 
         // Archived session/turn tables — same schema, plus archived_at timestamp.
         let _ = connection.execute_batch(

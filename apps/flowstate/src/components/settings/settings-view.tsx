@@ -40,6 +40,7 @@ import {
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
+import { useCheckpointSettings } from "@/hooks/useCheckpointSettings";
 import { visibleEffortOptions } from "@/components/chat/effort-selector";
 import { resolveModelDisplay } from "@/lib/model-lookup";
 import { MODE_ORDER, MODE_LABELS } from "@/lib/mode-cycling";
@@ -319,6 +320,47 @@ function StrictPlanModeRow() {
         checked={enabled}
         onCheckedChange={handleChange}
         aria-label="Strict plan mode"
+      />
+    </div>
+  );
+}
+
+function CheckpointsGlobalRow() {
+  const { settings, setGlobalEnabled } = useCheckpointSettings();
+  const [pending, setPending] = React.useState(false);
+
+  async function handleChange(next: boolean) {
+    if (pending) return;
+    setPending(true);
+    try {
+      await setGlobalEnabled(next);
+    } catch {
+      // Hook already toasts the underlying error — swallow here so
+      // the row stays in a consistent state. The daemon broadcast
+      // will reconcile if the write partially succeeded.
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">
+          Capture workspace snapshots
+        </div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Default for new sessions. Checkpoints let you revert the file
+          edits made during and after any message, including changes
+          from bash commands. Per-project overrides can be set from
+          each project's settings.
+        </div>
+      </div>
+      <Switch
+        checked={settings.globalEnabled}
+        onCheckedChange={handleChange}
+        disabled={pending}
+        aria-label="Capture workspace snapshots by default"
       />
     </div>
   );
@@ -932,6 +974,12 @@ export function SettingsView() {
                 onToggleEnabled={(enabled) => handleToggleEnabled(kind, enabled)}
               />
             ))}
+          </SettingsGroup>
+          <SettingsGroup
+            title="File checkpoints"
+            description="Capture a snapshot of each session's workspace at every message so you can revert file edits later. Disk cost is typically a few megabytes per 100 turns on a small project; huge monorepos may want a per-project override."
+          >
+            <CheckpointsGlobalRow />
           </SettingsGroup>
           <SettingsGroup
             title="Performance"

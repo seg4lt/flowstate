@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   AttachmentData,
+  CheckpointSettings,
   ClientMessage,
   ContextBreakdown,
   RewindOutcomeWire,
@@ -110,6 +111,56 @@ export async function rewindFiles(params: {
   if (resp?.type === "rewind_files_result") return resp.outcome;
   if (resp?.type === "error") throw new Error(resp.message);
   throw new Error("unexpected response to rewind_files");
+}
+
+/**
+ * Fetch the current checkpoint settings (global default + any project
+ * overrides). Bootstrap already ships the same payload on first
+ * connect; this API exists for explicit refreshes (settings dialog
+ * reopen, after a long sleep, etc.).
+ */
+export async function getCheckpointSettings(): Promise<CheckpointSettings> {
+  const resp = await sendMessage({ type: "get_checkpoint_settings" });
+  if (resp?.type === "checkpoint_settings_snapshot") return resp.settings;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to get_checkpoint_settings");
+}
+
+/**
+ * Flip the global checkpoint-enablement default. Returns the new
+ * snapshot so callers can update their local cache without waiting
+ * for the `CheckpointEnablementChanged` broadcast round-trip.
+ */
+export async function setCheckpointsGlobalEnabled(
+  enabled: boolean,
+): Promise<CheckpointSettings> {
+  const resp = await sendMessage({
+    type: "set_checkpoints_enabled",
+    scope: { scope: "global" },
+    enabled,
+  });
+  if (resp?.type === "checkpoint_settings_snapshot") return resp.settings;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to set_checkpoints_enabled");
+}
+
+/**
+ * Set or clear a per-project checkpoint-enablement override.
+ * `enabled === null` clears the override so the project inherits
+ * the global default.
+ */
+export async function setProjectCheckpointsOverride(
+  projectId: string,
+  enabled: boolean | null,
+): Promise<CheckpointSettings> {
+  const resp = await sendMessage({
+    type: "set_checkpoints_enabled",
+    scope: { scope: "project", project_id: projectId },
+    enabled: enabled ?? undefined,
+  });
+  if (resp?.type === "checkpoint_settings_snapshot") return resp.settings;
+  if (resp?.type === "error") throw new Error(resp.message);
+  throw new Error("unexpected response to set_checkpoints_enabled");
 }
 
 export function connectStream(

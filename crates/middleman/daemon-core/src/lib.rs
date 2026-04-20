@@ -221,6 +221,7 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
     // already-open SQLite handle — cheap and idempotent.
     runtime_core.reconcile_startup().await;
     runtime_core.seed_provider_enablement().await;
+    runtime_core.seed_checkpoint_enablement().await;
 
     Ok(InProcessCore {
         runtime_core,
