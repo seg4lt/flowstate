@@ -1892,15 +1892,9 @@ mod tests {
         // subagent bucket folds both Explore invocations together
         // ($0.20 each → $0.40 total) while main's $0.30 is preserved.
         // Counts: main = 1 invocation / 1 turn; subagent = 2 invocations / 1 turn.
-        let roles = store
-            .summary_by_agent_role(UsageRange::Last7Days)
-            .unwrap();
+        let roles = store.summary_by_agent_role(UsageRange::Last7Days).unwrap();
         assert_eq!(roles.groups.len(), 2);
-        let role_sub = roles
-            .groups
-            .iter()
-            .find(|r| r.key == "subagent")
-            .unwrap();
+        let role_sub = roles.groups.iter().find(|r| r.key == "subagent").unwrap();
         let role_main = roles.groups.iter().find(|r| r.key == "main").unwrap();
         assert_eq!(role_sub.label, "Subagents");
         assert_eq!(role_main.label, "Main agent");
