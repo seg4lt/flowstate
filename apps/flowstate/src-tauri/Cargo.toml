@@ -69,33 +69,13 @@ portable-pty = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# File-finder + grep SDK backing the /code view's picker and content
-# search. Replaces the old ripgrep-stack (`ignore` + `grep-regex` +
-# `grep-searcher`). `fff-search` maintains a live, fs-watched,
-# bigram-indexed file list in the background so indexing cost is paid
-# once per worktree and amortised across every search. See
-# `src/file_index.rs` for the integration.
-#
-# NOTE: the `zlob` feature (zig-compiled SIMD grep primitives) is
-# deliberately NOT enabled. Upstream fff-search pulls zig in as a
-# *build-time* dependency when zlob is on, which would force every
-# CI job, every release-matrix platform (Windows/Linux when we flip
-# them back on), and every contributor laptop to install zig via a
-# per-OS package manager (brew / choco / apt-snap). That's four
-# tool-install footguns for a performance knob on a dep we don't
-# author. The pure-Rust grep path (memchr + aho-corasick, same stack
-# ripgrep uses) is what local dev has shipped all along and has been
-# more than fast enough for our code-view search surface.
-#
-# fff-search's build.rs *also* hard-panics under CI=true without
-# zlob, so every workflow step that compiles this crate overrides
-# `CI=false` in its env block. Search for `CI: "false"` in
-# `.github/workflows/*.yml` for the rationale inline.
-#
-# Revisit if search latency becomes the bottleneck — re-enabling zlob
-# is a one-line change + reinstating the zig install steps in both
-# workflows.
-fff-search = "0.5.2"
-# Compile user-supplied include/exclude globs (`*.rs`, `target/*`) for
-# pre-filtering the indexed file list before content search.
-globset = "0.4.18"
+# ripgrep's gitignore-aware walker — used by the /code editor view's
+# file picker + content search. Honors .gitignore automatically so we
+# don't walk into node_modules/ etc.
+ignore = "0.4"
+# ripgrep's matcher + line searcher. Same lineage as `ignore`, used by
+# `search_file_contents` to produce Zed-style multibuffer blocks with
+# ±3 lines of context per match.
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"

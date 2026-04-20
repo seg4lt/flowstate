@@ -1,40 +1,45 @@
 import * as React from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, FileText, Folder } from "lucide-react";
+import { directoryQueryOptions } from "@/lib/queries";
+import type { DirEntry } from "@/lib/api";
 
-// Build a directory tree from the flat forward-slash relative path
-// list returned by the `list_project_files` Tauri command, then
-// render it as a collapsible nested list. Click a file to open it,
-// click a folder header (or its chevron) to expand/collapse.
+// Lazy, per-directory file tree. Each folder fetches its immediate
+// children on first expansion via the `list_directory` Tauri command,
+// which INCLUDES gitignored entries (flagged as dimmed). This means
+// heavy directories like `node_modules/` and `dist/` show up at the
+// top level but never get walked until the user explicitly opens
+// them.
 //
-// Folder children are sorted folders-first then alphabetically,
-// matching what users expect from VS Code / Finder. Nodes are
-// React.memo'd so chat-side re-renders or unrelated state changes
-// don't recompute every row.
-
-interface TreeNode {
-  /** Forward-slash full project-relative path (e.g. "src/foo.ts"). */
-  path: string;
-  /** Display name (basename for files, segment for folders). */
-  name: string;
-  /** Folder children (only set on directory nodes). */
-  children?: TreeNode[];
-}
+// The data flow is:
+//   - Root level: one query for `subPath = ""`, rendered below the
+//     root placeholder.
+//   - Each folder: its own query for `subPath = <folder.path>`,
+//     fired only when the folder is expanded (React Query's
+//     `enabled: expanded`).
+//
+// Results are cached per `(projectPath, subPath)` pair in the React
+// Query cache (staleTime: Infinity, gcTime: 30 min), so closing and
+// reopening a folder is instant and no extra round-trip fires.
 
 interface FileTreeProps {
-  files: string[];
+  /** Project root. Required — the tree renders nothing without it. */
+  projectPath: string | null;
+  /** Currently-focused file's project-relative path, for highlighting
+   *  and auto-expanding parents when the selection changes. */
   selectedPath: string | null;
+  /** Fired when the user clicks a file row. Parent owns open-in-tab
+   *  + url routing behavior; this component is purely presentational. */
   onSelect: (path: string) => void;
 }
 
-export function FileTree({ files, selectedPath, onSelect }: FileTreeProps) {
-  // Rebuild the tree only when the file list changes — not on every
-  // selection or chat tick. The construction is O(N) over paths,
-  // cheap enough that we don't need persistent caching.
-  const root = React.useMemo(() => buildTree(files), [files]);
-
-  // Track which directories are expanded. Start collapsed; the user
-  // expands folders manually. Keyed by full directory path so state
-  // survives tree rebuilds (e.g. after a file refresh).
+export function FileTree({
+  projectPath,
+  selectedPath,
+  onSelect,
+}: FileTreeProps) {
+  // Which folder paths are currently expanded. Keyed by forward-slash
+  // full project-relative path. Survives tree re-renders.
   const [expanded, setExpanded] = React.useState<Set<string>>(
     () => new Set<string>(),
   );
@@ -48,9 +53,9 @@ export function FileTree({ files, selectedPath, onSelect }: FileTreeProps) {
     });
   }, []);
 
-  // When the user picks a file from search (not the tree), expand
-  // every parent directory so the row is visible if they then look
-  // at the tree. Cheap: walks the path components once.
+  // Auto-expand every ancestor of the selected file so that a pick
+  // from the file picker (or a deep-link URL) makes the row visible
+  // in the tree. Cheap: walks the path components once.
   React.useEffect(() => {
     if (!selectedPath) return;
     const segments = selectedPath.split("/");
@@ -70,33 +75,128 @@ export function FileTree({ files, selectedPath, onSelect }: FileTreeProps) {
     });
   }, [selectedPath]);
 
-  if (!root.children || root.children.length === 0) {
+  if (!projectPath) {
     return (
       <div className="px-3 py-4 text-center text-[11px] text-muted-foreground">
-        No files in project.
+        No project for this session.
       </div>
     );
   }
 
   return (
     <ul role="tree" className="py-1">
-      {root.children.map((child) => (
-        <TreeRow
-          key={child.path}
-          node={child}
-          depth={0}
-          expanded={expanded}
-          onToggle={toggle}
-          selectedPath={selectedPath}
-          onSelect={onSelect}
-        />
-      ))}
+      <DirectoryChildren
+        projectPath={projectPath}
+        parentPath=""
+        depth={0}
+        expanded={expanded}
+        onToggle={toggle}
+        selectedPath={selectedPath}
+        onSelect={onSelect}
+      />
     </ul>
   );
 }
 
+interface DirectoryChildrenProps {
+  projectPath: string;
+  /** Forward-slash project-relative path of the parent directory;
+   *  empty string means the project root. */
+  parentPath: string;
+  depth: number;
+  expanded: Set<string>;
+  onToggle: (path: string) => void;
+  selectedPath: string | null;
+  onSelect: (path: string) => void;
+}
+
+// Fetches ONE directory's immediate children and renders each as
+// either a collapsible folder row or a file row. Ignored entries get
+// a dimmer text color so users can tell at a glance what's covered
+// by a gitignore rule without having to open it.
+function DirectoryChildren({
+  projectPath,
+  parentPath,
+  depth,
+  expanded,
+  onToggle,
+  selectedPath,
+  onSelect,
+}: DirectoryChildrenProps) {
+  // `enabled` is always true for depth 0 (the root fetches once on
+  // mount) and for any expanded folder (the query fires when the
+  // user opens it). Closed folders never fire the query, so heavy
+  // dirs like node_modules/ stay completely un-walked.
+  const enabled = depth === 0 || expanded.has(parentPath);
+  const { data, isLoading, error } = useQuery({
+    ...directoryQueryOptions(projectPath, parentPath),
+    enabled,
+  });
+
+  if (!enabled) return null;
+
+  if (error) {
+    return (
+      <li
+        role="treeitem"
+        className="py-0.5 pr-2 text-[11px] text-destructive"
+        style={{ paddingLeft: 6 + depth * 12 }}
+      >
+        {String(error)}
+      </li>
+    );
+  }
+
+  if (isLoading && !data) {
+    return (
+      <li
+        role="treeitem"
+        className="py-0.5 pr-2 text-[11px] text-muted-foreground/60"
+        style={{ paddingLeft: 6 + depth * 12 }}
+      >
+        …
+      </li>
+    );
+  }
+
+  const entries = data ?? [];
+  if (entries.length === 0) {
+    if (depth === 0) {
+      return (
+        <li
+          role="treeitem"
+          className="px-3 py-4 text-center text-[11px] text-muted-foreground"
+        >
+          No files in project.
+        </li>
+      );
+    }
+    return null;
+  }
+
+  return (
+    <>
+      {entries.map((entry) => (
+        <TreeRow
+          key={entry.name}
+          entry={entry}
+          projectPath={projectPath}
+          parentPath={parentPath}
+          depth={depth}
+          expanded={expanded}
+          onToggle={onToggle}
+          selectedPath={selectedPath}
+          onSelect={onSelect}
+        />
+      ))}
+    </>
+  );
+}
+
 interface TreeRowProps {
-  node: TreeNode;
+  entry: DirEntry;
+  projectPath: string;
+  parentPath: string;
   depth: number;
   expanded: Set<string>;
   onToggle: (path: string) => void;
@@ -105,37 +205,57 @@ interface TreeRowProps {
 }
 
 const TreeRow = React.memo(function TreeRow({
-  node,
+  entry,
+  projectPath,
+  parentPath,
   depth,
   expanded,
   onToggle,
   selectedPath,
   onSelect,
 }: TreeRowProps) {
-  const isFolder = node.children !== undefined;
-  const isOpen = isFolder && expanded.has(node.path);
-  const isSelected = !isFolder && node.path === selectedPath;
+  const fullPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+  const isOpen = entry.isDir && expanded.has(fullPath);
+  const isSelected = !entry.isDir && fullPath === selectedPath;
+  const queryClient = useQueryClient();
 
   // Tailwind's pl-{n} doesn't go fine-grained enough for arbitrary
   // depths, and inline padding-left is the cleanest cross-browser
   // way to do indentation that scales linearly with depth.
   const paddingLeft = 6 + depth * 12;
 
+  // Hover-prefetch a folder's children so the expand click feels
+  // instant even on a cold cache. Same React-Query staleTime infinite
+  // contract as the click path — if the query has resolved before,
+  // this is a no-op.
+  const handleFolderHover = React.useCallback(() => {
+    if (!entry.isDir) return;
+    void queryClient.prefetchQuery(
+      directoryQueryOptions(projectPath, fullPath),
+    );
+  }, [entry.isDir, fullPath, projectPath, queryClient]);
+
   return (
-    <li role="treeitem" aria-expanded={isFolder ? isOpen : undefined}>
+    <li role="treeitem" aria-expanded={entry.isDir ? isOpen : undefined}>
       <button
         type="button"
-        onClick={() => (isFolder ? onToggle(node.path) : onSelect(node.path))}
+        onClick={() =>
+          entry.isDir ? onToggle(fullPath) : onSelect(fullPath)
+        }
+        onMouseEnter={entry.isDir ? handleFolderHover : undefined}
+        onFocus={entry.isDir ? handleFolderHover : undefined}
         className={
           "flex w-full items-center gap-1 py-0.5 pr-2 text-left text-[11px] " +
           (isSelected
             ? "bg-muted text-foreground"
-            : "text-muted-foreground hover:bg-muted/40 hover:text-foreground")
+            : entry.isIgnored
+              ? "text-muted-foreground/50 hover:bg-muted/40 hover:text-muted-foreground"
+              : "text-muted-foreground hover:bg-muted/40 hover:text-foreground")
         }
         style={{ paddingLeft }}
-        title={node.path}
+        title={entry.isIgnored ? `${fullPath} (gitignored)` : fullPath}
       >
-        {isFolder ? (
+        {entry.isDir ? (
           isOpen ? (
             <ChevronDown className="h-3 w-3 shrink-0" />
           ) : (
@@ -146,75 +266,26 @@ const TreeRow = React.memo(function TreeRow({
           // rows below their chevron.
           <span className="inline-block h-3 w-3 shrink-0" />
         )}
-        {isFolder ? (
+        {entry.isDir ? (
           <Folder className="h-3 w-3 shrink-0" />
         ) : (
           <FileText className="h-3 w-3 shrink-0" />
         )}
-        <span className="truncate font-mono">{node.name}</span>
+        <span className="truncate font-mono">{entry.name}</span>
       </button>
-      {isFolder && isOpen && node.children && (
+      {entry.isDir && isOpen && (
         <ul role="group">
-          {node.children.map((child) => (
-            <TreeRow
-              key={child.path}
-              node={child}
-              depth={depth + 1}
-              expanded={expanded}
-              onToggle={onToggle}
-              selectedPath={selectedPath}
-              onSelect={onSelect}
-            />
-          ))}
+          <DirectoryChildren
+            projectPath={projectPath}
+            parentPath={fullPath}
+            depth={depth + 1}
+            expanded={expanded}
+            onToggle={onToggle}
+            selectedPath={selectedPath}
+            onSelect={onSelect}
+          />
         </ul>
       )}
     </li>
   );
 });
-
-// Walk a flat sorted list of forward-slash paths and produce a
-// nested tree. Paths are inserted in order; intermediate folder
-// nodes are created on first encounter and reused on subsequent
-// inserts. After insertion, every folder's children are sorted
-// folders-first then alphabetically.
-function buildTree(files: string[]): TreeNode {
-  const root: TreeNode = { path: "", name: "", children: [] };
-
-  for (const file of files) {
-    const segments = file.split("/");
-    let cursor = root;
-    let prefix = "";
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i];
-      prefix = prefix ? `${prefix}/${segment}` : segment;
-      const isLast = i === segments.length - 1;
-      if (!cursor.children) cursor.children = [];
-      // Linear scan is fine — directories rarely have more than a
-      // few hundred direct children in practice and we visit each
-      // file once. If this ever becomes a bottleneck, swap for a
-      // Map<segment, TreeNode> per cursor.
-      let child = cursor.children.find((c) => c.name === segment);
-      if (!child) {
-        child = isLast
-          ? { path: prefix, name: segment }
-          : { path: prefix, name: segment, children: [] };
-        cursor.children.push(child);
-      }
-      if (!isLast) cursor = child;
-    }
-  }
-
-  sortTree(root);
-  return root;
-}
-
-function sortTree(node: TreeNode) {
-  if (!node.children) return;
-  node.children.sort((a, b) => {
-    const aIsDir = a.children !== undefined;
-    const bIsDir = b.children !== undefined;
-    if (aIsDir !== bIsDir) return aIsDir ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-  for (const child of node.children) sortTree(child);
-}

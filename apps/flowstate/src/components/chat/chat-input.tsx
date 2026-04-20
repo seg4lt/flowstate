@@ -87,8 +87,9 @@ interface ChatInputProps {
   /** Absolute path to the session's project/worktree. Drives the
    *  `@<filename>` mention autocomplete — when null/undefined the
    *  mention popup is disabled (e.g. on threads without a project).
-   *  The file list is served by the `fff-search` index and cached
-   *  forever via `projectFilesQueryOptions`. */
+   *  The file list comes from `list_project_files` (ripgrep's
+   *  gitignore-aware walker) and is cached forever via
+   *  `projectFilesQueryOptions`. */
   projectPath?: string | null;
 }
 
@@ -275,9 +276,10 @@ export function ChatInput({
   }, [matches.length, inputToken]);
 
   // --- `@<filename>` mention autocomplete ---
-  // The project file list is served by the `fff-search` index and
-  // cached forever via `projectFilesQueryOptions`, so the second
-  // mention in the same session is instant. When `projectPath` is
+  // The project file list comes from `list_project_files` (ripgrep's
+  // gitignore walker) and is cached forever via
+  // `projectFilesQueryOptions`, so the second mention in the same
+  // session is instant. When `projectPath` is
   // null (unlikely but possible for degenerate sessions) the query
   // short-circuits and we get an empty list, which turns the popup
   // off naturally.

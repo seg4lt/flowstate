@@ -58,16 +58,7 @@ jobs:
       # derivable Default impls on PermissionMode/ReasoningEffort). A
       # follow-up PR should clean those up and promote this to
       # `-D warnings` — same one-line change.
-      #
-      # `env -u CI`: fff-search 0.5.2 hard-panics in its build.rs
-      # whenever it sees the `CI` env var set to ANYTHING (gate is
-      # `env::var("CI").is_ok()`, so "false" / "" / "0" all trip it).
-      # GitHub Actions exports CI=true runner-wide and we deliberately
-      # don't enable fff-search/zlob (see the dep comment in
-      # apps/flowstate/src-tauri/Cargo.toml) to avoid forcing zig on
-      # every matrix OS. `env -u CI` strips the var for just this
-      # command — same pure-Rust grep path local dev uses.
-      - run: env -u CI cargo clippy --workspace --all-features
+      - run: cargo clippy --workspace --all-features
 
   rust-test:
     name: cargo test (workspace)
@@ -82,11 +73,7 @@ jobs:
         with:
           bun-version: latest
       - uses: Swatinem/rust-cache@v2
-      # See clippy job above for the `env -u CI` rationale — fff-search
-      # refuses to build whenever CI is set (regardless of value)
-      # without its zig-backed zlob feature, which we intentionally
-      # skip.
-      - run: env -u CI cargo test --workspace
+      - run: cargo test --workspace
 
   feature-flag-bitrot:
     # Audit §6.2 — daemon-core only carries transport feature flags

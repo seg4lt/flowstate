@@ -2,6 +2,7 @@ import { queryOptions, type QueryClient } from "@tanstack/react-query";
 import {
   getAttachment,
   getGitBranch,
+  listDirectory,
   listGitBranches,
   listGitWorktrees,
   listProjectFiles,
@@ -9,7 +10,7 @@ import {
   resolveGitRoot,
   sendMessage,
 } from "./api";
-import type { GitBranchList, GitWorktree } from "./api";
+import type { DirEntry, GitBranchList, GitWorktree } from "./api";
 import type { SessionDetail } from "./types";
 
 // Pagination page size for session loads. Requesting the most
@@ -251,6 +252,34 @@ export function prefetchProjectFiles(
   void client.prefetchQuery({
     ...projectFilesQueryOptions(path),
     staleTime: PROJECT_FILES_PREFETCH_THROTTLE_MS,
+  });
+}
+
+// Single-directory listing for the /code view's file tree. Unlike
+// `projectFilesQueryOptions` (which does one monolithic gitignore
+// walk), this fetches just one level on demand — every folder click
+// hits this query with that folder's relative path. Results include
+// ignored entries flagged via `DirEntry.isIgnored` so the tree can
+// render them dimmed without walking their contents until the user
+// explicitly expands them. Cached per `(projectPath, subPath)` pair.
+//
+// Same "never auto-refetch" contract as the file list — the user
+// drives refreshes explicitly; we don't walk the filesystem on
+// window focus or mount.
+export function directoryQueryOptions(
+  path: string | null,
+  subPath: string,
+) {
+  return queryOptions({
+    queryKey: ["code", "directory", path, subPath] as const,
+    queryFn: async (): Promise<DirEntry[]> => {
+      if (!path) return [];
+      return listDirectory(path, subPath);
+    },
+    enabled: !!path,
+    staleTime: Infinity,
+    refetchOnMount: false,
+    gcTime: 30 * 60 * 1000,
   });
 }
 

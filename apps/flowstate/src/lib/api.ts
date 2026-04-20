@@ -329,6 +329,27 @@ export function listProjectFiles(path: string): Promise<string[]> {
   return invoke<string[]>("list_project_files", { path });
 }
 
+// One entry returned by `listDirectory`. `isIgnored` is true when the
+// entry is covered by a gitignore rule — the frontend shows it anyway,
+// just dimmed, so users can drill into ignored dirs on demand.
+export interface DirEntry {
+  name: string;
+  isDir: boolean;
+  isIgnored: boolean;
+}
+
+// List the immediate children (1 level only) of a project-relative
+// directory, INCLUDING gitignored entries. Used by the /code view's
+// file tree for lazy, on-click expansion so node_modules/ and dist/
+// never get eagerly walked. Pass an empty `subPath` to list the
+// project root.
+export function listDirectory(
+  path: string,
+  subPath: string,
+): Promise<DirEntry[]> {
+  return invoke<DirEntry[]>("list_directory", { path, subPath });
+}
+
 // Flowstate-app-owned key/value store. Backed by SQLite at
 // <app_data_dir>/user_config.sqlite — separate from the agent
 // SDK's daemon database. SDK and app each own their own SQLite;
@@ -636,20 +657,11 @@ export interface ContentBlock {
 // command. Defaults map to the boring case-sensitive literal
 // behavior with no path filtering — callers that don't care about
 // the advanced options can pass `defaultContentSearchOptions()`.
-//
-// The three match modes (useFuzzy, useRegex, literal) are mutually
-// exclusive. Precedence: useFuzzy > useRegex > literal.
 export interface ContentSearchOptions {
   /** Treat the query as a `regex` crate regex instead of a
-   *  literal string. Ignored when `useFuzzy` is true. Default false. */
+   *  literal string. Default false. */
   useRegex: boolean;
-  /** Fuzzy match the query against each line using fff-search's
-   *  frizbee scorer (tolerates typos and out-of-order chars).
-   *  Overrides `useRegex` when true. Inherently case-insensitive,
-   *  so `caseSensitive` is a no-op under fuzzy mode. Default false. */
-  useFuzzy: boolean;
-  /** Default true. The `aA` toggle in the UI flips this off.
-   *  No-op when `useFuzzy` is true. */
+  /** Default true. The `aA` toggle in the UI flips this off. */
   caseSensitive: boolean;
   /** Glob patterns restricting which files are searched. */
   includes: string[];
@@ -661,7 +673,6 @@ export interface ContentSearchOptions {
 export function defaultContentSearchOptions(): ContentSearchOptions {
   return {
     useRegex: false,
-    useFuzzy: false,
     caseSensitive: true,
     includes: [],
     excludes: [],
