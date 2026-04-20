@@ -45,6 +45,28 @@ type ReasoningEffortWire =
   | 'xhigh'
   | 'max';
 
+// Per-turn thinking-mode dial orthogonal to effort. `always` forces
+// the SDK's `{ type: 'enabled', budgetTokens: N }` shape (budget
+// derived from effort) so every turn produces reasoning; `adaptive`
+// maps to `{ type: 'adaptive' }` and lets the model decide. Host omits
+// the field for pre-upgrade clients — bridge defaults to `always`
+// to restore deterministic reasoning.
+type ThinkingModeWire = 'adaptive' | 'always';
+
+// Budget schedule for `always` mode. Scaled roughly by user intent;
+// matches the values from the pre-`11232b3` mapping so the default
+// behaviour is identical to what users had before adaptive landed.
+const ALWAYS_BUDGET_BY_EFFORT: Record<
+  Exclude<ReasoningEffortWire, 'minimal'>,
+  number
+> = {
+  low: 2048,
+  medium: 8000,
+  high: 32000,
+  xhigh: 48000,
+  max: 64000,
+};
+
 interface PendingPermission {
   resolve: (decision: PermissionResult) => void;
   // Echoed back as updatedInput when the user allows. Without this the
@@ -563,6 +585,7 @@ class ClaudeBridge {
    */
   private queryConfig?: {
     reasoningEffort?: ReasoningEffortWire;
+    thinkingMode?: ThinkingModeWire;
     // Trimmed; undefined and empty-string are equivalent (no steering).
     compactInstructions?: string;
   };
@@ -733,6 +756,7 @@ class ClaudeBridge {
     prompt: string,
     permissionMode: SdkPermissionMode,
     reasoningEffort?: ReasoningEffortWire,
+    thinkingMode?: ThinkingModeWire,
     images: Array<{ media_type: string; data_base64: string }> = [],
     compactCustomInstructions?: string,
   ): Promise<string> {
@@ -758,16 +782,17 @@ class ClaudeBridge {
       this.openPersistentQuery(
         permissionMode,
         reasoningEffort,
+        thinkingMode,
         compactCustomInstructions,
       );
     } else {
-      // Query already live. Two per-turn knobs may have changed:
+      // Query already live. Three per-turn knobs may have changed:
       //
-      //   1. `reasoningEffort` or `compactCustomInstructions` — the
-      //      SDK has no mid-session setter for these, so a change
-      //      forces a close-and-reopen with `resume: resumeSessionId`.
-      //      Full conversation history is preserved; only the SDK-
-      //      side Query object is recycled.
+      //   1. `reasoningEffort`, `thinkingMode`, or
+      //      `compactCustomInstructions` — the SDK has no mid-session
+      //      setter for these, so a change forces a close-and-reopen
+      //      with `resume: resumeSessionId`. Full conversation history
+      //      is preserved; only the SDK-side Query object is recycled.
       //   2. `permissionMode` — has a live SDK setter, apply in
       //      place so we don't pay the reopen cost for the common
       //      case of the user flipping permission mode between turns.
@@ -779,12 +804,15 @@ class ClaudeBridge {
         compactCustomInstructions?.trim() || undefined;
       const effortChanged =
         this.queryConfig?.reasoningEffort !== reasoningEffort;
+      const thinkingModeChanged =
+        this.queryConfig?.thinkingMode !== thinkingMode;
       const compactChanged =
         this.queryConfig?.compactInstructions !== desiredCompact;
-      if (effortChanged || compactChanged) {
+      if (effortChanged || thinkingModeChanged || compactChanged) {
         await this.reopenQueryForConfigChange(
           permissionMode,
           reasoningEffort,
+          thinkingMode,
           compactCustomInstructions,
         );
       } else if (this.livePermissionMode !== permissionMode) {
@@ -859,6 +887,7 @@ class ClaudeBridge {
   private openPersistentQuery(
     initialPermissionMode: SdkPermissionMode,
     reasoningEffort?: ReasoningEffortWire,
+    thinkingMode?: ThinkingModeWire,
     compactCustomInstructions?: string,
   ): void {
     this.livePermissionMode = initialPermissionMode;
@@ -921,16 +950,36 @@ class ClaudeBridge {
     };
     this.canUseToolCached = canUseTool;
 
-    // Extended-thinking / effort dial — see the long-form comment in
-    // the previous version of sendPrompt for the mapping rationale.
-    // In streaming-input mode these are fixed at Query open time; a
-    // change requires closing the Query and starting a new session.
+    // Extended-thinking / effort dial. `effort` and `thinking` are
+    // baked in at Query open time; a change requires closing the
+    // Query and starting a new session (see `reopenQueryForConfigChange`).
+    //
+    // Two knobs collaborate here:
+    //   * `reasoningEffort` — *how much* thinking (budget / depth hint)
+    //   * `thinkingMode`    — *when* to think:
+    //       - `'always'`   → `{ type: 'enabled', budgetTokens: N }`
+    //                        where N scales with effort. Deterministic:
+    //                        the model produces reasoning every turn.
+    //                        This is the bridge default; it restores
+    //                        the pre-`11232b3` behaviour users expect.
+    //       - `'adaptive'` → `{ type: 'adaptive' }`. Claude decides
+    //                        per-turn whether to think.
+    //
+    // `minimal` effort hard-wins with `{ type: 'disabled' }` regardless
+    // of mode — that's the user explicitly asking for no thinking.
     const thinkingConfig = (() => {
       if (reasoningEffort === undefined) return undefined;
       if (reasoningEffort === 'minimal') {
         return { type: 'disabled' as const };
       }
-      return { type: 'adaptive' as const };
+      // Default mode = 'always' when the host omits the field. Covers
+      // pre-upgrade clients and matches the bridge's stated default.
+      const mode: ThinkingModeWire = thinkingMode ?? 'always';
+      if (mode === 'adaptive') {
+        return { type: 'adaptive' as const };
+      }
+      const budgetTokens = ALWAYS_BUDGET_BY_EFFORT[reasoningEffort];
+      return { type: 'enabled' as const, budgetTokens };
     })();
     const effortLevel: EffortLevel | undefined =
       reasoningEffort && reasoningEffort !== 'minimal'
@@ -1055,6 +1104,7 @@ class ClaudeBridge {
     // collapsed above, so the stored value compares cleanly.
     this.queryConfig = {
       reasoningEffort,
+      thinkingMode,
       compactInstructions: trimmedCompactInstructions || undefined,
     };
 
@@ -1188,6 +1238,7 @@ class ClaudeBridge {
   private async reopenQueryForConfigChange(
     permissionMode: SdkPermissionMode,
     reasoningEffort: ReasoningEffortWire | undefined,
+    thinkingMode: ThinkingModeWire | undefined,
     compactCustomInstructions: string | undefined,
   ): Promise<void> {
     const pump = this.pumpPromise;
@@ -1231,6 +1282,7 @@ class ClaudeBridge {
     this.openPersistentQuery(
       permissionMode,
       reasoningEffort,
+      thinkingMode,
       compactCustomInstructions,
     );
   }
@@ -2359,6 +2411,12 @@ async function main(): Promise<void> {
         const effort = msg.reasoning_effort as
           | ReasoningEffortWire
           | undefined;
+        // Per-turn thinking-mode dial. Host omits the field on
+        // pre-upgrade clients; `sendPrompt` / `openPersistentQuery`
+        // treat `undefined` as the bridge default (`'always'`).
+        const thinkingMode = msg.thinking_mode as
+          | ThinkingModeWire
+          | undefined;
         const images = (msg.images as
           | Array<{ media_type: string; data_base64: string }>
           | undefined) ?? [];
@@ -2376,6 +2434,7 @@ async function main(): Promise<void> {
               prompt,
               mode,
               effort,
+              thinkingMode,
               images,
               compactCustomInstructions,
             );

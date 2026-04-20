@@ -255,6 +255,45 @@ impl ReasoningEffort {
     }
 }
 
+/// Per-turn dial orthogonal to [`ReasoningEffort`] controlling *when*
+/// the provider should think, not *how much*. Currently only the
+/// Claude Agent SDK adapter honours this — other adapters accept and
+/// ignore the hint.
+///
+/// - `Always` maps to the SDK's `{ type: 'enabled', budgetTokens: N }`
+///   where `N` is derived from [`ReasoningEffort`]. Produces reasoning
+///   on every turn (deterministic).
+/// - `Adaptive` maps to `{ type: 'adaptive' }` — the SDK / model
+///   decides whether to think based on task complexity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingMode {
+    /// Claude decides per-turn whether to think (SDK `adaptive`).
+    Adaptive,
+    /// Always think every turn with a concrete budget scaled from
+    /// [`ReasoningEffort`] (SDK `enabled` + `budgetTokens`).
+    Always,
+}
+
+impl Default for ThinkingMode {
+    /// Restores deterministic reasoning — the pre-`11232b3` behaviour
+    /// users expect.
+    fn default() -> Self {
+        ThinkingMode::Always
+    }
+}
+
+impl ThinkingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThinkingMode::Adaptive => "adaptive",
+            ThinkingMode::Always => "always",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]

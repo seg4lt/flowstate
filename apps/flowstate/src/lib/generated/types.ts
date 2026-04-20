@@ -20,6 +20,8 @@ export type PermissionMode = "default" | "accept_edits" | "plan" | "bypass" | "a
 
 export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
+export type ThinkingMode = "adaptive" | "always";
+
 export type FileOperation = "write" | "edit" | "delete";
 
 export type SubagentStatus = "running" | "completed" | "failed";
@@ -442,7 +444,14 @@ limit?: number, } | { "type": "start_session", provider: ProviderKind, model?: s
  * base64 bytes so the runtime can persist them to disk and
  * forward them to providers that support multimodal input.
  */
-images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effort?: ReasoningEffort, } | { "type": "get_attachment", attachment_id: string, } | { "type": "interrupt_turn", session_id: string, } | { "type": "steer_turn", session_id: string, input: string, images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effort?: ReasoningEffort, } | { "type": "update_permission_mode", session_id: string, permission_mode: PermissionMode, } | { "type": "update_session_settings", session_id: string, 
+images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effort?: ReasoningEffort, 
+/**
+ * Per-turn thinking-mode dial orthogonal to
+ * `reasoning_effort`. Only honoured by the Claude Agent SDK
+ * adapter today; others ignore. Absent = adapter default
+ * (`ThinkingMode::Always` for Claude SDK).
+ */
+thinking_mode?: ThinkingMode, } | { "type": "get_attachment", attachment_id: string, } | { "type": "interrupt_turn", session_id: string, } | { "type": "steer_turn", session_id: string, input: string, images: Array<ImageAttachment>, permission_mode?: PermissionMode, reasoning_effort?: ReasoningEffort, thinking_mode?: ThinkingMode, } | { "type": "update_permission_mode", session_id: string, permission_mode: PermissionMode, } | { "type": "update_session_settings", session_id: string, 
 /**
  * `None` here means "no change to this field". To clear the
  * value, pass `Some("".to_string())` — the empty string is

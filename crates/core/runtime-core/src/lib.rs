@@ -23,8 +23,9 @@ use zenui_provider_api::{
     ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
     ReasoningEffort, RewindConflictWire, RewindOutcomeWire, RewindUnavailableReason, RuntimeCall,
     RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult, RuntimeEvent, ServerMessage,
-    SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord, SubagentStatus, TokenUsage,
-    ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput, UserInputAnswer,
+    SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord, SubagentStatus, ThinkingMode,
+    TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput,
+    UserInputAnswer,
 };
 
 use crate::orchestration::{
@@ -986,10 +987,18 @@ impl RuntimeCore {
                 images,
                 permission_mode,
                 reasoning_effort,
+                thinking_mode,
             } => {
                 let mode = permission_mode.unwrap_or_default();
                 match self
-                    .send_turn(session_id, input, images, mode, reasoning_effort)
+                    .send_turn(
+                        session_id,
+                        input,
+                        images,
+                        mode,
+                        reasoning_effort,
+                        thinking_mode,
+                    )
                     .await
                 {
                     Ok(message) => Some(ServerMessage::Ack { message }),
@@ -1014,10 +1023,18 @@ impl RuntimeCore {
                 images,
                 permission_mode,
                 reasoning_effort,
+                thinking_mode,
             } => {
                 let mode = permission_mode.unwrap_or_default();
                 match self
-                    .steer_turn(session_id, input, images, mode, reasoning_effort)
+                    .steer_turn(
+                        session_id,
+                        input,
+                        images,
+                        mode,
+                        reasoning_effort,
+                        thinking_mode,
+                    )
                     .await
                 {
                     Ok(message) => Some(ServerMessage::Ack { message }),
@@ -1517,6 +1534,7 @@ impl RuntimeCore {
             Vec::new(),
             PermissionMode::AcceptEdits,
             None,
+            None,
         )
         .await
     }
@@ -1606,6 +1624,7 @@ impl RuntimeCore {
         images: Vec<ImageAttachment>,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        thinking_mode: Option<ThinkingMode>,
     ) -> Result<String, String> {
         let trimmed = input.trim().to_string();
         if trimmed.is_empty() && images.is_empty() {
@@ -1755,6 +1774,7 @@ impl RuntimeCore {
                     &user_input,
                     permission_mode,
                     reasoning_effort,
+                    thinking_mode,
                     adapter_sink,
                 )
                 .await;
@@ -3420,6 +3440,7 @@ impl RuntimeCore {
         images: Vec<ImageAttachment>,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        thinking_mode: Option<ThinkingMode>,
     ) -> Result<String, String> {
         // Is there actually a turn in flight for this session right
         // now? Read the live snapshot map rather than inspecting
@@ -3468,8 +3489,15 @@ impl RuntimeCore {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(10), &mut wait).await;
         }
 
-        self.send_turn(session_id, input, images, permission_mode, reasoning_effort)
-            .await
+        self.send_turn(
+            session_id,
+            input,
+            images,
+            permission_mode,
+            reasoning_effort,
+            thinking_mode,
+        )
+        .await
     }
 
     async fn delete_session(&self, session_id: String) -> Result<String, String> {
@@ -3531,7 +3559,7 @@ mod tests {
     use zenui_provider_api::{
         ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
         ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, RuntimeEvent,
-        SessionDetail, ToolCallStatus, TurnEventSink, TurnStatus, UserInput,
+        SessionDetail, ThinkingMode, ToolCallStatus, TurnEventSink, TurnStatus, UserInput,
     };
 
     use super::RuntimeCore;
@@ -3565,6 +3593,7 @@ mod tests {
             input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             _events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             Ok(ProviderTurnOutput {
@@ -3608,6 +3637,7 @@ mod tests {
             _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             // Two adjacent deltas to verify they coalesce.
@@ -3704,6 +3734,7 @@ mod tests {
             _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             events
@@ -3793,6 +3824,7 @@ mod tests {
                     images: Vec::new(),
                     permission_mode: None,
                     reasoning_effort: None,
+                    thinking_mode: None,
                 })
                 .await
         });
@@ -3890,6 +3922,7 @@ mod tests {
                 images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
+                thinking_mode: None,
             })
             .await;
 
@@ -3974,6 +4007,7 @@ mod tests {
                 images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
+                thinking_mode: None,
             })
             .await;
         assert!(matches!(
@@ -4027,6 +4061,7 @@ mod tests {
             input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             _events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -4079,6 +4114,7 @@ mod tests {
                 images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
+                thinking_mode: None,
             }),
         )
         .await
@@ -4142,6 +4178,7 @@ mod tests {
             _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             events
@@ -4220,6 +4257,7 @@ mod tests {
             _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             events
@@ -4291,6 +4329,7 @@ mod tests {
                     images: Vec::new(),
                     permission_mode: None,
                     reasoning_effort: None,
+                    thinking_mode: None,
                 })
                 .await
         });
@@ -4373,6 +4412,7 @@ mod tests {
             _input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             events: TurnEventSink,
         ) -> Result<ProviderTurnOutput, String> {
             events
@@ -4486,6 +4526,7 @@ mod tests {
                     images: Vec::new(),
                     permission_mode: None,
                     reasoning_effort: None,
+                    thinking_mode: None,
                 })
                 .await
         });
@@ -4661,6 +4702,7 @@ mod tests {
                 images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
+                thinking_mode: None,
             })
             .await;
 
@@ -4745,6 +4787,7 @@ mod tests {
                 images: Vec::new(),
                 permission_mode: None,
                 reasoning_effort: None,
+                thinking_mode: None,
             })
             .await;
 
@@ -4970,6 +5013,7 @@ mod tests {
             input: &UserInput,
             _permission_mode: PermissionMode,
             _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
             _events: TurnEventSink,
         ) -> Result<zenui_provider_api::ProviderTurnOutput, String> {
             Ok(zenui_provider_api::ProviderTurnOutput {

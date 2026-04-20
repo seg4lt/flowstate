@@ -357,6 +357,12 @@ pub enum ClientMessage {
         permission_mode: Option<PermissionMode>,
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
+        /// Per-turn thinking-mode dial orthogonal to
+        /// `reasoning_effort`. Only honoured by the Claude Agent SDK
+        /// adapter today; others ignore. Absent = adapter default
+        /// (`ThinkingMode::Always` for Claude SDK).
+        #[serde(default)]
+        thinking_mode: Option<ThinkingMode>,
     },
     /// Fetch the full bytes of a persisted image attachment. The
     /// frontend calls this lazily when the user clicks a chip on a
@@ -387,6 +393,8 @@ pub enum ClientMessage {
         permission_mode: Option<PermissionMode>,
         #[serde(default)]
         reasoning_effort: Option<ReasoningEffort>,
+        #[serde(default)]
+        thinking_mode: Option<ThinkingMode>,
     },
     /// Switch the active session's permission mode mid-turn. The runtime
     /// forwards this to the session's adapter; for Claude Agent SDK

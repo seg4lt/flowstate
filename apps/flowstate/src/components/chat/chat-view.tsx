@@ -12,6 +12,7 @@ import type {
   PermissionMode,
   ReasoningEffort,
   RuntimeEvent,
+  ThinkingMode,
   TurnRecord,
   UserInputAnswer,
   UserInputQuestion,
@@ -573,6 +574,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     () =>
       (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high",
   );
+  // Per-thread thinking-mode toggle. Default = "always" mirrors the
+  // bridge default: restores the pre-`11232b3` deterministic reasoning
+  // behaviour. Users who prefer the SDK's adaptive non-determinism can
+  // flip this per thread in the composer toolbar.
+  const thinkingModeStorageKey = `flowstate:thinkingMode:${sessionId}`;
+  const [thinkingMode, setThinkingModeState] = React.useState<ThinkingMode>(
+    () =>
+      (sessionStorage.getItem(thinkingModeStorageKey) as ThinkingMode) ??
+      "always",
+  );
   const permissionStorageKey = `flowstate:permissionMode:${sessionId}`;
   const [permissionMode, setPermissionModeState] =
     React.useState<PermissionMode>(
@@ -609,6 +620,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     },
     [effortStorageKey],
   );
+  const setThinkingMode = React.useCallback(
+    (m: ThinkingMode) => {
+      setThinkingModeState(m);
+      sessionStorage.setItem(thinkingModeStorageKey, m);
+    },
+    [thinkingModeStorageKey],
+  );
 
   // Reset composer state when switching threads. `ChatView` doesn't
   // remount on session-id change (see the sibling reset effect
@@ -632,14 +650,24 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       "accept_edits";
     const storedEffort =
       (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high";
+    const storedThinkingMode =
+      (sessionStorage.getItem(thinkingModeStorageKey) as ThinkingMode) ??
+      "always";
     setPermissionModeState(storedMode);
     setEffortState(storedEffort);
+    setThinkingModeState(storedThinkingMode);
     dispatch({
       type: "set_session_permission_mode",
       sessionId,
       mode: storedMode,
     });
-  }, [sessionId, permissionStorageKey, effortStorageKey, dispatch]);
+  }, [
+    sessionId,
+    permissionStorageKey,
+    effortStorageKey,
+    thinkingModeStorageKey,
+    dispatch,
+  ]);
 
   // Load user-configured defaults from Settings for freshly-created
   // threads only. "Fresh" = session has loaded AND has zero turns yet
@@ -1579,6 +1607,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         })),
         permission_mode: permissionMode,
         reasoning_effort: effort,
+        thinking_mode: thinkingMode,
       });
     } catch (err) {
       setPendingInput(null);
@@ -1619,6 +1648,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         })),
         permission_mode: permissionMode,
         reasoning_effort: effort,
+        thinking_mode: thinkingMode,
       });
     } catch (err) {
       setPendingInput(null);
@@ -1851,6 +1881,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       currentModel={session.model}
       effort={effort}
       onEffortChange={setEffort}
+      thinkingMode={thinkingMode}
+      onThinkingModeChange={setThinkingMode}
       permissionMode={permissionMode}
       onPermissionModeChange={handlePermissionModeChange}
     />

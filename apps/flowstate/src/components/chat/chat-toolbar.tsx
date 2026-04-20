@@ -1,12 +1,18 @@
 import { ModelSelector } from "./model-selector";
 import { EffortSelector } from "./effort-selector";
+import { ThinkingModeSelector } from "./thinking-mode-selector";
 import { ModeSelector } from "./mode-selector";
 import { ContextDisplay } from "./context-display";
 import { useApp } from "@/stores/app-store";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
 import { resolveModelDisplay } from "@/lib/model-lookup";
-import type { ProviderKind, ReasoningEffort, PermissionMode } from "@/lib/types";
+import type {
+  ProviderKind,
+  ReasoningEffort,
+  PermissionMode,
+  ThinkingMode,
+} from "@/lib/types";
 
 interface ChatToolbarProps {
   sessionId: string;
@@ -14,6 +20,8 @@ interface ChatToolbarProps {
   currentModel: string | undefined;
   effort: ReasoningEffort;
   onEffortChange: (effort: ReasoningEffort) => void;
+  thinkingMode: ThinkingMode;
+  onThinkingModeChange: (mode: ThinkingMode) => void;
   permissionMode: PermissionMode;
   onPermissionModeChange: (mode: PermissionMode) => void;
 }
@@ -24,6 +32,8 @@ export function ChatToolbar({
   currentModel,
   effort,
   onEffortChange,
+  thinkingMode,
+  onThinkingModeChange,
   permissionMode,
   onPermissionModeChange,
 }: ChatToolbarProps) {
@@ -61,6 +71,19 @@ export function ChatToolbar({
           value={effort}
           onChange={onEffortChange}
           supportedEffortLevels={supportedEffortLevels}
+        />
+      )}
+      {/* Thinking-mode dial (Always vs. Adaptive). Orthogonal to
+          effort — effort is *how much*, mode is *when*. Gated on the
+          same capability flag as the effort selector: only providers
+          that honour thinking config (Claude Agent SDK today) get
+          the control. Codex exposes `thinkingEffort` but its backend
+          doesn't take an adaptive/always switch, so the value is
+          silently ignored there — no dead control. */}
+      {features.thinkingEffort && provider === "claude" && (
+        <ThinkingModeSelector
+          value={thinkingMode}
+          onChange={onThinkingModeChange}
         />
       )}
       <ModeSelector

@@ -70,6 +70,7 @@ pub trait ProviderAdapter: Send + Sync {
         input: &UserInput,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        thinking_mode: Option<ThinkingMode>,
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String>;
 

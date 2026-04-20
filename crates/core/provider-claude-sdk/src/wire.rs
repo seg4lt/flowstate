@@ -95,6 +95,15 @@ pub(crate) enum BridgeRequest {
         permission_mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// Thinking-mode dial orthogonal to `reasoning_effort`:
+        /// `"adaptive"` (SDK decides per-turn whether to think — current
+        /// SDK default) or `"always"` (force `{ type: 'enabled',
+        /// budgetTokens: N }` so every turn produces reasoning, with
+        /// the budget scaled by `reasoning_effort`). Absent = bridge
+        /// default (`"always"`), which restores the deterministic
+        /// pre-`11232b3` behavior users expect.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thinking_mode: Option<String>,
         /// Multimodal image attachments. When non-empty the TS bridge
         /// switches to the `query({ prompt: AsyncIterable, … })` form
         /// and builds a user message whose `content` array carries
