@@ -14,6 +14,7 @@ import { UserMessage } from "./user-message";
 import { AgentMessage } from "./agent-message";
 import { CompactBlock } from "./compact-block";
 import { MemoryRecallBlock } from "./memory-recall-block";
+import { RewindDivider } from "./rewind-divider";
 
 const GROUP_DEFAULT_VISIBLE = 5;
 
@@ -466,12 +467,20 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
   return (
     <div className="space-y-3">
       {item.input !== null && (
-        <UserMessage
-          input={item.input}
-          attachments={item.inputAttachments}
-          onOpenAttachment={onOpenAttachment}
-          turnId={item.turnId}
-        />
+        <>
+          {/* Divider + "Restore to before" pill. Sits ABOVE the user
+              message so it visually separates one exchange from the
+              next and makes the rewind affordance the first thing
+              the eye lands on when scanning the thread. The divider
+              itself no-ops when we don't have a turn id yet (the
+              streaming-echo row before turn_started lands). */}
+          <RewindDivider turnId={item.turnId} />
+          <UserMessage
+            input={item.input}
+            attachments={item.inputAttachments}
+            onOpenAttachment={onOpenAttachment}
+          />
+        </>
       )}
 
       {!hasAnyContent && item.streaming && (
