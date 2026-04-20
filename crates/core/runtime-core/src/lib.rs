@@ -957,9 +957,32 @@ impl RuntimeCore {
                         }
                         Some(ServerMessage::SessionLoaded { session })
                     }
-                    None => Some(ServerMessage::Error {
-                        message: format!("Session `{session_id}` not found."),
-                    }),
+                    None => {
+                        // Read-only fallback: the session isn't in the live
+                        // tables, so try the archive. This lets the UI render
+                        // archived threads (transcript + attachments) without
+                        // physically unarchiving them. We deliberately skip
+                        // `spawn_catalog_refresh` on this path — archived
+                        // threads aren't resumable, so booting the provider
+                        // CLI just to refresh a slash-command catalog would
+                        // be pure waste (and on Claude SDK, an unwanted Node
+                        // bridge spawn). The client already disables the
+                        // composer for anything it knows to be archived, so
+                        // nothing downstream should try to send a turn here.
+                        match self
+                            .persistence
+                            .get_archived_session_limited(&session_id, limit)
+                            .await
+                        {
+                            Some(mut session) => {
+                                self.resolve_session_cwd(&mut session).await;
+                                Some(ServerMessage::SessionLoaded { session })
+                            }
+                            None => Some(ServerMessage::Error {
+                                message: format!("Session `{session_id}` not found."),
+                            }),
+                        }
+                    }
                 }
             }
             ClientMessage::StartSession {

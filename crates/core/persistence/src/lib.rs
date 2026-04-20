@@ -254,6 +254,34 @@ impl PersistenceService {
         load_session(&connection, session_id, limit).ok().flatten()
     }
 
+    /// Read-only counterpart to [`get_session`] that resolves against the
+    /// `archived_sessions` / `archived_turns` tables. Exists so the
+    /// `LoadSession` wire handler can render an archived thread when the
+    /// live lookup misses, without physically unarchiving the rows.
+    /// Callers that mutate state (SendTurn, checkpoints, branch ops) keep
+    /// using the live-only `get_session` path so archived threads remain
+    /// read-only by construction.
+    pub async fn get_archived_session(&self, session_id: &str) -> Option<SessionDetail> {
+        let connection = self.connection.lock();
+        load_archived_session(&connection, session_id, None)
+            .ok()
+            .flatten()
+    }
+
+    /// Paginated read-only counterpart to [`get_session_limited`] that
+    /// resolves against the archive tables. See [`get_archived_session`]
+    /// for the wider rationale.
+    pub async fn get_archived_session_limited(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Option<SessionDetail> {
+        let connection = self.connection.lock();
+        load_archived_session(&connection, session_id, limit)
+            .ok()
+            .flatten()
+    }
+
     pub async fn list_sessions(&self) -> Vec<SessionDetail> {
         let connection = self.connection.lock();
         let session_ids = match list_session_ids(&connection) {
@@ -1460,10 +1488,42 @@ fn load_session(
     session_id: &str,
     limit: Option<usize>,
 ) -> Result<Option<SessionDetail>> {
+    load_session_from(connection, session_id, limit, "sessions", "turns")
+}
+
+/// Same shape as [`load_session`] but reads from the `archived_sessions` /
+/// `archived_turns` tables. Used by the `LoadSession` read-only fallback so
+/// the UI can render archived threads without unarchiving them. No runtime
+/// state is materialized from this — archived sessions aren't resumable,
+/// just readable.
+fn load_archived_session(
+    connection: &Connection,
+    session_id: &str,
+    limit: Option<usize>,
+) -> Result<Option<SessionDetail>> {
+    load_session_from(
+        connection,
+        session_id,
+        limit,
+        "archived_sessions",
+        "archived_turns",
+    )
+}
+
+fn load_session_from(
+    connection: &Connection,
+    session_id: &str,
+    limit: Option<usize>,
+    sessions_table: &str,
+    turns_table: &str,
+) -> Result<Option<SessionDetail>> {
+    let summary_sql = format!(
+        "SELECT session_id, provider, status, created_at, updated_at, turn_count, provider_state_json, model, project_id
+         FROM {sessions_table} WHERE session_id = ?1"
+    );
     let summary = connection
         .query_row(
-            "SELECT session_id, provider, status, created_at, updated_at, turn_count, provider_state_json, model, project_id
-             FROM sessions WHERE session_id = ?1",
+            &summary_sql,
             params![session_id],
             |row| {
                 Ok(SessionSummary {
@@ -1493,20 +1553,22 @@ fn load_session(
     // sees turns in chronological order.
     let (sql, turn_limit_param): (String, Option<i64>) = if let Some(n) = limit {
         (
-            "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
-                    tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
-                    reasoning_effort, blocks_json
-             FROM turns WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2"
-                .to_string(),
+            format!(
+                "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
+                        tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
+                        reasoning_effort, blocks_json
+                 FROM {turns_table} WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2"
+            ),
             Some(n as i64),
         )
     } else {
         (
-            "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
-                    tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
-                    reasoning_effort, blocks_json
-             FROM turns WHERE session_id = ?1 ORDER BY created_at ASC"
-                .to_string(),
+            format!(
+                "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
+                        tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
+                        reasoning_effort, blocks_json
+                 FROM {turns_table} WHERE session_id = ?1 ORDER BY created_at ASC"
+            ),
             None,
         )
     };
@@ -1626,9 +1688,12 @@ fn load_session(
         }
     }
 
+    let provider_state_sql = format!(
+        "SELECT provider_state_json FROM {sessions_table} WHERE session_id = ?1"
+    );
     let provider_state = connection
         .query_row(
-            "SELECT provider_state_json FROM sessions WHERE session_id = ?1",
+            &provider_state_sql,
             params![session_id],
             |row| row.get::<_, Option<String>>(0),
         )
