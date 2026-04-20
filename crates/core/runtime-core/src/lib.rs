@@ -11,7 +11,7 @@ use internals::{
     spawn_model_refresh_detached, write_in_flight_snapshot,
 };
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -279,6 +279,12 @@ pub struct RuntimeCore {
     /// `install_worktree_provisioner`. `None` means worktree
     /// orchestration tools return a structured "not available" error.
     worktree_provisioner: std::sync::RwLock<Option<Arc<dyn WorktreeProvisioner>>>,
+    /// Checkpoint store used at turn end to capture a snapshot of the
+    /// session's workspace, and on `RewindFiles` / `DeleteSession` to
+    /// restore or reclaim. Always set; the daemon bootstrap passes in a
+    /// real `FsCheckpointStore`, while unit tests pass `NoopCheckpointStore`.
+    /// See the `zenui-checkpoints` crate for details.
+    checkpoints: Arc<dyn zenui_checkpoints::CheckpointStore>,
 }
 
 impl RuntimeCore {
@@ -286,6 +292,7 @@ impl RuntimeCore {
         adapters: Vec<Arc<dyn ProviderAdapter>>,
         orchestration: Arc<OrchestrationService>,
         persistence: Arc<PersistenceService>,
+        checkpoints: Arc<dyn zenui_checkpoints::CheckpointStore>,
         turn_observer: Option<Arc<dyn TurnLifecycleObserver>>,
         default_threads_dir: String,
         app_name: String,
@@ -330,6 +337,7 @@ impl RuntimeCore {
             self_weak: std::sync::RwLock::new(None),
             metadata_provider: std::sync::RwLock::new(None),
             worktree_provisioner: std::sync::RwLock::new(None),
+            checkpoints,
         }
     }
 
@@ -2327,6 +2335,51 @@ impl RuntimeCore {
         };
 
         self.persistence.upsert_session(session.clone()).await;
+
+        // Capture a workspace checkpoint for this turn. Happens after
+        // persistence so the turn is durable regardless of capture
+        // outcome. Fire-and-forget semantics — capture failures never
+        // bubble up to the turn; the user just sees "revert unavailable
+        // for this turn" if they later try to rewind here. Gated on
+        // `session.cwd` because checkpointing requires a workspace to
+        // snapshot; pure SDK sessions without a project go unchecked.
+        //
+        // The separate `CheckpointCaptured` event is what the frontend
+        // uses to light up the per-turn "Revert since here" affordance,
+        // so we publish it only on success — turns where capture failed
+        // get no affordance, which is the correct behavior (pretending
+        // to offer rewind when no checkpoint exists would be worse).
+        if let Some(cwd) = session.cwd.as_deref() {
+            match self
+                .checkpoints
+                .capture(
+                    &session.summary.session_id,
+                    &merged_turn.turn_id,
+                    std::path::Path::new(cwd),
+                )
+                .await
+            {
+                Ok(Some(_handle)) => {
+                    self.publish(RuntimeEvent::CheckpointCaptured {
+                        session_id: session.summary.session_id.clone(),
+                        turn_id: merged_turn.turn_id.clone(),
+                    });
+                }
+                Ok(None) => {
+                    // Store deliberately skipped — e.g. disabled by
+                    // user setting (PR 5.5). No affordance lit up.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session.summary.session_id,
+                        turn_id = %merged_turn.turn_id,
+                        error = %e,
+                        "checkpoint capture failed",
+                    );
+                }
+            }
+        }
+
         if status == TurnStatus::Failed {
             self.publish(RuntimeEvent::Error {
                 message: merged_turn.output.clone(),
@@ -3509,6 +3562,7 @@ mod tests {
             vec![adapter],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -3610,6 +3664,7 @@ mod tests {
             vec![Arc::new(InterleavingAdapter)],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -3694,6 +3749,7 @@ mod tests {
             vec![Arc::new(FakeAdapter)],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -3796,6 +3852,7 @@ mod tests {
             vec![Arc::new(SlowFakeAdapter)],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -3994,6 +4051,7 @@ mod tests {
             vec![adapter],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4175,6 +4233,7 @@ mod tests {
             vec![adapter],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4376,6 +4435,7 @@ mod tests {
             vec![Arc::new(FailingAdapter)],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4444,6 +4504,7 @@ mod tests {
             vec![Arc::new(FakeAdapter)],
             Arc::new(OrchestrationService::new()),
             Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4514,6 +4575,7 @@ mod tests {
             vec![Arc::new(FakeAdapter)],
             Arc::new(OrchestrationService::new()),
             persistence.clone(),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4637,6 +4699,7 @@ mod tests {
             vec![Arc::new(FakeAdapter)],
             Arc::new(OrchestrationService::new()),
             persistence.clone(),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4669,6 +4732,7 @@ mod tests {
             vec![Arc::new(FakeAdapter)],
             Arc::new(OrchestrationService::new()),
             persistence.clone(),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),
@@ -4751,6 +4815,7 @@ mod tests {
             vec![adapter.clone()],
             Arc::new(OrchestrationService::new()),
             persistence.clone(),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
             None,
             "/tmp/zenui-test/threads".to_string(),
             "test-app".to_string(),

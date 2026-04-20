@@ -102,6 +102,15 @@ pub enum RuntimeEvent {
         before: Option<String>,
         after: Option<String>,
     },
+    /// Emitted after a successful checkpoint capture at turn end.
+    /// Frontends track the `(session_id, turn_id)` pairs they've seen
+    /// via this event so the "Revert since here" affordance only lights
+    /// up on turns that actually have a restorable checkpoint. Consumers
+    /// that don't care about checkpoints can ignore the event.
+    CheckpointCaptured {
+        session_id: String,
+        turn_id: String,
+    },
     SubagentStarted {
         session_id: String,
         turn_id: String,

@@ -186,10 +186,25 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
         .to_string_lossy()
         .into_owned();
     let turn_observer: Arc<dyn TurnLifecycleObserver> = lifecycle.clone();
+
+    // Checkpoint store — on-disk content-addressed snapshot backing
+    // the `RewindFiles` / per-turn revert feature. Lives next to the
+    // sqlite database under the same `.zenui` data dir; blobs and
+    // manifests never touch the user's project tree. A failure here is
+    // fatal because checkpoints are part of the runtime contract — if
+    // we can't open the store we can't guarantee rewind semantics and
+    // it's safer to refuse to start than to silently run without it.
+    let checkpoints_dir = working_directory.join(".zenui").join("checkpoints");
+    let checkpoints: Arc<dyn zenui_checkpoints::CheckpointStore> = Arc::new(
+        zenui_checkpoints::FsCheckpointStore::open(checkpoints_dir, persistence.clone())
+            .context("failed to open checkpoint store")?,
+    );
+
     let runtime_core = Arc::new(RuntimeCore::new(
         adapters,
         orchestration,
         persistence,
+        checkpoints,
         Some(turn_observer),
         threads_dir,
         config.app_name.clone(),

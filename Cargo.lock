@@ -7090,6 +7090,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zenui-checkpoints",
  "zenui-persistence",
  "zenui-provider-api",
  "zenui-runtime-core",
@@ -7222,6 +7223,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zenui-checkpoints",
  "zenui-persistence",
  "zenui-provider-api",
 ]
