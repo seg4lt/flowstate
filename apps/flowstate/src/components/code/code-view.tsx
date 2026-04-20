@@ -29,6 +29,13 @@ import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
 import { useTheme } from "@/hooks/use-theme";
 import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
+import { TabBar } from "./tab-bar";
+import { EditorPanes } from "./editor-panes";
+import {
+  useEditorTabs,
+  type PaneIndex,
+  type Pane as PaneState,
+} from "./use-editor-tabs";
 
 // Read-only editor view: file tree + Cmd+P / content search picker
 // + single-file viewer. Layout:
@@ -201,31 +208,56 @@ export function CodeView(props: CodeViewProps) {
   const [contentOptions, setContentOptions] =
     React.useState<ContentSearchUiOptions>(defaultContentSearchUiOptions);
 
-  // ─── viewer state ────────────────────────────────────────────
-  // `loadedFile` bundles the fetched path + contents + cacheKey in a
-  // single state atom so they update atomically. Splitting them across
-  // two useState slots lets React commit one intermediate render after
-  // a click (where `selectedPath` is the new file but `contents` still
-  // holds the previous file) — PierreFile then mounts with the new
-  // name but stale contents, which is the "opens the wrong file" bug.
-  // The cacheKey drives @pierre/diffs' worker-pool LRU; see the sibling
-  // explanation in `diff-panel.tsx` around line 361.
-  const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
-  const [loadedFile, setLoadedFile] = React.useState<LoadedFile | null>(null);
-  const [fileError, setFileError] = React.useState<string | null>(null);
-  const [fileLoading, setFileLoading] = React.useState(false);
+  // ─── tabs + panes layout ─────────────────────────────────────
+  // `useEditorTabs` owns the per-project tab/pane layout and
+  // persists it to localStorage keyed by projectPath. File CONTENTS
+  // live in the separate cache below so switching between already-
+  // opened tabs is instant (no re-fetch flash).
+  const tabs = useEditorTabs(projectPath, files);
+  const layout = tabs.layout;
+
+  // Per-path content cache. Kept in refs so that async fetches can
+  // mutate without stomping the render cycle, with a bumpable
+  // `cacheVersion` to signal React when something visible changed.
+  // `loadedFile` still bundles {path, contents, cacheKey} atomically
+  // — splitting across two useState slots lets React commit one
+  // intermediate render after a click (where activePath is the new
+  // file but contents still hold the previous file) — PierreFile
+  // then mounts with the new name but stale contents, the "opens
+  // the wrong file" bug. The cacheKey drives @pierre/diffs'
+  // worker-pool LRU; see the sibling explanation in `diff-panel.tsx`.
+  const fileCacheRef = React.useRef<Map<string, LoadedFile>>(new Map());
+  const loadingPathsRef = React.useRef<Set<string>>(new Set());
+  // Bumping this state is the one-liner we use to re-render after
+  // mutating a ref-owned cache. The value itself is never read —
+  // React re-renders on any state update, which re-executes
+  // TabPaneView and re-reads `fileCacheRef.current`.
+  const [, setCacheVersion] = React.useState(0);
+  const [fileErrors, setFileErrors] = React.useState<Map<string, string>>(
+    () => new Map(),
+  );
+
+  // When the user clicks "Back to N matches" while a tab is active,
+  // we temporarily show the multibuffer in the focused pane even
+  // though a tab is active. Any subsequent tab activation or file
+  // open clears the override.
+  const [multibufferOverride, setMultibufferOverride] = React.useState(false);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
 
-  // Reset selection / search / viewer state when the project
-  // changes. The file list itself is owned by `filesQuery` above;
-  // useQuery swaps in the new project's cached entry (or kicks off
-  // a cold fetch if none) on its own, so there's no fetch logic
-  // here — only stale per-project UI state to clear.
+  // Reset search + file-content caches when the project changes.
+  // The tab/pane layout is owned by `useEditorTabs` and re-hydrates
+  // from localStorage for the new project on its own. The file list
+  // itself is owned by `filesQuery` above; useQuery swaps in the
+  // new project's cached entry (or kicks off a cold fetch if none)
+  // on its own, so there's no fetch logic here — only stale
+  // per-project UI state to clear.
   React.useEffect(() => {
-    setSelectedPath(null);
-    setLoadedFile(null);
-    setFileError(null);
+    fileCacheRef.current = new Map();
+    loadingPathsRef.current = new Set();
+    setFileErrors(new Map());
+    setCacheVersion((v) => v + 1);
+    setMultibufferOverride(false);
     setQuery("");
     setHighlightedIndex(0);
     setContentBlocks([]);
@@ -316,21 +348,30 @@ export function CodeView(props: CodeViewProps) {
     return n;
   }, [contentBlocks]);
 
-  // Show the multibuffer in the right pane when a content search
-  // is actively producing results (or about to). The viewer takes
-  // priority once the user opens a specific file via "Open".
+  // Show the multibuffer (in place of the single-pane viewer) when
+  // a content search is actively producing results. Split layouts
+  // always show file viewers — the multibuffer only takes over the
+  // single-pane case so we never pre-empt a deliberately opened
+  // tab in the non-focused pane.
+  const focusedPane: PaneState =
+    layout.panes[layout.focusedPaneIndex] ?? layout.panes[0]!;
+  const noActiveTabInFocusedPane = focusedPane.activePath === null;
+  const isSplit = layout.panes.length === 2 && layout.split !== null;
   const showMultibuffer =
+    !isSplit &&
     searchMode === "content" &&
     query.trim().length > 0 &&
-    selectedPath === null;
+    (noActiveTabInFocusedPane || multibufferOverride);
 
   // Whether to surface a "back to N matches" link in the viewer
-  // header (only when the user opened a file from the multibuffer
+  // header (only when the user has a file open from the multibuffer
   // and content matches still exist).
   const canReturnToMultibuffer =
+    !isSplit &&
+    !multibufferOverride &&
     searchMode === "content" &&
     query.trim().length > 0 &&
-    selectedPath !== null &&
+    !noActiveTabInFocusedPane &&
     contentBlocks.length > 0;
 
   // Result count depending on mode — used for keyboard nav bounds.
@@ -343,41 +384,67 @@ export function CodeView(props: CodeViewProps) {
     setHighlightedIndex(0);
   }, [query, searchMode]);
 
-  // ─── lazy file-content fetch on selection ───────────────────
+  // ─── lazy file-content fetch for each pane's active tab ─────
+  // Kicks off fetches for any active path not already in the
+  // cache. Results land in `fileCacheRef` and a `cacheVersion`
+  // bump re-renders the viewer. Tracks in-flight paths in a ref
+  // set so we never double-fetch the same file while an earlier
+  // request is still running.
+  const activePathsKey = layout.panes
+    .map((p) => p.activePath ?? "")
+    .join("|");
   React.useEffect(() => {
-    if (!projectPath || !selectedPath) {
-      setLoadedFile(null);
-      setFileError(null);
-      return;
+    if (!projectPath) return;
+    const toFetch: string[] = [];
+    for (const pane of layout.panes) {
+      const p = pane.activePath;
+      if (!p) continue;
+      if (fileCacheRef.current.has(p)) continue;
+      if (loadingPathsRef.current.has(p)) continue;
+      toFetch.push(p);
     }
+    if (toFetch.length === 0) return;
+    for (const p of toFetch) {
+      loadingPathsRef.current.add(p);
+    }
+    // Signal loading state to the viewer.
+    setCacheVersion((v) => v + 1);
 
     let cancelled = false;
-    const fetchPath = selectedPath;
-    setFileLoading(true);
-    setFileError(null);
-    setLoadedFile(null);
-    readProjectFile(projectPath, fetchPath)
-      .then((contents) => {
-        if (cancelled) return;
-        setLoadedFile({
-          path: fetchPath,
-          contents,
-          cacheKey: `${fetchPath}::${contents.length}::${Date.now()}`,
+    for (const fetchPath of toFetch) {
+      readProjectFile(projectPath, fetchPath)
+        .then((contents) => {
+          if (cancelled) return;
+          fileCacheRef.current.set(fetchPath, {
+            path: fetchPath,
+            contents,
+            cacheKey: `${fetchPath}::${contents.length}::${Date.now()}`,
+          });
+          loadingPathsRef.current.delete(fetchPath);
+          setFileErrors((prev) => {
+            if (!prev.has(fetchPath)) return prev;
+            const next = new Map(prev);
+            next.delete(fetchPath);
+            return next;
+          });
+          setCacheVersion((v) => v + 1);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          loadingPathsRef.current.delete(fetchPath);
+          setFileErrors((prev) => {
+            const next = new Map(prev);
+            next.set(fetchPath, String(err));
+            return next;
+          });
+          setCacheVersion((v) => v + 1);
         });
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        setFileError(String(err));
-      })
-      .finally(() => {
-        if (cancelled) return;
-        setFileLoading(false);
-      });
-
+    }
     return () => {
       cancelled = true;
     };
-  }, [projectPath, selectedPath]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectPath, activePathsKey]);
 
   // Cmd/Ctrl+P focuses the picker in `files` mode; Cmd/Ctrl+Shift+F
   // focuses it in `content` mode; Cmd/Ctrl+B toggles the file tree
@@ -401,22 +468,65 @@ export function CodeView(props: CodeViewProps) {
         setSearchMode("content");
         inputRef.current?.focus();
         inputRef.current?.select();
-      } else if (!e.shiftKey && key === "p") {
+        return;
+      }
+      if (!e.shiftKey && key === "p") {
         e.preventDefault();
         setSearchMode("files");
         inputRef.current?.focus();
         inputRef.current?.select();
-      } else if (!e.shiftKey && key === "b") {
+        return;
+      }
+      if (!e.shiftKey && key === "b") {
         // Skip when typing in a real text input so the shortcut
         // doesn't clobber things like Cmd+B-as-bold in textareas.
         if (isInTextInput(e.target)) return;
         e.preventDefault();
         toggleTreeCollapsed();
+        return;
+      }
+      // Tab-bar shortcuts — all guarded by "not typing in an input"
+      // so regular form editing keeps working.
+      if (isInTextInput(e.target)) return;
+
+      if (!e.shiftKey && key === "w") {
+        e.preventDefault();
+        tabs.closeActiveTab();
+        setMultibufferOverride(false);
+        return;
+      }
+      if (key === "tab") {
+        // Cmd+Tab on macOS is app-switch; most users won't actually
+        // get this event. Ctrl+Tab on all platforms works though.
+        e.preventDefault();
+        tabs.cycleTab(e.shiftKey ? -1 : 1);
+        setMultibufferOverride(false);
+        return;
+      }
+      if (!e.shiftKey && key === "\\") {
+        e.preventDefault();
+        tabs.splitPane("horizontal");
+        setMultibufferOverride(false);
+        return;
+      }
+      if (e.shiftKey && key === "\\") {
+        e.preventDefault();
+        tabs.splitPane("vertical");
+        setMultibufferOverride(false);
+        return;
+      }
+      // Cmd/Ctrl+1..9 → jump to tab N (1-indexed) in focused pane.
+      if (!e.shiftKey && key.length === 1 && key >= "1" && key <= "9") {
+        const idx = Number.parseInt(key, 10) - 1;
+        e.preventDefault();
+        tabs.focusTabAtIndex(idx);
+        setMultibufferOverride(false);
+        return;
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [toggleTreeCollapsed]);
+  }, [toggleTreeCollapsed, tabs]);
 
   function openFromPickerIndex(index: number) {
     // Files mode only — content mode uses the multibuffer, where
@@ -424,7 +534,8 @@ export function CodeView(props: CodeViewProps) {
     if (searchMode !== "files") return;
     const pick = filteredFiles[index] ?? filteredFiles[0];
     if (pick) {
-      setSelectedPath(pick);
+      tabs.openFile(pick);
+      setMultibufferOverride(false);
       setQuery("");
       inputRef.current?.blur();
     }
@@ -483,11 +594,14 @@ export function CodeView(props: CodeViewProps) {
               {projectLabel}
             </span>
           )}
-          {selectedPath && (
+          {focusedPane.activePath && (
             <>
               <span className="shrink-0">/</span>
-              <span className="truncate font-mono" title={selectedPath}>
-                {selectedPath}
+              <span
+                className="truncate font-mono"
+                title={focusedPane.activePath}
+              >
+                {focusedPane.activePath}
               </span>
             </>
           )}
@@ -543,9 +657,10 @@ export function CodeView(props: CodeViewProps) {
                 ) : (
                   <FileTree
                     files={files}
-                    selectedPath={selectedPath}
+                    selectedPath={focusedPane.activePath}
                     onSelect={(p) => {
-                      setSelectedPath(p);
+                      tabs.openFile(p);
+                      setMultibufferOverride(false);
                       setQuery("");
                     }}
                   />
@@ -631,7 +746,8 @@ export function CodeView(props: CodeViewProps) {
                 highlightedIndex={highlightedIndex}
                 onHover={setHighlightedIndex}
                 onPick={(p) => {
-                  setSelectedPath(p);
+                  tabs.openFile(p);
+                  setMultibufferOverride(false);
                   setQuery("");
                   inputRef.current?.blur();
                 }}
@@ -642,7 +758,7 @@ export function CodeView(props: CodeViewProps) {
           {canReturnToMultibuffer && (
             <button
               type="button"
-              onClick={() => setSelectedPath(null)}
+              onClick={() => setMultibufferOverride(true)}
               className="flex shrink-0 items-center gap-1 border-b border-border bg-muted/30 px-3 py-1 text-left text-[10px] text-muted-foreground hover:bg-muted/60 hover:text-foreground"
             >
               <ArrowLeft className="h-3 w-3" />
@@ -660,17 +776,63 @@ export function CodeView(props: CodeViewProps) {
                 error={contentSearchError}
                 projectPath={projectPath}
                 onOpenFile={(p) => {
-                  setSelectedPath(p);
+                  tabs.openFile(p);
+                  setMultibufferOverride(false);
                 }}
               />
             ) : (
-              <CodeViewBody
-                path={selectedPath}
-                loadedFile={loadedFile}
-                loading={fileLoading}
-                error={fileError}
-                filesError={filesError}
-                hasProject={projectPath !== null}
+              <EditorPanes
+                direction={layout.split}
+                ratio={layout.splitRatio}
+                onRatioChange={tabs.setSplitRatio}
+                first={
+                  <TabPaneView
+                    paneIndex={0}
+                    pane={layout.panes[0]!}
+                    focused={layout.focusedPaneIndex === 0}
+                    canSplit={layout.panes.length === 1}
+                    fileCacheRef={fileCacheRef}
+                    loadingPathsRef={loadingPathsRef}
+                    fileErrors={fileErrors}
+                    filesError={filesError}
+                    hasProject={projectPath !== null}
+                    onActivate={(p) => {
+                      tabs.activateTab(p, 0);
+                      setMultibufferOverride(false);
+                    }}
+                    onClose={(p) => tabs.closeTab(p, 0)}
+                    onFocus={() => tabs.focusPane(0)}
+                    onSplitHorizontal={() => tabs.splitPane("horizontal")}
+                    onSplitVertical={() => tabs.splitPane("vertical")}
+                    onDropTab={(fromPane, path) => {
+                      if (fromPane !== 0) tabs.moveTab(fromPane, 0, path);
+                    }}
+                  />
+                }
+                second={
+                  layout.panes.length === 2 ? (
+                    <TabPaneView
+                      paneIndex={1}
+                      pane={layout.panes[1]!}
+                      focused={layout.focusedPaneIndex === 1}
+                      canSplit={false}
+                      fileCacheRef={fileCacheRef}
+                      loadingPathsRef={loadingPathsRef}
+                      fileErrors={fileErrors}
+                      filesError={filesError}
+                      hasProject={projectPath !== null}
+                      onActivate={(p) => {
+                        tabs.activateTab(p, 1);
+                        setMultibufferOverride(false);
+                      }}
+                      onClose={(p) => tabs.closeTab(p, 1)}
+                      onFocus={() => tabs.focusPane(1)}
+                      onDropTab={(fromPane, path) => {
+                        if (fromPane !== 1) tabs.moveTab(fromPane, 1, path);
+                      }}
+                    />
+                  ) : undefined
+                }
               />
             )}
           </div>
@@ -938,6 +1100,87 @@ const FilePickerResults = React.memo(function FilePickerResults({
     </>
   );
 });
+
+// One pane = tab strip + viewer. Owns no state itself; all inputs
+// come from the parent `CodeView`. The viewer reads the shared
+// fileCacheRef (mutable, ref-stable) — the parent bumps its own
+// `cacheVersion` state whenever the cache changes, which re-renders
+// CodeView and (since this is not memoized) this pane alongside,
+// so the fresh read below picks up fetched contents.
+interface TabPaneViewProps {
+  paneIndex: PaneIndex;
+  pane: PaneState;
+  focused: boolean;
+  canSplit: boolean;
+  fileCacheRef: React.RefObject<Map<string, LoadedFile>>;
+  loadingPathsRef: React.RefObject<Set<string>>;
+  fileErrors: Map<string, string>;
+  filesError: string | null;
+  hasProject: boolean;
+  onActivate: (path: string) => void;
+  onClose: (path: string) => void;
+  onFocus: () => void;
+  onSplitHorizontal?: () => void;
+  onSplitVertical?: () => void;
+  onDropTab: (fromPane: PaneIndex, path: string) => void;
+}
+
+function TabPaneView({
+  paneIndex,
+  pane,
+  focused,
+  canSplit,
+  fileCacheRef,
+  loadingPathsRef,
+  fileErrors,
+  filesError,
+  hasProject,
+  onActivate,
+  onClose,
+  onFocus,
+  onSplitHorizontal,
+  onSplitVertical,
+  onDropTab,
+}: TabPaneViewProps) {
+  const activePath = pane.activePath;
+  const loadedFile =
+    activePath !== null
+      ? (fileCacheRef.current?.get(activePath) ?? null)
+      : null;
+  const loading =
+    activePath !== null && loadingPathsRef.current?.has(activePath) === true;
+  const error = activePath !== null ? (fileErrors.get(activePath) ?? null) : null;
+  return (
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <TabBar
+        paneIndex={paneIndex}
+        tabs={pane.tabs}
+        activePath={pane.activePath}
+        focused={focused}
+        canSplit={canSplit}
+        onActivate={onActivate}
+        onClose={onClose}
+        onSplitHorizontal={onSplitHorizontal}
+        onSplitVertical={onSplitVertical}
+        onFocus={onFocus}
+        onDropTab={onDropTab}
+      />
+      <div
+        className="min-h-0 flex-1 overflow-hidden"
+        onMouseDown={onFocus}
+      >
+        <CodeViewBody
+          path={activePath}
+          loadedFile={loadedFile}
+          loading={loading}
+          error={error}
+          filesError={filesError}
+          hasProject={hasProject}
+        />
+      </div>
+    </div>
+  );
+}
 
 interface CodeViewBodyProps {
   path: string | null;
