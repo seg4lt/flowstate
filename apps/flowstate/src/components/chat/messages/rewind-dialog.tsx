@@ -104,9 +104,14 @@ function RewindBody({
       <>
         <div className="flex gap-2 rounded-md bg-destructive/10 p-3 text-sm text-destructive">
           <AlertTriangle className="h-4 w-4 shrink-0" />
-          <div>
+          {/* `min-w-0` lets this flex child shrink below its intrinsic
+              content width — without it a long unbreakable token in
+              `state.message` (stack-trace frame, absolute path, URL)
+              would push the whole dialog wider than `max-w-lg`.
+              `break-words` then wraps that token at any point. */}
+          <div className="min-w-0 flex-1">
             <div className="font-medium">Rewind failed</div>
-            <div className="mt-1 text-xs">{state.message}</div>
+            <div className="mt-1 text-xs break-words">{state.message}</div>
           </div>
         </div>
         <DialogFooter>
@@ -225,7 +230,9 @@ function ConflictsBody({ conflicts }: { conflicts: RewindConflictWire[] }) {
     <div className="space-y-3">
       <div className="flex gap-2 rounded-md bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
         <AlertTriangle className="h-4 w-4 shrink-0" />
-        <div>
+        {/* `min-w-0` same rationale as the error body — keeps the flex
+            child from being sized by its intrinsic content width. */}
+        <div className="min-w-0 flex-1">
           <div className="font-medium">
             {conflicts.length} file(s) modified outside this session
           </div>
@@ -285,9 +292,16 @@ function Section({
       <div className={`text-xs font-medium ${toneClass}`}>
         {title} · {paths.length}
       </div>
-      <ul className="mt-1 max-h-40 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-2 font-mono text-[11px]">
+      <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto rounded-md border border-border/40 bg-muted/20 p-2 font-mono text-[11px]">
         {paths.map((p) => (
-          <li key={p} className="truncate">
+          // `break-all` wraps long paths at any character so the full
+          // path stays visible. Previously this was `truncate`, which
+          // hid the tail with an ellipsis — confusing when two paths
+          // share a long common prefix, since every row looked
+          // identical. `max-h-40 overflow-y-auto` on the parent keeps
+          // the list compact even when many paths wrap to several
+          // lines.
+          <li key={p} className="break-all">
             {p}
           </li>
         ))}

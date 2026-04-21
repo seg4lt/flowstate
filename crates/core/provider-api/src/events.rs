@@ -252,11 +252,22 @@ pub type PermissionPolicy = Arc<Mutex<HashMap<String, PermissionDecision>>>;
 pub struct TurnEventSink {
     tx: tokio::sync::mpsc::Sender<ProviderTurnEvent>,
     /// Oneshot per outstanding permission request, keyed by the
-    /// internal `perm-N` id. The payload is `(decision, mode_override)`
-    /// so "approve and switch mode" is delivered atomically with the
-    /// decision itself — no side channel, no id-lookup mistakes.
-    permission_pending:
-        Arc<Mutex<HashMap<String, oneshot::Sender<(PermissionDecision, Option<PermissionMode>)>>>>,
+    /// internal `perm-N` id. The payload is
+    /// `(decision, mode_override, deny_reason)` so "approve and switch
+    /// mode" and "deny with feedback" are both delivered atomically
+    /// with the decision itself — no side channel, no id-lookup
+    /// mistakes. `deny_reason` is only meaningful on deny paths; the
+    /// Claude SDK adapter surfaces it to the model as the `message`
+    /// field of `{behavior:'deny', message}` on the bridge's
+    /// `PermissionResult`.
+    permission_pending: Arc<
+        Mutex<
+            HashMap<
+                String,
+                oneshot::Sender<(PermissionDecision, Option<PermissionMode>, Option<String>)>,
+            >,
+        >,
+    >,
     question_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>,
     /// Oneshot per outstanding orchestration `RuntimeCall`, keyed by
     /// the internal `run-N` id. Mirrors the permission / question
@@ -315,12 +326,12 @@ impl TurnEventSink {
         tool_name: String,
         input: Value,
         suggested: PermissionDecision,
-    ) -> (PermissionDecision, Option<PermissionMode>) {
+    ) -> (PermissionDecision, Option<PermissionMode>, Option<String>) {
         // Fast path: prior "always" decision in this session.
         {
             let policy = self.policy.lock().await;
             if let Some(decision) = policy.get(&tool_name).copied() {
-                return (decision, None);
+                return (decision, None, None);
             }
         }
 
@@ -343,7 +354,7 @@ impl TurnEventSink {
             suggested_decision: suggested,
         })
         .await;
-        let (decision, mode_override) = match receiver.await {
+        let (decision, mode_override, deny_reason) = match receiver.await {
             Ok(payload) => payload,
             Err(_) => {
                 tracing::warn!(
@@ -352,7 +363,7 @@ impl TurnEventSink {
                 );
                 let mut guard = self.permission_pending.lock().await;
                 guard.remove(&request_id);
-                return (PermissionDecision::Deny, None);
+                return (PermissionDecision::Deny, None, None);
             }
         };
 
@@ -376,7 +387,7 @@ impl TurnEventSink {
             }
             other => other,
         };
-        (normalized, mode_override)
+        (normalized, mode_override, deny_reason)
     }
 
     /// Ask the user one or more structured clarifying questions and await their
@@ -408,7 +419,7 @@ impl TurnEventSink {
 
     /// Host-side: called by the runtime when the user answers a permission request.
     pub async fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) {
-        self.resolve_permission_with_mode(request_id, decision, None)
+        self.resolve_permission_full(request_id, decision, None, None)
             .await;
     }
 
@@ -417,14 +428,32 @@ impl TurnEventSink {
     /// decision through the oneshot. Used by the plan-exit
     /// approve-and-switch flow so the Claude SDK adapter can include
     /// `updatedPermissions` in the bridge's `PermissionResult` within
-    /// the same wake-up that delivers the decision. Logs a warning if
-    /// there is no pending sender for the id — that almost always
-    /// means a stale or mis-routed answer.
+    /// the same wake-up that delivers the decision.
     pub async fn resolve_permission_with_mode(
         &self,
         request_id: &str,
         decision: PermissionDecision,
         mode_override: Option<PermissionMode>,
+    ) {
+        self.resolve_permission_full(request_id, decision, mode_override, None)
+            .await;
+    }
+
+    /// Resolve a pending permission request with the full payload:
+    /// decision, optional mode override (bundles with allow), and
+    /// optional free-form deny reason (surfaced to the model as the
+    /// `message` of `{behavior:'deny', message}` in the SDK's
+    /// `PermissionResult`). Used by plan-exit "Send feedback" so the
+    /// model sees the user's steer as the tool-denial context and can
+    /// iterate within the same turn. Logs a warning if there is no
+    /// pending sender for the id — that almost always means a stale or
+    /// mis-routed answer.
+    pub async fn resolve_permission_full(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+        mode_override: Option<PermissionMode>,
+        deny_reason: Option<String>,
     ) {
         let mut guard = self.permission_pending.lock().await;
         match guard.remove(request_id) {
@@ -433,9 +462,10 @@ impl TurnEventSink {
                     request_id,
                     ?decision,
                     has_mode_override = mode_override.is_some(),
+                    has_deny_reason = deny_reason.is_some(),
                     "resolve_permission firing oneshot"
                 );
-                let _ = sender.send((decision, mode_override));
+                let _ = sender.send((decision, mode_override, deny_reason));
             }
             None => {
                 tracing::warn!(

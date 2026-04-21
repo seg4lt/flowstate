@@ -557,7 +557,7 @@ async fn handle_callback(
                     if matches!(kind, "read" | "write") {
                         PermissionDecision::Allow
                     } else {
-                        let (d, _mode_override) = events
+                        let (d, _mode_override, _deny_reason) = events
                             .request_permission(
                                 kind.to_string(),
                                 perm_req.clone(),
@@ -568,7 +568,7 @@ async fn handle_callback(
                     }
                 }
                 PermissionMode::Default | PermissionMode::Auto => {
-                    let (d, _mode_override) = events
+                    let (d, _mode_override, _deny_reason) = events
                         .request_permission(
                             kind.to_string(),
                             perm_req.clone(),

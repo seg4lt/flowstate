@@ -2071,6 +2071,7 @@ class ClaudeBridge {
     requestId: string,
     decision: DecisionString,
     permissionMode?: SdkPermissionMode,
+    reason?: string,
   ): void {
     const p = pendingPermissions.get(requestId);
     // stderr is teed into the Rust daemon log via the adapter's stderr
@@ -2078,7 +2079,7 @@ class ClaudeBridge {
     // receive the answer for this request_id" signal when diagnosing a
     // stuck-pending tool card.
     console.error(
-      `[bridge] answer_permission request_id=${requestId} decision=${decision} mode=${permissionMode ?? '-'} found=${!!p}`,
+      `[bridge] answer_permission request_id=${requestId} decision=${decision} mode=${permissionMode ?? '-'} reason=${reason ? 'yes' : '-'} found=${!!p}`,
     );
     if (!p) return;
     pendingPermissions.delete(requestId);
@@ -2118,7 +2119,19 @@ class ClaudeBridge {
       }
       p.resolve(result);
     } else {
-      p.resolve({ behavior: 'deny', message: 'User denied' });
+      // When the user supplies free-form feedback (plan-exit "Send
+      // feedback"), surface it as the denial `message`. The Claude
+      // Agent SDK threads this string into the synthetic tool_result
+      // that replaces the denied tool call, so the model sees it as
+      // the rejection context and can iterate within the same turn —
+      // no new user message required. Empty / missing feedback falls
+      // back to the canned "User denied" string so existing behavior
+      // is unchanged.
+      const trimmed = reason?.trim();
+      p.resolve({
+        behavior: 'deny',
+        message: trimmed && trimmed.length > 0 ? trimmed : 'User denied',
+      });
     }
   }
 
@@ -2419,10 +2432,12 @@ async function main(): Promise<void> {
 
       case 'answer_permission': {
         const mode = msg.permission_mode as SdkPermissionMode | undefined;
+        const reason = msg.reason as string | undefined;
         bridge.answerPermission(
           msg.request_id as string,
           msg.decision as DecisionString,
           mode,
+          reason,
         );
         break;
       }

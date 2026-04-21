@@ -92,11 +92,12 @@ export function ThreadItem({
 
   // Tint the running-spinner by the session's *live* composer mode —
   // same source chat-view's WorkingIndicator uses — so a mid-turn
-  // plan↔bypass↔accept flip recolours the sidebar immediately. The
-  // map is populated by chat-view on mount and on every toggle; for
-  // sessions the user hasn't opened yet the entry is absent and
-  // `toneForMode(undefined)` falls back to "green" (the accept-edits
-  // baseline), which matches what the WorkingIndicator would show.
+  // plan↔bypass↔auto↔accept flip recolours the sidebar immediately.
+  // The map is populated by chat-view on mount and on every toggle;
+  // for sessions the user hasn't opened yet the entry is absent and
+  // `toneForMode(undefined)` falls back to "neutral" (the muted
+  // baseline for default / accept_edits), which matches what the
+  // WorkingIndicator would show.
   const spinnerTone = toneForMode(state.permissionModeBySession.get(sessionId));
   // Hover prefetch: warm the session cache the moment the pointer
   // enters this row so the click itself only has to consume cached

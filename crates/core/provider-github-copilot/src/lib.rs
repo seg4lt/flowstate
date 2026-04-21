@@ -336,10 +336,11 @@ impl GitHubCopilotAdapter {
                         let req_id_for_writer = request_id;
                         tokio::spawn(async move {
                             // The Copilot bridge doesn't honor a mid-answer
-                            // permission-mode change, so drop that part of the
-                            // tuple. Adapters that do want it (Claude SDK) keep
-                            // both halves.
-                            let (decision, _mode_override) = events_clone
+                            // permission-mode change nor a deny-reason
+                            // feedback message, so drop those parts of the
+                            // tuple. Adapters that do want them (Claude SDK)
+                            // keep all three halves.
+                            let (decision, _mode_override, _deny_reason) = events_clone
                                 .request_permission(tool_name, input, suggested)
                                 .await;
                             let _ = perm_tx.send((req_id_for_writer, decision));

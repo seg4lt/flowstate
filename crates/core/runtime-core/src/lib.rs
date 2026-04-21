@@ -1233,12 +1233,14 @@ impl RuntimeCore {
                 request_id,
                 decision,
                 permission_mode_override,
+                reason,
             } => {
                 self.answer_permission(
                     &session_id,
                     &request_id,
                     decision,
                     permission_mode_override,
+                    reason,
                 )
                 .await;
                 Some(ServerMessage::Ack {
@@ -1597,6 +1599,7 @@ impl RuntimeCore {
         request_id: &str,
         decision: PermissionDecision,
         mode_override: Option<PermissionMode>,
+        deny_reason: Option<String>,
     ) {
         // Update the live-mode tracker BEFORE we forward to the sink.
         // The sink wakes the adapter's pending canUseTool promise,
@@ -1618,9 +1621,10 @@ impl RuntimeCore {
                 request_id,
                 ?decision,
                 has_mode_override = mode_override.is_some(),
+                has_deny_reason = deny_reason.is_some(),
                 "runtime-core routing answer_permission to sink"
             );
-            sink.resolve_permission_with_mode(request_id, decision, mode_override)
+            sink.resolve_permission_full(request_id, decision, mode_override, deny_reason)
                 .await;
         } else {
             tracing::warn!(

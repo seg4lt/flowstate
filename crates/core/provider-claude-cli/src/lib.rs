@@ -625,7 +625,7 @@ impl ClaudeCliAdapter {
                         // The legacy Claude CLI permission channel doesn't
                         // carry a mode switch; drop the mode_override half of
                         // the tuple.
-                        let (decision, _mode_override) = events
+                        let (decision, _mode_override, _deny_reason) = events
                             .request_permission(tool_name, tool_input, PermissionDecision::Allow)
                             .await;
                         let granted = matches!(
@@ -687,7 +687,7 @@ impl ClaudeCliAdapter {
                             } else {
                                 // control_request path doesn't thread a mode
                                 // switch either; drop the mode_override half.
-                                let (decision, _mode_override) = events
+                                let (decision, _mode_override, _deny_reason) = events
                                     .request_permission(
                                         tool_name,
                                         tool_input.clone(),

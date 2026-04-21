@@ -52,8 +52,28 @@ export function useStreamedGitDiffSummary(
   enabled: boolean,
 ): StreamedDiffSummary {
   const [state, setState] = React.useState<StreamedDiffSummary>(INITIAL_STATE);
+  // Remember the path the currently-committed `state.diffs` belong
+  // to. Same-path restarts (refresh-tick bumps from turn_completed,
+  // branch checkout, panel hover) keep the previous list visible
+  // until Phase 1 of the new subscription lands — that's what kills
+  // the Diff-button badge flicker. Cross-path switches (thread A ->
+  // thread B on different projects, or worktree swaps) MUST wipe
+  // the slate: thread A's numbers are meaningless for thread B and
+  // would otherwise linger on the action bar until the new stream's
+  // first `files` event arrives.
+  const lastPathRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
+    // Cross-path reset BEFORE starting (or skipping) the subscription.
+    // Running this inside the subscription effect — rather than a
+    // separate effect — guarantees ordering: the state clear lands
+    // in the same render as the subscription restart, so there is
+    // never a frame where the old diffs are visible alongside the
+    // new-path `streaming` status.
+    if (lastPathRef.current !== path) {
+      lastPathRef.current = path;
+      setState(INITIAL_STATE);
+    }
     if (!enabled || !path) return;
 
     // Working map is mutated in place by incoming events. React

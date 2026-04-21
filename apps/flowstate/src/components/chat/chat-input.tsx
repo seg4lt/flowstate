@@ -947,17 +947,20 @@ export function ChatInput({
                 rows={1}
                 className={cn(
                   "block h-10 min-h-10 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
-                  // Mode tint. Plan + bypass are the modes where the
-                  // next send behaves *differently* from the defaults,
-                  // so they get a coloured border and a subtle L→R
-                  // fade matching the WorkingIndicator's spinner tone.
-                  // Default / accept_edits keep the neutral look so
-                  // the tint only draws the eye when it matters.
+                  // Mode tint. Plan, bypass, and auto are the modes
+                  // where the next send behaves *differently* from the
+                  // defaults, so they each get a coloured border and a
+                  // subtle L→R fade matching the WorkingIndicator's
+                  // spinner tone (see `toneForMode` / BrailleSpinner).
+                  // Default / accept_edits keep the neutral look so the
+                  // tint only draws the eye when it matters.
                   permissionMode === "plan"
                     ? "border-blue-500/60 bg-gradient-to-r from-blue-500/10 to-transparent focus-visible:ring-blue-500/60"
                     : permissionMode === "bypass"
                       ? "border-orange-500/60 bg-gradient-to-r from-orange-500/10 to-transparent focus-visible:ring-orange-500/60"
-                      : "border-input bg-background focus-visible:ring-ring",
+                      : permissionMode === "auto"
+                        ? "border-green-500/60 bg-gradient-to-r from-green-500/10 to-transparent focus-visible:ring-green-500/60"
+                        : "border-input bg-background focus-visible:ring-ring",
                 )}
               />
               {/* Ghost-text overlay for prompt-suggestion. Only

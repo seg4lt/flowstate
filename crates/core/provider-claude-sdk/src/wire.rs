@@ -124,6 +124,14 @@ pub(crate) enum BridgeRequest {
         /// the active turn is `ExitPlanMode`.
         #[serde(skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
+        /// Optional free-form feedback surfaced to the model on deny.
+        /// The bridge passes this as the `message` field of
+        /// `{behavior:'deny', message}` on the SDK's `PermissionResult`,
+        /// so the model sees it as the tool-denial context and can
+        /// iterate within the same turn (primarily used by plan-exit
+        /// "Send feedback"). Ignored on allow.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     #[serde(rename = "answer_question")]
     AnswerQuestion {
