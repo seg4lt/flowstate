@@ -19,13 +19,14 @@ const BRAILLE_FRAMES = [
 ];
 const FRAME_MS = 80;
 
-export type SpinnerTone = "blue" | "green" | "orange";
+export type SpinnerTone = "blue" | "green" | "orange" | "neutral";
 
 interface BrailleSpinnerProps {
   /** Colour signal. "blue" for plan mode, "orange" for bypass
-   *  permissions, "green" for default / accept-edits. Callers map
-   *  their own mode state onto one of these so the spinner stays
-   *  mode-agnostic. */
+   *  permissions, "green" for auto (SDK decides per tool),
+   *  "neutral" for default / accept-edits (the unremarkable
+   *  baseline). Callers map their own mode state onto one of these
+   *  via `toneForMode()` so the spinner stays mode-agnostic. */
   tone: SpinnerTone;
   className?: string;
   /** Accessible label — announced by screen readers in place of the
@@ -61,6 +62,10 @@ function BrailleSpinnerInner({
     blue: "text-blue-500 dark:text-blue-400",
     green: "text-green-500 dark:text-green-400",
     orange: "text-orange-500 dark:text-orange-400",
+    // Muted-foreground matches the sidebar / working-indicator text
+    // baseline, so default / accept_edits spinners blend in instead
+    // of signaling an anomaly.
+    neutral: "text-muted-foreground",
   }[tone];
 
   return (
