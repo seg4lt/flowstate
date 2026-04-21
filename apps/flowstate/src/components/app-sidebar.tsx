@@ -290,11 +290,17 @@ function AppSidebarBody() {
 
   const archivedByProject = new Map<string | null, SessionSummary[]>();
   for (const session of state.archivedSessions) {
-    // If projectId exists and is still a known project, group under
-    // the EFFECTIVE parent (rolling up worktree projects to their
-    // main repo); otherwise fall through to "General". This mirrors
-    // the active-session grouping above so archived worktree threads
-    // show under the same visual project they always did.
+    // Mirror the active-session grouping above: sessions tied to a
+    // tombstoned/deleted project are filtered out entirely (they
+    // stay hibernating until the folder is re-added) rather than
+    // spilling into "General" and inflating its count. After that
+    // filter, worktree projects roll up to their parent so archived
+    // worktree threads show under the same visual project they
+    // always did. Only sessions with a truly null projectId land
+    // in "General".
+    if (session.projectId && !knownProjectIds.has(session.projectId)) {
+      continue;
+    }
     const rolledUp = effectiveProjectId(session.projectId ?? null);
     const key = rolledUp && projectNameMap.has(rolledUp) ? rolledUp : null;
     const list = archivedByProject.get(key) ?? [];
