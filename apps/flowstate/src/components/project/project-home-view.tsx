@@ -783,6 +783,10 @@ function WorktreeDiffBody({
   return (
     <DiffPanel
       projectPath={worktreePath}
+      // Project-home diff view has no chat session — passing null
+      // disables the review-comment overlay (hover/selection "+" is
+      // hidden and the pending-comments store is untouched).
+      sessionId={null}
       diffs={diffs}
       refreshKey={refreshTick}
       streamStatus={diffStream.status}

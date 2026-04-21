@@ -5,6 +5,7 @@ import type { FileDiffMetadata } from "@pierre/diffs/react";
 import { Button } from "@/components/ui/button";
 import { readProjectFile, type ContentBlock } from "@/lib/api";
 import { useTheme } from "@/hooks/use-theme";
+import { DiffCommentOverlay } from "@/components/chat/diff-comment-overlay";
 
 // Zed-style multibuffer for content-search results, rendered via
 // `@pierre/diffs` MultiFileDiff. Trick: we build a synthetic "before"
@@ -28,6 +29,10 @@ interface MultibufferProps {
   error: string | null;
   projectPath: string | null;
   onOpenFile: (path: string) => void;
+  /** Active session id used by the review-comment overlay. When null
+   *  (e.g. no active chat session) the overlay is disabled and the
+   *  multibuffer renders exactly as it did before. */
+  sessionId: string | null;
 }
 
 interface FileGroup {
@@ -43,6 +48,7 @@ export function Multibuffer({
   error,
   projectPath,
   onOpenFile,
+  sessionId,
 }: MultibufferProps) {
   // Suppress "unused" warning — query is kept on props for symmetry
   // with the rest of the picker plumbing in case we want to thread
@@ -106,6 +112,7 @@ export function Multibuffer({
           matchLines={group.matchLines}
           projectPath={projectPath}
           onOpenFile={onOpenFile}
+          sessionId={sessionId}
         />
       ))}
     </div>
@@ -117,6 +124,7 @@ interface FileMatchGroupProps {
   matchLines: Set<number>;
   projectPath: string;
   onOpenFile: (path: string) => void;
+  sessionId: string | null;
 }
 
 // Min height of an unmounted file group placeholder. Big enough
@@ -139,6 +147,7 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
   matchLines,
   projectPath,
   onOpenFile,
+  sessionId,
 }: FileMatchGroupProps) {
   const { resolvedTheme } = useTheme();
   const sectionRef = React.useRef<HTMLElement>(null);
@@ -289,7 +298,11 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
 
   if (loadError) {
     return (
-      <section ref={sectionRef} className="border-b border-border/50">
+      <section
+        ref={sectionRef}
+        className="border-b border-border/50"
+        data-search-path={path}
+      >
         {placeholderHeader}
         <div
           style={{ minHeight: PLACEHOLDER_MIN_HEIGHT }}
@@ -302,7 +315,11 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
   }
   if (!hasBeenVisible || !synthetic) {
     return (
-      <section ref={sectionRef} className="border-b border-border/50">
+      <section
+        ref={sectionRef}
+        className="border-b border-border/50"
+        data-search-path={path}
+      >
         {placeholderHeader}
         <div
           aria-hidden
@@ -320,7 +337,16 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
   }
 
   return (
-    <section ref={sectionRef} className="border-b border-border/50">
+    <section
+      ref={sectionRef}
+      className="border-b border-border/50"
+      data-search-path={path}
+    >
+      <DiffCommentOverlay
+        sessionId={sessionId}
+        surface="search"
+        pathAttr="data-search-path"
+      >
       <MultiFileDiff
         oldFile={{ name: path, contents: synthetic.before }}
         newFile={{ name: path, contents: synthetic.after }}
@@ -352,6 +378,7 @@ const FileMatchGroup = React.memo(function FileMatchGroup({
           maxLineDiffLength: 2_000,
         }}
       />
+      </DiffCommentOverlay>
     </section>
   );
 });

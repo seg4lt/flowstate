@@ -7,6 +7,7 @@ import type { DiffStreamStatus } from "@/lib/git-diff-stream";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 import { useTheme } from "@/hooks/use-theme";
 import { hashContent } from "@/lib/content-hash";
+import { DiffCommentOverlay } from "./diff-comment-overlay";
 
 export type DiffStyle = "split" | "unified";
 
@@ -18,6 +19,10 @@ const LARGE_FILE_LINE_THRESHOLD = 500;
 
 interface DiffPanelProps {
   projectPath: string | null;
+  /** Active session id. Drives the pending review-comment store — when
+   *  null (transient pre-persist states) the comment overlay renders
+   *  passthrough so any accidental "+" click can't orphan a comment. */
+  sessionId: string | null;
   diffs: AggregatedFileDiff[];
   // Bumped by ChatView whenever the on-disk state may have changed
   // (turn_completed, panel toggle, etc.). Per-file cache entries
@@ -71,6 +76,7 @@ type CacheEntry =
 //     the new key so visible sections refetch automatically.
 export function DiffPanel({
   projectPath,
+  sessionId,
   diffs,
   refreshKey,
   streamStatus,
@@ -236,6 +242,7 @@ export function DiffPanel({
               ensureLoaded={ensureLoaded}
               style={style}
               countsPending={isStreaming && d.additions === 0 && d.deletions === 0}
+              sessionId={sessionId}
             />
           ))
         )}
@@ -254,6 +261,10 @@ interface FileSectionProps {
   // instead of the literal `+0/−0` so users can tell the counts
   // are in-flight, not that the file is actually unchanged.
   countsPending: boolean;
+  /** Forwarded to DiffCommentOverlay so hover / selection
+   *  "+" triggers attach to the right session's pending-comment list.
+   *  `null` disables the overlay (renders passthrough). */
+  sessionId: string | null;
 }
 
 // Each file section watches its own visibility via IntersectionObserver.
@@ -270,6 +281,7 @@ const FileSection = React.memo(function FileSection({
   ensureLoaded,
   style,
   countsPending,
+  sessionId,
 }: FileSectionProps) {
   const sectionRef = React.useRef<HTMLElement>(null);
   const [hasBeenVisible, setHasBeenVisible] = React.useState(false);
@@ -319,7 +331,16 @@ const FileSection = React.memo(function FileSection({
   }, []);
 
   return (
-    <section ref={sectionRef} className="border-b border-border/50">
+    // data-diff-path is read by DiffCommentOverlay when resolving
+    // which file a hovered line / selection belongs to. Keeping it
+    // on the outermost <section> means nested lookups only walk up
+    // a shallow tree (line element → section) regardless of how
+    // many wrappers @pierre/diffs inserts internally.
+    <section
+      ref={sectionRef}
+      className="border-b border-border/50"
+      data-diff-path={diff.path}
+    >
       <button
         type="button"
         onClick={toggleCollapsed}
@@ -350,12 +371,18 @@ const FileSection = React.memo(function FileSection({
         </span>
       </button>
       {!collapsed && (
-        <DiffBody
-          path={diff.path}
-          state={state}
-          style={style}
-          hasBeenVisible={hasBeenVisible}
-        />
+        <DiffCommentOverlay
+          sessionId={sessionId}
+          surface="diff"
+          pathAttr="data-diff-path"
+        >
+          <DiffBody
+            path={diff.path}
+            state={state}
+            style={style}
+            hasBeenVisible={hasBeenVisible}
+          />
+        </DiffCommentOverlay>
       )}
     </section>
   );

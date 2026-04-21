@@ -2116,6 +2116,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             promptSuggestion={promptSuggestion}
             onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
             projectPath={projectPath}
+            sessionId={sessionId}
           />
         </div>
 
@@ -2140,6 +2141,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             >
               <DiffPanel
                 projectPath={projectPath}
+                sessionId={sessionId}
                 diffs={diffs}
                 refreshKey={diffRefreshTick}
                 streamStatus={diffStream.status}

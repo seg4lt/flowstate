@@ -77,7 +77,7 @@ export const DiffPanelHost = React.forwardRef<
   DiffPanelHostProps
 >(function DiffPanelHost(props, apiRef) {
   const {
-    sessionId: _sessionId,
+    sessionId,
     projectPath,
     containerRef,
     open,
@@ -183,6 +183,7 @@ export const DiffPanelHost = React.forwardRef<
       >
         <DiffPanel
           projectPath={projectPath}
+          sessionId={sessionId}
           diffs={diffs}
           refreshKey={diffRefreshTick}
           streamStatus={diffStream.status}

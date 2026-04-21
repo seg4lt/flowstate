@@ -1,0 +1,20 @@
+# Project-local tool versions. Pinning Node to 24 here because:
+#
+#  * Node 20.x (still common in default PATHs) is pre-`require(esm)` and
+#    chokes on jsdom → html-encoding-sniffer@6 → @exodus/bytes (ESM-only):
+#        Error [ERR_REQUIRE_ESM]: require() of ES Module
+#          @exodus/bytes/encoding-lite.js …
+#    `require(esm)` is only available starting in Node 20.19 / 22.12.
+#  * Node 25 ships its own experimental `globalThis.localStorage`
+#    (gated on `--localstorage-file`) that shadows jsdom's Storage
+#    implementation inside the vitest jsdom environment, making
+#    `window.localStorage.clear` not-a-function and failing
+#    usage-range-picker.test.tsx.
+#
+# Node 24 avoids both landmines: it supports `require(esm)` natively
+# (no ERR_REQUIRE_ESM) and doesn't expose the experimental localStorage.
+# Pin here so `mise install` / `mise use` resolves the right version
+# regardless of whatever Node a contributor's shell has on PATH.
+[tools]
+node = "24"
+pnpm = "latest"
