@@ -231,21 +231,27 @@ export function ThreadItem({
                   <GitBranch className="h-3 w-3" />
                 </span>
               </TooltipTrigger>
-              <TooltipContent side="right" className="max-w-xs">
+              <TooltipContent side="right" className="max-w-sm">
                 {/* Radix Tooltip content is hoverable by default
                  *  (TooltipProvider.disableHoverableContent is false),
                  *  so the nested copy button actually survives the
                  *  move from trigger → content. stopPropagation on the
                  *  button prevents the underlying thread row's
                  *  navigation click from firing when the user clicks
-                 *  Copy. */}
+                 *  Copy.
+                 *
+                 *  Path uses break-all + whitespace-normal so long
+                 *  paths wrap onto multiple lines instead of being
+                 *  truncated — otherwise the user can't see the full
+                 *  path and the copy button was getting visually
+                 *  crowded out by the ellipsis. */}
                 <div className="flex items-start gap-2">
-                  <div className="min-w-0 space-y-0.5">
+                  <div className="min-w-0 flex-1 space-y-0.5">
                     <div className="font-medium">
                       Worktree
                       {worktreeBranch ? `: ${worktreeBranch}` : ""}
                     </div>
-                    <div className="truncate font-mono text-[10px] opacity-80">
+                    <div className="whitespace-normal break-all font-mono text-[10px] opacity-80">
                       {worktreePath}
                     </div>
                   </div>
