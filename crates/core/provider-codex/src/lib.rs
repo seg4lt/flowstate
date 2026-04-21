@@ -10,10 +10,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::warn;
 use zenui_provider_api::{
-    PermissionMode, ProbeCliOptions, ProviderAdapter, ProviderKind, ProviderModel,
-    ProviderSessionState, ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
-    SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
-    probe_cli, session_cwd,
+    OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProbeCliOptions,
+    ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState, ProviderStatus,
+    ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
+    UserInput, UserInputAnswer, UserInputOption, UserInputQuestion, probe_cli, session_cwd,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -31,6 +31,14 @@ const RECOVERABLE_THREAD_RESUME_ERRORS: &[&str] = &[
 pub struct CodexAdapter {
     binary_path: String,
     working_directory: PathBuf,
+    /// Shared handle over the runtime's loopback HTTP transport. When
+    /// populated, `create_session_process` adds a
+    /// `-c mcp_servers.flowstate=…` flag to each Codex spawn so the
+    /// agent can call cross-provider orchestration tools. Codex's
+    /// `-c` flag accepts TOML fragments that override entries from
+    /// `~/.codex/config.toml`; using it session-scoped keeps the
+    /// user's global config untouched.
+    orchestration: Option<OrchestrationIpcHandle>,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CodexSessionProcess>>>>>,
 }
 
@@ -73,10 +81,23 @@ struct TurnCompletion {
 }
 
 impl CodexAdapter {
+    /// Construct without cross-provider orchestration wiring.
     pub fn new(working_directory: PathBuf) -> Self {
+        Self::new_with_orchestration(working_directory, None)
+    }
+
+    /// Construct with an optional [`OrchestrationIpcHandle`]. When
+    /// populated, every Codex app-server spawn picks up a
+    /// `-c mcp_servers.flowstate=…` TOML override registering the
+    /// flowstate MCP server for that session.
+    pub fn new_with_orchestration(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+    ) -> Self {
         Self {
             binary_path: Self::find_codex_binary(),
             working_directory,
+            orchestration,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -126,8 +147,20 @@ impl CodexAdapter {
         permission_mode: PermissionMode,
     ) -> Result<CodexSessionProcess, String> {
         let cwd = session_cwd(session, &self.working_directory);
-        let mut child = Command::new(&self.binary_path)
-            .arg("app-server")
+        let mut cmd = Command::new(&self.binary_path);
+        cmd.arg("app-server");
+        // Cross-provider orchestration: when the Tauri app has
+        // mounted the loopback HTTP transport, register the flowstate
+        // MCP server with this Codex session via `-c
+        // mcp_servers.flowstate=…`. Codex merges this TOML override
+        // with `~/.codex/config.toml`, so user-authored MCP servers
+        // keep working. Session-scoped (this codex process only).
+        if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
+            let toml_value =
+                render_flowstate_toml_override(ipc, &session.summary.session_id);
+            cmd.arg("-c").arg(format!("mcp_servers.flowstate={toml_value}"));
+        }
+        let mut child = cmd
             .current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -206,6 +239,10 @@ impl CodexAdapter {
 
         Ok(process)
     }
+
+    // ---------------------------------------------------------
+    // helpers
+    // ---------------------------------------------------------
 
     async fn invalidate_session(&self, session_id: &str) {
         let process = self.sessions.lock().await.remove(session_id);
@@ -967,6 +1004,88 @@ fn is_recoverable_thread_resume_error(error: &str) -> bool {
     RECOVERABLE_THREAD_RESUME_ERRORS
         .iter()
         .any(|snippet| lower.contains(snippet))
+}
+
+/// Render the flowstate MCP server entry as a TOML inline table for
+/// Codex's `-c key=value` flag (the value is parsed as TOML). Codex
+/// merges the result with `mcp_servers.flowstate` from
+/// `~/.codex/config.toml`, so pass-through precedence is "session
+/// override wins."
+///
+/// We emit a single inline table string rather than multiple `-c`
+/// flags because Codex tokenises each `-c` independently — using
+/// one `-c mcp_servers.flowstate={…}` keeps every field scoped to
+/// the same override key and avoids partial-apply bugs if Codex
+/// ever rejects one specific field.
+///
+/// Escapes `\` and `"` inside any field value — the other TOML
+/// escape characters (`\b`, `\t`, `\n`, `\f`, `\r`, `\uXXXX`) don't
+/// occur in our inputs (URLs, UUIDs, hex tokens, filesystem paths).
+fn render_flowstate_toml_override(info: &OrchestrationIpcInfo, session_id: &str) -> String {
+    fn escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    let command = escape(&info.executable_path.to_string_lossy());
+    let base = escape(&info.base_url);
+    let sid = escape(session_id);
+    let tok = escape(&info.auth_token);
+    format!(
+        "{{ command = {command}, args = [\"mcp-server\", \"--http-base\", {base}, \
+         \"--session-id\", {sid}], env = {{ FLOWSTATE_AUTH_TOKEN = {tok}, \
+         FLOWSTATE_SESSION_ID = {sid}, FLOWSTATE_HTTP_BASE = {base} }} }}"
+    )
+}
+
+#[cfg(test)]
+mod codex_mcp_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn sample_info() -> OrchestrationIpcInfo {
+        OrchestrationIpcInfo {
+            base_url: "http://127.0.0.1:54321".to_string(),
+            auth_token: "tok-abc".to_string(),
+            executable_path: PathBuf::from("/Applications/flowstate.app/Contents/MacOS/flowstate"),
+        }
+    }
+
+    #[test]
+    fn toml_override_contains_expected_keys() {
+        let out = render_flowstate_toml_override(&sample_info(), "sess-1");
+        assert!(out.contains("command = \""));
+        assert!(out.contains("args = [\"mcp-server\""));
+        assert!(out.contains("--http-base"));
+        assert!(out.contains("--session-id"));
+        assert!(out.contains("env = {"));
+        assert!(out.contains("FLOWSTATE_AUTH_TOKEN"));
+        assert!(out.contains("FLOWSTATE_SESSION_ID"));
+        assert!(out.contains("FLOWSTATE_HTTP_BASE"));
+        assert!(out.contains("sess-1"));
+        assert!(out.contains("tok-abc"));
+    }
+
+    #[test]
+    fn toml_override_escapes_quotes_and_backslashes() {
+        let info = OrchestrationIpcInfo {
+            base_url: "http://evil.example/\"attack".to_string(),
+            auth_token: "bad\\\"token".to_string(),
+            executable_path: PathBuf::from("/weird\"path/flowstate"),
+        };
+        let out = render_flowstate_toml_override(&info, "sess");
+        // Quotes inside values must be backslash-escaped; backslashes too.
+        assert!(out.contains("\\\""));
+        assert!(out.contains("\\\\"));
+    }
 }
 
 fn spawn_stderr_drain(stderr: ChildStderr) -> JoinHandle<()> {

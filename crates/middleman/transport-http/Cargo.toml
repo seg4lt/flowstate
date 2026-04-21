@@ -14,5 +14,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 zenui-provider-api = { path = "../../core/provider-api" }
 zenui-runtime-core = { path = "../../core/runtime-core" }

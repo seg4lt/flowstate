@@ -1294,9 +1294,11 @@ dependencies = [
 name = "flowstate"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "dirs 5.0.1",
+ "flowstate-mcp-server",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
@@ -1323,6 +1325,20 @@ dependencies = [
  "zenui-provider-github-copilot-cli",
  "zenui-provider-opencode",
  "zenui-runtime-core",
+ "zenui-transport-http",
+]
+
+[[package]]
+name = "flowstate-mcp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -7062,6 +7078,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
  "zenui-provider-api",
  "zenui-runtime-core",
 ]

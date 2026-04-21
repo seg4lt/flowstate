@@ -29,8 +29,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
+use serde::{Deserialize, Serialize};
 use zenui_provider_api::{
-    AppSnapshot, BootstrapPayload, ClientMessage, HealthPayload, ServerMessage,
+    AppSnapshot, BootstrapPayload, ClientMessage, HealthPayload, RuntimeCall, RuntimeCallError,
+    RuntimeCallOrigin, RuntimeCallResult, ServerMessage, ToolCatalogEntry, capability_tools_wire,
 };
 use zenui_runtime_core::transport::{Bound, Transport, TransportAddressInfo, TransportHandle};
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
@@ -38,13 +40,38 @@ use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 /// HTTP + WebSocket transport. Construct this in your app's `main()`,
 /// add it to `run_blocking`'s transport list, and daemon-core handles
 /// the rest of the lifecycle.
+///
+/// When an `auth_token` is supplied, every route except `/api/health`
+/// and `/api/version` requires `Authorization: Bearer <token>`. The
+/// token is expected to be written to a 0600 handshake file by the
+/// embedder (Tauri app or daemon binary) so local subprocesses that
+/// need to talk back to the runtime can fetch it without ever
+/// appearing on a command line or in an environment variable.
 pub struct HttpTransport {
     bind_addr: SocketAddr,
+    auth_token: Option<String>,
 }
 
 impl HttpTransport {
+    /// Unauthenticated transport. Use only for dev / tests where you
+    /// explicitly want any local process to reach the runtime.
     pub fn new(bind_addr: SocketAddr) -> Self {
-        Self { bind_addr }
+        Self {
+            bind_addr,
+            auth_token: None,
+        }
+    }
+
+    /// Token-gated transport. Every route except liveness/version
+    /// demands `Authorization: Bearer <token>` and returns 401 on
+    /// mismatch. Pair with a 0600 handshake file for the token
+    /// channel — do not ship the token through stdout or env vars
+    /// that a crash-reporter might capture.
+    pub fn new_with_auth(bind_addr: SocketAddr, auth_token: String) -> Self {
+        Self {
+            bind_addr,
+            auth_token: Some(auth_token),
+        }
     }
 }
 
@@ -66,6 +93,7 @@ impl Transport for HttpTransport {
         Ok(Box::new(HttpBound {
             std_listener: Some(std_listener),
             address,
+            auth_token: self.auth_token,
         }))
     }
 }
@@ -75,6 +103,7 @@ impl Transport for HttpTransport {
 pub struct HttpBound {
     std_listener: Option<StdTcpListener>,
     address: SocketAddr,
+    auth_token: Option<String>,
 }
 
 impl Bound for HttpBound {
@@ -108,18 +137,54 @@ impl Bound for HttpBound {
             runtime,
             ws_url,
             observer,
+            auth_token: self.auth_token.clone(),
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let task = tokio::spawn(async move {
-            let router = Router::new()
+            // Routes below are split into two bands so auth can be
+            // applied layer-wise.
+            //
+            // PUBLIC: `/api/health`, `/api/version`. Liveness + schema
+            // handshake. Always reachable so a supervisor / updater
+            // can probe the daemon without holding the token.
+            //
+            // AUTHED: everything else. When `auth_token` is set,
+            // every request must carry `Authorization: Bearer <t>`.
+            // When unset (dev / tests) the middleware is a no-op.
+            let public = Router::new()
                 .route("/api/health", get(health_handler))
+                .route("/api/version", get(version_handler));
+
+            let authed = Router::new()
                 .route("/api/bootstrap", get(bootstrap_handler))
                 .route("/api/snapshot", get(snapshot_handler))
                 .route("/api/status", get(status_handler))
                 .route("/api/shutdown", post(shutdown_handler))
+                // Cross-provider orchestration entry point consumed by
+                // the `flowstate mcp-server` subprocess. Agents running
+                // under opencode, Copilot SDK, or any CLI that accepts
+                // an MCP stdio subprocess invoke flowstate's
+                // spawn/send/read tools through a local MCP server that
+                // POSTs `RuntimeCall`s here and returns the runtime's
+                // result verbatim. Single source of truth for the tool
+                // catalog lives in
+                // `zenui_provider_api::capabilities::capability_tools_wire`.
+                .route(
+                    "/api/orchestration/catalog",
+                    get(orchestration_catalog_handler),
+                )
+                .route(
+                    "/api/orchestration/dispatch",
+                    post(orchestration_dispatch_handler),
+                )
                 .route("/ws", get(ws_handler))
-                .with_state(state);
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    require_bearer_token,
+                ));
+
+            let router = public.merge(authed).with_state(state);
 
             let server = axum::serve(
                 listener,
@@ -206,6 +271,65 @@ struct ApiState {
     runtime: Arc<RuntimeCore>,
     ws_url: String,
     observer: Arc<dyn ConnectionObserver>,
+    /// Bearer token required on every authed route. `None` in dev /
+    /// test binds where we deliberately want the port to be open.
+    auth_token: Option<String>,
+}
+
+/// Bearer-token middleware for the authed router branch. Absence of
+/// a configured token on the transport (`auth_token == None`) bypasses
+/// the check so the same code path works for dev builds. Otherwise we
+/// do a constant-time-enough comparison against the `Authorization`
+/// header and 401 on mismatch. The handshake-file delivery channel
+/// for the token lives in the embedder (flowstate Tauri app), not
+/// here — this transport only knows "a client either presents the
+/// expected token or it doesn't."
+async fn require_bearer_token(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(expected) = state.auth_token.as_deref() else {
+        return next.run(request).await;
+    };
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let provided = header.strip_prefix("Bearer ").unwrap_or("");
+    if provided == expected && !provided.is_empty() {
+        next.run(request).await
+    } else {
+        tracing::debug!("rejecting request with missing/invalid bearer token");
+        (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
+    }
+}
+
+/// GET /api/version — stable handshake payload consumed by daemon
+/// clients (the flowstate Tauri proxy, the MCP subprocess) to detect
+/// mismatched shell ↔ daemon versions after an auto-update. Public so
+/// a supervisor can probe it without the bearer token.
+///
+/// `schema_version` bumps only on breaking changes to the HTTP/WS
+/// wire shape; `build_sha` is a commit-sha stamp for debugging / bug
+/// reports. Keep the schema_version increment policy documented on
+/// the matching consumer in the Tauri shell.
+#[derive(serde::Serialize)]
+struct VersionPayload {
+    schema_version: u32,
+    build_sha: &'static str,
+    transport: &'static str,
+}
+
+async fn version_handler() -> Json<VersionPayload> {
+    Json(VersionPayload {
+        schema_version: 1,
+        // `option_env!` returns `Option<&'static str>` — so default
+        // to "dev" for local builds that don't set the env var.
+        build_sha: option_env!("FLOWSTATE_BUILD_SHA").unwrap_or("dev"),
+        transport: "http",
+    })
 }
 
 async fn health_handler() -> Json<HealthPayload> {
@@ -236,6 +360,87 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
     match state.observer.status() {
         Some(status) => Json(status).into_response(),
         None => StatusCode::NOT_IMPLEMENTED.into_response(),
+    }
+}
+
+/// Request body for `POST /api/orchestration/dispatch`. The caller —
+/// currently only the `flowstate-mcp-server` binary — supplies the
+/// originating session id (passed in via env var when the provider
+/// adapter spawned the MCP server subprocess) plus the `RuntimeCall`
+/// shape the agent wants to execute. `turn_id` is optional: external
+/// callers without a real turn context should omit it so the server
+/// synthesizes a per-call id, which means orchestration budget is
+/// scoped per call rather than per turn.
+#[derive(Debug, Deserialize)]
+pub struct OrchestrationDispatchRequest {
+    pub session_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(flatten)]
+    pub call: RuntimeCall,
+}
+
+/// Response body for `POST /api/orchestration/dispatch`. Exactly one
+/// of `result` / `error` is populated — same contract as the bridge
+/// RPC's `runtime_call_response` so the MCP server can relay both
+/// shapes to its MCP client without reshaping.
+#[derive(Debug, Serialize)]
+pub struct OrchestrationDispatchResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<RuntimeCallResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RuntimeCallError>,
+}
+
+/// GET /api/orchestration/catalog — serves the cross-provider tool
+/// catalog. The `flowstate-mcp-server` binary fetches this once at
+/// startup and replays it to its MCP client on `tools/list`. Returning
+/// the same wire shape the Claude SDK bridge consumes (see
+/// `BridgeRequest::LoadToolCatalog` in `provider-claude-sdk/src/wire.rs`)
+/// means every provider's flowstate tools stay in lock-step — adding a
+/// variant to `ProviderKind` or a new orchestration tool in
+/// `capabilities.rs` shows up on every client after a rebuild, with no
+/// per-provider edits.
+async fn orchestration_catalog_handler() -> Json<Vec<ToolCatalogEntry>> {
+    Json(capability_tools_wire())
+}
+
+/// POST /api/orchestration/dispatch — executes a `RuntimeCall` on
+/// behalf of an out-of-process MCP server. Body:
+/// `{ "session_id": "...", "turn_id": "...", "kind": "spawn", ... }`
+/// (the `kind` + call-specific fields flatten from `RuntimeCall`).
+/// 200 + `{ result }` on success, 200 + `{ error }` on a dispatcher
+/// error (cycle, budget, timeout, …). Non-200 is reserved for
+/// transport-level failures.
+async fn orchestration_dispatch_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<OrchestrationDispatchRequest>,
+) -> Json<OrchestrationDispatchResponse> {
+    let origin = RuntimeCallOrigin {
+        session_id: body.session_id,
+        // Synthesize a per-call turn id when the external caller
+        // doesn't have one. Budgets key off `turn_id`, so this gives
+        // each external call its own fresh budget — equivalent to the
+        // in-process "one tool call per turn" bound when the call
+        // isn't riding on a real agent turn.
+        turn_id: body
+            .turn_id
+            .unwrap_or_else(|| format!("ext-{}", uuid::Uuid::new_v4())),
+    };
+    match state
+        .runtime
+        .clone()
+        .dispatch_runtime_call_external(origin, body.call)
+        .await
+    {
+        Ok(result) => Json(OrchestrationDispatchResponse {
+            result: Some(result),
+            error: None,
+        }),
+        Err(error) => Json(OrchestrationDispatchResponse {
+            result: None,
+            error: Some(error),
+        }),
     }
 }
 

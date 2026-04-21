@@ -10,12 +10,13 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
-    ProbeCliOptions, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
-    ProviderSessionState, ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, RateLimitInfo,
-    RateLimitStatus, ReasoningEffort, SessionDetail, SkillSource, TokenUsage, TurnEventSink,
-    UserInput, UserInputQuestion, claude_bucket_label, claude_file_change_from_tool_call,
-    parse_options_from_value, probe_cli, session_cwd, skills_disk,
+    CommandCatalog, CommandKind, McpServerInfo, OrchestrationIpcHandle, PermissionDecision,
+    PermissionMode, ProbeCliOptions, ProviderAdapter, ProviderAgent, ProviderCommand,
+    ProviderKind, ProviderModel, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
+    ProviderTurnOutput, RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail,
+    SkillSource, TokenUsage, TurnEventSink, UserInput, UserInputQuestion, claude_bucket_label,
+    claude_file_change_from_tool_call, flowstate_mcp_config_file, parse_options_from_value,
+    probe_cli, session_cwd, skills_disk, write_mcp_config_file,
 };
 
 const TURN_TIMEOUT_SECS: u64 = 600;
@@ -209,6 +210,14 @@ struct InitSnapshot {
 #[derive(Clone)]
 pub struct ClaudeCliAdapter {
     working_directory: PathBuf,
+    /// Shared handle over the runtime's loopback HTTP transport. When
+    /// populated (i.e. the app mounted the loopback listener), every
+    /// `claude` spawn writes a session-scoped `flowstate.mcp.json`
+    /// registering the `flowstate` MCP server and passes it via
+    /// `--mcp-config`. `None` disables cross-provider orchestration
+    /// on this adapter — sessions behave exactly like the
+    /// pre-refactor Claude CLI.
+    orchestration: Option<OrchestrationIpcHandle>,
     /// One active process per session (for interrupt support).
     active_processes: Arc<Mutex<HashMap<String, Arc<Mutex<ClaudeCliProcess>>>>>,
     /// Per-session `system/init` payload cache. Populated inside
@@ -218,9 +227,31 @@ pub struct ClaudeCliAdapter {
 }
 
 impl ClaudeCliAdapter {
+    /// Construct a Claude CLI adapter without cross-provider
+    /// orchestration. The `claude` subprocess sees only its own
+    /// native tools — sessions on this adapter cannot call
+    /// `flowstate_spawn` / `flowstate_send_and_await` / etc. Kept as
+    /// the default constructor so call sites that don't yet thread
+    /// the orchestration IPC handle still compile unchanged.
     pub fn new(working_directory: PathBuf) -> Self {
+        Self::new_with_orchestration(working_directory, None)
+    }
+
+    /// Construct with an optional [`OrchestrationIpcHandle`]. When
+    /// populated, every spawn of the `claude` binary gets a
+    /// `--mcp-config PATH` flag pointing at a session-scoped
+    /// `flowstate.mcp.json` file, registering the `flowstate`
+    /// server that runs `flowstate mcp-server --session-id …`. The
+    /// handle is shared with the other provider adapters so all of
+    /// them see the same loopback URL + bearer token once the Tauri
+    /// app populates the cell.
+    pub fn new_with_orchestration(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+    ) -> Self {
         Self {
             working_directory,
+            orchestration,
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             init_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -284,6 +315,43 @@ impl ClaudeCliAdapter {
         {
             args.push("--resume".to_string());
             args.push(native_id.to_string());
+        }
+
+        // Cross-provider orchestration wiring. If the Tauri app has
+        // mounted the loopback HTTP transport AND populated the IPC
+        // handle, render a session-scoped `flowstate.mcp.json` that
+        // registers the `flowstate` MCP server and pass it via
+        // `--mcp-config`. Claude CLI merges this with any existing
+        // `.mcp.json` it auto-discovered in cwd, so user-authored
+        // MCP configs keep working. A None handle / failed write is
+        // non-fatal: the session just won't see the
+        // `flowstate_spawn` / `flowstate_send_and_await` tools.
+        if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
+            let cfg = flowstate_mcp_config_file(ipc, &session.summary.session_id);
+            let config_path = self
+                .working_directory
+                .join("sessions")
+                .join(&session.summary.session_id)
+                .join("flowstate.mcp.json");
+            match write_mcp_config_file(&config_path, &cfg) {
+                Ok(path) => {
+                    args.push("--mcp-config".to_string());
+                    args.push(path.to_string_lossy().into_owned());
+                    debug!(
+                        target: "provider-claude-cli",
+                        ?path,
+                        "registered flowstate MCP server via --mcp-config"
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        target: "provider-claude-cli",
+                        %err,
+                        "failed to write flowstate.mcp.json; \
+                         session will not expose cross-provider orchestration tools"
+                    );
+                }
+            }
         }
 
         info!("Spawning claude CLI: {} {:?}", binary, args);

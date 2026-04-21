@@ -12,6 +12,7 @@ members = [
   "crates/core/provider-github-copilot",
   "crates/core/provider-github-copilot-cli",
   "crates/core/provider-opencode",
+  "crates/core/mcp-server",
   "crates/middleman/transport-http",
   "crates/middleman/daemon-core",
   "crates/middleman/transport-tauri",

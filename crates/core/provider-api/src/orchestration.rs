@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ProjectRecord, ProviderKind, SessionDetail, SessionSummary};
+use crate::{PermissionMode, ProjectRecord, ProviderKind, ReasoningEffort, SessionDetail, SessionSummary};
 
 /// Lean peek at a session — what the agent gets back from
 /// `flowstate_list_sessions`. Wraps [`SessionSummary`] with short
@@ -120,6 +120,18 @@ pub enum RuntimeCall {
         #[serde(default)]
         model: Option<String>,
         initial_message: String,
+        /// Permission mode applied to the spawned session's opening
+        /// turn. `None` preserves the historical behavior
+        /// (`PermissionMode::Default`); callers opt in when they want
+        /// the sub-agent to run with looser/stricter permissions than
+        /// the strictest default.
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+        /// Reasoning effort for the opening turn. `None` preserves the
+        /// historical behavior (no effort override); only honoured by
+        /// providers whose `ProviderFeatures.thinking_effort` is true.
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
@@ -133,6 +145,12 @@ pub enum RuntimeCall {
         #[serde(default)]
         model: Option<String>,
         initial_message: String,
+        /// See `SpawnAndAwait::permission_mode`.
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+        /// See `SpawnAndAwait::reasoning_effort`.
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
     },
     /// Deliver a message to an existing session and block until that
     /// session's next final assistant reply.
@@ -204,11 +222,31 @@ pub enum RuntimeCall {
         provider: Option<ProviderKind>,
         #[serde(default)]
         model: Option<String>,
+        /// See `SpawnAndAwait::permission_mode`.
+        #[serde(default)]
+        permission_mode: Option<PermissionMode>,
+        /// See `SpawnAndAwait::reasoning_effort`.
+        #[serde(default)]
+        reasoning_effort: Option<ReasoningEffort>,
         #[serde(default)]
         await_reply: Option<bool>,
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
+    /// Introspection: enumerate every provider the runtime knows
+    /// about along with its available models, per-model reasoning
+    /// effort levels, and the permission modes / efforts the wire
+    /// type supports. Agents call this before a `spawn` when they're
+    /// uncertain about the right provider/model string — especially
+    /// useful for opencode where model ids look like
+    /// `opencode/kimi-k2.5` and are easy to typo.
+    ///
+    /// No arguments — the result is always the full catalog. If an
+    /// agent wants only the enabled ones, filter on `enabled` in the
+    /// response. Flowstate does not paginate; the catalog is a
+    /// handful of providers and typically <200 models total, well
+    /// within a single tool response budget.
+    ListProviders,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,6 +289,69 @@ pub enum RuntimeCallResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reply: Option<String>,
     },
+    /// Result of `ListProviders`. One [`ProviderCatalogEntry`] per
+    /// registered provider, plus the wire-level enum vocabularies
+    /// (permission modes, reasoning efforts) an agent can use on
+    /// `spawn` / `spawn_and_await` / `spawn_in_worktree`. Keeping
+    /// the wire vocabularies in the same payload saves a second
+    /// round-trip — the agent always has everything it needs to
+    /// construct a well-formed spawn call.
+    Providers {
+        providers: Vec<ProviderCatalogEntry>,
+        /// Every `permission_mode` value the `spawn*` tools accept.
+        /// Derived from [`crate::PermissionMode::ALL`] so it can never
+        /// drift from the enum.
+        permission_modes: Vec<String>,
+        /// Every `reasoning_effort` value the `spawn*` tools accept.
+        /// Derived from [`crate::ReasoningEffort::ALL`]. Per-model
+        /// effort support is reported inside each
+        /// `ProviderCatalogEntry`'s models.
+        reasoning_efforts: Vec<String>,
+    },
+}
+
+/// Per-provider snapshot returned by `RuntimeCall::ListProviders`.
+/// Enough for an agent to pick a `provider` + `model` + (optional)
+/// `reasoning_effort` / `permission_mode` without a separate docs
+/// round-trip. Mirrors the shape of [`crate::ProviderStatus`] the
+/// frontend already renders in its settings panel, narrowed to what
+/// an agent actually needs to make a spawn decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+pub struct ProviderCatalogEntry {
+    /// Wire-tag for the `spawn*` tools' `provider` field — exactly
+    /// what should go into `spawn(provider="…")`.
+    pub kind: crate::ProviderKind,
+    /// Human-readable display name (e.g. "GitHub Copilot"). For log
+    /// lines + tool-output narration, not for passing back to the
+    /// runtime.
+    pub label: String,
+    /// Whether the user has this provider enabled. Disabled providers
+    /// are still listed so agents can suggest "enable X in settings
+    /// to use model Y" rather than silently omitting them.
+    pub enabled: bool,
+    /// Whether the provider is installed + authenticated. Pulled
+    /// from [`crate::ProviderStatusLevel`]: `Ready` = good to spawn,
+    /// `Warning` = usually spawns but may misbehave, `Error` = don't
+    /// try. Emitted as a stable lowercase tag so the agent can
+    /// exact-match.
+    pub status: String,
+    /// Optional diagnostic from the health check — reason a provider
+    /// isn't `Ready` (e.g. "binary not on PATH", "auth missing"). Use
+    /// verbatim in error messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    /// Feature flags. Agents should gate optional spawn args on
+    /// these — e.g. omit `reasoning_effort` for providers where
+    /// `thinking_effort == false`.
+    pub features: crate::ProviderFeatures,
+    /// Models the provider advertises. Each entry is a
+    /// [`crate::ProviderModel`] carrying: `value` (the wire string
+    /// for `spawn(model="…")`), `label` (display name), plus the
+    /// per-model effort level list — the model-specific filter over
+    /// the provider-level `reasoning_efforts` list.
+    pub models: Vec<crate::ProviderModel>,
 }
 
 /// Wire-shape mirror of `runtime_core::WorktreeBlueprint`. Kept in

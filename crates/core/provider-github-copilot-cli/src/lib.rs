@@ -14,11 +14,12 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 use zenui_provider_api::{
-    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
-    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
+    CommandCatalog, CommandKind, McpServerInfo, OrchestrationIpcHandle, PermissionDecision,
+    PermissionMode, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion, session_cwd, skills_disk,
+    UserInputQuestion, flowstate_mcp_config_file, session_cwd, skills_disk,
+    write_mcp_config_file,
 };
 
 pub(crate) const TURN_TIMEOUT_SECS: u64 = 600;
@@ -39,6 +40,14 @@ use crate::rpc::{make_error_response, make_response};
 #[derive(Clone)]
 pub struct GitHubCopilotCliAdapter {
     working_directory: PathBuf,
+    /// Shared handle over the runtime's loopback HTTP transport — see
+    /// `zenui_provider_api::orchestration_ipc` for the full contract.
+    /// When populated, each per-session spawn registers a
+    /// session-scoped `flowstate.mcp.json` via
+    /// `--additional-mcp-config @PATH` (Copilot CLI's equivalent of
+    /// Claude CLI's `--mcp-config`). `None` disables orchestration
+    /// wiring on this adapter.
+    orchestration: Option<OrchestrationIpcHandle>,
     /// One process per ZenUI session. Backed by the shared
     /// `ProcessCache` helper so the idle-kill watchdog logic stays in
     /// lockstep with the SDK/bridge adapters.
@@ -46,9 +55,24 @@ pub struct GitHubCopilotCliAdapter {
 }
 
 impl GitHubCopilotCliAdapter {
+    /// Construct without orchestration wiring — sessions on this
+    /// adapter won't see flowstate's cross-provider tools. Kept as
+    /// the default constructor so existing call sites compile
+    /// unchanged.
     pub fn new(working_directory: PathBuf) -> Self {
+        Self::new_with_orchestration(working_directory, None)
+    }
+
+    /// Construct with an optional [`OrchestrationIpcHandle`]. When
+    /// populated, every spawn picks up a `--additional-mcp-config`
+    /// flag pointing at a session-scoped `flowstate.mcp.json`.
+    pub fn new_with_orchestration(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+    ) -> Self {
         Self {
             working_directory,
+            orchestration,
             active_processes: Arc::new(zenui_provider_api::ProcessCache::new(
                 CLI_IDLE_TIMEOUT_SECS,
                 CLI_WATCHDOG_INTERVAL_SECS,
@@ -79,16 +103,30 @@ impl GitHubCopilotCliAdapter {
     }
 
     /// Spawn the copilot binary in headless stdio (JSON-RPC) mode.
-    async fn spawn_process(binary: &str, cwd: &PathBuf) -> Result<CopilotCliProcess, String> {
-        info!("Spawning copilot CLI: {}", binary);
-        let mut child = Command::new(binary)
-            .args([
-                "--headless",
-                "--no-auto-update",
-                "--log-level",
-                "warning",
-                "--stdio",
-            ])
+    /// `extra_args` is appended to the base arg vector — primarily
+    /// used by `ensure_session_process` to inject
+    /// `--additional-mcp-config @PATH` for cross-provider
+    /// orchestration wiring. Non-session callers (health check, list
+    /// models) pass an empty slice.
+    async fn spawn_process(
+        binary: &str,
+        cwd: &PathBuf,
+        extra_args: &[String],
+    ) -> Result<CopilotCliProcess, String> {
+        info!("Spawning copilot CLI: {} {:?}", binary, extra_args);
+        let base_args: &[&str] = &[
+            "--headless",
+            "--no-auto-update",
+            "--log-level",
+            "warning",
+            "--stdio",
+        ];
+        let mut cmd = Command::new(binary);
+        cmd.args(base_args);
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+        let mut child = cmd
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -165,7 +203,46 @@ impl GitHubCopilotCliAdapter {
 
         let binary = Self::find_copilot_binary();
         let resolved_cwd = session_cwd(session, &self.working_directory);
-        let mut process = Self::spawn_process(&binary, &resolved_cwd).await?;
+
+        // Cross-provider orchestration: when the Tauri app has mounted
+        // the loopback HTTP transport, write a session-scoped
+        // `flowstate.mcp.json` and pass it via
+        // `--additional-mcp-config @PATH`. Copilot CLI merges this
+        // with its global `~/.copilot/mcp-config.json` and any
+        // workspace `.mcp.json`, so user-authored MCP configs are
+        // preserved. Any failure here is non-fatal: the session just
+        // skips registering flowstate's MCP server, and agents don't
+        // see cross-provider orchestration tools.
+        let extra_args = self
+            .orchestration
+            .as_ref()
+            .and_then(|h| h.get())
+            .and_then(|ipc| {
+                let cfg = flowstate_mcp_config_file(ipc, &session.summary.session_id);
+                let config_path = self
+                    .working_directory
+                    .join("sessions")
+                    .join(&session.summary.session_id)
+                    .join("flowstate.mcp.json");
+                match write_mcp_config_file(&config_path, &cfg) {
+                    Ok(path) => Some(vec![
+                        "--additional-mcp-config".to_string(),
+                        format!("@{}", path.to_string_lossy()),
+                    ]),
+                    Err(err) => {
+                        warn!(
+                            target: "provider-github-copilot-cli",
+                            %err,
+                            "failed to write flowstate.mcp.json; \
+                             session will not expose cross-provider orchestration tools"
+                        );
+                        None
+                    }
+                }
+            })
+            .unwrap_or_default();
+
+        let mut process = Self::spawn_process(&binary, &resolved_cwd, &extra_args).await?;
 
         let native_session_id = session
             .provider_state
@@ -698,10 +775,13 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             };
         }
 
-        // Try to spawn and ping the binary.
+        // Try to spawn and ping the binary. No MCP config injection
+        // for health — the probe is a transient subprocess and the
+        // cost of a stale `flowstate.mcp.json` here isn't worth the
+        // complexity.
         let spawn_result = tokio::time::timeout(
             std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),
-            Self::spawn_process(&binary, &self.working_directory),
+            Self::spawn_process(&binary, &self.working_directory, &[]),
         )
         .await;
 
@@ -817,7 +897,9 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
         let binary = Self::find_copilot_binary();
-        let process = Self::spawn_process(&binary, &self.working_directory).await?;
+        // Model listing is a read-only ephemeral subprocess — skip
+        // flowstate MCP injection.
+        let process = Self::spawn_process(&binary, &self.working_directory, &[]).await?;
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(HEALTH_TIMEOUT_SECS),

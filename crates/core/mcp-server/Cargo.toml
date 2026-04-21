@@ -1,0 +1,42 @@
+[package]
+name = "flowstate-mcp-server"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# MCP stdio server that exposes flowstate's cross-session orchestration
+# tools to any provider whose native agent can consume a local MCP
+# subprocess (opencode, GitHub Copilot SDK, Claude CLI, Codex, Copilot
+# CLI). Intentionally thin — owns the MCP JSON-RPC protocol and an
+# HTTP client; every tool's schema, arg parsing, and dispatch logic
+# lives in `zenui-provider-api` + the flowstate daemon's HTTP transport.
+#
+# Packaged as a library so the main `flowstate` Tauri binary can expose
+# it as a `flowstate mcp-server …` subcommand via argv dispatch in
+# `apps/flowstate/src-tauri/src/main.rs`. Distributing one binary
+# instead of two avoids install-path gymnastics for provider adapters
+# that need to construct the MCP command-line — `std::env::current_exe()`
+# always resolves to the running flowstate app, regardless of how it
+# was installed.
+#
+# Lifecycle: each provider adapter spawns one of these processes per
+# session, passing `FLOWSTATE_HTTP_BASE` + `FLOWSTATE_SESSION_ID` as
+# env vars (or the equivalent `--http-base` / `--session-id` CLI
+# flags when the provider's config store only supports a static
+# `command` array). The server fetches the tool catalog from the
+# daemon at startup (`GET /api/orchestration/catalog`) and dispatches
+# tool calls back to it (`POST /api/orchestration/dispatch`). No
+# persistent in-process state — a crashed MCP server is restartable
+# transparently.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true }

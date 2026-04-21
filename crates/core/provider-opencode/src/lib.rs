@@ -25,6 +25,7 @@ mod events;
 mod http;
 mod server;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -32,9 +33,9 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, warn};
 use zenui_provider_api::{
-    PermissionMode, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
-    ProviderStatus, ProviderStatusLevel, ProviderTurnOutput, ReasoningEffort, SessionDetail,
-    ThinkingMode, TurnEventSink, UserInput, find_cli_binary,
+    OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProviderAdapter, ProviderKind,
+    ProviderModel, ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnOutput,
+    ReasoningEffort, SessionDetail, ThinkingMode, TurnEventSink, UserInput, find_cli_binary,
 };
 
 use crate::events::EventRouter;
@@ -69,35 +70,244 @@ const TURN_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Clone)]
 pub struct OpenCodeAdapter {
-    /// Working-directory fallback handed to the server process when a
-    /// session doesn't carry its own `cwd`. Sessions attached to a
-    /// project override this per-request via the REST API's
-    /// `directory` parameter; the server's own cwd is only used as a
-    /// last-resort default.
+    /// Working-directory fallback handed to the probe server when a
+    /// session doesn't carry its own `cwd`. Per-flowstate-session
+    /// servers are spawned in their own tmp cwds (see
+    /// `session_cwd_dir`) so each one can pick up its own
+    /// `opencode.json` with a session-scoped flowstate MCP entry.
     working_directory: PathBuf,
-    /// Lazy singleton: the first `execute_turn` / `health` that needs
-    /// the server spawns it; subsequent calls reuse the same child.
-    /// Wrapped in a `Mutex<OnceCell<…>>` so concurrent callers during
-    /// a cold start block on the first spawn instead of racing it.
+    /// Probe-only shared server. Lazy singleton used by `health()` and
+    /// `fetch_models()` only — neither of those flows needs the
+    /// flowstate MCP server registered, and spawning a fresh server
+    /// for every probe would be wasteful. Session work goes through
+    /// `session_servers` instead.
     server: Arc<OnceCell<Arc<OpenCodeServer>>>,
-    /// Guards the one-time server spawn. `OnceCell::get_or_try_init`
-    /// would do this too, but holding the lock lets us emit a single
-    /// consolidated "opencode server starting…" log line from the
-    /// winning task without interleaving from concurrent losers.
+    /// Guards the one-time probe-server spawn.
     server_init_lock: Arc<Mutex<()>>,
-    /// Routes SSE events to the right session's sink. Lives at the
-    /// adapter level because one SSE connection feeds every in-flight
-    /// session — multiplexing happens here, not per-session.
+    /// One `opencode serve` per flowstate session. Keyed by flowstate
+    /// session id (not opencode's native id — we need this map *before*
+    /// opencode has minted a session, because `start_session` is what
+    /// creates the opencode side). The per-session server's cwd is
+    /// `session_cwd_dir(flowstate_session_id)` and contains the
+    /// session-specific `opencode.json` with `mcp.flowstate` pointing
+    /// at `flowstate mcp-server --session-id <flowstate_session_id>`.
+    /// Torn down in `end_session` so the child exits immediately when
+    /// the user deletes a session; the process-count overhead is
+    /// approximately one `opencode serve` per active flowstate
+    /// session.
+    session_servers: Arc<Mutex<HashMap<String, Arc<OpenCodeServer>>>>,
+    /// Shared handle over the runtime's loopback HTTP transport. When
+    /// populated, `ensure_session_server` writes a session-scoped
+    /// `opencode.json` registering the flowstate MCP server before
+    /// spawning. Absent → sessions run without cross-provider
+    /// orchestration tools (pre-refactor behaviour).
+    orchestration: Option<OrchestrationIpcHandle>,
+    /// Routes SSE events to the right session's sink. Each per-session
+    /// server kicks its own reader into this shared router; opencode
+    /// mints unique session ids across servers so the map never
+    /// collides.
     event_router: Arc<EventRouter>,
 }
 
 impl OpenCodeAdapter {
+    /// Construct without cross-provider orchestration wiring. Sessions
+    /// behave exactly like pre-refactor opencode — `opencode.json` is
+    /// not written, the flowstate MCP server isn't registered, and
+    /// agents can't call `flowstate_spawn` / etc.
     pub fn new(working_directory: PathBuf) -> Self {
+        Self::new_with_orchestration(working_directory, None)
+    }
+
+    /// Construct with an optional [`OrchestrationIpcHandle`]. When
+    /// populated, every per-session `opencode serve` spawn writes an
+    /// `opencode.json` into its cwd that registers the `flowstate`
+    /// MCP server for that session. Agents on those sessions see
+    /// flowstate's spawn/send/read tools alongside opencode's
+    /// built-ins.
+    pub fn new_with_orchestration(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+    ) -> Self {
         Self {
             working_directory,
             server: Arc::new(OnceCell::new()),
             server_init_lock: Arc::new(Mutex::new(())),
+            session_servers: Arc::new(Mutex::new(HashMap::new())),
+            orchestration,
             event_router: Arc::new(EventRouter::new()),
+        }
+    }
+
+    /// Filesystem path for a flowstate session's dedicated `opencode
+    /// serve` cwd. Relative to the adapter's working directory so
+    /// tear-down naturally clusters under one prefix and a
+    /// `rm -rf opencode-sessions/` purges everything. Not created
+    /// here — `ensure_session_server` handles directory creation +
+    /// `opencode.json` emission atomically.
+    fn session_cwd_dir(&self, flowstate_session_id: &str) -> PathBuf {
+        self.working_directory
+            .join("opencode-sessions")
+            .join(flowstate_session_id)
+    }
+
+    /// Render the `opencode.json` payload registering the flowstate
+    /// MCP server for this session. Returns `None` when orchestration
+    /// isn't wired — callers fall through to starting the server
+    /// without the config file (opencode accepts a missing
+    /// `opencode.json` as "no project overrides").
+    ///
+    /// Shape (matches opencode's `McpLocalConfig`):
+    /// ```json
+    /// { "mcp": { "flowstate": {
+    ///     "type": "local",
+    ///     "command": [<flowstate>, "mcp-server",
+    ///                 "--http-base", <URL>,
+    ///                 "--session-id", <SID>],
+    ///     "environment": {
+    ///         "FLOWSTATE_AUTH_TOKEN": <token>,
+    ///         "FLOWSTATE_SESSION_ID": <SID>,
+    ///         "FLOWSTATE_HTTP_BASE":  <URL>
+    ///     }
+    /// } } }
+    /// ```
+    fn render_opencode_json(
+        info: &OrchestrationIpcInfo,
+        flowstate_session_id: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "mcp": {
+                "flowstate": {
+                    "type": "local",
+                    "command": [
+                        info.executable_path.to_string_lossy(),
+                        "mcp-server",
+                        "--http-base",
+                        &info.base_url,
+                        "--session-id",
+                        flowstate_session_id,
+                    ],
+                    "environment": {
+                        "FLOWSTATE_AUTH_TOKEN": &info.auth_token,
+                        "FLOWSTATE_SESSION_ID": flowstate_session_id,
+                        "FLOWSTATE_HTTP_BASE": &info.base_url,
+                    }
+                }
+            }
+        })
+    }
+
+    /// Ensure a per-flowstate-session `opencode serve` is up and
+    /// return its handle. Writes `opencode.json` in the session's tmp
+    /// cwd on first spawn, starts the SSE reader, and caches the
+    /// handle in `session_servers`. Subsequent calls return the same
+    /// handle.
+    ///
+    /// The double-checked pattern around `session_servers` avoids
+    /// holding the mutex across the (slow) `OpenCodeServer::spawn`
+    /// call. Two concurrent callers for the same session race, but
+    /// the loser drops its freshly-spawned server and waits for the
+    /// winner — no leaked children.
+    async fn ensure_session_server(
+        &self,
+        flowstate_session_id: &str,
+    ) -> Result<Arc<OpenCodeServer>, String> {
+        // Fast path: already spawned.
+        {
+            let guard = self.session_servers.lock().await;
+            if let Some(existing) = guard.get(flowstate_session_id) {
+                return Ok(existing.clone());
+            }
+        }
+
+        // Slow path: spawn outside the lock.
+        let binary = Self::find_opencode_binary().ok_or_else(|| {
+            format!(
+                "opencode binary not found on PATH. {}",
+                OPENCODE_INSTALL_HINT
+            )
+        })?;
+        let cwd = self.session_cwd_dir(flowstate_session_id);
+        tokio::fs::create_dir_all(&cwd)
+            .await
+            .map_err(|e| format!("failed to create opencode session cwd: {e}"))?;
+
+        // Write `opencode.json` if orchestration wiring is active.
+        // Doing this BEFORE the spawn means opencode reads it during
+        // its own startup — no restart required.
+        if let Some(info) = self.orchestration.as_ref().and_then(|h| h.get()) {
+            let body = serde_json::to_string_pretty(&Self::render_opencode_json(
+                info,
+                flowstate_session_id,
+            ))
+            .map_err(|e| format!("failed to render opencode.json: {e}"))?;
+            tokio::fs::write(cwd.join("opencode.json"), body)
+                .await
+                .map_err(|e| format!("failed to write opencode.json: {e}"))?;
+            debug!(
+                flowstate_session_id,
+                cwd = %cwd.display(),
+                "wrote per-session opencode.json with flowstate MCP entry"
+            );
+        }
+
+        let server = OpenCodeServer::spawn(
+            &binary,
+            &cwd,
+            std::time::Duration::from_secs(SERVER_STARTUP_TIMEOUT_SECS),
+        )
+        .await?;
+        let server = Arc::new(server);
+        self.event_router
+            .spawn_reader(server.clone(), server.client());
+
+        // Insert under the lock; if a concurrent caller beat us to it
+        // the kill_on_drop on our child will tear it down when the
+        // Arc we're about to drop falls out of scope.
+        let mut guard = self.session_servers.lock().await;
+        let stored = guard
+            .entry(flowstate_session_id.to_string())
+            .or_insert_with(|| server.clone())
+            .clone();
+        Ok(stored)
+    }
+
+    /// HTTP client for a given flowstate session. Thin wrapper around
+    /// [`Self::ensure_session_server`].
+    async fn session_client(
+        &self,
+        flowstate_session_id: &str,
+    ) -> Result<Arc<OpenCodeClient>, String> {
+        let server = self.ensure_session_server(flowstate_session_id).await?;
+        Ok(server.client())
+    }
+
+    /// Tear down a flowstate session's dedicated opencode server.
+    /// Called from `end_session` so that the child process exits
+    /// promptly — the `kill_on_drop` on the Command handle would
+    /// eventually reap it, but explicit cleanup is polite and
+    /// deterministic. Also removes the tmp cwd so stale
+    /// `opencode.json` files don't accumulate.
+    async fn shutdown_session_server(&self, flowstate_session_id: &str) {
+        let server = {
+            let mut guard = self.session_servers.lock().await;
+            guard.remove(flowstate_session_id)
+        };
+        if let Some(server) = server {
+            // Dropping the Arc fires `Drop for OpenCodeServer` which
+            // start_kill()s the child. The `kill_on_drop(true)` on
+            // the `Command` handle is our backstop.
+            drop(server);
+            let cwd = self.session_cwd_dir(flowstate_session_id);
+            if let Err(err) = tokio::fs::remove_dir_all(&cwd).await {
+                // Non-fatal; leaving the dir around only costs a few
+                // KB on disk.
+                debug!(
+                    flowstate_session_id,
+                    cwd = %cwd.display(),
+                    %err,
+                    "failed to remove opencode session cwd"
+                );
+            }
         }
     }
 
@@ -321,7 +531,13 @@ impl ProviderAdapter for OpenCodeAdapter {
             return Ok(None);
         }
 
-        let client = self.client().await?;
+        // Per-session server — spawns a dedicated `opencode serve`
+        // for this flowstate session and writes its `opencode.json`
+        // with the flowstate MCP entry before startup so the server
+        // picks up cross-provider orchestration tools from turn one.
+        let client = self
+            .session_client(&session.summary.session_id)
+            .await?;
         let cwd = zenui_provider_api::helpers::session_cwd(session, &self.working_directory);
         // On `start_session` we don't yet know which permission mode
         // the user will run with — the runtime only hands it through
@@ -359,7 +575,9 @@ impl ProviderAdapter for OpenCodeAdapter {
             );
         }
 
-        let client = self.client().await?;
+        let client = self
+            .session_client(&session.summary.session_id)
+            .await?;
 
         // Resolve / create the native opencode session id. Sessions
         // created by a prior `start_session` carry it through
@@ -438,17 +656,19 @@ impl ProviderAdapter for OpenCodeAdapter {
             return Ok("No opencode session to interrupt.".to_string());
         };
 
-        let client = self.client().await?;
+        let client = self
+            .session_client(&session.summary.session_id)
+            .await?;
         client.abort_session(native_id).await?;
         Ok("Interrupt sent to opencode.".to_string())
     }
 
     async fn end_session(&self, session: &SessionDetail) -> Result<(), String> {
-        // Tell the router to drop any sink registered for this
-        // session, but leave the opencode server alone — other
-        // flowstate sessions may still be using it. Server shutdown
-        // happens when the `OpenCodeServer` arc is dropped (daemon
-        // tear-down) or the child exits on its own.
+        // Unsubscribe from SSE routing *and* shut down this session's
+        // dedicated opencode server. With per-session servers, there
+        // are no other flowstate sessions sharing this process — it
+        // belongs to exactly one flowstate session id and leaks if we
+        // leave it running after session delete.
         if let Some(native_id) = session
             .provider_state
             .as_ref()
@@ -456,6 +676,8 @@ impl ProviderAdapter for OpenCodeAdapter {
         {
             self.event_router.unsubscribe(native_id).await;
         }
+        self.shutdown_session_server(&session.summary.session_id)
+            .await;
         Ok(())
     }
 }

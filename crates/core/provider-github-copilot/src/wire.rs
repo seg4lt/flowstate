@@ -84,6 +84,14 @@ pub(crate) enum BridgeRequest {
         /// after the first successful turn.
         #[serde(skip_serializing_if = "Option::is_none")]
         resume_session_id: Option<String>,
+        /// Flowstate-side session id. Propagated to the bridge so it
+        /// can bake the correct `--session-id` into the flowstate
+        /// MCP server registration (`SessionConfig.mcpServers.flowstate`),
+        /// which in turn makes `RuntimeCall` dispatches originate
+        /// from this exact session. Absent on older bridges / when
+        /// the Tauri app hasn't mounted the loopback HTTP transport.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flowstate_session_id: Option<String>,
     },
     #[serde(rename = "send_prompt")]
     SendPrompt {

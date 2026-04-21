@@ -9,9 +9,42 @@
 //! each bridge writes ~40 lines of glue instead of re-deriving the
 //! call shape.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::orchestration::{RuntimeCall, RuntimeCallResult};
+use crate::{PermissionMode, ProviderKind, ReasoningEffort};
+
+// --- Single-source enum tag arrays ------------------------------------
+//
+// The JSON Schema `"enum"` arrays below are derived from the Rust
+// wire enums' `ALL` / `as_tag` helpers. Adding a variant means editing
+// the enum in `types.rs` — these schemas and every bridge that consumes
+// them pick up the change automatically. Previously these arrays were
+// hand-typed in three places inside this file AND again in each
+// provider bridge's tool declaration; see
+// `crates/core/provider-claude-sdk/bridge/src/index.ts` for how the
+// Claude bridge now consumes `capability_tools()` directly instead of
+// re-declaring the schemas.
+
+fn provider_kind_tags() -> Vec<&'static str> {
+    ProviderKind::ALL.iter().map(|k| k.as_tag()).collect()
+}
+
+fn permission_mode_tags() -> Vec<&'static str> {
+    PermissionMode::ALL.iter().map(|m| m.as_tag()).collect()
+}
+
+fn reasoning_effort_tags() -> Vec<&'static str> {
+    ReasoningEffort::ALL.iter().map(|e| e.as_tag()).collect()
+}
+
+/// Human-readable provider list used in tool descriptions. Kept in
+/// sync with [`ProviderKind::ALL`] via the same iterator so "Provider
+/// kind: …" copy in the description never drifts from the `enum` array.
+fn provider_kind_description_list() -> String {
+    provider_kind_tags().join(", ")
+}
 
 /// A single tool the runtime exposes to the agent. Providers register
 /// these with their native tool mechanism; tool invocations are serialized
@@ -32,6 +65,43 @@ pub struct AgentCapabilityTool {
     pub input_schema: Value,
 }
 
+/// Wire form of [`AgentCapabilityTool`] with owned `String`s so it
+/// round-trips cleanly over the bridge RPC. Built from the in-process
+/// catalog by [`capability_tools_wire`] — bridges deserialize this
+/// vector at startup and feed each entry into their native tool
+/// registration (Claude SDK `createSdkMcpServer`, Copilot SDK tool
+/// registry, opencode HTTP `/tools`, Codex JSON-RPC tool defs). Wire
+/// schema is intentionally trivial so new provider bridges only need
+/// a JSON-Schema-to-native-tool adapter, not a re-declaration of the
+/// catalog itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+pub struct ToolCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+impl From<&AgentCapabilityTool> for ToolCatalogEntry {
+    fn from(t: &AgentCapabilityTool) -> Self {
+        Self {
+            name: t.name.to_string(),
+            description: t.description.to_string(),
+            input_schema: t.input_schema.clone(),
+        }
+    }
+}
+
+/// Same catalog as [`capability_tools`], wire-friendly. Every provider
+/// bridge consumes this at startup — it's the single source of truth for
+/// the orchestration tool surface exposed to an LLM.
+pub fn capability_tools_wire() -> Vec<ToolCatalogEntry> {
+    capability_tools()
+        .iter()
+        .map(ToolCatalogEntry::from)
+        .collect()
+}
+
 /// Canonical tool catalog. Ordered by expected frequency.
 pub fn capability_tools() -> Vec<AgentCapabilityTool> {
     vec![
@@ -50,8 +120,8 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     },
                     "provider": {
                         "type": "string",
-                        "description": "Provider kind: claude, codex, github_copilot, claude_cli, github_copilot_cli. Omit to inherit the caller's provider.",
-                        "enum": ["claude", "codex", "github_copilot", "claude_cli", "github_copilot_cli"]
+                        "description": format!("Provider kind: {}. Omit to inherit the caller's provider.", provider_kind_description_list()),
+                        "enum": provider_kind_tags()
                     },
                     "model": {
                         "type": "string",
@@ -60,6 +130,16 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     "initial_message": {
                         "type": "string",
                         "description": "The user-message the spawned agent starts with."
+                    },
+                    "permission_mode": {
+                        "type": "string",
+                        "description": "Permission mode for the spawned session's first turn. Omit for default (strictest).",
+                        "enum": permission_mode_tags()
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Reasoning effort for the first turn. Honoured by providers where thinking_effort is supported (Claude, Codex, opencode). `xhigh` / `max` are further gated per-model; unsupported values are clamped.",
+                        "enum": reasoning_effort_tags()
                     },
                     "timeout_secs": {
                         "type": "integer",
@@ -83,10 +163,20 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     "project_id": { "type": "string" },
                     "provider": {
                         "type": "string",
-                        "enum": ["claude", "codex", "github_copilot", "claude_cli", "github_copilot_cli"]
+                        "enum": provider_kind_tags()
                     },
                     "model": { "type": "string" },
-                    "initial_message": { "type": "string" }
+                    "initial_message": { "type": "string" },
+                    "permission_mode": {
+                        "type": "string",
+                        "description": "Permission mode for the spawned session's first turn. Omit for default (strictest).",
+                        "enum": permission_mode_tags()
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Reasoning effort for the first turn. Honoured by providers where thinking_effort is supported (Claude, Codex, opencode). `xhigh` / `max` are further gated per-model; unsupported values are clamped.",
+                        "enum": reasoning_effort_tags()
+                    }
                 },
                 "required": ["initial_message"]
             }),
@@ -183,6 +273,25 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
             }),
         },
         AgentCapabilityTool {
+            name: "list_providers",
+            description: "Enumerate every provider flowstate knows about, with their \
+                available models, per-model reasoning effort levels, feature flags, \
+                and the wire-level `permission_mode` / `reasoning_effort` vocabularies \
+                the spawn tools accept. Use this before `spawn` / `spawn_and_await` / \
+                `spawn_in_worktree` whenever you're unsure about the exact `provider` \
+                tag (e.g. is it `opencode` or `open_code`?) or `model` string (e.g. \
+                `opencode/kimi-k2.5` vs `moonshotai/kimi-k2` — the former is correct for \
+                opencode, the latter is a different catalog entirely). Returns \
+                `{providers: [{kind, label, enabled, status, status_message?, features, \
+                models: [{value, label, supports_effort, supported_effort_levels, ...}]}], \
+                permission_modes, reasoning_efforts}`. Pass `provider = kind`, \
+                `model = models[].value` verbatim to the spawn tools.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        AgentCapabilityTool {
             name: "create_worktree",
             description: "Create a git worktree off an existing project. Runs \
                 `git worktree add` at a host-chosen path, creates a new flowstate project \
@@ -244,10 +353,20 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     "initial_message": { "type": "string" },
                     "provider": {
                         "type": "string",
-                        "enum": ["claude", "codex", "github_copilot", "claude_cli", "github_copilot_cli"]
+                        "enum": provider_kind_tags()
                     },
                     "model": { "type": "string" },
                     "await_reply": { "type": "boolean" },
+                    "permission_mode": {
+                        "type": "string",
+                        "description": "Permission mode for the spawned session's first turn. Omit for default (strictest).",
+                        "enum": permission_mode_tags()
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Reasoning effort for the first turn. Honoured by providers where thinking_effort is supported (Claude, Codex, opencode). `xhigh` / `max` are further gated per-model; unsupported values are clamped.",
+                        "enum": reasoning_effort_tags()
+                    },
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
@@ -288,6 +407,17 @@ pub fn parse_runtime_call(tool_name: &str, args: &Value) -> Result<RuntimeCall, 
         let raw = get_str("provider")?;
         serde_json::from_value::<crate::ProviderKind>(Value::String(raw)).ok()
     };
+    // Invalid enum strings fall back to `None` instead of failing the
+    // whole call — matches `get_provider` above and keeps a typo on
+    // `permission_mode: "wat"` from making the whole spawn unreachable.
+    let get_permission_mode = || -> Option<crate::PermissionMode> {
+        let raw = get_str("permission_mode")?;
+        serde_json::from_value::<crate::PermissionMode>(Value::String(raw)).ok()
+    };
+    let get_reasoning_effort = || -> Option<crate::ReasoningEffort> {
+        let raw = get_str("reasoning_effort")?;
+        serde_json::from_value::<crate::ReasoningEffort>(Value::String(raw)).ok()
+    };
 
     match tool_name {
         "spawn_and_await" => Ok(RuntimeCall::SpawnAndAwait {
@@ -295,6 +425,8 @@ pub fn parse_runtime_call(tool_name: &str, args: &Value) -> Result<RuntimeCall, 
             provider: get_provider(),
             model: get_str("model"),
             initial_message: get_required_str("initial_message")?,
+            permission_mode: get_permission_mode(),
+            reasoning_effort: get_reasoning_effort(),
             timeout_secs: get_u64("timeout_secs"),
         }),
         "spawn" => Ok(RuntimeCall::Spawn {
@@ -302,6 +434,8 @@ pub fn parse_runtime_call(tool_name: &str, args: &Value) -> Result<RuntimeCall, 
             provider: get_provider(),
             model: get_str("model"),
             initial_message: get_required_str("initial_message")?,
+            permission_mode: get_permission_mode(),
+            reasoning_effort: get_reasoning_effort(),
         }),
         "send_and_await" => Ok(RuntimeCall::SendAndAwait {
             session_id: get_required_str("session_id")?,
@@ -324,6 +458,7 @@ pub fn parse_runtime_call(tool_name: &str, args: &Value) -> Result<RuntimeCall, 
             project_id: get_str("project_id"),
         }),
         "list_projects" => Ok(RuntimeCall::ListProjects),
+        "list_providers" => Ok(RuntimeCall::ListProviders),
         "create_worktree" => Ok(RuntimeCall::CreateWorktree {
             base_project_id: get_required_str("base_project_id")?,
             branch: get_required_str("branch")?,
@@ -341,6 +476,8 @@ pub fn parse_runtime_call(tool_name: &str, args: &Value) -> Result<RuntimeCall, 
             initial_message: get_required_str("initial_message")?,
             provider: get_provider(),
             model: get_str("model"),
+            permission_mode: get_permission_mode(),
+            reasoning_effort: get_reasoning_effort(),
             await_reply: obj.get("await_reply").and_then(Value::as_bool),
             timeout_secs: get_u64("timeout_secs"),
         }),
@@ -426,6 +563,222 @@ mod tests {
     fn all_tool_schemas_are_objects() {
         for tool in capability_tools() {
             assert_eq!(tool.input_schema["type"], "object", "{}", tool.name);
+        }
+    }
+
+    // ------- drift guards: JSON Schema enum arrays == Rust enum ALL -------
+    //
+    // These tests lock the cross-provider contract: every orchestration
+    // tool schema's `provider` / `permission_mode` / `reasoning_effort`
+    // enum array must be the wire-tag projection of the corresponding
+    // Rust enum's `ALL`. Adding a new `ProviderKind` variant (e.g.
+    // `opencode`) without updating every tool schema used to be a silent
+    // drift source — and a stale build of the Claude bridge is what
+    // blocked the first opencode spawn attempt on 2026-04-21. These
+    // assertions fail the moment a future variant gets added without the
+    // schemas being regenerated from `ALL`.
+
+    fn expected_provider_tags() -> Vec<&'static str> {
+        crate::ProviderKind::ALL
+            .iter()
+            .map(|k| k.as_tag())
+            .collect()
+    }
+
+    fn expected_permission_mode_tags() -> Vec<&'static str> {
+        crate::PermissionMode::ALL
+            .iter()
+            .map(|m| m.as_tag())
+            .collect()
+    }
+
+    fn expected_reasoning_effort_tags() -> Vec<&'static str> {
+        crate::ReasoningEffort::ALL
+            .iter()
+            .map(|e| e.as_tag())
+            .collect()
+    }
+
+    fn enum_array(schema: &Value, property: &str) -> Option<Vec<String>> {
+        Some(
+            schema["properties"][property]["enum"]
+                .as_array()?
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn tool_schemas_provider_enum_matches_provider_kind_all() {
+        let expected = expected_provider_tags();
+        for tool in capability_tools() {
+            if let Some(actual) = enum_array(&tool.input_schema, "provider") {
+                assert_eq!(
+                    actual, expected,
+                    "tool `{}` provider enum drifted from ProviderKind::ALL",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_schemas_permission_mode_enum_matches_permission_mode_all() {
+        let expected = expected_permission_mode_tags();
+        for tool in capability_tools() {
+            if let Some(actual) = enum_array(&tool.input_schema, "permission_mode") {
+                assert_eq!(
+                    actual, expected,
+                    "tool `{}` permission_mode enum drifted from PermissionMode::ALL",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_schemas_reasoning_effort_enum_matches_reasoning_effort_all() {
+        let expected = expected_reasoning_effort_tags();
+        for tool in capability_tools() {
+            if let Some(actual) = enum_array(&tool.input_schema, "reasoning_effort") {
+                assert_eq!(
+                    actual, expected,
+                    "tool `{}` reasoning_effort enum drifted from ReasoningEffort::ALL",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capability_tools_wire_round_trips() {
+        // Wire form must serialize and deserialize without data loss so
+        // the bridge → runtime RPC stays lossless.
+        let wire = capability_tools_wire();
+        assert_eq!(wire.len(), capability_tools().len());
+        let json = serde_json::to_string(&wire).expect("serialize wire catalog");
+        let back: Vec<ToolCatalogEntry> =
+            serde_json::from_str(&json).expect("deserialize wire catalog");
+        assert_eq!(back.len(), wire.len());
+        for (a, b) in wire.iter().zip(back.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.description, b.description);
+            assert_eq!(a.input_schema, b.input_schema);
+        }
+    }
+
+    // ------- permission_mode + reasoning_effort on spawn* tools -------
+    //
+    // The three spawn tools (`spawn`, `spawn_and_await`, `spawn_in_worktree`)
+    // accept optional `permission_mode` and `reasoning_effort` so an agent
+    // can configure the spawned session's *first turn*. Round-trip both,
+    // and verify the "omit = None" + "typo = None" contracts — a bad enum
+    // string must not take the whole call down, same as the existing
+    // `get_provider` behavior.
+
+    #[test]
+    fn spawn_carries_permission_mode_and_reasoning_effort() {
+        let args = json!({
+            "initial_message": "hi",
+            "permission_mode": "plan",
+            "reasoning_effort": "high"
+        });
+        let call = parse_runtime_call("spawn", &args).unwrap();
+        match call {
+            RuntimeCall::Spawn {
+                permission_mode,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(permission_mode, Some(crate::PermissionMode::Plan));
+                assert_eq!(reasoning_effort, Some(crate::ReasoningEffort::High));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_and_await_carries_permission_mode_and_reasoning_effort() {
+        let args = json!({
+            "initial_message": "hi",
+            "permission_mode": "auto",
+            "reasoning_effort": "xhigh"
+        });
+        let call = parse_runtime_call("spawn_and_await", &args).unwrap();
+        match call {
+            RuntimeCall::SpawnAndAwait {
+                permission_mode,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(permission_mode, Some(crate::PermissionMode::Auto));
+                assert_eq!(reasoning_effort, Some(crate::ReasoningEffort::Xhigh));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_in_worktree_carries_permission_mode_and_reasoning_effort() {
+        let args = json!({
+            "base_project_id": "p",
+            "branch": "b",
+            "initial_message": "hi",
+            "permission_mode": "bypass",
+            "reasoning_effort": "max"
+        });
+        let call = parse_runtime_call("spawn_in_worktree", &args).unwrap();
+        match call {
+            RuntimeCall::SpawnInWorktree {
+                permission_mode,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(permission_mode, Some(crate::PermissionMode::Bypass));
+                assert_eq!(reasoning_effort, Some(crate::ReasoningEffort::Max));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_fields_default_to_none_when_omitted() {
+        let args = json!({ "initial_message": "hi" });
+        let call = parse_runtime_call("spawn", &args).unwrap();
+        match call {
+            RuntimeCall::Spawn {
+                permission_mode,
+                reasoning_effort,
+                ..
+            } => {
+                assert!(permission_mode.is_none());
+                assert!(reasoning_effort.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_tolerates_invalid_enum_strings() {
+        // Typos must not take the whole call down — mirrors
+        // `get_provider`'s existing tolerance.
+        let args = json!({
+            "initial_message": "hi",
+            "permission_mode": "wat",
+            "reasoning_effort": "turbo"
+        });
+        let call = parse_runtime_call("spawn", &args).unwrap();
+        match call {
+            RuntimeCall::Spawn {
+                permission_mode,
+                reasoning_effort,
+                ..
+            } => {
+                assert!(permission_mode.is_none());
+                assert!(reasoning_effort.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }

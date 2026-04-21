@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use zenui_provider_api::{
-    PermissionDecision, PermissionMode, ProviderModel, UserInputAnswer, UserInputQuestion,
+    PermissionDecision, PermissionMode, ProviderModel, ToolCatalogEntry, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::rpc::BridgeRpcKind;
@@ -192,6 +193,18 @@ pub(crate) enum BridgeRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<Value>,
     },
+    /// Rust → bridge: the full orchestration tool catalog (name,
+    /// description, JSON Schema) the bridge should register with its
+    /// Claude Agent SDK MCP server. Sent exactly once, immediately
+    /// after the bridge reports `ready`. The bridge buffers incoming
+    /// `create_session` requests until the catalog lands, then builds
+    /// its `createSdkMcpServer` tool list from this array instead of
+    /// redeclaring schemas inline. Single source of truth lives in
+    /// `zenui_provider_api::capabilities::capability_tools_wire()` —
+    /// adding a tool / provider / enum variant there means zero edits
+    /// on the bridge side.
+    #[serde(rename = "load_tool_catalog")]
+    LoadToolCatalog { tools: Vec<ToolCatalogEntry> },
 }
 
 #[derive(Debug, Deserialize)]

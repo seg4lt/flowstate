@@ -20,8 +20,10 @@ mod binary_resolver;
 pub mod capabilities;
 mod events;
 pub mod helpers;
+pub mod mcp_config;
 mod messages;
 pub mod orchestration;
+pub mod orchestration_ipc;
 pub mod probe;
 pub mod process_cache;
 pub mod skills_disk;
@@ -30,8 +32,8 @@ mod types;
 pub use adapter::*;
 pub use binary_resolver::find_cli_binary;
 pub use capabilities::{
-    AgentCapabilityTool, capability_tools, encode_runtime_error, encode_runtime_result,
-    parse_runtime_call,
+    AgentCapabilityTool, ToolCatalogEntry, capability_tools, capability_tools_wire,
+    encode_runtime_error, encode_runtime_result, parse_runtime_call,
 };
 pub use events::*;
 pub use helpers::{
@@ -40,9 +42,14 @@ pub use helpers::{
 };
 pub use messages::*;
 pub use orchestration::{
-    PollOutcome, RuntimeCall, RuntimeCallDispatcher, RuntimeCallError, RuntimeCallOrigin,
-    RuntimeCallResult, SessionCreator, SessionDigest, WorktreeSummary,
+    PollOutcome, ProviderCatalogEntry, RuntimeCall, RuntimeCallDispatcher, RuntimeCallError,
+    RuntimeCallOrigin, RuntimeCallResult, SessionCreator, SessionDigest, WorktreeSummary,
 };
+pub use mcp_config::{
+    McpConfigFile, McpServerConfig, flowstate_mcp_config_file, flowstate_mcp_entry,
+    write_mcp_config_file,
+};
+pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
 pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
 pub use types::*;

@@ -359,154 +359,155 @@ async function dispatchRuntimeCall(
 }
 
 /**
- * In-process MCP server exposing the flowstate orchestration tool
- * surface to the Claude Agent SDK. Tool names match the canonical
- * catalog in `zenui_provider_api::capabilities` — if you add a new
- * variant there, add a matching `tool(...)` here.
- *
- * Tools show up to the model as `mcp__flowstate__<name>` in the
- * SDK's tool registry; their handlers are thin adapters that call
- * `dispatchRuntimeCall` with the name and args verbatim.
+ * Narrow JSON-Schema subset the orchestration tool catalog uses. Keep
+ * in sync with the shapes emitted by
+ * `zenui_provider_api::capabilities::capability_tools()`. If we ever
+ * need `oneOf` / `$ref` / pattern / etc., extend this then — for now
+ * the schemas are deliberately tame so the converter stays auditable.
  */
-const flowstateOrchestrationServer = createSdkMcpServer({
-  name: 'flowstate',
-  version: '0.1.0',
-  tools: [
-    tool(
-      'spawn_and_await',
-      'Create a brand-new flowstate session (optionally in a different project) with an initial user message, and block until that session produces its next assistant reply. Returns the new session id and the reply text.',
-      {
-        project_id: z.string().optional(),
-        provider: z
-          .enum([
-            'claude',
-            'codex',
-            'github_copilot',
-            'claude_cli',
-            'github_copilot_cli',
-          ])
-          .optional(),
-        model: z.string().optional(),
-        initial_message: z.string(),
-        timeout_secs: z.number().int().min(1).max(600).optional(),
-      },
-      async (args) => dispatchRuntimeCall('spawn_and_await', args),
-    ),
-    tool(
-      'spawn',
-      'Create a brand-new flowstate session with an initial user message, and return its session id immediately without waiting for a reply.',
-      {
-        project_id: z.string().optional(),
-        provider: z
-          .enum([
-            'claude',
-            'codex',
-            'github_copilot',
-            'claude_cli',
-            'github_copilot_cli',
-          ])
-          .optional(),
-        model: z.string().optional(),
-        initial_message: z.string(),
-      },
-      async (args) => dispatchRuntimeCall('spawn', args),
-    ),
-    tool(
-      'send_and_await',
-      'Deliver a message to an existing flowstate session and block until that session produces its next assistant reply.',
-      {
-        session_id: z.string(),
-        message: z.string(),
-        timeout_secs: z.number().int().min(1).max(600).optional(),
-      },
-      async (args) => dispatchRuntimeCall('send_and_await', args),
-    ),
-    tool(
-      'send',
-      'Deliver a message to an existing flowstate session without blocking.',
-      {
-        session_id: z.string(),
-        message: z.string(),
-      },
-      async (args) => dispatchRuntimeCall('send', args),
-    ),
-    tool(
-      'poll',
-      'Return the most recent completed reply from the target session, optionally after a specific turn id.',
-      {
-        session_id: z.string(),
-        since_turn_id: z.string().optional(),
-      },
-      async (args) => dispatchRuntimeCall('poll', args),
-    ),
-    tool(
-      'read_session',
-      "Read a session's summary and most-recent turns.",
-      {
-        session_id: z.string(),
-        last_turns: z.number().int().min(1).max(100).optional(),
-      },
-      async (args) => dispatchRuntimeCall('read_session', args),
-    ),
-    tool(
-      'list_sessions',
-      'List sessions you can message. Each entry includes a preview of the first user message and last assistant reply, so you can match "the UI refactor thread" without reading each session. Optional project_id filter.',
-      {
-        project_id: z.string().optional(),
-      },
-      async (args) => dispatchRuntimeCall('list_sessions', args),
-    ),
-    tool(
-      'list_projects',
-      'List every project the runtime knows about. Use this to look up a project_id when the user mentions a project by name — match the returned `path` against their words.',
-      {},
-      async (args) => dispatchRuntimeCall('list_projects', args),
-    ),
-    tool(
-      'create_worktree',
-      'Create a git worktree off an existing project and register a flowstate project for it. Returns { projectId, path, branch, parentProjectId }. Set create_branch=true (default) to make a new branch from base_ref, or false to check out an existing branch.',
-      {
-        base_project_id: z.string(),
-        branch: z.string(),
-        base_ref: z.string().optional(),
-        create_branch: z.boolean().optional(),
-      },
-      async (args) => dispatchRuntimeCall('create_worktree', args),
-    ),
-    tool(
-      'list_worktrees',
-      'List worktrees the runtime knows about. Pass base_project_id to restrict to worktrees rooted at one project.',
-      {
-        base_project_id: z.string().optional(),
-      },
-      async (args) => dispatchRuntimeCall('list_worktrees', args),
-    ),
-    tool(
-      'spawn_in_worktree',
-      'Create a worktree for `branch` off `base_project_id` and spawn a session inside it with `initial_message`. Set await_reply=true to block until the session produces its first assistant reply.',
-      {
-        base_project_id: z.string(),
-        branch: z.string(),
-        base_ref: z.string().optional(),
-        create_branch: z.boolean().optional(),
-        initial_message: z.string(),
-        provider: z
-          .enum([
-            'claude',
-            'codex',
-            'github_copilot',
-            'claude_cli',
-            'github_copilot_cli',
-          ])
-          .optional(),
-        model: z.string().optional(),
-        await_reply: z.boolean().optional(),
-        timeout_secs: z.number().int().min(1).max(600).optional(),
-      },
-      async (args) => dispatchRuntimeCall('spawn_in_worktree', args),
-    ),
-  ],
+interface JsonSchemaNode {
+  type?: 'object' | 'string' | 'integer' | 'number' | 'boolean' | 'array';
+  description?: string;
+  enum?: string[];
+  minimum?: number;
+  maximum?: number;
+  properties?: Record<string, JsonSchemaNode>;
+  required?: string[];
+  items?: JsonSchemaNode;
+}
+
+/**
+ * Convert a single JSON-Schema leaf into the Zod schema the Claude
+ * Agent SDK's `tool()` helper expects. Only covers the primitive
+ * shapes the orchestration catalog uses today; unknown constructs
+ * fall back to `z.unknown()` so the bridge stays forward-compatible
+ * when the Rust side adds new fields.
+ */
+function jsonSchemaToZod(node: JsonSchemaNode): z.ZodTypeAny {
+  switch (node.type) {
+    case 'string': {
+      if (node.enum && node.enum.length > 0) {
+        // z.enum requires a non-empty tuple; cast is safe because we
+        // check length above.
+        return z.enum(node.enum as [string, ...string[]]);
+      }
+      return z.string();
+    }
+    case 'integer': {
+      let s = z.number().int();
+      if (typeof node.minimum === 'number') s = s.min(node.minimum);
+      if (typeof node.maximum === 'number') s = s.max(node.maximum);
+      return s;
+    }
+    case 'number': {
+      let s = z.number();
+      if (typeof node.minimum === 'number') s = s.min(node.minimum);
+      if (typeof node.maximum === 'number') s = s.max(node.maximum);
+      return s;
+    }
+    case 'boolean':
+      return z.boolean();
+    case 'array':
+      return z.array(node.items ? jsonSchemaToZod(node.items) : z.unknown());
+    case 'object':
+    case undefined:
+      // Nested objects are rare in the catalog but we handle them
+      // recursively just in case the Rust side adds one.
+      if (node.properties) {
+        return z.object(jsonSchemaObjectToShape(node));
+      }
+      return z.unknown();
+    default:
+      return z.unknown();
+  }
+}
+
+/**
+ * Convert a top-level object JSON Schema into the raw Zod shape the
+ * Agent SDK's `tool()` helper expects (property-name → Zod schema,
+ * with non-required properties marked `.optional()`).
+ */
+function jsonSchemaObjectToShape(
+  schema: JsonSchemaNode,
+): Record<string, z.ZodTypeAny> {
+  const shape: Record<string, z.ZodTypeAny> = {};
+  const required = new Set(schema.required ?? []);
+  for (const [key, child] of Object.entries(schema.properties ?? {})) {
+    let leaf = jsonSchemaToZod(child);
+    if (!required.has(key)) {
+      leaf = leaf.optional();
+    }
+    shape[key] = leaf;
+  }
+  return shape;
+}
+
+/**
+ * Wire shape of a single orchestration tool, as emitted by
+ * `zenui_provider_api::capabilities::capability_tools_wire()` and
+ * delivered over the `load_tool_catalog` stdin message. The bridge
+ * builds the Claude Agent SDK MCP server from this array — there is
+ * no fallback to hand-declared schemas, so the single source of truth
+ * is the Rust `capabilities.rs` catalog.
+ */
+interface ToolCatalogEntry {
+  name: string;
+  description: string;
+  input_schema: JsonSchemaNode;
+}
+
+/**
+ * In-process MCP server exposing the flowstate orchestration tool
+ * surface to the Claude Agent SDK. Built lazily from the catalog
+ * `load_tool_catalog` delivers at bridge startup — **do not** pre-
+ * populate this with hand-typed schemas. Source of truth lives in
+ * `crates/core/provider-api/src/capabilities.rs`.
+ *
+ * Tools show up to the model as `mcp__flowstate__<name>`. Their
+ * handlers are thin adapters that call `dispatchRuntimeCall` with
+ * the tool name + args verbatim, same as before.
+ */
+let flowstateOrchestrationServer: ReturnType<
+  typeof createSdkMcpServer
+> | null = null;
+
+/**
+ * Resolves when the tool catalog has been loaded and the MCP server
+ * has been built. `sendPrompt` awaits this before constructing the
+ * SDK `Options` so we never race the runtime on the first turn of a
+ * fresh bridge. In steady-state the catalog arrives before any
+ * prompt, so this promise is already resolved by the time anyone
+ * awaits it.
+ */
+let resolveCatalogLoaded: (() => void) | null = null;
+const catalogLoaded: Promise<void> = new Promise((resolve) => {
+  resolveCatalogLoaded = resolve;
 });
+
+function loadToolCatalog(entries: ToolCatalogEntry[]): void {
+  const tools = entries.map((entry) =>
+    tool(
+      entry.name,
+      entry.description,
+      jsonSchemaObjectToShape(entry.input_schema),
+      async (args) => dispatchRuntimeCall(entry.name, args),
+    ),
+  );
+  flowstateOrchestrationServer = createSdkMcpServer({
+    name: 'flowstate',
+    version: '0.1.0',
+    tools,
+  });
+  if (resolveCatalogLoaded) {
+    resolveCatalogLoaded();
+    resolveCatalogLoaded = null;
+  }
+  console.error(
+    `[claude-bridge] Loaded orchestration tool catalog: ${entries
+      .map((e) => e.name)
+      .join(', ')}`,
+  );
+}
 
 class ClaudeBridge {
   private cwd: string = process.cwd();
@@ -761,6 +762,15 @@ class ClaudeBridge {
       throw new Error('Another turn is already in flight');
     }
 
+    // The orchestration tool catalog is shipped over stdin exactly
+    // once, right after the bridge reports `ready`. In steady-state
+    // it's been loaded long before anyone calls `sendPrompt`; the
+    // await is a safety net for the boot race where the first prompt
+    // arrives on the same tick as the catalog message. Do NOT move
+    // this below `openPersistentQuery` — the SDK Options constructor
+    // reads `flowstateOrchestrationServer` and would see `null`.
+    await catalogLoaded;
+
     // Per-turn accumulator resets. `lastContextWindow` deliberately
     // persists across turns — the SDK only reports it inside
     // `result.modelUsage`, so holding the previous turn's value lets
@@ -1000,9 +1010,12 @@ class ClaudeBridge {
       // orchestration tools (flowstate_spawn, flowstate_send, ...).
       // Tool calls are routed through `dispatchRuntimeCall` → Rust
       // runtime dispatcher → back through the same stdin channel.
-      mcpServers: {
-        flowstate: flowstateOrchestrationServer,
-      },
+      // The server is built from the catalog `load_tool_catalog`
+      // ships over stdin; `sendPrompt` awaits `catalogLoaded` before
+      // reaching here so the non-null assertion is safe.
+      mcpServers: flowstateOrchestrationServer
+        ? { flowstate: flowstateOrchestrationServer }
+        : {},
       hooks: {
         PostCompact: [
           {
@@ -2590,6 +2603,26 @@ async function main(): Promise<void> {
           entry.resolve({ ok: false, error });
         } else {
           entry.resolve({ ok: true, payload: payload ?? null });
+        }
+        break;
+      }
+
+      case 'load_tool_catalog': {
+        // Rust → bridge: the orchestration tool catalog (name,
+        // description, JSON Schema) is the single source of truth in
+        // `crates/core/provider-api/src/capabilities.rs`. Rust sends
+        // this exactly once, right after the bridge reports `ready`.
+        // We build the in-process Claude SDK MCP server from this
+        // array — no hand-typed Zod schemas here, so adding a tool /
+        // provider / permission-mode variant on the Rust side shows
+        // up automatically once the bridge is rebuilt.
+        const rawTools = (msg.tools as ToolCatalogEntry[] | undefined) ?? [];
+        try {
+          loadToolCatalog(rawTools);
+        } catch (err) {
+          console.error(
+            `[claude-bridge] Failed to load tool catalog: ${(err as Error).message}`,
+          );
         }
         break;
       }

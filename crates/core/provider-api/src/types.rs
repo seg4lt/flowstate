@@ -227,6 +227,31 @@ impl Default for PermissionMode {
     }
 }
 
+impl PermissionMode {
+    /// Every known variant. Keep in sync with the enum definition.
+    /// Used by `capabilities::capability_tools()` to derive the JSON
+    /// Schema enum array from a single source so orchestration tool
+    /// schemas can never drift from the wire type.
+    pub const ALL: &[PermissionMode] = &[
+        PermissionMode::Default,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Plan,
+        PermissionMode::Bypass,
+        PermissionMode::Auto,
+    ];
+
+    /// Serde wire form. Matches `#[serde(rename_all = "snake_case")]`.
+    pub fn as_tag(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept_edits",
+            Self::Plan => "plan",
+            Self::Bypass => "bypass",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
@@ -253,6 +278,18 @@ impl Default for ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    /// Every known variant. Keep in sync with the enum definition.
+    /// Used by `capabilities::capability_tools()` to derive the JSON
+    /// Schema enum array from a single source.
+    pub const ALL: &[ReasoningEffort] = &[
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             ReasoningEffort::Minimal => "minimal",
@@ -262,6 +299,14 @@ impl ReasoningEffort {
             ReasoningEffort::Xhigh => "xhigh",
             ReasoningEffort::Max => "max",
         }
+    }
+
+    /// Alias for [`Self::as_str`] matching the `as_tag` naming on
+    /// other wire enums (`ProviderKind::as_tag`, `PermissionMode::as_tag`).
+    /// Prefer this in new code.
+    #[inline]
+    pub fn as_tag(self) -> &'static str {
+        self.as_str()
     }
 }
 

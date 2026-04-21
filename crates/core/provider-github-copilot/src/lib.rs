@@ -34,13 +34,37 @@ use crate::wire::{
 #[derive(Clone)]
 pub struct GitHubCopilotAdapter {
     working_directory: PathBuf,
+    /// Shared handle over the runtime's loopback HTTP transport —
+    /// populated by the embedder after the HTTP listener binds. When
+    /// populated, every Copilot bridge spawn receives
+    /// `FLOWSTATE_HTTP_BASE` + `FLOWSTATE_AUTH_TOKEN` +
+    /// `FLOWSTATE_EXECUTABLE_PATH` env vars; the bridge reads these
+    /// when constructing `SessionConfig.mcpServers.flowstate` so the
+    /// Copilot SDK spawns the `flowstate mcp-server` subprocess as
+    /// part of each session.
+    orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
     sessions: Arc<zenui_provider_api::ProcessCache<CopilotBridgeProcess>>,
 }
 
 impl GitHubCopilotAdapter {
+    /// Construct without cross-provider orchestration wiring.
     pub fn new(working_directory: PathBuf) -> Self {
+        Self::new_with_orchestration(working_directory, None)
+    }
+
+    /// Construct with an optional
+    /// [`zenui_provider_api::OrchestrationIpcHandle`]. When
+    /// populated, the Copilot TS bridge gets the loopback base URL,
+    /// auth token, and executable path as env vars at spawn time;
+    /// it uses them to register the flowstate MCP server in every
+    /// `SessionConfig.mcpServers` payload it builds.
+    pub fn new_with_orchestration(
+        working_directory: PathBuf,
+        orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
+    ) -> Self {
         Self {
             working_directory,
+            orchestration,
             sessions: Arc::new(zenui_provider_api::ProcessCache::new(
                 BRIDGE_IDLE_TIMEOUT_SECS,
                 BRIDGE_WATCHDOG_INTERVAL_SECS,
@@ -82,14 +106,29 @@ impl GitHubCopilotAdapter {
             format!("{}{sep}{}", node.bin_dir.display(), existing_path)
         };
 
-        let mut child = Command::new(&node.node_bin)
-            .arg(&bridge.script)
+        let mut cmd = Command::new(&node.node_bin);
+        cmd.arg(&bridge.script)
             .current_dir(&bridge.dir)
             .env("PATH", new_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Cross-provider orchestration: when the runtime's loopback
+        // HTTP is up, pass its coordinates through the bridge's env
+        // so the TS side can mount the flowstate MCP server inside
+        // `SessionConfig.mcpServers` for every session it creates.
+        // The env vars stay bridge-scoped (no command-line exposure)
+        // which matches the Copilot SDK's own handling of secrets.
+        if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
+            cmd.env("FLOWSTATE_HTTP_BASE", &ipc.base_url);
+            cmd.env("FLOWSTATE_AUTH_TOKEN", &ipc.auth_token);
+            cmd.env(
+                "FLOWSTATE_EXECUTABLE_PATH",
+                ipc.executable_path.as_os_str(),
+            );
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn bridge: {e}"))?;
 
@@ -476,6 +515,16 @@ impl GitHubCopilotAdapter {
                         .to_string(),
                     model: session.summary.model.clone(),
                     resume_session_id,
+                    // Only pass the flowstate session id when
+                    // orchestration is actually wired — prevents older
+                    // bridges from seeing a field they'd reject and
+                    // avoids spurious MCP-server registration on builds
+                    // where the loopback transport didn't start.
+                    flowstate_session_id: self
+                        .orchestration
+                        .as_ref()
+                        .and_then(|h| h.get())
+                        .map(|_| session.summary.session_id.clone()),
                 },
             )
             .await?;

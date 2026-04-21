@@ -320,6 +320,26 @@ impl ClaudeSdkAdapter {
             }
         }
 
+        // Ship the cross-provider orchestration tool catalog to the
+        // bridge exactly once, right after ready. The bridge registers
+        // each entry with its in-process Claude SDK MCP server, so
+        // schemas stay single-sourced in `capabilities.rs` instead of
+        // being redeclared as Zod in `bridge/src/index.ts`. Any new
+        // variant on `ProviderKind` / `PermissionMode` / etc. or any
+        // new orchestration tool shows up to the model without editing
+        // the bridge.
+        let catalog_request = BridgeRequest::LoadToolCatalog {
+            tools: zenui_provider_api::capability_tools_wire(),
+        };
+        if let Err(err) = write_request(&process.stdin, &catalog_request).await {
+            // Non-fatal: older bridges that don't understand the
+            // message will log and ignore. A current bridge that
+            // expected the catalog and didn't get it will surface a
+            // tool-registration error on the first `spawn*` call from
+            // the model, which is loud enough to debug.
+            warn!(%err, "failed to ship tool catalog to Claude SDK bridge");
+        }
+
         Ok(process)
     }
 

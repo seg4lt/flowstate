@@ -2817,11 +2817,18 @@ impl RuntimeCore {
             {
                 if let Some(rc) = self.self_arc() {
                     let target = session.summary.session_id.clone();
+                    // Mailbox drains come from `send`/`send_and_await`
+                    // — the caller didn't get to pick a mode or
+                    // effort, so we run the turn with the target's
+                    // existing defaults (strictest permission mode,
+                    // no effort override).
                     crate::orchestration::spawn_peer_turn(
                         rc,
                         target,
                         next.message,
                         "mailbox_drain",
+                        PermissionMode::Default,
+                        None,
                     );
                 }
             }
@@ -2872,6 +2879,24 @@ impl RuntimeCore {
     // Cross-session orchestration dispatcher
     // ============================================================
 
+    /// External entry point for the standalone `flowstate-mcp-server`
+    /// binary (and any other out-of-process orchestrator). Same budget +
+    /// cycle-guard contract as the in-process path — the caller
+    /// synthesizes an origin (the MCP server uses the session id of the
+    /// agent that invoked the tool plus a per-call synthetic turn id
+    /// that's cleaned up on return).
+    ///
+    /// Wraps [`Self::dispatch_runtime_call`] so provider adapters can
+    /// stay the sole in-process caller while external transports have a
+    /// public surface without visibility to internal plumbing.
+    pub async fn dispatch_runtime_call_external(
+        self: Arc<Self>,
+        origin: RuntimeCallOrigin,
+        call: RuntimeCall,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        self.dispatch_runtime_call(origin, call).await
+    }
+
     /// Entry point for every `RuntimeCall` produced by an agent. The
     /// drain loop in `send_turn` spawns a task that calls into here.
     /// All variants share the same budget + cycle-guard rails before
@@ -2892,6 +2917,8 @@ impl RuntimeCore {
                 provider,
                 model,
                 initial_message,
+                permission_mode,
+                reasoning_effort,
                 timeout_secs,
             } => {
                 self.dispatch_spawn_and_await(
@@ -2900,6 +2927,8 @@ impl RuntimeCore {
                     provider,
                     model,
                     initial_message,
+                    permission_mode,
+                    reasoning_effort,
                     timeout_secs,
                 )
                 .await
@@ -2909,9 +2938,19 @@ impl RuntimeCore {
                 provider,
                 model,
                 initial_message,
+                permission_mode,
+                reasoning_effort,
             } => {
-                self.dispatch_spawn(origin, project_id, provider, model, initial_message)
-                    .await
+                self.dispatch_spawn(
+                    origin,
+                    project_id,
+                    provider,
+                    model,
+                    initial_message,
+                    permission_mode,
+                    reasoning_effort,
+                )
+                .await
             }
             RuntimeCall::SendAndAwait {
                 session_id,
@@ -2937,6 +2976,7 @@ impl RuntimeCore {
                 self.dispatch_list_sessions(origin, project_id).await
             }
             RuntimeCall::ListProjects => self.dispatch_list_projects().await,
+            RuntimeCall::ListProviders => self.dispatch_list_providers().await,
             RuntimeCall::CreateWorktree {
                 base_project_id,
                 branch,
@@ -2963,6 +3003,8 @@ impl RuntimeCore {
                 initial_message,
                 provider,
                 model,
+                permission_mode,
+                reasoning_effort,
                 await_reply,
                 timeout_secs,
             } => {
@@ -2975,6 +3017,8 @@ impl RuntimeCore {
                     initial_message,
                     provider,
                     model,
+                    permission_mode,
+                    reasoning_effort,
                     await_reply.unwrap_or(false),
                     timeout_secs,
                 )
@@ -3008,6 +3052,7 @@ impl RuntimeCore {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_spawn_and_await(
         self: Arc<Self>,
         origin: RuntimeCallOrigin,
@@ -3015,6 +3060,8 @@ impl RuntimeCore {
         provider: Option<ProviderKind>,
         model: Option<String>,
         initial_message: String,
+        permission_mode: Option<PermissionMode>,
+        reasoning_effort: Option<ReasoningEffort>,
         timeout_secs: Option<u64>,
     ) -> Result<RuntimeCallResult, RuntimeCallError> {
         let (provider, model) = self
@@ -3060,6 +3107,8 @@ impl RuntimeCore {
             peer_sid,
             initial_message,
             "spawn_and_await",
+            permission_mode.unwrap_or(PermissionMode::Default),
+            reasoning_effort,
         );
 
         let timeout = clamp_timeout(timeout_secs);
@@ -3080,6 +3129,7 @@ impl RuntimeCore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_spawn(
         self: Arc<Self>,
         origin: RuntimeCallOrigin,
@@ -3087,6 +3137,8 @@ impl RuntimeCore {
         provider: Option<ProviderKind>,
         model: Option<String>,
         initial_message: String,
+        permission_mode: Option<PermissionMode>,
+        reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<RuntimeCallResult, RuntimeCallError> {
         let (provider, model) = self
             .resolve_spawn_defaults(&origin, provider, model)
@@ -3109,7 +3161,14 @@ impl RuntimeCore {
 
         let rc_for_turn = self.clone();
         let peer_sid = new_sid.clone();
-        crate::orchestration::spawn_peer_turn(rc_for_turn, peer_sid, initial_message, "spawn");
+        crate::orchestration::spawn_peer_turn(
+            rc_for_turn,
+            peer_sid,
+            initial_message,
+            "spawn",
+            permission_mode.unwrap_or(PermissionMode::Default),
+            reasoning_effort,
+        );
 
         Ok(RuntimeCallResult::SpawnedAsync {
             session_id: new_sid,
@@ -3165,7 +3224,17 @@ impl RuntimeCore {
         } else {
             let rc_for_turn = self.clone();
             let target = target_session_id.clone();
-            crate::orchestration::spawn_peer_turn(rc_for_turn, target, message, "send_and_await");
+            // `send*` paths don't surface mode/effort controls to the
+            // caller — the target keeps its own defaults, same as
+            // pre-refactor behavior.
+            crate::orchestration::spawn_peer_turn(
+                rc_for_turn,
+                target,
+                message,
+                "send_and_await",
+                PermissionMode::Default,
+                None,
+            );
         }
 
         let timeout = clamp_timeout(timeout_secs);
@@ -3213,7 +3282,14 @@ impl RuntimeCore {
         } else {
             let rc_for_turn = self.clone();
             let target = target_session_id.clone();
-            crate::orchestration::spawn_peer_turn(rc_for_turn, target, message, "send");
+            crate::orchestration::spawn_peer_turn(
+                rc_for_turn,
+                target,
+                message,
+                "send",
+                PermissionMode::Default,
+                None,
+            );
         }
 
         Ok(RuntimeCallResult::SentAsync)
@@ -3348,6 +3424,131 @@ impl RuntimeCore {
         Ok(RuntimeCallResult::Projects { projects })
     }
 
+    /// Enumerate every registered provider along with its cached
+    /// model catalog + feature flags. Pulled from the persistence
+    /// layer's health + model caches rather than running a live probe
+    /// per call — this is an introspection tool, not a liveness
+    /// check. Providers whose cache is empty return an entry marked
+    /// with an `error` status and a diagnostic message so the agent
+    /// can narrate "try again in a moment" rather than silently
+    /// omitting the provider.
+    ///
+    /// Response also carries the full wire vocabularies for
+    /// `permission_mode` and `reasoning_effort` so an agent doesn't
+    /// need a second round-trip to discover valid values.
+    async fn dispatch_list_providers(
+        self: Arc<Self>,
+    ) -> Result<RuntimeCallResult, RuntimeCallError> {
+        use zenui_provider_api::{
+            PermissionMode, ProviderCatalogEntry, ProviderFeatures, ReasoningEffort,
+            features_for_kind,
+        };
+
+        let mut providers: Vec<ProviderCatalogEntry> = Vec::new();
+        for &kind in self.adapters.keys() {
+            let cached_health = self.persistence.get_cached_health(kind).await;
+            let cached_models = self
+                .persistence
+                .get_cached_models(kind)
+                .await
+                .map(|(_, m)| m)
+                .unwrap_or_default();
+            let enabled = self.is_provider_enabled(kind);
+
+            let (label, status_tag, status_message, features, models) = match cached_health {
+                Some((_, status)) => {
+                    let status_tag = match status.status {
+                        zenui_provider_api::ProviderStatusLevel::Ready => "ready",
+                        zenui_provider_api::ProviderStatusLevel::Warning => "warning",
+                        zenui_provider_api::ProviderStatusLevel::Error => "error",
+                    };
+                    // Model catalog precedence: dedicated model cache wins
+                    // over whatever was embedded in the health snapshot —
+                    // same rule `bootstrap` applies.
+                    let merged_models = if cached_models.is_empty() {
+                        status.models
+                    } else {
+                        cached_models
+                    };
+                    (
+                        status.label,
+                        status_tag,
+                        status.message,
+                        status.features,
+                        merged_models,
+                    )
+                }
+                None => (
+                    kind.label().to_string(),
+                    "error",
+                    Some(
+                        "provider health not yet probed; try again after the next \
+                         health check completes"
+                            .to_string(),
+                    ),
+                    features_for_kind(kind),
+                    cached_models,
+                ),
+            };
+
+            // Even when health cache is missing we always surface the
+            // real feature set — otherwise agents would see an
+            // all-false `ProviderFeatures` and conclude the provider
+            // supports nothing. Overwrite defensively.
+            let features = if matches!(
+                features,
+                ProviderFeatures {
+                    thinking_effort: false,
+                    status_labels: false,
+                    tool_progress: false,
+                    api_retries: false,
+                    prompt_suggestions: false,
+                    context_breakdown: false,
+                    supports_auto_permission_mode: false,
+                    ..
+                }
+            ) {
+                features_for_kind(kind)
+            } else {
+                features
+            };
+
+            providers.push(ProviderCatalogEntry {
+                kind,
+                label,
+                enabled,
+                status: status_tag.to_string(),
+                status_message,
+                features,
+                models,
+            });
+        }
+
+        // Stable ordering — sort by the same canonical variant order
+        // as `ProviderKind::ALL`. Agents scanning the list get a
+        // consistent presentation across calls, which matters for
+        // reproducibility when the agent feeds the catalog into a
+        // system prompt.
+        providers.sort_by_key(|p| {
+            zenui_provider_api::ProviderKind::ALL
+                .iter()
+                .position(|k| *k == p.kind)
+                .unwrap_or(usize::MAX)
+        });
+
+        Ok(RuntimeCallResult::Providers {
+            providers,
+            permission_modes: PermissionMode::ALL
+                .iter()
+                .map(|m| m.as_tag().to_string())
+                .collect(),
+            reasoning_efforts: ReasoningEffort::ALL
+                .iter()
+                .map(|e| e.as_tag().to_string())
+                .collect(),
+        })
+    }
+
     async fn dispatch_create_worktree(
         self: Arc<Self>,
         base_project_id: &str,
@@ -3396,6 +3597,8 @@ impl RuntimeCore {
         initial_message: String,
         provider: Option<ProviderKind>,
         model: Option<String>,
+        permission_mode: Option<PermissionMode>,
+        reasoning_effort: Option<ReasoningEffort>,
         await_reply: bool,
         timeout_secs: Option<u64>,
     ) -> Result<RuntimeCallResult, RuntimeCallError> {
@@ -3464,6 +3667,8 @@ impl RuntimeCore {
                 new_sid.clone(),
                 initial_message,
                 "spawn_in_worktree",
+                permission_mode.unwrap_or(PermissionMode::Default),
+                reasoning_effort,
             );
 
             let timeout = clamp_timeout(timeout_secs);
@@ -3488,6 +3693,8 @@ impl RuntimeCore {
                 new_sid.clone(),
                 initial_message,
                 "spawn_in_worktree",
+                permission_mode.unwrap_or(PermissionMode::Default),
+                reasoning_effort,
             );
             Ok(RuntimeCallResult::SpawnedInWorktree {
                 worktree: summary,

@@ -249,6 +249,7 @@ class CopilotBridge {
     cwd: string,
     model?: string,
     resumeSessionId?: string,
+    flowstateSessionId?: string,
   ): Promise<string> {
     if (!this.client) {
       throw new Error('Client not started');
@@ -308,13 +309,57 @@ class CopilotBridge {
     // `~/Library/Caches/zenui/copilot-bridge-<hash>/`, which is not a
     // project at all. The Rust adapter passes the zenui session cwd via
     // the `cwd` parameter on this call; forward it here.
-    const baseConfig = {
+    // Cross-provider orchestration: when the Rust adapter has
+    // supplied a flowstate session id AND the bridge was spawned
+    // with the loopback HTTP env vars (populated by the Tauri app
+    // after the HTTP listener bound), register a `flowstate` MCP
+    // server in this session's `SessionConfig.mcpServers`. The
+    // Copilot SDK will spawn `flowstate mcp-server --session-id …`
+    // as a stdio subprocess, the model will see flowstate's
+    // orchestration tools alongside its built-ins, and every tool
+    // call roundtrips to the runtime via the loopback HTTP.
+    //
+    // Skipping this entire block when any piece is missing keeps
+    // the bridge forward-compatible with older Rust adapters and
+    // dev builds that deliberately don't mount the loopback.
+    const flowstateHttpBase = process.env.FLOWSTATE_HTTP_BASE;
+    const flowstateAuthToken = process.env.FLOWSTATE_AUTH_TOKEN;
+    const flowstateExePath = process.env.FLOWSTATE_EXECUTABLE_PATH;
+    const mcpServers: Record<string, unknown> = {};
+    if (
+      flowstateSessionId &&
+      flowstateHttpBase &&
+      flowstateAuthToken &&
+      flowstateExePath
+    ) {
+      mcpServers.flowstate = {
+        type: 'local',
+        command: flowstateExePath,
+        args: [
+          'mcp-server',
+          '--http-base',
+          flowstateHttpBase,
+          '--session-id',
+          flowstateSessionId,
+        ],
+        env: {
+          FLOWSTATE_AUTH_TOKEN: flowstateAuthToken,
+          FLOWSTATE_SESSION_ID: flowstateSessionId,
+          FLOWSTATE_HTTP_BASE: flowstateHttpBase,
+        },
+      };
+    }
+
+    const baseConfig: Record<string, unknown> = {
       model: selectedModel,
       streaming: true,
       workingDirectory: cwd,
       onPermissionRequest: permissionHandler,
       onUserInputRequest: userInputHandler,
     };
+    if (Object.keys(mcpServers).length > 0) {
+      baseConfig.mcpServers = mcpServers;
+    }
 
     // Resume path: if the Rust adapter handed us a previously-persisted
     // native_thread_id, try to rehydrate that Copilot-server-side
@@ -332,7 +377,7 @@ class CopilotBridge {
       try {
         this.session = await this.client.resumeSession(
           resumeSessionId,
-          baseConfig as Parameters<typeof this.client.resumeSession>[1],
+          baseConfig as unknown as Parameters<typeof this.client.resumeSession>[1],
         );
       } catch (err) {
         console.error(
@@ -348,8 +393,13 @@ class CopilotBridge {
       console.error(
         `[bridge] Creating session in: ${cwd} (model: ${selectedModel})`,
       );
+      // Double cast through `unknown` because we widened baseConfig
+      // to `Record<string, unknown>` to allow conditional insertion
+      // of the `mcpServers` field. The shape is still compatible
+      // with `SessionConfig` at runtime — we're just telling TS "we
+      // know what we're doing."
       this.session = await this.client.createSession(
-        baseConfig as Parameters<typeof this.client.createSession>[0],
+        baseConfig as unknown as Parameters<typeof this.client.createSession>[0],
       );
     }
 
@@ -817,7 +867,21 @@ async function main(): Promise<void> {
             const cwd = (msg.cwd as string) ?? process.cwd();
             const model = msg.model as string | undefined;
             const resumeSessionId = msg.resume_session_id as string | undefined;
-            const sessionId = await bridge.createSession(cwd, model, resumeSessionId);
+            // New in the cross-provider orchestration round: the
+            // Rust adapter now passes the flowstate-side session id
+            // so the bridge can bake it into
+            // `SessionConfig.mcpServers.flowstate`. Older adapters
+            // omit this field — `createSession` falls through to the
+            // pre-refactor behaviour when it's absent.
+            const flowstateSessionId = msg.flowstate_session_id as
+              | string
+              | undefined;
+            const sessionId = await bridge.createSession(
+              cwd,
+              model,
+              resumeSessionId,
+              flowstateSessionId,
+            );
             process.stdout.write(
               JSON.stringify({ type: 'session_created', session_id: sessionId }) + '\n',
             );

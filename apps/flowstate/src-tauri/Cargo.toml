@@ -34,6 +34,16 @@ serde_json = "1"
 # is re-exported by daemon-core as `zenui_daemon_core::transport_tauri`.
 zenui-daemon-core = { path = "../../../crates/middleman/daemon-core", features = ["transport-tauri"] }
 
+# Loopback HTTP transport mounted alongside the Tauri transport. Both
+# share the same `Arc<RuntimeCore>` so every route it serves reflects
+# current runtime state. Used by the per-session MCP subprocesses
+# that opencode / Copilot SDK / CLIs spawn — they hit
+# `/api/orchestration/{catalog,dispatch}` on this loopback port.
+# Binds `127.0.0.1:0` (ephemeral port, loopback only); auth is a
+# bearer token written to the handshake file under the app's data
+# dir. Not reachable from other hosts on the LAN.
+zenui-transport-http = { path = "../../../crates/middleman/transport-http" }
+
 # Provider adapters the app wants to expose. Construction happens in
 # `src/lib.rs`; keeping the path deps here makes the set of supported
 # providers a single-file edit for downstream apps.
@@ -48,7 +58,15 @@ zenui-provider-opencode = { path = "../../../crates/core/provider-opencode" }
 zenui-provider-api = { path = "../../../crates/core/provider-api" }
 zenui-runtime-core = { path = "../../../crates/core/runtime-core" }
 
-# Async
+# The MCP stdio server is packaged as a library and exposed by the
+# main flowstate binary as a `flowstate mcp-server …` subcommand.
+# Argv dispatch in `src/main.rs` picks this path before Tauri's
+# builder runs, so one binary covers both the UI and the per-session
+# MCP subprocess that opencode / Copilot SDK / the CLIs spawn.
+flowstate-mcp-server = { path = "../../../crates/core/mcp-server" }
+
+# Async + error handling
+anyhow = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"

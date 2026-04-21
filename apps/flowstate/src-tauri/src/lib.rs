@@ -22,6 +22,7 @@ use pty::{PtyId, PtyManager};
 
 mod shell_env;
 
+mod loopback_http;
 mod orchestration_adapters;
 mod user_config;
 use orchestration_adapters::{AppMetadataProviderImpl, WorktreeProvisionerImpl};
@@ -33,7 +34,7 @@ use usage::{
     TopSessionRow, UsageAgentPayload, UsageBucket, UsageEvent, UsageGroupBy, UsageRange,
     UsageStore, UsageSummaryPayload, UsageTimeseriesPayload,
 };
-use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
+use zenui_provider_api::{OrchestrationIpcHandle, ProviderAdapter, RuntimeEvent};
 use zenui_provider_claude_cli::ClaudeCliAdapter;
 use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
@@ -2204,19 +2205,55 @@ pub fn run() {
                 // `runtime-core` never knows its host app's name.
                 config.app_name = "Flowstate".to_string();
 
+                // Shared handle every provider adapter reads at
+                // session-spawn time to discover the loopback HTTP
+                // base URL + bearer token for the `flowstate
+                // mcp-server` subprocesses they launch. Starts empty;
+                // `loopback_http::spawn` (further down) populates it
+                // once the listener binds. Adapters that see it as
+                // empty skip MCP orchestration wiring — graceful
+                // degradation to "Claude-SDK-only orchestration",
+                // which is the pre-refactor behaviour.
+                let ipc_handle = OrchestrationIpcHandle::new();
+
                 // Construct the provider adapters the app wants to
                 // expose. Adding or removing providers now lives in a
                 // single call site here — `daemon-core` stays
                 // provider-agnostic. Per-provider `default_enabled()`
                 // decides which are on out of the box.
+                //
+                // Adapters that want orchestration tooling take a
+                // clone of `ipc_handle` through their constructor.
+                // Adapters that don't (Claude SDK — registers
+                // in-process via `createSdkMcpServer`) keep the
+                // existing single-arg constructor. Threading is
+                // per-provider because each bridge wires its MCP
+                // subprocess differently (`SessionConfig.mcpServers`
+                // for Copilot SDK, `.mcp.json` for the CLIs,
+                // per-session `opencode.json` for opencode).
                 config.adapters = vec![
                     Arc::new(ClaudeSdkAdapter::new(flowstate_root.clone()))
                         as Arc<dyn ProviderAdapter>,
-                    Arc::new(ClaudeCliAdapter::new(flowstate_root.clone())),
-                    Arc::new(CodexAdapter::new(flowstate_root.clone())),
-                    Arc::new(GitHubCopilotAdapter::new(flowstate_root.clone())),
-                    Arc::new(GitHubCopilotCliAdapter::new(flowstate_root.clone())),
-                    Arc::new(OpenCodeAdapter::new(flowstate_root.clone())),
+                    Arc::new(ClaudeCliAdapter::new_with_orchestration(
+                        flowstate_root.clone(),
+                        Some(ipc_handle.clone()),
+                    )),
+                    Arc::new(CodexAdapter::new_with_orchestration(
+                        flowstate_root.clone(),
+                        Some(ipc_handle.clone()),
+                    )),
+                    Arc::new(GitHubCopilotAdapter::new_with_orchestration(
+                        flowstate_root.clone(),
+                        Some(ipc_handle.clone()),
+                    )),
+                    Arc::new(GitHubCopilotCliAdapter::new_with_orchestration(
+                        flowstate_root.clone(),
+                        Some(ipc_handle.clone()),
+                    )),
+                    Arc::new(OpenCodeAdapter::new_with_orchestration(
+                        flowstate_root.clone(),
+                        Some(ipc_handle.clone()),
+                    )),
                 ];
 
                 let core = bootstrap_core_async(&config)
@@ -2274,8 +2311,41 @@ pub fn run() {
                 let bound = transport.bind().expect("transport bind failed");
                 let observer: Arc<dyn ConnectionObserver> = core.lifecycle.clone();
                 let handle = bound
-                    .serve(core.runtime_core.clone(), observer)
+                    .serve(core.runtime_core.clone(), observer.clone())
                     .expect("transport serve failed");
+
+                // Loopback HTTP transport, mounted alongside the
+                // Tauri transport. Both share the same
+                // `Arc<RuntimeCore>` so every route reflects the live
+                // runtime. The `flowstate mcp-server` subprocesses
+                // that provider adapters launch per-session read the
+                // handshake file this call writes to discover the
+                // port + auth token. Failure is non-fatal: the Tauri
+                // UI works without it, only cross-provider
+                // orchestration degrades (to "Claude SDK only" —
+                // which is the pre-refactor state).
+                // Bind return value ignored by design — `LoopbackHttp`
+                // owns the server's `TransportHandle`, and the whole
+                // struct lives for the duration of this spawned task
+                // (which itself lives for the life of the app). When
+                // the task returns, dropping `_loopback` aborts the
+                // HTTP accept loop cleanly.
+                let _loopback = match loopback_http::spawn(
+                    &flowstate_root,
+                    core.runtime_core.clone(),
+                    observer.clone(),
+                    ipc_handle.clone(),
+                ) {
+                    Ok(l) => Some(l),
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            "loopback HTTP transport failed to start; \
+                             cross-provider orchestration will be unavailable"
+                        );
+                        None
+                    }
+                };
 
                 // Signal main thread AFTER serve() has managed TauriDaemonState.
                 // This guarantees the connect command can access it.
