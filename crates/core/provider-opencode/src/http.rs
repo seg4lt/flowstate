@@ -388,20 +388,26 @@ impl OpenCodeClient {
                         continue;
                     }
                     let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
+                    let variants = variant_keys(model);
                     models.push(ProviderModel {
                         value: format!("{provider_id}/{id}"),
                         label: format!("{name} \u{00b7} {provider_name}"),
                         is_free: is_free_model(provider_id, model),
+                        supports_effort: !variants.is_empty(),
+                        supported_effort_levels: variants,
                         ..Default::default()
                     });
                 }
             } else if let Some(obj) = model_map.as_object() {
                 for (id, model) in obj {
                     let name = model.get("name").and_then(Value::as_str).unwrap_or(id);
+                    let variants = variant_keys(model);
                     models.push(ProviderModel {
                         value: format!("{provider_id}/{id}"),
                         label: format!("{name} \u{00b7} {provider_name}"),
                         is_free: is_free_model(provider_id, model),
+                        supports_effort: !variants.is_empty(),
+                        supported_effort_levels: variants,
                         ..Default::default()
                     });
                 }
@@ -501,6 +507,42 @@ pub fn permission_rules_for(mode: PermissionMode) -> Value {
             { "permission": "doom_loop",  "pattern": "*", "action": "ask"   },
         ]),
     }
+}
+
+/// Extract the variant names a model exposes under its `variants`
+/// object.
+///
+/// Opencode's catalogue puts per-model reasoning variants under
+/// `variants: { low: {...}, medium: {...}, high: {...}, ... }`;
+/// the keys are the strings our adapter sends on
+/// `POST /session/:id/prompt_async` under `variant`.
+///
+/// Only keys matching flowstate's canonical effort levels are
+/// surfaced (`low`, `medium`, `high`, `xhigh`, `max`) — opencode
+/// occasionally ships variant keys that don't map cleanly onto
+/// flowstate's `ReasoningEffort` enum (e.g. `"codex-low"`,
+/// provider-specific flavours); dropping them here keeps the
+/// effort selector's options aligned with values the adapter can
+/// actually round-trip.
+///
+/// Returns an empty `Vec` when the model has no variants object
+/// (catalogue entries without reasoning support) or none of its
+/// keys are recognised; that's what `ProviderModel.supports_effort`
+/// checks to decide whether to render the selector at all.
+fn variant_keys(model: &Value) -> Vec<String> {
+    const KNOWN: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+    let Some(variants) = model.get("variants").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = variants
+        .keys()
+        .filter(|k| KNOWN.contains(&k.as_str()))
+        .map(|k| k.to_string())
+        .collect();
+    // Stable order for tests / UI: follow the enum's natural
+    // ascending intensity rather than hash-map iteration order.
+    out.sort_by_key(|k| KNOWN.iter().position(|x| *x == k).unwrap_or(usize::MAX));
+    out
 }
 
 /// Pick an opencode agent for the caller's permission mode.
@@ -716,6 +758,47 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["permission"], "*");
         assert_eq!(arr[0]["action"], "allow");
+    }
+
+    #[test]
+    fn variant_keys_extracts_in_intensity_order() {
+        // Real fixture copied from `/config/providers` for
+        // `opencode/gpt-5.1-codex-max`.
+        let model = json!({
+            "variants": {
+                "high":   { "reasoningEffort": "high" },
+                "low":    { "reasoningEffort": "low" },
+                "medium": { "reasoningEffort": "medium" },
+            }
+        });
+        assert_eq!(
+            variant_keys(&model),
+            vec!["low", "medium", "high"],
+            "expected canonical ascending order regardless of JSON order"
+        );
+    }
+
+    #[test]
+    fn variant_keys_filters_unknown_variants() {
+        let model = json!({
+            "variants": {
+                "low": {},
+                "codex-low": {},
+                "high": {},
+                "banana": {}
+            }
+        });
+        assert_eq!(variant_keys(&model), vec!["low", "high"]);
+    }
+
+    #[test]
+    fn variant_keys_empty_when_no_variants_object() {
+        assert_eq!(variant_keys(&json!({ "id": "kimi" })), Vec::<String>::new());
+    }
+
+    #[test]
+    fn variant_keys_empty_when_variants_is_not_object() {
+        assert_eq!(variant_keys(&json!({ "variants": [] })), Vec::<String>::new());
     }
 
     #[test]

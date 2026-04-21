@@ -801,17 +801,23 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
             ..ProviderFeatures::default()
         },
 
-        // Claude CLI, GitHub Copilot (SaaS and CLI), and opencode
-        // don't expose any of the flagged capabilities today — the UI
-        // hides the corresponding affordances when selected. Opencode
-        // emits structured SSE events for text, tool calls, and
-        // permissions, but none of those map onto the flagged feature
-        // set (status labels, tool heartbeats, retry banners, etc.) —
-        // opt in later if we wire specific surfaces.
+        // Claude CLI, GitHub Copilot (SaaS and CLI) don't expose any
+        // of the flagged capabilities today — the UI hides the
+        // corresponding affordances when selected.
         ProviderKind::ClaudeCli
         | ProviderKind::GitHubCopilot
-        | ProviderKind::GitHubCopilotCli
-        | ProviderKind::OpenCode => ProviderFeatures::default(),
+        | ProviderKind::GitHubCopilotCli => ProviderFeatures::default(),
+
+        // Opencode accepts a `variant` on the prompt body which maps
+        // onto flowstate's reasoning-effort scale (low/medium/high/
+        // xhigh/max). The per-model list of supported variants is
+        // surfaced through `ProviderModel.supported_effort_levels`
+        // so the effort selector only renders for models that
+        // actually expose variants in `/config/providers`.
+        ProviderKind::OpenCode => ProviderFeatures {
+            thinking_effort: true,
+            ..ProviderFeatures::default()
+        },
     }
 }
 

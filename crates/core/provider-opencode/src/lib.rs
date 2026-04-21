@@ -175,6 +175,18 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     async fn health(&self) -> ProviderStatus {
+        // IMPORTANT: every ProviderStatus we return below must carry
+        // `features: features_for_kind(ProviderKind::OpenCode)`, NOT
+        // `ProviderFeatures::default()`. The broadcast
+        // `provider_health_updated` event sends this status verbatim
+        // to the frontend, and the reducer *replaces* the whole
+        // provider entry. Emitting a default (all-false) features
+        // payload here causes the UI to lose any capability flag
+        // (effort selector, context breakdown, etc.) the moment a
+        // post-bootstrap health check lands — bootstrap alone reads
+        // from `persistence::get_cached_health`, which re-hydrates
+        // features, but subsequent broadcasts do not go through that
+        // re-hydration path.
         let label = ProviderKind::OpenCode.label().to_string();
         let binary = match Self::find_opencode_binary() {
             Some(b) => b,
@@ -192,7 +204,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                     )),
                     models: Vec::new(),
                     enabled: true,
-                    features: zenui_provider_api::ProviderFeatures::default(),
+                    features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
                 };
             }
         };
@@ -225,7 +237,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                     )),
                     models: Vec::new(),
                     enabled: true,
-                    features: zenui_provider_api::ProviderFeatures::default(),
+                    features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
                 };
             }
         };
@@ -249,7 +261,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                     message: Some(format!("{label} server is running on {}.", server.url())),
                     models: Vec::new(),
                     enabled: true,
-                    features: zenui_provider_api::ProviderFeatures::default(),
+                    features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
                 },
                 Err(err) => ProviderStatus {
                     kind: ProviderKind::OpenCode,
@@ -263,7 +275,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                     )),
                     models: Vec::new(),
                     enabled: true,
-                    features: zenui_provider_api::ProviderFeatures::default(),
+                    features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
                 },
             },
             Err(err) => ProviderStatus {
@@ -276,7 +288,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 message: Some(format!("failed to start opencode server: {err}")),
                 models: Vec::new(),
                 enabled: true,
-                features: zenui_provider_api::ProviderFeatures::default(),
+                features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
             },
         };
 
