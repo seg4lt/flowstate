@@ -308,6 +308,22 @@ pub enum RuntimeEvent {
         to_session_id: String,
         reason: SessionLinkReason,
     },
+    /// The runtime observed a Claude Code `ScheduleWakeup` tool call
+    /// and persisted a pending wakeup. UIs can use this to render a
+    /// "zzz — next wake at <fire_at>" chip on the session row.
+    WakeupScheduled {
+        session_id: String,
+        wakeup_id: String,
+        fire_at_unix: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A previously-persisted wakeup just fired — the runtime is about
+    /// to deliver the wakeup's prompt as a user turn on `session_id`.
+    WakeupFired {
+        session_id: String,
+        wakeup_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

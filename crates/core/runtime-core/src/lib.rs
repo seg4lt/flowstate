@@ -2,9 +2,13 @@ mod internals;
 pub mod orchestration;
 pub mod session_ops;
 pub mod transport;
+pub mod wakeup;
 
 pub use orchestration::OrchestrationState;
 pub use session_ops::OrchestrationService;
+pub use wakeup::{
+    WAKEUP_MAX_DELAY_SECS, WAKEUP_MAX_PENDING_PER_SESSION, WAKEUP_MIN_DELAY_SECS, WakeupScheduler,
+};
 
 use internals::{
     InFlightPermissionModeGuard, TurnCounterGuard, is_cache_stale,
@@ -292,6 +296,21 @@ pub struct RuntimeCore {
     /// `seed_checkpoint_enablement`, mutated by `SetCheckpointsEnabled`.
     /// Read on every turn-end by `checkpoints_enabled_for_session`.
     global_checkpoints_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Scheduler for Claude Code's `ScheduleWakeup` tool. The runtime
+    /// observes tool calls the model emits in its stream, persists
+    /// them, and fires via `send_turn` when the timer elapses —
+    /// bypassing Claude Code's own in-CLI timer which dies when
+    /// `ProcessCache` reaps the bridge. Installed by
+    /// `init_wakeup_scheduler` after `install_self_ref`; `None` on
+    /// unit-test builds that don't exercise wakeups.
+    wakeup_scheduler: std::sync::RwLock<Option<wakeup::WakeupScheduler>>,
+    /// Sessions whose current turn observed at least one
+    /// `ScheduleWakeup` tool call. Consumed on turn-end — the session
+    /// is then invalidated on the adapter side so Claude Code's
+    /// in-CLI timer (which would otherwise fire and produce output
+    /// that nobody reads, deadlocking the pipe) dies with the
+    /// subprocess. Our persisted wakeup is now the only timer.
+    pending_wakeup_invalidations: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RuntimeCore {
@@ -355,6 +374,8 @@ impl RuntimeCore {
                     zenui_persistence::PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT,
                 ),
             ),
+            wakeup_scheduler: std::sync::RwLock::new(None),
+            pending_wakeup_invalidations: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -426,6 +447,129 @@ impl RuntimeCore {
         if let Ok(mut slot) = self.self_weak.write() {
             *slot = Some(Arc::downgrade(self));
         }
+    }
+
+    /// Spawn the wakeup scheduler and rehydrate any pending rows from
+    /// persistence. Called once from the daemon bootstrap *after*
+    /// [`install_self_ref`] — the fire handler holds a
+    /// `Weak<RuntimeCore>` so the task doesn't keep the runtime alive
+    /// after shutdown. Past-due wakeups (daemon was down at their
+    /// original `fire_at`) fire on the first scheduler tick.
+    pub async fn init_wakeup_scheduler(self: &Arc<Self>) {
+        let fire_handler: Arc<dyn wakeup::WakeupFireHandler> =
+            Arc::new(wakeup::RuntimeCoreFireHandler {
+                runtime: Arc::downgrade(self),
+            });
+        let scheduler =
+            wakeup::WakeupScheduler::spawn(Arc::clone(&self.persistence), fire_handler);
+        scheduler.reload_pending(&self.persistence).await;
+        if let Ok(mut slot) = self.wakeup_scheduler.write() {
+            *slot = Some(scheduler);
+        }
+    }
+
+    fn wakeup_scheduler(&self) -> Option<wakeup::WakeupScheduler> {
+        self.wakeup_scheduler.read().ok()?.clone()
+    }
+
+    /// Observe a Claude Code `ScheduleWakeup` tool call surfaced by
+    /// the adapter's stream. Parses the tool args, persists a row,
+    /// arms the scheduler, and publishes `WakeupScheduled`. Invoked
+    /// from the drain loop when a `ToolCallStarted` with
+    /// `name == "ScheduleWakeup"` lands. Non-blocking — errors are
+    /// logged, never propagated (one malformed tool call must not
+    /// tear down the turn's stream).
+    ///
+    /// Self-delivery only: the target session is the one whose turn
+    /// emitted the call. Also marks the session for bridge
+    /// invalidation at turn end — see
+    /// [`Self::pending_wakeup_invalidations`] for rationale.
+    pub(crate) fn observe_schedule_wakeup_tool_call(
+        self: &Arc<Self>,
+        session_id: &str,
+        origin_turn_id: &str,
+        args: &serde_json::Value,
+    ) {
+        let Some((delay_secs, prompt, reason)) = wakeup::parse_schedule_wakeup_args(args) else {
+            tracing::warn!(
+                session_id,
+                "ignoring malformed ScheduleWakeup tool call args"
+            );
+            return;
+        };
+
+        let Some(scheduler) = self.wakeup_scheduler() else {
+            tracing::warn!(
+                session_id,
+                "observed ScheduleWakeup but scheduler is not installed; dropping"
+            );
+            return;
+        };
+
+        let delay = wakeup::clamp_wakeup_delay(delay_secs);
+        let now = wakeup::now_unix_secs();
+        let fire_at_unix = now.saturating_add(delay as i64);
+        let wakeup_id = uuid::Uuid::new_v4().to_string();
+        let session_id_s = session_id.to_string();
+        let turn_id_s = origin_turn_id.to_string();
+
+        let row = zenui_persistence::ScheduledWakeupRow {
+            wakeup_id: wakeup_id.clone(),
+            session_id: session_id_s.clone(),
+            origin_turn_id: Some(turn_id_s),
+            fire_at_unix,
+            prompt,
+            reason: reason.clone(),
+            status: zenui_persistence::ScheduledWakeupStatus::Pending,
+            created_at_unix: now,
+        };
+
+        let rc = Arc::clone(self);
+        tokio::spawn(async move {
+            // Enforce per-session cap. Over-cap: drop the observation
+            // with a log, but DON'T error the turn — the tool call
+            // has already been emitted by the model and we can't
+            // un-emit it. The user sees a `WakeupScheduled` omission
+            // (no event published) and the dangling tool call in the
+            // transcript.
+            let pending = rc
+                .persistence
+                .count_pending_wakeups_for_session(&row.session_id)
+                .await;
+            if pending >= wakeup::WAKEUP_MAX_PENDING_PER_SESSION {
+                tracing::warn!(
+                    session_id = %row.session_id,
+                    pending,
+                    cap = wakeup::WAKEUP_MAX_PENDING_PER_SESSION,
+                    "pending wakeup cap exceeded; dropping observation"
+                );
+                return;
+            }
+
+            if let Err(err) = rc.persistence.insert_wakeup(row.clone()).await {
+                tracing::error!(
+                    session_id = %row.session_id,
+                    error = %err,
+                    "failed to persist observed wakeup; dropping"
+                );
+                return;
+            }
+            scheduler.arm(&row);
+            wakeup::publish_wakeup_scheduled(
+                &rc,
+                &row.session_id,
+                &row.wakeup_id,
+                row.fire_at_unix,
+                reason.as_deref(),
+            );
+            // Mark the session for post-turn bridge invalidation so
+            // Claude Code's in-CLI timer can't race our own. See the
+            // turn-end handler in `send_turn`.
+            rc.pending_wakeup_invalidations
+                .lock()
+                .await
+                .insert(row.session_id.clone());
+        });
     }
 
     /// Upgrade the back-reference into a live Arc. Returns `None` if
@@ -1899,6 +2043,18 @@ impl RuntimeCore {
                     blocks.push(ContentBlock::ToolCall {
                         call_id: call_id.clone(),
                     });
+                    // Observe Claude Code's native `ScheduleWakeup`
+                    // tool call: the model emits it, the harness inside
+                    // the CLI schedules its own timer — but that timer
+                    // dies when `ProcessCache` reaps the bridge ~2 min
+                    // later. We persist the observation so our own
+                    // scheduler (which survives bridge reaps) owns the
+                    // fire path. See `wakeup.rs` for the full flow.
+                    if name == "ScheduleWakeup" {
+                        if let Some(rc) = self.self_arc() {
+                            rc.observe_schedule_wakeup_tool_call(&sid, &tid, &args);
+                        }
+                    }
                     self.publish(RuntimeEvent::ToolCallStarted {
                         session_id: sid.clone(),
                         turn_id: tid.clone(),
@@ -2662,6 +2818,29 @@ impl RuntimeCore {
             .cloned()
         {
             notifier.notify_waiters();
+        }
+
+        // If this turn emitted a `ScheduleWakeup` tool call, reap the
+        // provider's bridge subprocess now. Claude Code's in-CLI timer
+        // would otherwise fire autonomous output into a stdout pipe
+        // flowstate isn't reading (run_turn just ended), deadlocking
+        // the bridge. Our persisted wakeup owns the fire path from
+        // here — the bridge respawns lazily on the fired user turn.
+        let consumed_wakeup = self
+            .pending_wakeup_invalidations
+            .lock()
+            .await
+            .remove(&session.summary.session_id);
+        if consumed_wakeup {
+            if let Some(adapter) = self.adapters.get(&session.summary.provider).cloned() {
+                if let Err(err) = adapter.invalidate_process(&session).await {
+                    tracing::warn!(
+                        session_id = %session.summary.session_id,
+                        error = %err,
+                        "invalidate_process after observed wakeup failed (continuing)"
+                    );
+                }
+            }
         }
 
         result
@@ -5059,5 +5238,241 @@ mod tests {
             .expect("refreshed model cache row");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].value, "refreshed-model");
+    }
+
+    /// Adapter that emits exactly one `ScheduleWakeup` tool call with
+    /// canonical Claude-Code-shaped args. Used to exercise the
+    /// observation hook end-to-end.
+    struct WakeupObservingAdapter {
+        prompt: String,
+    }
+
+    #[async_trait]
+    impl ProviderAdapter for WakeupObservingAdapter {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::Codex
+        }
+        async fn health(&self) -> ProviderStatus {
+            ProviderStatus {
+                kind: ProviderKind::Codex,
+                label: "Codex".to_string(),
+                installed: true,
+                authenticated: true,
+                version: Some("test".to_string()),
+                status: ProviderStatusLevel::Ready,
+                message: None,
+                models: vec![],
+                enabled: true,
+                features: Default::default(),
+            }
+        }
+        async fn execute_turn(
+            &self,
+            _session: &SessionDetail,
+            _input: &UserInput,
+            _permission_mode: PermissionMode,
+            _reasoning_effort: Option<ReasoningEffort>,
+            _thinking_mode: Option<ThinkingMode>,
+            events: TurnEventSink,
+        ) -> Result<ProviderTurnOutput, String> {
+            events
+                .send(ProviderTurnEvent::ToolCallStarted {
+                    call_id: "wakeup-call-1".to_string(),
+                    name: "ScheduleWakeup".to_string(),
+                    args: serde_json::json!({
+                        "delaySeconds": 120,
+                        "prompt": self.prompt,
+                        "reason": "polling the build",
+                    }),
+                    parent_call_id: None,
+                })
+                .await;
+            events
+                .send(ProviderTurnEvent::ToolCallCompleted {
+                    call_id: "wakeup-call-1".to_string(),
+                    output: "{\"scheduled\": true}".to_string(),
+                    error: None,
+                })
+                .await;
+            Ok(ProviderTurnOutput {
+                output: "sleeping now".to_string(),
+                provider_state: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn observes_schedule_wakeup_tool_call_and_persists_row() {
+        let persistence = Arc::new(
+            PersistenceService::in_memory().expect("in-memory db should initialize"),
+        );
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![Arc::new(WakeupObservingAdapter {
+                prompt: "continue polling".to_string(),
+            })],
+            Arc::new(OrchestrationService::new()),
+            Arc::clone(&persistence),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ));
+        runtime.install_self_ref();
+        runtime.init_wakeup_scheduler().await;
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                model: None,
+                project_id: None,
+            })
+            .await;
+        let session_id = runtime
+            .snapshot()
+            .await
+            .sessions
+            .first()
+            .expect("session created")
+            .summary
+            .session_id
+            .clone();
+
+        runtime
+            .handle_client_message(ClientMessage::SendTurn {
+                session_id: session_id.clone(),
+                input: "go".to_string(),
+                images: Vec::new(),
+                permission_mode: None,
+                reasoning_effort: None,
+                thinking_mode: None,
+            })
+            .await;
+
+        // Observation runs in a tokio::spawn; give it a moment to
+        // land its persistence write. Poll briefly — this is the
+        // only async-between-drain-loop-and-assertion gap in the
+        // feature.
+        let mut row: Option<zenui_persistence::ScheduledWakeupRow> = None;
+        for _ in 0..50 {
+            let pending = persistence.list_pending_wakeups().await;
+            if !pending.is_empty() {
+                row = pending.into_iter().next();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let row = row.expect("observer should persist a wakeup row");
+        assert_eq!(row.session_id, session_id);
+        assert_eq!(row.prompt, "continue polling");
+        assert_eq!(row.reason.as_deref(), Some("polling the build"));
+        let now = crate::wakeup::now_unix_secs();
+        assert!(
+            row.fire_at_unix >= now + 115 && row.fire_at_unix <= now + 125,
+            "fire_at should be ~now + 120 (got delta {})",
+            row.fire_at_unix - now
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_non_wakeup_tool_calls() {
+        // A tool call with a different name must not persist a row.
+        struct BoringToolAdapter;
+        #[async_trait]
+        impl ProviderAdapter for BoringToolAdapter {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Codex
+            }
+            async fn health(&self) -> ProviderStatus {
+                ProviderStatus {
+                    kind: ProviderKind::Codex,
+                    label: "Codex".to_string(),
+                    installed: true,
+                    authenticated: true,
+                    version: Some("test".to_string()),
+                    status: ProviderStatusLevel::Ready,
+                    message: None,
+                    models: vec![],
+                    enabled: true,
+                    features: Default::default(),
+                }
+            }
+            async fn execute_turn(
+                &self,
+                _session: &SessionDetail,
+                _input: &UserInput,
+                _permission_mode: PermissionMode,
+                _reasoning_effort: Option<ReasoningEffort>,
+                _thinking_mode: Option<ThinkingMode>,
+                events: TurnEventSink,
+            ) -> Result<ProviderTurnOutput, String> {
+                events
+                    .send(ProviderTurnEvent::ToolCallStarted {
+                        call_id: "c1".to_string(),
+                        name: "Read".to_string(),
+                        args: serde_json::json!({"file_path": "/tmp/x"}),
+                        parent_call_id: None,
+                    })
+                    .await;
+                events
+                    .send(ProviderTurnEvent::ToolCallCompleted {
+                        call_id: "c1".to_string(),
+                        output: "ok".to_string(),
+                        error: None,
+                    })
+                    .await;
+                Ok(ProviderTurnOutput {
+                    output: "done".to_string(),
+                    provider_state: None,
+                })
+            }
+        }
+
+        let persistence = Arc::new(
+            PersistenceService::in_memory().expect("in-memory db should initialize"),
+        );
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![Arc::new(BoringToolAdapter)],
+            Arc::new(OrchestrationService::new()),
+            Arc::clone(&persistence),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ));
+        runtime.install_self_ref();
+        runtime.init_wakeup_scheduler().await;
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                model: None,
+                project_id: None,
+            })
+            .await;
+        let session_id = runtime
+            .snapshot()
+            .await
+            .sessions
+            .first()
+            .unwrap()
+            .summary
+            .session_id
+            .clone();
+        runtime
+            .handle_client_message(ClientMessage::SendTurn {
+                session_id,
+                input: "go".to_string(),
+                images: Vec::new(),
+                permission_mode: None,
+                reasoning_effort: None,
+                thinking_mode: None,
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            persistence.list_pending_wakeups().await.is_empty(),
+            "a non-ScheduleWakeup tool call must not persist a wakeup row"
+        );
     }
 }

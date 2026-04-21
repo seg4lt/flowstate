@@ -257,6 +257,12 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
     runtime_core.reconcile_startup().await;
     runtime_core.seed_provider_enablement().await;
     runtime_core.seed_checkpoint_enablement().await;
+    // Boot the wakeup scheduler. Rehydrates pending `scheduled_wakeups`
+    // rows from persistence and arms an in-memory tokio timer for each
+    // — past-due rows (daemon was down at their `fire_at`) fire on the
+    // first scheduler tick. Must come after `install_self_ref` since
+    // the fire handler holds a `Weak<RuntimeCore>`.
+    runtime_core.init_wakeup_scheduler().await;
 
     Ok(InProcessCore {
         runtime_core,

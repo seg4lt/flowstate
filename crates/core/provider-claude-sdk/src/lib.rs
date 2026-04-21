@@ -1187,6 +1187,17 @@ impl ProviderAdapter for ClaudeSdkAdapter {
         Ok(())
     }
 
+    async fn invalidate_process(&self, session: &SessionDetail) -> Result<(), String> {
+        // Reaps the bridge subprocess — `native_thread_id` stays in
+        // persistence, so the next turn respawns with a fresh Claude
+        // Code CLI that resumes the same conversation. Same mechanics
+        // as `end_session` above; kept as a separate method because
+        // runtime-core only wants the subprocess reap, not full
+        // session teardown (catalog refresh, etc.).
+        self.invalidate_session(&session.summary.session_id).await;
+        Ok(())
+    }
+
     async fn get_context_usage(
         &self,
         session: &SessionDetail,

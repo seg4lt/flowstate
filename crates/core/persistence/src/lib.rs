@@ -61,6 +61,80 @@ pub struct CheckpointRow {
     pub manifest_path: String,
 }
 
+/// Row decoder for `scheduled_wakeups`. Extracted as a free function
+/// so both `list_pending_wakeups` and the per-id accessor share the
+/// same column order without duplicating the SELECT shape.
+fn wakeup_row_from_sqlite(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledWakeupRow> {
+    let status_str: String = r.get(6)?;
+    let status =
+        ScheduledWakeupStatus::from_str(&status_str).unwrap_or(ScheduledWakeupStatus::Pending);
+    Ok(ScheduledWakeupRow {
+        wakeup_id: r.get(0)?,
+        session_id: r.get(1)?,
+        origin_turn_id: r.get(2)?,
+        fire_at_unix: r.get(3)?,
+        prompt: r.get(4)?,
+        reason: r.get(5)?,
+        status,
+        created_at_unix: r.get(7)?,
+    })
+}
+
+/// A row in the `scheduled_wakeups` table. The runtime's wakeup
+/// scheduler OBSERVES Claude Code's native `ScheduleWakeup` tool call
+/// (emitted by the model via the Claude Code harness inside the SDK
+/// subprocess) and writes a row here so it can fire the follow-up
+/// turn even after flowstate's `ProcessCache` reaps the bridge (which
+/// takes Claude Code's internal timer down with it).
+///
+/// Field names match Claude Code's tool spec (`delaySeconds`,
+/// `prompt`, `reason`) so the observer can decode the tool args
+/// verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledWakeupRow {
+    pub wakeup_id: String,
+    pub session_id: String,
+    pub origin_turn_id: Option<String>,
+    pub fire_at_unix: i64,
+    /// The `prompt` argument the agent passed to `ScheduleWakeup`.
+    /// When the timer fires, the runtime injects this as a user turn
+    /// on `session_id` — the respawned bridge resumes Claude Code via
+    /// `native_thread_id`, so the model sees it as a normal
+    /// continuation of its prior conversation.
+    pub prompt: String,
+    pub reason: Option<String>,
+    pub status: ScheduledWakeupStatus,
+    pub created_at_unix: i64,
+}
+
+/// State machine for [`ScheduledWakeupRow::status`]. Stored as a
+/// lowercase string in SQLite (`pending` | `fired` | `cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledWakeupStatus {
+    Pending,
+    Fired,
+    Cancelled,
+}
+
+impl ScheduledWakeupStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ScheduledWakeupStatus::Pending => "pending",
+            ScheduledWakeupStatus::Fired => "fired",
+            ScheduledWakeupStatus::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "pending" => Some(ScheduledWakeupStatus::Pending),
+            "fired" => Some(ScheduledWakeupStatus::Fired),
+            "cancelled" => Some(ScheduledWakeupStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
 /// A row in the `file_state` cache. One per canonicalized absolute path
 /// we've ever captured; updated in place when a file's mtime/size moves.
 #[derive(Debug, Clone)]
@@ -94,6 +168,24 @@ impl PersistenceService {
         };
         service.migrate()?;
         Ok(service)
+    }
+
+    /// Test-only helper: insert a skeletal `sessions` row so cross-crate
+    /// tests can exercise code paths that join against it (e.g. the
+    /// wakeup scheduler's FK against `scheduled_wakeups.session_id`)
+    /// without reaching for the full `upsert_session` payload surface.
+    #[doc(hidden)]
+    pub fn insert_session_row_for_tests(&self, session_id: &str) -> Result<()> {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO sessions
+                    (session_id, provider, status, created_at, updated_at, turn_count)
+                 VALUES (?1, 'claude', 'idle', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z', 0)",
+                params![session_id],
+            )
+            .context("failed to insert test session row")?;
+        Ok(())
     }
 
     pub fn in_memory() -> Result<Self> {
@@ -795,6 +887,123 @@ impl PersistenceService {
         }
     }
 
+    // ---------- scheduled_wakeups -----------------------------------
+
+    /// Insert a freshly-observed pending wakeup. Fails with UNIQUE on
+    /// `wakeup_id` collisions — callers generate a fresh UUID per
+    /// observed tool call (we key on flowstate's own id, not Claude
+    /// Code's tool-call id, so we retain ownership even if the tool
+    /// call id scheme changes).
+    pub async fn insert_wakeup(&self, row: ScheduledWakeupRow) -> Result<()> {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO scheduled_wakeups
+                    (wakeup_id, session_id, origin_turn_id, fire_at_unix, prompt,
+                     reason, status, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    row.wakeup_id,
+                    row.session_id,
+                    row.origin_turn_id,
+                    row.fire_at_unix,
+                    row.prompt,
+                    row.reason,
+                    row.status.as_str(),
+                    row.created_at_unix,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "insert wakeup row (session={}, wakeup={})",
+                    row.session_id, row.wakeup_id
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Every `Pending` wakeup, oldest-first by fire time. Used at
+    /// daemon startup to rehydrate the scheduler's in-memory heap.
+    pub async fn list_pending_wakeups(&self) -> Vec<ScheduledWakeupRow> {
+        let connection = self.connection.lock();
+        let mut statement = match connection.prepare(
+            "SELECT wakeup_id, session_id, origin_turn_id, fire_at_unix, prompt,
+                    reason, status, created_at_unix
+             FROM scheduled_wakeups
+             WHERE status = 'pending'
+             ORDER BY fire_at_unix ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map([], wakeup_row_from_sqlite);
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Count pending wakeups for one session. Used by the observer
+    /// to enforce a per-session cap so a runaway agent can't queue
+    /// unlimited wakeups.
+    pub async fn count_pending_wakeups_for_session(&self, session_id: &str) -> i64 {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_wakeups
+                 WHERE session_id = ?1 AND status = 'pending'",
+                params![session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Flip a wakeup from `pending` to `fired`. Returns `true` iff a
+    /// row was actually updated — the scheduler uses this to
+    /// distinguish "fired for real" from "raced with a cancel" and
+    /// skip the turn dispatch in the latter case.
+    pub async fn mark_wakeup_fired(&self, wakeup_id: &str) -> bool {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "UPDATE scheduled_wakeups SET status = 'fired'
+                 WHERE wakeup_id = ?1 AND status = 'pending'",
+                params![wakeup_id],
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    /// Cancel every pending wakeup for a session. Returns the cancelled
+    /// ids so callers can emit matching events. Invoked when a session
+    /// is archived or deleted.
+    pub async fn cancel_wakeups_for_session(&self, session_id: &str) -> Vec<String> {
+        let connection = self.connection.lock();
+        let ids: Vec<String> = {
+            let mut statement = match connection.prepare(
+                "SELECT wakeup_id FROM scheduled_wakeups
+                 WHERE session_id = ?1 AND status = 'pending'",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows = statement.query_map(params![session_id], |r| r.get::<_, String>(0));
+            match rows {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let _ = connection.execute(
+            "UPDATE scheduled_wakeups SET status = 'cancelled'
+             WHERE session_id = ?1 AND status = 'pending'",
+            params![session_id],
+        );
+        ids
+    }
+
     pub async fn get_file_state(&self, abs_path: &str) -> Option<FileStateRow> {
         let connection = self.connection.lock();
         connection
@@ -1278,6 +1487,36 @@ impl PersistenceService {
                 value      TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            -- Observed scheduled wakeups. Populated when the runtime
+            -- sees Claude Code's native `ScheduleWakeup` tool call
+            -- land in a turn's stream. Runtime-read (not display): on
+            -- daemon startup the scheduler rehydrates every `pending`
+            -- row and arms a tokio timer. On fire, the scheduler
+            -- injects `prompt` as a user turn on `session_id` —
+            -- respawning the bridge as needed so Claude Code resumes
+            -- via `native_thread_id` and sees it as a normal turn.
+            --
+            -- We persist because our timer (not Claude Code's) is the
+            -- one that has to survive daemon + bridge lifecycle
+            -- events, including the `ProcessCache` idle-kill that
+            -- takes Claude Code's in-CLI timer down with it. Cascade
+            -- on session delete so archival can't leave dangling
+            -- timers.
+            CREATE TABLE IF NOT EXISTS scheduled_wakeups (
+                wakeup_id       TEXT PRIMARY KEY,
+                session_id      TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                origin_turn_id  TEXT,
+                fire_at_unix    INTEGER NOT NULL,
+                prompt          TEXT NOT NULL,
+                reason          TEXT,
+                status          TEXT NOT NULL,
+                created_at_unix INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wakeups_pending_fire_at
+                ON scheduled_wakeups(status, fire_at_unix);
+            CREATE INDEX IF NOT EXISTS idx_wakeups_session
+                ON scheduled_wakeups(session_id);
             ",
             )
             .context("failed to run sqlite migrations")?;
@@ -1831,5 +2070,95 @@ mod tests {
             roundtripped.features,
             zenui_provider_api::features_for_kind(ProviderKind::Claude)
         );
+    }
+
+    fn sample_wakeup(wakeup_id: &str, session_id: &str, fire_at: i64) -> ScheduledWakeupRow {
+        ScheduledWakeupRow {
+            wakeup_id: wakeup_id.to_string(),
+            session_id: session_id.to_string(),
+            origin_turn_id: Some("turn-1".to_string()),
+            fire_at_unix: fire_at,
+            prompt: "continue polling the build".to_string(),
+            reason: Some("loop probe".to_string()),
+            status: ScheduledWakeupStatus::Pending,
+            created_at_unix: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_list_pending_wakeups_round_trip() {
+        let service = PersistenceService::in_memory().expect("in-memory service");
+        service.insert_session_row_for_tests("s-1").unwrap();
+        service.insert_session_row_for_tests("s-2").unwrap();
+
+        service
+            .insert_wakeup(sample_wakeup("w-2", "s-1", 2_000))
+            .await
+            .expect("insert w-2");
+        service
+            .insert_wakeup(sample_wakeup("w-1", "s-1", 1_000))
+            .await
+            .expect("insert w-1");
+        service
+            .insert_wakeup(sample_wakeup("w-3", "s-2", 3_000))
+            .await
+            .expect("insert w-3");
+
+        let pending = service.list_pending_wakeups().await;
+        assert_eq!(
+            pending.iter().map(|r| r.wakeup_id.as_str()).collect::<Vec<_>>(),
+            vec!["w-1", "w-2", "w-3"],
+            "pending must be ordered by fire_at_unix ASC"
+        );
+        assert_eq!(
+            service.count_pending_wakeups_for_session("s-1").await,
+            2
+        );
+        assert_eq!(
+            service.count_pending_wakeups_for_session("s-2").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_fired_is_idempotent_and_gates_on_pending() {
+        let service = PersistenceService::in_memory().expect("in-memory service");
+        service.insert_session_row_for_tests("s-1").unwrap();
+        service
+            .insert_wakeup(sample_wakeup("w-1", "s-1", 1_000))
+            .await
+            .expect("insert");
+
+        assert!(service.mark_wakeup_fired("w-1").await, "first fire wins");
+        assert!(
+            !service.mark_wakeup_fired("w-1").await,
+            "second fire is a no-op"
+        );
+        assert!(
+            service.list_pending_wakeups().await.is_empty(),
+            "fired row leaves pending set"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_wakeups_for_session_returns_affected_ids() {
+        let service = PersistenceService::in_memory().expect("in-memory service");
+        service.insert_session_row_for_tests("s-1").unwrap();
+        for (i, id) in ["w-a", "w-b", "w-c"].iter().enumerate() {
+            service
+                .insert_wakeup(sample_wakeup(id, "s-1", 1_000 + i as i64))
+                .await
+                .expect("insert");
+        }
+        assert!(service.mark_wakeup_fired("w-a").await);
+
+        let mut cancelled = service.cancel_wakeups_for_session("s-1").await;
+        cancelled.sort();
+        assert_eq!(cancelled, vec!["w-b".to_string(), "w-c".to_string()]);
+        assert_eq!(
+            service.count_pending_wakeups_for_session("s-1").await,
+            0
+        );
+        assert!(service.cancel_wakeups_for_session("s-1").await.is_empty());
     }
 }

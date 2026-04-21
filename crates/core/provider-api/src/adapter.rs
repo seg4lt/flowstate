@@ -110,6 +110,24 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Reap the session's live provider subprocess without tearing
+    /// down conversation state. The next turn respawns it and the
+    /// model resumes (for Claude SDK, via `native_thread_id`).
+    ///
+    /// Runtime-core calls this after a turn whose stream surfaced a
+    /// Claude Code `ScheduleWakeup` tool call, to prevent the CLI's
+    /// in-process timer from firing autonomous output into a pipe
+    /// nobody is reading (flowstate's bridge-stdout consumer only
+    /// runs during an active turn). After invalidation, flowstate's
+    /// own persisted wakeup scheduler owns the fire path; the bridge
+    /// respawns lazily on the fired user turn.
+    ///
+    /// Default is a no-op for adapters whose backends don't hold a
+    /// per-session subprocess with in-memory timers.
+    async fn invalidate_process(&self, _session: &SessionDetail) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Return a per-category breakdown of what's currently filling
     /// the session's context window. Powers the "Context breakdown"
     /// popover on the session's token counter.
