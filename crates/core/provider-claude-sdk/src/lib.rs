@@ -454,8 +454,12 @@ impl ClaudeSdkAdapter {
         write_request(&process.stdin, &request).await?;
 
         let stdin = process.stdin.clone();
-        let (perm_tx, mut perm_rx) =
-            mpsc::unbounded_channel::<(String, PermissionDecision, Option<PermissionMode>)>();
+        let (perm_tx, mut perm_rx) = mpsc::unbounded_channel::<(
+            String,
+            PermissionDecision,
+            Option<PermissionMode>,
+            Option<String>,
+        )>();
         let (q_tx, mut q_rx) = mpsc::unbounded_channel::<(String, QuestionOutcome)>();
         // Single-item channel the writer task uses to abort the main
         // read loop when it fails to forward a permission / question
@@ -472,12 +476,13 @@ impl ClaudeSdkAdapter {
         let writer_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    Some((request_id, decision, mode_override)) = perm_rx.recv() => {
+                    Some((request_id, decision, mode_override, deny_reason)) = perm_rx.recv() => {
                         let req = BridgeRequest::AnswerPermission {
                             request_id: request_id.clone(),
                             decision: permission_decision_to_str(decision).to_string(),
                             permission_mode: mode_override
                                 .map(|m| permission_mode_to_str(m).to_string()),
+                            reason: deny_reason,
                         };
                         if let Err(e) = write_request(&stdin_for_writer, &req).await {
                             let msg = format!(
@@ -635,16 +640,22 @@ impl ClaudeSdkAdapter {
                             let perm_tx = perm_tx.clone();
                             let req_id_for_writer = request_id;
                             tokio::spawn(async move {
-                                let (decision, mode_override) = events_clone
+                                let (decision, mode_override, deny_reason) = events_clone
                                     .request_permission(tool_name, input, suggested)
                                     .await;
                                 tracing::info!(
                                     bridge_request_id = %req_id_for_writer,
                                     ?decision,
                                     has_mode_override = mode_override.is_some(),
+                                    has_deny_reason = deny_reason.is_some(),
                                     "claude-sdk adapter: forwarding permission answer to writer"
                                 );
-                                let _ = perm_tx.send((req_id_for_writer, decision, mode_override));
+                                let _ = perm_tx.send((
+                                    req_id_for_writer,
+                                    decision,
+                                    mode_override,
+                                    deny_reason,
+                                ));
                             });
                         }
                         "user_question" => {

@@ -6,12 +6,17 @@ interface PermissionPromptProps {
   toolName: string;
   input: unknown;
   /** Called when the user approves or denies the request. The optional
-   *  modeOverride is set by the plan-exit and plan-enter flows and is
+   *  `modeOverride` is set by the plan-exit and plan-enter flows and is
    *  bundled into the daemon's answer_permission so the SDK applies the
-   *  mode change as part of accepting the tool call. */
+   *  mode change as part of accepting the tool call. The optional
+   *  `feedback` is set by plan-exit "Send feedback" and is threaded to
+   *  the Claude SDK as the `message` field of `{behavior:'deny', message}`
+   *  so the model sees it as the tool-denial reason and can iterate on
+   *  the plan within the same turn. */
   onDecision: (
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
+    feedback?: string,
   ) => void;
   /** Total number of queued prompts including this one. When the SDK
    *  fires parallel canUseTool callbacks (e.g. three Grep calls in one
@@ -131,9 +136,18 @@ function PlanExitPrompt({
   onDecision: (
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
+    feedback?: string,
   ) => void;
 }) {
   const [pending, setPending] = React.useState(false);
+  // Free-form feedback surfaced to the model on deny. Sending it
+  // resolves the pending canUseTool with `{behavior:'deny', message}`,
+  // which the SDK passes to the model as the synthetic tool_result —
+  // so the user can steer a plan without restarting the turn. Empty
+  // textarea keeps the original "Reject plan" behavior intact.
+  const [feedback, setFeedback] = React.useState("");
+  const trimmedFeedback = feedback.trim();
+  const hasFeedback = trimmedFeedback.length > 0;
 
   function approveWith(mode: PermissionMode) {
     if (pending) return;
@@ -151,6 +165,12 @@ function PlanExitPrompt({
     onDecision("allow", mode);
   }
 
+  function denyWithFeedback() {
+    if (pending) return;
+    setPending(true);
+    onDecision("deny", undefined, hasFeedback ? trimmedFeedback : undefined);
+  }
+
   return (
     <div className="space-y-3">
       <div className="text-sm font-medium">Plan ready for review</div>
@@ -160,6 +180,17 @@ function PlanExitPrompt({
       <div className="max-h-80 overflow-auto">
         {renderPlanBody(input) ?? renderToolArgs("ExitPlanMode", input)}
       </div>
+      {/* Optional feedback textarea. Typing here flips the reject button
+          from "Reject plan" (canned denial) to "Send feedback" (denial
+          with a message the model iterates on within the same turn). */}
+      <textarea
+        value={feedback}
+        onChange={(e) => setFeedback(e.target.value)}
+        disabled={pending}
+        rows={3}
+        placeholder="Optional: steer the plan — e.g. reuse `bar()` from utils.ts instead of writing new code"
+        className="w-full resize-y rounded-md border border-amber-500/30 bg-background/60 px-2 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:border-amber-500/60 focus:outline-none focus:ring-1 focus:ring-amber-500/40 disabled:opacity-50"
+      />
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">Approve and switch to:</span>
         {PLAN_EXIT_MODES.map((opt) => (
@@ -177,10 +208,10 @@ function PlanExitPrompt({
         <button
           type="button"
           disabled={pending}
-          onClick={() => onDecision("deny")}
+          onClick={denyWithFeedback}
           className="ml-auto rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
         >
-          Reject plan
+          {hasFeedback ? "Send feedback" : "Reject plan"}
         </button>
       </div>
       <p className="text-[11px] text-muted-foreground">

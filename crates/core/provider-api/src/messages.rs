@@ -423,6 +423,15 @@ pub enum ClientMessage {
         /// model continue executing within the same turn.
         #[serde(default)]
         permission_mode_override: Option<PermissionMode>,
+        /// Optional free-form feedback surfaced to the model when the
+        /// user denies a tool call. Threaded through to the Claude SDK
+        /// adapter as the `message` field of `{behavior:'deny', message}`
+        /// on the `PermissionResult`, which the model sees as the
+        /// tool_result denial reason and can iterate on within the same
+        /// turn. Primarily intended for `ExitPlanMode` rejections where
+        /// the user wants to steer the plan without restarting the turn.
+        #[serde(default)]
+        reason: Option<String>,
     },
     AnswerQuestion {
         session_id: String,

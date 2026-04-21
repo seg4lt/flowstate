@@ -1650,6 +1650,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   async function handlePermissionDecision(
     decision: PermissionDecision,
     modeOverride?: PermissionMode,
+    feedback?: string,
   ) {
     // Always act on the head of the queue — that's what the user
     // just clicked on. Pop it before the await so a rapid double
@@ -1668,6 +1669,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       request_id: head.requestId,
       decision,
       ...(modeOverride ? { permission_mode_override: modeOverride } : {}),
+      // `reason` rides along with a deny to surface user feedback to
+      // the model as the synthetic tool_result message. Plan-exit
+      // "Send feedback" is the only caller that sets it today.
+      ...(feedback ? { reason: feedback } : {}),
     });
     if (modeOverride) {
       // Mirror the chosen mode into local state so the toolbar dropdown
