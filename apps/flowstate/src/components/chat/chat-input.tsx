@@ -27,6 +27,14 @@ import { MentionPopup } from "./mention-popup";
 import { InFluxAttachmentChip } from "./attachment-chip";
 import { FileMentionChip } from "./file-mention-chip";
 import { ImageLightbox, type LightboxSource } from "./image-lightbox";
+import { CommentChip } from "./comment-chip";
+import {
+  clearComments,
+  removeComment,
+  serializeCommentsAsPrefix,
+  updateComment,
+  useSessionComments,
+} from "@/lib/diff-comments-store";
 
 interface ChatInputProps {
   onSend: (input: string, images: AttachedImage[]) => void;
@@ -91,6 +99,11 @@ interface ChatInputProps {
    *  gitignore-aware walker) and is cached forever via
    *  `projectFilesQueryOptions`. */
   projectPath?: string | null;
+  /** Active session id. Keys the pending-comments store so the chip
+   *  row above the textarea reflects this session's review comments.
+   *  When null (new unsaved thread) no comments are shown and the
+   *  send path behaves exactly as before. */
+  sessionId: string | null;
 }
 
 export interface QueuedMessage {
@@ -171,7 +184,13 @@ export function ChatInput({
   promptSuggestion,
   onPromptSuggestionDismissed,
   projectPath,
+  sessionId,
 }: ChatInputProps) {
+  // Pending review comments for this session — rendered as chips
+  // above the textarea and serialized into the outgoing message on
+  // send. Populated by DiffCommentOverlay when the user adds a
+  // comment via the diff panel or search multibuffer.
+  const comments = useSessionComments(sessionId);
   const [value, setValueRaw] = React.useState(initialValue);
   // Notify the parent of every draft change so it can persist the text
   // across component remounts (tab switches). The ref avoids stale
@@ -580,7 +599,13 @@ export function ChatInput({
   function handleSubmit() {
     if (providerDisabled || archived) return;
     const trimmed = value.trim();
-    if (!trimmed && attachedImages.length === 0) return;
+    // Review comments can stand in for a non-empty message too — a user
+    // might queue a few "please rename this" notes and hit Send with no
+    // free-form text. Comments are snapshotted from the store (not
+    // state) so use the closed-over `comments` value, then clear the
+    // store once the composed text has been committed to a queue entry
+    // or direct send — mirrors how attachedImages is snapshotted.
+    if (!trimmed && attachedImages.length === 0 && comments.length === 0) return;
     // Snapshot images then clear state — we hand the snapshot off to
     // either the queue or onSend, so the chip row clears immediately.
     const imagesToSend = attachedImages;
@@ -592,8 +617,27 @@ export function ChatInput({
     // neutral default so the user's "just analyze this screenshot"
     // intent goes through. Normalize here (before the queue/direct
     // branch) so drained messages get the same treatment.
-    const textToSend =
-      !trimmed && imagesToSend.length > 0 ? "Analyze image" : trimmed;
+    const baseText =
+      !trimmed && imagesToSend.length > 0 && comments.length === 0
+        ? "Analyze image"
+        : trimmed;
+    // Prepend the serialized review-comments block so queued/direct
+    // paths both carry the review context. serializeCommentsAsPrefix
+    // returns "" when the list is empty, so no-comments sends are
+    // byte-identical to the pre-feature behavior.
+    const prefix = serializeCommentsAsPrefix(comments);
+    const textToSend = prefix
+      ? baseText
+        ? `${prefix}\n\n${baseText}`
+        : prefix
+      : baseText;
+    // Clear the store now that the text has been materialized —
+    // whether it goes to the queue or straight through, the chips
+    // should disappear at the same moment the user hit Send. Scoped
+    // by sessionId so comments for other threads are untouched.
+    if (sessionId && comments.length > 0) {
+      clearComments(sessionId);
+    }
     // While a turn is running OR earlier messages are still queued,
     // append this one to the queue. Clearing the textarea immediately
     // mirrors what the user just did ("send"), and the queued chip
@@ -783,7 +827,11 @@ export function ChatInput({
 
   const hasText = value.trim().length > 0;
   const hasAttachments = attachedImages.length > 0;
-  const hasContent = hasText || hasAttachments;
+  // Comments behave like attachments for the send-affordance: they
+  // make the Send button active and suppress the Stop-while-idle
+  // swap, because the outgoing message would be non-empty (the
+  // serialized comments prefix) even when the textarea is empty.
+  const hasContent = hasText || hasAttachments || comments.length > 0;
   // Stop button shows whenever the turn is running and the user isn't
   // mid-compose. Queued chips are intentionally NOT a precondition --
   // interrupting only stops the current turn and leaves the queue
@@ -865,7 +913,9 @@ export function ChatInput({
       )}
       <div className="border-t border-border px-3 pb-2 pt-3">
         <div>
-          {(attachedImages.length > 0 || attachedFiles.length > 0) && (
+          {(attachedImages.length > 0 ||
+            attachedFiles.length > 0 ||
+            comments.length > 0) && (
             <div className="mb-2 flex flex-wrap gap-1">
               {attachedImages.map((img) => (
                 <InFluxAttachmentChip
@@ -884,6 +934,19 @@ export function ChatInput({
                   onRemove={() => removeAttachedFile(p)}
                 />
               ))}
+              {/* Review-comment chips seeded by DiffCommentOverlay.
+                  Update/remove are scoped to sessionId so tab-switch
+                  clean-up is implicit: chips vanish when the
+                  composer re-keys onto a different session. */}
+              {sessionId &&
+                comments.map((c) => (
+                  <CommentChip
+                    key={c.id}
+                    comment={c}
+                    onUpdate={(text) => updateComment(sessionId, c.id, text)}
+                    onRemove={() => removeComment(sessionId, c.id)}
+                  />
+                ))}
             </div>
           )}
           <div className="relative flex items-end gap-2">

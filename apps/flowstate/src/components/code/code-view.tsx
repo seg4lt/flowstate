@@ -31,6 +31,7 @@ import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
 import { TabBar } from "./tab-bar";
 import { EditorPanes } from "./editor-panes";
+import { DiffCommentOverlay } from "@/components/chat/diff-comment-overlay";
 import {
   useEditorTabs,
   type PaneIndex,
@@ -781,6 +782,7 @@ export function CodeView(props: CodeViewProps) {
                   tabs.openFile(p);
                   setMultibufferOverride(false);
                 }}
+                sessionId={sessionId ?? null}
               />
             ) : (
               <EditorPanes
@@ -809,6 +811,7 @@ export function CodeView(props: CodeViewProps) {
                     onDropTab={(fromPane, path) => {
                       if (fromPane !== 0) tabs.moveTab(fromPane, 0, path);
                     }}
+                    sessionId={sessionId ?? null}
                   />
                 }
                 second={
@@ -832,6 +835,7 @@ export function CodeView(props: CodeViewProps) {
                       onDropTab={(fromPane, path) => {
                         if (fromPane !== 1) tabs.moveTab(fromPane, 1, path);
                       }}
+                      sessionId={sessionId ?? null}
                     />
                   ) : undefined
                 }
@@ -1097,6 +1101,9 @@ interface TabPaneViewProps {
   onSplitHorizontal?: () => void;
   onSplitVertical?: () => void;
   onDropTab: (fromPane: PaneIndex, path: string) => void;
+  /** Forwarded to DiffCommentOverlay so hover "+" works on the open
+   *  file viewer. Null disables the overlay (passthrough). */
+  sessionId: string | null;
 }
 
 function TabPaneView({
@@ -1115,6 +1122,7 @@ function TabPaneView({
   onSplitHorizontal,
   onSplitVertical,
   onDropTab,
+  sessionId,
 }: TabPaneViewProps) {
   const activePath = pane.activePath;
   const loadedFile =
@@ -1150,6 +1158,7 @@ function TabPaneView({
           error={error}
           filesError={filesError}
           hasProject={hasProject}
+          sessionId={sessionId}
         />
       </div>
     </div>
@@ -1163,6 +1172,9 @@ interface CodeViewBodyProps {
   error: string | null;
   filesError: string | null;
   hasProject: boolean;
+  /** Forwarded to DiffCommentOverlay — hover "+" only works when we
+   *  have a chat session to attach comments to. */
+  sessionId: string | null;
 }
 
 const CodeViewBody = React.memo(function CodeViewBody({
@@ -1172,6 +1184,7 @@ const CodeViewBody = React.memo(function CodeViewBody({
   error,
   filesError,
   hasProject,
+  sessionId,
 }: CodeViewBodyProps) {
   const { resolvedTheme } = useTheme();
   if (!hasProject) {
@@ -1217,23 +1230,37 @@ const CodeViewBody = React.memo(function CodeViewBody({
       </div>
     );
   }
+  // Wrap the viewer with the comment overlay so hovering a line
+  // surfaces the gutter "+" just like on the diff panel and the
+  // search multibuffer. `data-code-path` is what
+  // DiffCommentOverlay walks up to find the file path — it sits on
+  // the outermost wrapper so the shadow-DOM ancestor walk always
+  // reaches it regardless of pierre's internal layout.
   return (
-    <Virtualizer className="h-full overflow-auto">
-      <PierreFile
-        key={loadedFile.path}
-        file={{
-          name: loadedFile.path,
-          contents: loadedFile.contents,
-          cacheKey: loadedFile.cacheKey,
-        }}
-        options={{
-          theme: { dark: "pierre-dark", light: "pierre-light" },
-          themeType: resolvedTheme,
-          overflow: "scroll",
-          tokenizeMaxLineLength: 5_000,
-        }}
-      />
-    </Virtualizer>
+    <div className="h-full" data-code-path={loadedFile.path}>
+      <DiffCommentOverlay
+        sessionId={sessionId}
+        surface="code"
+        pathAttr="data-code-path"
+      >
+        <Virtualizer className="h-full overflow-auto">
+          <PierreFile
+            key={loadedFile.path}
+            file={{
+              name: loadedFile.path,
+              contents: loadedFile.contents,
+              cacheKey: loadedFile.cacheKey,
+            }}
+            options={{
+              theme: { dark: "pierre-dark", light: "pierre-light" },
+              themeType: resolvedTheme,
+              overflow: "scroll",
+              tokenizeMaxLineLength: 5_000,
+            }}
+          />
+        </Virtualizer>
+      </DiffCommentOverlay>
+    </div>
   );
 });
 
