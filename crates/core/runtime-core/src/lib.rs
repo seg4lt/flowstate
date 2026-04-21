@@ -676,6 +676,24 @@ impl RuntimeCore {
             },
         };
         self.publish(RuntimeEvent::ProviderHealthUpdated { status });
+
+        // Kick a fresh probe on enable. Bootstrap only probes
+        // providers whose enablement flag is already `true`, so a
+        // provider that ships disabled-by-default (or was turned off
+        // previously and never probed) has no cached health to show
+        // the moment the user flips it on. Without this the UI would
+        // be stuck on the synthesised `"No health check yet"` status
+        // until the next daemon restart.
+        //
+        // `spawn_health_check` dedupes via `in_flight_health_checks`
+        // so a fast toggle off→on→off can't stack probes, and it
+        // re-checks enablement inside itself — if the user has
+        // already toggled back off by the time the task runs it will
+        // bail. The matching model refresh is gated the same way.
+        if enabled {
+            self.spawn_health_check(kind);
+            self.spawn_model_refresh(kind);
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<RuntimeEvent> {

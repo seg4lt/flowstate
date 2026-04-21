@@ -375,6 +375,7 @@ function DefaultModelRow() {
     codex: null,
     github_copilot: null,
     github_copilot_cli: null,
+    opencode: null,
   });
   const [loaded, setLoaded] = React.useState(false);
 

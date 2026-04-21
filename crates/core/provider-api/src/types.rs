@@ -16,6 +16,12 @@ pub enum ProviderKind {
     ClaudeCli,
     #[serde(rename = "github_copilot_cli")]
     GitHubCopilotCli,
+    /// The `opencode` CLI (https://opencode.ai) — driven via its
+    /// headless HTTP server (`opencode serve`) with an SSE event
+    /// stream. The wire tag is the bare name `"opencode"`; the
+    /// default snake-case rule would emit `"open_code"`.
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 impl ProviderKind {
@@ -26,6 +32,7 @@ impl ProviderKind {
         ProviderKind::GitHubCopilot,
         ProviderKind::ClaudeCli,
         ProviderKind::GitHubCopilotCli,
+        ProviderKind::OpenCode,
     ];
 
     pub fn label(self) -> &'static str {
@@ -35,6 +42,7 @@ impl ProviderKind {
             Self::GitHubCopilot => "GitHub Copilot",
             Self::ClaudeCli => "Claude (CLI)",
             Self::GitHubCopilotCli => "GitHub Copilot (CLI)",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -49,6 +57,7 @@ impl ProviderKind {
             Self::GitHubCopilot => "github_copilot",
             Self::ClaudeCli => "claude_cli",
             Self::GitHubCopilotCli => "github_copilot_cli",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -62,6 +71,7 @@ impl ProviderKind {
             "github_copilot" => Self::GitHubCopilot,
             "claude_cli" => Self::ClaudeCli,
             "github_copilot_cli" => Self::GitHubCopilotCli,
+            "opencode" => Self::OpenCode,
             _ => return None,
         })
     }
@@ -616,6 +626,16 @@ pub struct ProviderModel {
     /// support it).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub supports_auto_mode: bool,
+    /// Marks a model that the provider bills at zero cost (input and
+    /// output). Populated today by the opencode adapter by reading the
+    /// `cost` object on each model entry from
+    /// `GET /config/providers`; other adapters leave this `false`.
+    /// The frontend renders a small "Free" pill next to these entries
+    /// in the model picker so users can spot them at a glance in long
+    /// catalogs (opencode's flattened provider/model list routinely
+    /// exceeds 30 entries).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_free: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -784,9 +804,20 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
         // Claude CLI, GitHub Copilot (SaaS and CLI) don't expose any
         // of the flagged capabilities today — the UI hides the
         // corresponding affordances when selected.
-        ProviderKind::ClaudeCli | ProviderKind::GitHubCopilot | ProviderKind::GitHubCopilotCli => {
-            ProviderFeatures::default()
-        }
+        ProviderKind::ClaudeCli
+        | ProviderKind::GitHubCopilot
+        | ProviderKind::GitHubCopilotCli => ProviderFeatures::default(),
+
+        // Opencode accepts a `variant` on the prompt body which maps
+        // onto flowstate's reasoning-effort scale (low/medium/high/
+        // xhigh/max). The per-model list of supported variants is
+        // surfaced through `ProviderModel.supported_effort_levels`
+        // so the effort selector only renders for models that
+        // actually expose variants in `/config/providers`.
+        ProviderKind::OpenCode => ProviderFeatures {
+            thinking_effort: true,
+            ..ProviderFeatures::default()
+        },
     }
 }
 

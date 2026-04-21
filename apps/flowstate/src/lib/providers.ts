@@ -69,6 +69,18 @@ export const PROVIDER_META: Record<ProviderKind, ProviderMeta> = {
     defaultEnabled: false,
     slashPrefix: "/",
   },
+  opencode: {
+    label: "opencode",
+    color: "bg-orange-500",
+    hex: "#f97316",
+    order: 5,
+    // Opt-in — the adapter depends on the external `opencode`
+    // binary being on PATH. Showing it enabled by default on a
+    // fresh install would produce a warning badge in Settings for
+    // every user who hasn't installed opencode yet.
+    defaultEnabled: false,
+    slashPrefix: "/",
+  },
 };
 
 /** Provider kinds in canonical display order. Derived from

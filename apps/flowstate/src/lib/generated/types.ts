@@ -4,7 +4,7 @@
 
 export type JsonValue = unknown;
 
-export type ProviderKind = "codex" | "claude" | "github_copilot" | "claude_cli" | "github_copilot_cli";
+export type ProviderKind = "codex" | "claude" | "github_copilot" | "claude_cli" | "github_copilot_cli" | "opencode";
 
 export type ProviderStatusLevel = "ready" | "warning" | "error";
 
@@ -260,7 +260,18 @@ supportsAdaptiveThinking: boolean,
  * gate on both (provider opts in, then the active model must also
  * support it).
  */
-supportsAutoMode: boolean, };
+supportsAutoMode: boolean, 
+/**
+ * Marks a model that the provider bills at zero cost (input and
+ * output). Populated today by the opencode adapter by reading the
+ * `cost` object on each model entry from
+ * `GET /config/providers`; other adapters leave this `false`.
+ * The frontend renders a small "Free" pill next to these entries
+ * in the model picker so users can spot them at a glance in long
+ * catalogs (opencode's flattened provider/model list routinely
+ * exceeds 30 entries).
+ */
+isFree: boolean, };
 
 export type ProviderFeatures = { 
 /**
