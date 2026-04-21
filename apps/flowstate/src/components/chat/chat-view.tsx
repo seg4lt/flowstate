@@ -1264,25 +1264,38 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // clean slate, and the previous fetch resolves into its own
     // cache entry regardless.
     setLoadingOlder(false);
-    // Diff subscription gate. Opening the diff on thread A latched
-    // the hook's `enabled` and the "ever opened" ref to true — both
-    // are per-ChatView lifetime flags, but ChatView's lifetime
-    // spans every thread the user visits. Reset so thread B
-    // doesn't run `git diff` subscriptions the user never asked
-    // for.
-    setDiffSubscriptionActive(false);
-    diffPanelEverOpenedRef.current = false;
     // Resync per-thread panel open flags from the module-level maps.
     // ChatView doesn't remount on session switch, so the lazy
     // useState initializers only ran for the very first session —
     // this effect brings the mirror state into sync with the map on
     // every subsequent switch. Fullscreen is intentionally reset
     // (it's a momentary intent, not a thread preference).
-    setDiffOpenState(sessionDiffOpen.get(sessionId) ?? false);
+    const nextDiffOpen = sessionDiffOpen.get(sessionId) ?? false;
+    setDiffOpenState(nextDiffOpen);
     setContextOpenState(sessionContextOpen.get(sessionId) ?? false);
     setDiffFullscreen(false);
     setContextFullscreen(false);
-  }, [sessionId]);
+    // Diff subscription lifecycle on thread switch. Previous
+    // revision killed the subscription here ("don't run git diff
+    // subscriptions the user never asked for") but that left the
+    // streaming hook's committed `diffs` pinned to thread A's
+    // numbers — visible on thread B's action-bar badge until the
+    // user re-opened the panel. The hook now clears state on
+    // path change (see useStreamedGitDiffSummary), so a stale
+    // badge can't bleed across threads even if we do nothing here.
+    //
+    // When the user has ever opened the diff panel in this
+    // ChatView OR the target thread remembers the panel as open,
+    // kick off a fresh subscription for the new project so both
+    // the badge and (if it's open) the panel show current numbers
+    // without requiring a hover. `refreshDiffs({force:true})`
+    // bypasses the 400ms debounce since this is a one-shot gesture
+    // tied to the thread-switch intent.
+    if (diffPanelEverOpenedRef.current || nextDiffOpen) {
+      activateDiffSubscription();
+      refreshDiffs({ force: true });
+    }
+  }, [sessionId, activateDiffSubscription, refreshDiffs]);
 
   // Single stream listener for the lifetime of ChatView. It
   // *never* reads sessionId from a closure — turn updates go into
