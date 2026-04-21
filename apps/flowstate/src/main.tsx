@@ -10,6 +10,8 @@ import {
   readPoolSizeSetting,
 } from "@/lib/pierre-diffs-worker";
 import { checkForUpdate } from "@/lib/updater";
+import { HighlighterWarmup } from "@/lib/highlighter-warmup";
+import { prewarmCodeBlockHighlighter } from "@/components/chat/messages/code-block";
 import "./index.css";
 
 // Single QueryClient for the whole app. Defaults chosen for a
@@ -71,6 +73,22 @@ async function bootstrap() {
             poolSize,
           }}
           highlighterOptions={{
+            // Oniguruma via WebAssembly. Default is "shiki-js"
+            // which uses the runtime's native regex engine —
+            // great on V8 (Chrome, Node), noticeably slower on
+            // JavaScriptCore (Safari/WKWebView/Tauri) because JSC's
+            // regex JIT is less aggressive for the long alternations
+            // and lookbehinds in Shiki grammars.
+            //
+            // "shiki-wasm" compiles each grammar's regexes once into
+            // Oniguruma WASM and runs the same bytecode regardless
+            // of JS engine, giving consistent ~Chrome-class tokenize
+            // times inside WKWebView. One-time cost is ~50-100 ms
+            // per worker to instantiate the WASM module (hidden
+            // behind HighlighterWarmup below) plus ~200 KB resident
+            // per worker. On an 8-worker pool that's ~1.6 MB extra
+            // memory for a multi-hundred-ms win on real diffs.
+            preferredHighlighter: "shiki-wasm",
             // ThemesType shape covers both dark and light — the
             // per-render `themeType` (set inside DiffBody's options)
             // picks which of these to apply. The worker just needs
@@ -101,6 +119,15 @@ async function bootstrap() {
             ],
           }}
         >
+          {/*
+            Offscreen hidden PatchDiffs that force the worker pool
+            to tokenize each common language once, so the first
+            *real* diff the user opens is a cache hit instead of
+            paying ~50-200ms per-grammar onig compile inside the
+            worker. Self-unmounts after a few seconds — the cache
+            lives in the workers, not in this React subtree.
+          */}
+          <HighlighterWarmup />
           <RouterProvider router={router} />
         </WorkerPoolContextProvider>
       </QueryClientProvider>
@@ -120,3 +147,20 @@ void bootstrap();
 window.setTimeout(() => {
   void checkForUpdate();
 }, 5000);
+
+// Prewarm the main-thread Shiki singleton used by <CodeBlock>. This
+// is a separate highlighter from the worker pool's (the chat's
+// inline code blocks render on the main thread for latency, since
+// each block is small and the IPC roundtrip dominates), so it pays
+// its own cold start. Doing the work on an idle callback moves the
+// ~100-300ms first-tokenize cost off the user's first render.
+// Safe to no-op if the browser lacks requestIdleCallback.
+type IdleWindow = Window & {
+  requestIdleCallback?: (cb: () => void) => number;
+};
+const idleWindow = window as IdleWindow;
+if (typeof idleWindow.requestIdleCallback === "function") {
+  idleWindow.requestIdleCallback(() => prewarmCodeBlockHighlighter());
+} else {
+  window.setTimeout(() => prewarmCodeBlockHighlighter(), 500);
+}

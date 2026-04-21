@@ -26,6 +26,7 @@ import {
 import { projectFilesQueryOptions } from "@/lib/queries";
 import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
 import { useTheme } from "@/hooks/use-theme";
+import { hashContent } from "@/lib/content-hash";
 import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
 import { TabBar } from "./tab-bar";
@@ -410,7 +411,16 @@ export function CodeView(props: CodeViewProps) {
           fileCacheRef.current.set(fetchPath, {
             path: fetchPath,
             contents,
-            cacheKey: `${fetchPath}::${contents.length}::${Date.now()}`,
+            // Content-hashed so switching back to an already-loaded
+            // tab re-uses the @pierre/diffs LRU entry. The prior
+            // `Date.now()` suffix guaranteed a cache miss on every
+            // remount (because the key was time-based, not
+            // content-based), which is why reopening the same file
+            // felt slow even though bytes hadn't changed. djb2 over
+            // the contents is ~20 ms for a 1 MB file, amortized
+            // once per fetch, and a cache hit skips the Shiki
+            // tokenize + the whole worker roundtrip.
+            cacheKey: `${fetchPath}::${hashContent(contents)}`,
           });
           loadingPathsRef.current.delete(fetchPath);
           setFileErrors((prev) => {

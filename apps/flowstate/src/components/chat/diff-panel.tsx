@@ -6,6 +6,7 @@ import { getGitDiffFile, type GitFileContents } from "@/lib/api";
 import type { DiffStreamStatus } from "@/lib/git-diff-stream";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 import { useTheme } from "@/hooks/use-theme";
+import { hashContent } from "@/lib/content-hash";
 
 export type DiffStyle = "split" | "unified";
 
@@ -35,9 +36,25 @@ interface DiffPanelProps {
   onToggleFullscreen: () => void;
 }
 
+// Content hashes are computed once at fetch time and baked into the
+// cache entry so <DiffBody>'s `cacheKey` is content-addressed, not
+// refreshKey-scoped. This matters because `refreshKey` bumps on
+// every `turn_completed` even if the file didn't actually change —
+// scoping cacheKey by refreshKey would invalidate the @pierre/diffs
+// LRU on every turn and force re-tokenization of every visible file
+// once per turn. Hashing the contents means: same bytes → same key
+// → LRU hit → no re-tokenize. The fetch still runs (we don't know
+// if contents changed without refetching), but the expensive Shiki
+// tokenize + Myers diff are skipped when bytes are unchanged.
 type CacheEntry =
   | { kind: "loading"; refreshKey: number }
-  | { kind: "ready"; contents: GitFileContents; refreshKey: number }
+  | {
+      kind: "ready";
+      contents: GitFileContents;
+      beforeHash: string;
+      afterHash: string;
+      refreshKey: number;
+    }
   | { kind: "error"; message: string; refreshKey: number };
 
 // All-files-expanded layout with lazy mounting:
@@ -103,6 +120,13 @@ export function DiffPanel({
           cacheRef.current.set(path, {
             kind: "ready",
             contents,
+            // Hash once per fetch (not per render) so DiffBody's
+            // cacheKey derivation is a cheap string concat. If
+            // contents are unchanged since the last fetch, these
+            // hashes match the prior entry's and the
+            // @pierre/diffs LRU short-circuits tokenize.
+            beforeHash: hashContent(contents.before),
+            afterHash: hashContent(contents.after),
             refreshKey,
           });
           bumpCacheVersion();
@@ -391,24 +415,31 @@ const DiffBody = React.memo(function DiffBody({
   }
   // cacheKey is what makes the @pierre/diffs LRU actually do its
   // job — without it, `getFileResultCache` returns undefined and
-  // every mount re-tokenizes from scratch. Keying on
-  // `path::refreshKey::side` means same-content within a refresh
-  // tick shares the cache, so reopening the panel on an unchanged
-  // diff hits the cache instead of re-tokenizing. Bumping
-  // refreshKey (turn_completed, manual refresh, branch checkout)
-  // produces a new key — old entries age out via the LRU.
+  // every mount re-tokenizes from scratch.
+  //
+  // Content-hashed (not refreshKey-scoped) so the cache survives
+  // across refresh bumps whenever the underlying bytes haven't
+  // actually changed. Previous keying on `::refreshKey::` threw
+  // away every cached tokenization on every chat `turn_completed`,
+  // even for files untouched by that turn — which is exactly the
+  // "every highlight takes a second" behavior. Keying on the
+  // djb2 hash of contents means a bump that doesn't mutate file X
+  // re-uses X's prior AST and the tokenize cost disappears.
+  // Path is still in the key so two different files with
+  // identical contents (rare, but e.g. empty init.py stubs) get
+  // their own cache entries and keep their own line numbers.
   return (
     <MultiFileDiff
       key={`${path}::${style}`}
       oldFile={{
         name: path,
         contents: state.contents.before,
-        cacheKey: `${path}::${state.refreshKey}::before`,
+        cacheKey: `${path}::${state.beforeHash}::before`,
       }}
       newFile={{
         name: path,
         contents: state.contents.after,
-        cacheKey: `${path}::${state.refreshKey}::after`,
+        cacheKey: `${path}::${state.afterHash}::after`,
       }}
       options={{
         diffStyle: style,
