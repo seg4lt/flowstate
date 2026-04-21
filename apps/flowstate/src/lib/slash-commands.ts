@@ -298,7 +298,7 @@ export function resolveCommand(
 }
 
 /**
- * Return commands whose `/name` starts with the given partial input.
+ * Return commands whose name contains the given partial input.
  * Used by the autocomplete popup in ChatInput. When `commands` is
  * provided it's used as the source of truth; otherwise we fall back
  * to the hardcoded core commands.
@@ -308,14 +308,13 @@ export function getCompletions(
   commands?: SlashCommandItem[],
 ): SlashCommandItem[] {
   const source = commands ?? COMMAND_META;
-  const lower = partial.toLowerCase();
   // The popup is triggered by either `/` (slash commands + skills) or
-  // `$` (Codex skill invocations). We match against both prefix forms
-  // so Codex sessions see their `$skill` entries when the user starts
-  // typing `$`.
-  return source.filter((c) => {
-    const slashMatch = `/${c.name.toLowerCase()}`.startsWith(lower);
-    const dollarMatch = `$${c.name.toLowerCase()}`.startsWith(lower);
-    return slashMatch || dollarMatch;
-  });
+  // `$` (Codex skill invocations). Strip the leading trigger char so
+  // the user's remaining query is matched as a substring against each
+  // command's name (contains check, case-insensitive).
+  const lower = partial.toLowerCase();
+  const query =
+    lower.startsWith("/") || lower.startsWith("$") ? lower.slice(1) : lower;
+  if (query.length === 0) return [...source];
+  return source.filter((c) => c.name.toLowerCase().includes(query));
 }
