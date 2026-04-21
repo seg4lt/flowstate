@@ -39,6 +39,7 @@ use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
 use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
+use zenui_provider_opencode::OpenCodeAdapter;
 
 use std::collections::HashMap;
 
@@ -2215,6 +2216,7 @@ pub fn run() {
                     Arc::new(CodexAdapter::new(flowstate_root.clone())),
                     Arc::new(GitHubCopilotAdapter::new(flowstate_root.clone())),
                     Arc::new(GitHubCopilotCliAdapter::new(flowstate_root.clone())),
+                    Arc::new(OpenCodeAdapter::new(flowstate_root.clone())),
                 ];
 
                 let core = bootstrap_core_async(&config)

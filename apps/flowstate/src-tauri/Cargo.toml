@@ -42,6 +42,7 @@ zenui-provider-claude-cli = { path = "../../../crates/core/provider-claude-cli" 
 zenui-provider-codex = { path = "../../../crates/core/provider-codex" }
 zenui-provider-github-copilot = { path = "../../../crates/core/provider-github-copilot" }
 zenui-provider-github-copilot-cli = { path = "../../../crates/core/provider-github-copilot-cli" }
+zenui-provider-opencode = { path = "../../../crates/core/provider-opencode" }
 
 # Types used in Tauri commands
 zenui-provider-api = { path = "../../../crates/core/provider-api" }

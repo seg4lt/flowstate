@@ -1,10 +1,13 @@
+import { useState } from "react";
 import { ChevronDown, Check, Loader2 } from "lucide-react";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind } from "@/lib/types";
 
@@ -14,12 +17,19 @@ interface ModelSelectorProps {
   currentModel: string | undefined;
 }
 
+// Threshold above which the popup grows wider + shows the search
+// input prominently. Below this, the list fits at a glance and the
+// search box just adds visual noise — but it's still rendered for
+// keyboard-first users and to keep the markup consistent.
+const SEARCH_RELEVANT_MODEL_COUNT = 8;
+
 export function ModelSelector({
   sessionId,
   provider,
   currentModel,
 }: ModelSelectorProps) {
   const { state, send } = useApp();
+  const [open, setOpen] = useState(false);
   const providerStatus = state.providers.find((p) => p.kind === provider);
   const models = providerStatus?.models ?? [];
 
@@ -58,8 +68,10 @@ export function ModelSelector({
 
   const currentLabel =
     models.find((m) => m.value === currentModel)?.label ?? currentModel ?? "Default";
+  const showSearch = models.length >= SEARCH_RELEVANT_MODEL_COUNT;
 
   async function handleSelect(model: string) {
+    setOpen(false);
     await send({
       type: "update_session_model",
       session_id: sessionId,
@@ -68,8 +80,8 @@ export function ModelSelector({
   }
 
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
         <button
           type="button"
           className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-accent"
@@ -77,21 +89,60 @@ export function ModelSelector({
           {currentLabel}
           <ChevronDown className="h-3 w-3 text-muted-foreground" />
         </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-52">
-        {models.map((model) => (
-          <DropdownMenuItem
-            key={model.value}
-            onClick={() => handleSelect(model.value)}
-          >
-            {currentModel === model.value && (
-              <Check className="mr-2 h-3 w-3" />
-            )}
-            {currentModel !== model.value && <span className="mr-2 w-3" />}
-            {model.label}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
+      </PopoverTrigger>
+      {/* `p-0` and a dynamic width: small lists stay compact (min-w-56),
+          catalogs above the search threshold (e.g. opencode's flattened
+          provider/model list) expand to w-72 so long labels like
+          `"claude-opus-4-1-20250805 · Anthropic"` don't truncate. */}
+      <PopoverContent
+        align="start"
+        className={showSearch ? "w-80 p-0" : "min-w-56 p-0"}
+      >
+        <Command
+          // Match on both the label the user sees and the underlying
+          // value. cmdk's default filter is substring-based and
+          // case-insensitive; feeding both strings in via `value`
+          // makes `gpt-5` match both `"GPT-5"` and the provider/model
+          // slug form `"openai/gpt-5"`.
+          filter={(value, search) =>
+            value.toLowerCase().includes(search.toLowerCase()) ? 1 : 0
+          }
+        >
+          {showSearch ? (
+            <CommandInput placeholder="Search models…" autoFocus />
+          ) : null}
+          <CommandList>
+            <CommandEmpty>No models match.</CommandEmpty>
+            {models.map((model) => {
+              const isSelected = currentModel === model.value;
+              // The string cmdk fuzzy-matches against. Join label +
+              // value so searching for either works — the displayed
+              // label is often pretty ("Claude Sonnet 4"), while
+              // the value carries the slug ("claude-sonnet-4-0").
+              const searchValue = `${model.label} ${model.value}`;
+              return (
+                <CommandItem
+                  key={model.value}
+                  value={searchValue}
+                  onSelect={() => handleSelect(model.value)}
+                >
+                  {isSelected ? (
+                    <Check className="mr-2 h-3 w-3" />
+                  ) : (
+                    <span className="mr-2 w-3" />
+                  )}
+                  <span className="flex-1 truncate">{model.label}</span>
+                  {model.isFree ? (
+                    <span className="ml-2 shrink-0 rounded-sm border border-emerald-500/30 bg-emerald-500/10 px-1 py-px text-[9px] font-medium uppercase tracking-wide text-emerald-600 dark:text-emerald-400">
+                      Free
+                    </span>
+                  ) : null}
+                </CommandItem>
+              );
+            })}
+          </CommandList>
+        </Command>
+      </PopoverContent>
+    </Popover>
   );
 }

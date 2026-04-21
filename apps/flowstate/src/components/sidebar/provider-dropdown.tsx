@@ -9,7 +9,6 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
-  DropdownMenuSubContent,
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -18,6 +17,7 @@ import type { ProviderKind } from "@/lib/types";
 import { readDefaultModel } from "@/lib/defaults-settings";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constants";
+import { SearchableModelSubMenu } from "./searchable-model-submenu";
 
 interface ProviderDropdownProps {
   projectId?: string;
@@ -151,16 +151,10 @@ export function ProviderDropdown({
                   />
                   New {label} thread
                 </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent>
-                  {info.models.map((model) => (
-                    <DropdownMenuItem
-                      key={model.value}
-                      onClick={() => createThread(kind, model.value)}
-                    >
-                      {model.label}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuSubContent>
+                <SearchableModelSubMenu
+                  models={info.models}
+                  onSelect={(modelValue) => createThread(kind, modelValue)}
+                />
               </DropdownMenuSub>
             );
           }

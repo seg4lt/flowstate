@@ -13,6 +13,7 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { SearchableModelSubMenu } from "./searchable-model-submenu";
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind } from "@/lib/types";
 import type { GitWorktree } from "@/lib/api";
@@ -278,16 +279,10 @@ function WorktreeDropdownInner({
                   />
                   New {label} thread
                 </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent>
-                  {info.models.map((m) => (
-                    <DropdownMenuItem
-                      key={m.value}
-                      onClick={() => onPick(kind, m.value)}
-                    >
-                      {m.label}
-                    </DropdownMenuItem>
-                  ))}
-                </DropdownMenuSubContent>
+                <SearchableModelSubMenu
+                  models={info.models}
+                  onSelect={(modelValue) => onPick(kind, modelValue)}
+                />
               </DropdownMenuSub>
             );
           }
