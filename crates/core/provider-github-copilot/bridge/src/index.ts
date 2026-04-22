@@ -322,16 +322,29 @@ class CopilotBridge {
     // Skipping this entire block when any piece is missing keeps
     // the bridge forward-compatible with older Rust adapters and
     // dev builds that deliberately don't mount the loopback.
+    //
+    // No auth token — the loopback bind is the only boundary.
     const flowstateHttpBase = process.env.FLOWSTATE_HTTP_BASE;
-    const flowstateAuthToken = process.env.FLOWSTATE_AUTH_TOKEN;
     const flowstateExePath = process.env.FLOWSTATE_EXECUTABLE_PATH;
+    // `FLOWSTATE_PID` is the flowstate process id — the Rust adapter
+    // stamps it into this bridge's env (see provider-github-copilot
+    // `spawn_bridge`). Forwarding it into the MCP subprocess env is
+    // what lets the stdio proxy watchdog flowstate's liveness and
+    // self-exit on parent death (see `mcp-server`'s parent watchdog).
+    const flowstatePid = process.env.FLOWSTATE_PID;
     const mcpServers: Record<string, unknown> = {};
     if (
       flowstateSessionId &&
       flowstateHttpBase &&
-      flowstateAuthToken &&
       flowstateExePath
     ) {
+      const flowstateEnv: Record<string, string> = {
+        FLOWSTATE_SESSION_ID: flowstateSessionId,
+        FLOWSTATE_HTTP_BASE: flowstateHttpBase,
+      };
+      if (flowstatePid) {
+        flowstateEnv.FLOWSTATE_PID = flowstatePid;
+      }
       mcpServers.flowstate = {
         type: 'local',
         command: flowstateExePath,
@@ -342,11 +355,7 @@ class CopilotBridge {
           '--session-id',
           flowstateSessionId,
         ],
-        env: {
-          FLOWSTATE_AUTH_TOKEN: flowstateAuthToken,
-          FLOWSTATE_SESSION_ID: flowstateSessionId,
-          FLOWSTATE_HTTP_BASE: flowstateHttpBase,
-        },
+        env: flowstateEnv,
       };
     }
 

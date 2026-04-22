@@ -37,11 +37,11 @@ pub struct GitHubCopilotAdapter {
     /// Shared handle over the runtime's loopback HTTP transport —
     /// populated by the embedder after the HTTP listener binds. When
     /// populated, every Copilot bridge spawn receives
-    /// `FLOWSTATE_HTTP_BASE` + `FLOWSTATE_AUTH_TOKEN` +
-    /// `FLOWSTATE_EXECUTABLE_PATH` env vars; the bridge reads these
-    /// when constructing `SessionConfig.mcpServers.flowstate` so the
-    /// Copilot SDK spawns the `flowstate mcp-server` subprocess as
-    /// part of each session.
+    /// `FLOWSTATE_HTTP_BASE` + `FLOWSTATE_EXECUTABLE_PATH` env vars;
+    /// the bridge reads these when constructing
+    /// `SessionConfig.mcpServers.flowstate` so the Copilot SDK spawns
+    /// the `flowstate mcp-server` subprocess as part of each session.
+    /// No auth token — the loopback bind is the only boundary.
     orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
     sessions: Arc<zenui_provider_api::ProcessCache<CopilotBridgeProcess>>,
 }
@@ -118,15 +118,17 @@ impl GitHubCopilotAdapter {
         // HTTP is up, pass its coordinates through the bridge's env
         // so the TS side can mount the flowstate MCP server inside
         // `SessionConfig.mcpServers` for every session it creates.
-        // The env vars stay bridge-scoped (no command-line exposure)
-        // which matches the Copilot SDK's own handling of secrets.
+        // No auth token — the loopback bind is the only boundary.
         if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
             cmd.env("FLOWSTATE_HTTP_BASE", &ipc.base_url);
-            cmd.env("FLOWSTATE_AUTH_TOKEN", &ipc.auth_token);
             cmd.env(
                 "FLOWSTATE_EXECUTABLE_PATH",
                 ipc.executable_path.as_os_str(),
             );
+            // Plumb flowstate's pid so the TS bridge can forward it
+            // into the MCP subprocess env. See the `FLOWSTATE_PID`
+            // note in `crates/core/provider-api/src/mcp_config.rs`.
+            cmd.env("FLOWSTATE_PID", std::process::id().to_string());
         }
         let mut child = cmd
             .spawn()

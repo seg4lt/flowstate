@@ -218,7 +218,7 @@ impl GitHubCopilotCliAdapter {
             .as_ref()
             .and_then(|h| h.get())
             .and_then(|ipc| {
-                let cfg = flowstate_mcp_config_file(ipc, &session.summary.session_id);
+                let cfg = flowstate_mcp_config_file(&ipc, &session.summary.session_id);
                 let config_path = self
                     .working_directory
                     .join("sessions")

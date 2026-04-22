@@ -327,7 +327,7 @@ impl ClaudeCliAdapter {
         // non-fatal: the session just won't see the
         // `flowstate_spawn` / `flowstate_send_and_await` tools.
         if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
-            let cfg = flowstate_mcp_config_file(ipc, &session.summary.session_id);
+            let cfg = flowstate_mcp_config_file(&ipc, &session.summary.session_id);
             let config_path = self
                 .working_directory
                 .join("sessions")

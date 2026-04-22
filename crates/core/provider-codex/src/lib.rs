@@ -157,7 +157,7 @@ impl CodexAdapter {
         // keep working. Session-scoped (this codex process only).
         if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
             let toml_value =
-                render_flowstate_toml_override(ipc, &session.summary.session_id);
+                render_flowstate_toml_override(&ipc, &session.summary.session_id);
             cmd.arg("-c").arg(format!("mcp_servers.flowstate={toml_value}"));
         }
         let mut child = cmd
@@ -1038,11 +1038,15 @@ fn render_flowstate_toml_override(info: &OrchestrationIpcInfo, session_id: &str)
     let command = escape(&info.executable_path.to_string_lossy());
     let base = escape(&info.base_url);
     let sid = escape(session_id);
-    let tok = escape(&info.auth_token);
+    // `pid` is a simple integer — no escaping needed; TOML accepts
+    // both `"42"` (string) and `42` (integer) for a string-typed env
+    // value, but we render as a TOML string for uniformity with the
+    // other env entries.
+    let pid = escape(&std::process::id().to_string());
     format!(
         "{{ command = {command}, args = [\"mcp-server\", \"--http-base\", {base}, \
-         \"--session-id\", {sid}], env = {{ FLOWSTATE_AUTH_TOKEN = {tok}, \
-         FLOWSTATE_SESSION_ID = {sid}, FLOWSTATE_HTTP_BASE = {base} }} }}"
+         \"--session-id\", {sid}], env = {{ FLOWSTATE_SESSION_ID = {sid}, \
+         FLOWSTATE_HTTP_BASE = {base}, FLOWSTATE_PID = {pid} }} }}"
     )
 }
 
@@ -1054,7 +1058,6 @@ mod codex_mcp_tests {
     fn sample_info() -> OrchestrationIpcInfo {
         OrchestrationIpcInfo {
             base_url: "http://127.0.0.1:54321".to_string(),
-            auth_token: "tok-abc".to_string(),
             executable_path: PathBuf::from("/Applications/flowstate.app/Contents/MacOS/flowstate"),
         }
     }
@@ -1067,19 +1070,22 @@ mod codex_mcp_tests {
         assert!(out.contains("--http-base"));
         assert!(out.contains("--session-id"));
         assert!(out.contains("env = {"));
-        assert!(out.contains("FLOWSTATE_AUTH_TOKEN"));
         assert!(out.contains("FLOWSTATE_SESSION_ID"));
         assert!(out.contains("FLOWSTATE_HTTP_BASE"));
+        assert!(out.contains("FLOWSTATE_PID"));
         assert!(out.contains("sess-1"));
-        assert!(out.contains("tok-abc"));
+        // No auth token on the loopback — the bind is the boundary.
+        assert!(!out.contains("FLOWSTATE_AUTH_TOKEN"));
     }
 
     #[test]
     fn toml_override_escapes_quotes_and_backslashes() {
         let info = OrchestrationIpcInfo {
-            base_url: "http://evil.example/\"attack".to_string(),
-            auth_token: "bad\\\"token".to_string(),
-            executable_path: PathBuf::from("/weird\"path/flowstate"),
+            // Backslash in the URL (e.g. a Windows-style file:// URL
+            // someone typed by hand) and a quote in the exe path
+            // (pathological but catches the shape of the escaping).
+            base_url: "http://evil.example/\\\"attack".to_string(),
+            executable_path: PathBuf::from("/weird\"path\\flowstate"),
         };
         let out = render_flowstate_toml_override(&info, "sess");
         // Quotes inside values must be backslash-escaped; backslashes too.
