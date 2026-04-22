@@ -208,6 +208,65 @@ impl OpenCodeServer {
     pub fn client(&self) -> Arc<OpenCodeClient> {
         self.client.clone()
     }
+
+    /// Async, cooperative teardown. Preferred over relying on `Drop`
+    /// for the Phase-B idle-kill path because:
+    ///
+    /// - `Drop` must be sync, so it uses `try_lock` on the child
+    ///   mutex and skips tear-down if something else is holding it.
+    ///   An async `shutdown()` can `.lock().await` and is guaranteed
+    ///   to consume the child handle.
+    /// - Idle-kill wants to `await` the child's actual exit so the
+    ///   next spawn doesn't race against the previous port being
+    ///   released. `Drop` can't await.
+    ///
+    /// Order of operations mirrors `Drop` for consistency:
+    ///   1. `killpg(pgid, SIGTERM)` — polite signal to the whole
+    ///      opencode process group (server + its MCP subprocess +
+    ///      any per-session workers).
+    ///   2. Take the child handle under the mutex and await its
+    ///      exit, bounded by a short timeout.
+    ///   3. If the child is still alive past the timeout, escalate
+    ///      via tokio's `start_kill` (maps to SIGKILL on Unix).
+    ///
+    /// Phase A: this method exists but is never called — `Drop` is
+    /// still the only teardown path. Wired in so Phase B's idle
+    /// watcher can adopt it without another refactor.
+    #[allow(dead_code)] // Phase B makes this live
+    pub async fn shutdown(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.child_pgid {
+            // Safety: `killpg` with a valid pgid is a standard POSIX
+            // syscall. ESRCH (already reaped) is the expected outcome
+            // on a clean shutdown and silently ignored.
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
+        let mut guard = self.child.lock().await;
+        if let Some(mut child) = guard.take() {
+            // Bounded wait. 3s matches what opencode's own
+            // signal-handler path takes to flush state on a SIGTERM —
+            // generous but not so long it lets a wedged server block
+            // the idle-kill path.
+            let wait_result = tokio::time::timeout(
+                Duration::from_secs(3),
+                child.wait(),
+            )
+            .await;
+            if wait_result.is_err() {
+                warn!("opencode serve did not exit within 3s of SIGTERM; escalating to SIGKILL");
+                let _ = child.start_kill();
+                // One more bounded wait so the caller doesn't return
+                // while the child is still mid-reap.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    child.wait(),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 impl Drop for OpenCodeServer {

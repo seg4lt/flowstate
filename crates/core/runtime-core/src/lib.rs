@@ -409,6 +409,34 @@ impl RuntimeCore {
         self.metadata_provider.read().ok()?.clone()
     }
 
+    /// Ask every registered adapter whether it claims the supplied
+    /// origin session id as its shared-bridge sentinel (see
+    /// [`ProviderAdapter::shared_bridge_origin`]). The first match
+    /// gets asked for a [`SharedBridgeGuard`], which the caller holds
+    /// for the duration of an orchestration-dispatch call from that
+    /// bridge.
+    ///
+    /// Returns `None` if no adapter claims the origin (the common
+    /// case: a real flowstate session id, not a bridge sentinel) or
+    /// if the claiming adapter declined to mint a lease (its bridge
+    /// couldn't be brought up). In either case the caller should
+    /// proceed with the dispatch lease-less.
+    ///
+    /// Used by the HTTP transport's `orchestration_dispatch_handler`
+    /// to keep providers like opencode from idle-killing their
+    /// shared server mid-MCP-call.
+    pub async fn acquire_shared_bridge_lease(
+        &self,
+        origin_session_id: &str,
+    ) -> Option<zenui_provider_api::SharedBridgeGuard> {
+        for adapter in self.adapters.values() {
+            if adapter.shared_bridge_origin() == Some(origin_session_id) {
+                return adapter.acquire_shared_bridge_lease().await;
+            }
+        }
+        None
+    }
+
     fn worktree_provisioner(&self) -> Option<Arc<dyn WorktreeProvisioner>> {
         self.worktree_provisioner.read().ok()?.clone()
     }

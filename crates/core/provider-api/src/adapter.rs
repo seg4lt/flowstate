@@ -2,6 +2,28 @@ use async_trait::async_trait;
 
 use crate::*;
 
+/// Opaque RAII guard returned from
+/// [`ProviderAdapter::acquire_shared_bridge_lease`]. Holding the guard
+/// signals to the provider that its shared bridge (the long-lived
+/// process behind which multiple sessions multiplex, e.g. `opencode
+/// serve`) has in-flight work and must not be idle-killed. Drop the
+/// guard the moment the work finishes; release is idempotent.
+///
+/// The inner `Box<dyn Any + Send + Sync>` lets each provider stash
+/// whatever concrete lease type it wants (an `Arc<LeaseTracker>`
+/// decrement guard, a per-request ticket, etc.) without leaking that
+/// type into the trait signature.
+pub struct SharedBridgeGuard(Box<dyn std::any::Any + Send + Sync>);
+
+impl SharedBridgeGuard {
+    /// Wrap a provider-specific lease value. The concrete type is
+    /// erased — callers just hold the guard until their work is done
+    /// and drop it.
+    pub fn new<T: Send + Sync + 'static>(inner: T) -> Self {
+        Self(Box::new(inner))
+    }
+}
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> ProviderKind;
@@ -222,5 +244,39 @@ pub trait ProviderAdapter: Send + Sync {
             agents: Vec::new(),
             mcp_servers: Vec::new(),
         })
+    }
+
+    /// If this provider owns a **shared bridge** — a single long-lived
+    /// upstream process behind which multiple flowstate sessions
+    /// multiplex — return the sentinel origin `session_id` that
+    /// orchestration tool calls from that bridge's MCP subprocess
+    /// carry. Returns `None` for providers without such a bridge
+    /// (one-subprocess-per-session designs).
+    ///
+    /// The runtime's orchestration dispatch path uses this to identify
+    /// which adapter to consult when an MCP call arrives on the
+    /// loopback HTTP transport — so the bridge can be kept alive for
+    /// the duration of the call even if its per-session leases are
+    /// temporarily zero.
+    ///
+    /// Currently populated only by the opencode adapter (sentinel
+    /// `"opencode-shared"`). Default `None` for everyone else.
+    fn shared_bridge_origin(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Acquire a lease that keeps this provider's shared bridge alive
+    /// for the duration the returned [`SharedBridgeGuard`] is held.
+    /// Called by the orchestration dispatcher when an MCP call's
+    /// origin session id matches [`Self::shared_bridge_origin`].
+    ///
+    /// Returns `Some(guard)` on success. `None` means either this
+    /// provider has no shared bridge, or the bridge is currently
+    /// down and could not be brought up — the caller should proceed
+    /// without a lease (the call may be from a stale subprocess that
+    /// is about to be reaped; no point in spawning a fresh bridge
+    /// just to service it).
+    async fn acquire_shared_bridge_lease(&self) -> Option<SharedBridgeGuard> {
+        None
     }
 }

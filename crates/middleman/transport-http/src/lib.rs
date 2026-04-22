@@ -419,6 +419,19 @@ async fn orchestration_dispatch_handler(
             .origin_turn_id
             .unwrap_or_else(|| format!("ext-{}", uuid::Uuid::new_v4())),
     };
+    // Hold a shared-bridge lease for the duration of the dispatch
+    // when the origin matches a provider's bridge sentinel (e.g.
+    // opencode's `"opencode-shared"`). Without this, the provider's
+    // idle watcher could fire between two SSE events and kill the
+    // bridge out from under a pending MCP tool call — the call's
+    // response would never reach the agent. `None` is fine: either
+    // the origin is a real flowstate session id (no bridge involved)
+    // or the bridge failed to come up (in which case the caller is
+    // a subprocess being torn down anyway).
+    let _bridge_lease = state
+        .runtime
+        .acquire_shared_bridge_lease(&origin.session_id)
+        .await;
     match state
         .runtime
         .clone()

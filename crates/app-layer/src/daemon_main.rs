@@ -68,7 +68,17 @@ use crate::user_config::UserConfigStore;
 pub fn build_adapters(
     data_dir: PathBuf,
     ipc_handle: OrchestrationIpcHandle,
+    user_config: Option<&UserConfigStore>,
 ) -> Vec<Arc<dyn ProviderAdapter>> {
+    // Opencode alone needs per-provider config today: its shared
+    // `opencode serve` supports idle-kill, with a TTL persisted in
+    // `user_config`. Other adapters don't take tunables yet; when
+    // they do, read them here and thread them through their
+    // constructors the same way.
+    let opencode_idle_ttl = user_config
+        .map(UserConfigStore::opencode_idle_ttl)
+        .unwrap_or_else(|| std::time::Duration::from_secs(600));
+
     vec![
         Arc::new(ClaudeSdkAdapter::new(data_dir.clone())) as Arc<dyn ProviderAdapter>,
         Arc::new(ClaudeCliAdapter::new_with_orchestration(
@@ -87,9 +97,10 @@ pub fn build_adapters(
             data_dir.clone(),
             Some(ipc_handle.clone()),
         )),
-        Arc::new(OpenCodeAdapter::new_with_orchestration(
+        Arc::new(OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
             data_dir,
             Some(ipc_handle),
+            Some(opencode_idle_ttl),
         )),
     ]
 }
@@ -228,7 +239,11 @@ pub async fn run(args: DaemonMainArgs) -> Result<()> {
         .with_explicit_data_dir(args.data_dir.clone());
     config.idle_timeout = args.idle_timeout.unwrap_or(Duration::MAX);
     config.app_name = "Flowstate".to_string();
-    config.adapters = build_adapters(args.data_dir.clone(), ipc_handle.clone());
+    config.adapters = build_adapters(
+        args.data_dir.clone(),
+        ipc_handle.clone(),
+        Some(&user_config),
+    );
 
     // Bootstrap runtime + persistence + lifecycle + reconcile.
     let core = bootstrap_core_async(&config)

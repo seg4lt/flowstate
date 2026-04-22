@@ -2183,9 +2183,16 @@ pub fn run() {
                     // with the same origin.session_id — see the
                     // docstring on `OPENCODE_SHARED_SESSION_ID` for
                     // the implications.
-                    Arc::new(OpenCodeAdapter::new_with_orchestration(
+                    Arc::new(OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
+                        // Read the TTL from `user_config` so a
+                        // Settings-UI knob can tune it without a
+                        // rebuild. `0` in the SQLite row disables
+                        // idle-kill. See
+                        // `UserConfigStore::opencode_idle_ttl` for
+                        // the defaulting rules.
+                        Some(user_config_for_orch.opencode_idle_ttl()),
                     )),
                 ];
 

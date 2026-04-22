@@ -164,6 +164,45 @@ impl EventRouter {
         guard.remove(native_session_id);
     }
 
+    /// Fail every in-flight subscriber with the supplied reason,
+    /// clearing the session map. Called by the idle-kill path in
+    /// the adapter right before it tears down the `OpenCodeServer`
+    /// so subscribers surface a clean error instead of hanging on
+    /// their completion oneshot forever.
+    ///
+    /// In practice `inflight == 0` (the idle-kill precondition)
+    /// implies no `execute_turn` is mid-flight, so this is mostly
+    /// a defensive sweep — it primarily catches stale entries from
+    /// e.g. a `cancel()` path that didn't fully drain, or a
+    /// permission-ask task that spawned during teardown. The cost
+    /// of the sweep is O(entries) and bounded by the number of
+    /// open flowstate sessions.
+    pub async fn fail_all_in_flight(&self, reason: &str) {
+        let mut guard = self.sessions.lock().await;
+        if guard.is_empty() {
+            return;
+        }
+        // Drain so the map is empty regardless of whether individual
+        // oneshots had already been `take()`n by `session.idle` /
+        // `session.error` paths earlier.
+        let drained: Vec<_> = guard.drain().collect();
+        drop(guard);
+        for (session_id, mut state) in drained {
+            if let Some(sender) = state.completion.take() {
+                // `let _ =` — receiver may already be gone (caller
+                // timed out, dropped the subscription). Not an error.
+                let _ = sender.send(Err(reason.to_string()));
+            }
+            // Log at debug; a watcher-driven mass-fail is expected
+            // during idle-kill and not a user-facing incident.
+            debug!(
+                %session_id,
+                reason,
+                "opencode: failing in-flight session due to server shutdown"
+            );
+        }
+    }
+
     /// Spawn an SSE reader bound to one specific `opencode serve`
     /// child. In the per-flowstate-session architecture there is one
     /// reader per server — every server mints its own URL, and each
@@ -1210,6 +1249,45 @@ mod tests {
     }
 
     // ── dispatcher: drop events we don't care about ─────────────
+
+    // ── router: idle-kill sweep ─────────────────────────────────
+
+    #[tokio::test]
+    async fn fail_all_in_flight_resolves_subscription_with_reason() {
+        // Subscribe a session, then simulate the idle-kill path
+        // calling `fail_all_in_flight` while the turn is still
+        // waiting on completion. The subscription's
+        // `wait_for_completion` must surface the supplied reason
+        // as `Err` rather than hanging on the oneshot.
+        let router = Arc::new(EventRouter::new());
+        let (tx, _rx) = mpsc::channel(8);
+        let sink = TurnEventSink::new(tx);
+        let sub = router.subscribe(SESSION_ID.to_string(), sink).await;
+
+        router
+            .fail_all_in_flight("opencode server idle-killed; respawning on next use")
+            .await;
+
+        let result = sub.wait_for_completion(Duration::from_millis(100)).await;
+        let err = result.expect_err("fail_all_in_flight should surface as Err");
+        assert!(
+            err.contains("idle-killed"),
+            "reason should appear in error message, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_all_in_flight_is_noop_when_empty() {
+        // Calling the sweep with no subscribers must not panic or
+        // allocate a sender — the idle watcher runs it defensively
+        // every kill, often with an already-empty map (execute_turn
+        // holds a lease across wait_for_completion, so `inflight
+        // == 0` already implies no subscribers).
+        let router = Arc::new(EventRouter::new());
+        router.fail_all_in_flight("whatever").await;
+        // No assertion beyond "does not panic"; empty is the happy
+        // path.
+    }
 
     #[tokio::test]
     async fn known_ignored_events_produce_nothing() {
