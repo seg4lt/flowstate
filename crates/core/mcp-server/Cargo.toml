@@ -40,3 +40,13 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true }
+
+# Parent-liveness watchdog (see `spawn_parent_watchdog` in src/lib.rs):
+# `getppid()` and `kill(pid, 0)` are the two POSIX syscalls that let
+# the stdio proxy detect when its grand-parent flowstate dies, so the
+# subprocess can self-exit instead of orphaning and pointing at a dead
+# loopback port. Unix-only — the Windows build skips the watchdog (no
+# equivalent primitive; tauri's dev-reload SIGKILL pattern is
+# Unix-specific anyway).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

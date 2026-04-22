@@ -91,8 +91,17 @@ impl Config {
     /// session id into the `command` array verbatim, since opencode's
     /// `McpLocalConfig.environment` is a static dict shared across
     /// every session that uses the config.
+    ///
+    /// Invoked as `flowstate mcp-server …`, so argv looks like
+    /// `[<exe>, "mcp-server", "--http-base", URL, "--session-id", SID]`.
+    /// We skip both argv[0] (the binary path) AND argv[1] (the
+    /// subcommand name that main.rs already dispatched on). Without
+    /// this, the parser saw "mcp-server" as the first flag and
+    /// errored with `unknown flag: mcp-server`, which manifested as
+    /// `MCP error -32000: Connection closed` on the opencode side —
+    /// the subprocess crashed before emitting its ready handshake.
     fn resolve() -> Result<Self> {
-        let mut args = env::args().skip(1); // skip argv[0]
+        let mut args = env::args().skip(2);
         let mut http_base = env::var("FLOWSTATE_HTTP_BASE").ok();
         let mut session_id = env::var("FLOWSTATE_SESSION_ID").ok();
         let mut http_timeout_secs = env::var("FLOWSTATE_HTTP_TIMEOUT_SECS")
@@ -127,6 +136,9 @@ impl Config {
                          Usage: flowstate-mcp-server --http-base URL --session-id ID [--timeout-secs N]\n\
                          \n\
                          Env fallbacks: FLOWSTATE_HTTP_BASE, FLOWSTATE_SESSION_ID, FLOWSTATE_HTTP_TIMEOUT_SECS\n\
+                         \n\
+                         No authentication on the target HTTP — the daemon binds 127.0.0.1 only,\n\
+                         which on a single-user desktop is the intended boundary.\n\
                          \n\
                          Reads JSON-RPC on stdin, writes on stdout. Logs on stderr."
                     );
@@ -192,14 +204,30 @@ async fn dispatch_tool(
     args: &Value,
 ) -> Result<DispatchResponse> {
     let url = format!("{}/api/orchestration/dispatch", cfg.http_base);
-    // The daemon expects `{ session_id, ..<RuntimeCall> }`. The
-    // `RuntimeCall` enum is internally `#[serde(tag = "kind")]` so
-    // we need to fold the tool name in as the `kind` alongside the
-    // tool args (which the model shaped against the JSON Schema).
+    // The daemon expects `{ origin_session_id, origin_turn_id?,
+    // kind, ..<RuntimeCall fields> }`. Keys:
+    //
+    // - `origin_session_id` — WHO is calling (us). Derived from
+    //   `cfg.session_id`, which provider adapters bake into the MCP
+    //   command array or env at spawn time. Intentionally named
+    //   `origin_*` (not plain `session_id`) because several
+    //   `RuntimeCall` variants have their OWN `session_id` field
+    //   naming the TARGET peer, and `#[serde(flatten)]` on the outer
+    //   struct would otherwise collide and produce a cryptic
+    //   "missing field session_id" error on every poll / send call.
+    //
+    // - `kind` — tool name; `RuntimeCall` is `#[serde(tag = "kind")]`.
+    //
+    // - The rest of the agent's args (`session_id`, `message`,
+    //   `initial_message`, `since_turn_id`, …) flatten into the
+    //   inner variant untouched.
     let body = match args {
         Value::Object(map) => {
             let mut merged = map.clone();
-            merged.insert("session_id".to_string(), Value::String(cfg.session_id.clone()));
+            merged.insert(
+                "origin_session_id".to_string(),
+                Value::String(cfg.session_id.clone()),
+            );
             merged.insert("kind".to_string(), Value::String(tool_name.to_string()));
             Value::Object(merged)
         }
@@ -429,8 +457,97 @@ async fn write_response(
 /// request, write responses to stdout. Called by [`run_blocking`]
 /// after a dedicated tokio runtime has been built, and reusable from
 /// any other tokio context (e.g. integration tests).
+/// Spawn a background task that polls every 2 s and forces the
+/// process to exit if its grand-parent flowstate has died. Two
+/// independent signals — either one triggers shutdown:
+///
+/// 1. **Reparenting to init** (`getppid() == 1`): when a direct parent
+///    dies, Unix kernels reparent the child to PID 1. Our direct
+///    parent is the *agent* (opencode, claude-cli, …), not flowstate,
+///    but in practice when flowstate is SIGKILL'd the agent subprocess
+///    tree also dies (opencode's `kill_on_drop` usually fires, or the
+///    agent exits when its MCP stdio connection goes silent), so
+///    reparenting is a strong signal in the SIGKILL path too.
+/// 2. **Direct pid probe** (`kill(FLOWSTATE_PID, 0)`): returns 0 iff
+///    the pid still exists. Catches the case where the agent survives
+///    flowstate (e.g. opencode serve's detached reader keeps draining
+///    stdin).
+///
+/// Signal 1 false-positives if the agent genuinely outlives flowstate
+/// by design — but no agent we wire today does that, and in any case
+/// signal 2 is the authoritative check. Signal 1 is kept as a cheap
+/// first filter so we don't syscall `kill` every tick on the common
+/// healthy case.
+///
+/// 2-second latency is fine — this is a cleanup mechanism, not a
+/// hot-path. `std::process::exit(0)` (not `1`) because a stale parent
+/// isn't an error; the MCP client will see its stdin/stdout close and
+/// treat it as a clean subprocess shutdown.
+#[cfg(unix)]
+fn spawn_parent_watchdog(flowstate_pid: u32) {
+    tokio::spawn(async move {
+        // Guard against pathological FLOWSTATE_PID=1 (would mean
+        // flowstate IS init — impossible in real deploys; in test
+        // harnesses the value would be wrong anyway). Short-circuit
+        // rather than tripping false positives.
+        if flowstate_pid <= 1 {
+            warn!(pid = flowstate_pid, "FLOWSTATE_PID unusable; watchdog disabled");
+            return;
+        }
+        let flowstate_pid = flowstate_pid as libc::pid_t;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let reparented = unsafe { libc::getppid() } == 1;
+            // `kill(pid, 0)` returns 0 if the process exists and the
+            // caller has permission to signal it, else -1 with errno
+            // ESRCH (no such process). Any non-zero return on a pid
+            // we legitimately stamped means the parent is gone.
+            let flowstate_dead = unsafe { libc::kill(flowstate_pid, 0) } != 0;
+            if reparented || flowstate_dead {
+                info!(
+                    reparented,
+                    flowstate_dead,
+                    flowstate_pid = flowstate_pid as i64,
+                    "flowstate gone; MCP subprocess self-exiting"
+                );
+                // exit(0) — a missing parent is not our error.
+                // Using libc::_exit would skip tokio's drain; the
+                // normal std::process::exit is fine here because the
+                // stdio proxy has no persistent state to flush.
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// Non-Unix fallback: no cheap equivalent of `getppid()` /
+/// `kill(pid, 0)`. Could use `sysinfo::System::process()` but that
+/// would pull in a ~MB dep for Windows only where flowstate doesn't
+/// ship a tauri-dev SIGKILL path to worry about. Keep the stub so
+/// callers compile cross-platform and revisit when Windows ships.
+#[cfg(not(unix))]
+fn spawn_parent_watchdog(_flowstate_pid: u32) {}
+
 pub async fn run() -> Result<()> {
     let cfg = Config::resolve()?;
+
+    // Parent-liveness watchdog: if flowstate dies (SIGKILL during
+    // `tauri dev` reload, crash, Activity Monitor force-quit), this
+    // subprocess would otherwise reparent to PID 1 and survive,
+    // pointing at a now-dead loopback port. Detect via two cheap
+    // syscalls polled every 2 s:
+    //   - `getppid() == 1` (reparented to init → orphaned)
+    //   - `kill(FLOWSTATE_PID, 0)` fails (original parent pid gone)
+    // Either condition ⇒ self-exit. See the FLOWSTATE_PID notes in
+    // `crates/core/provider-api/src/mcp_config.rs`.
+    if let Some(pid_str) = env::var("FLOWSTATE_PID").ok() {
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            spawn_parent_watchdog(pid);
+        } else {
+            warn!(%pid_str, "FLOWSTATE_PID not a positive integer; watchdog disabled");
+        }
+    }
+
     let http = Client::builder()
         .timeout(cfg.http_timeout)
         .build()

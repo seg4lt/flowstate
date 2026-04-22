@@ -62,20 +62,26 @@ pub struct McpConfigFile {
 /// (Codex `-c` flags, opencode.json, Copilot `SessionConfig`).
 pub fn flowstate_mcp_entry(info: &OrchestrationIpcInfo, session_id: &str) -> McpServerConfig {
     let mut env = std::collections::BTreeMap::new();
-    // Token travels via env so it never lands in a command line an
-    // ordinary `ps` can read. `FLOWSTATE_SESSION_ID` is also env'd
-    // (redundant with `--session-id` on argv) so the subprocess has
-    // two places to find it — a defence against callers that embed
-    // a stale session id in the command array while env is fresh.
-    env.insert(
-        "FLOWSTATE_AUTH_TOKEN".to_string(),
-        info.auth_token.clone(),
-    );
+    // Environment is redundant with the argv flags the subprocess
+    // parses first — we plant both so callers whose config store
+    // only lets them set one (env vs args) still work. Loopback
+    // HTTP is unauthenticated (see the note in
+    // `orchestration_ipc.rs`), so no bearer token rides here.
     env.insert(
         "FLOWSTATE_SESSION_ID".to_string(),
         session_id.to_string(),
     );
     env.insert("FLOWSTATE_HTTP_BASE".to_string(), info.base_url.clone());
+    // `FLOWSTATE_PID` lets the stdio proxy subprocess watchdog its
+    // grand-parent (flowstate) liveness. When flowstate dies the
+    // proxy's `getppid()` flips to 1 (orphaned) and / or `kill(PID, 0)`
+    // starts failing — either signal causes the proxy to self-exit
+    // within ~2 s, so no zombie mcp-server processes survive the app.
+    // See `crates/core/mcp-server/src/lib.rs::spawn_parent_watchdog`.
+    env.insert(
+        "FLOWSTATE_PID".to_string(),
+        std::process::id().to_string(),
+    );
 
     McpServerConfig {
         transport: "stdio".to_string(),
@@ -130,7 +136,6 @@ mod tests {
     fn sample_info() -> OrchestrationIpcInfo {
         OrchestrationIpcInfo {
             base_url: "http://127.0.0.1:54321".to_string(),
-            auth_token: "tok-abc".to_string(),
             executable_path: PathBuf::from("/Applications/flowstate.app/Contents/MacOS/flowstate"),
         }
     }
@@ -144,11 +149,20 @@ mod tests {
         assert!(e.args.iter().any(|a| a == "--http-base"));
         let env = e.env.unwrap();
         assert_eq!(env.get("FLOWSTATE_SESSION_ID").unwrap(), "sess-xyz");
-        assert_eq!(env.get("FLOWSTATE_AUTH_TOKEN").unwrap(), "tok-abc");
         assert_eq!(
             env.get("FLOWSTATE_HTTP_BASE").unwrap(),
             "http://127.0.0.1:54321"
         );
+        // No auth token plumbed — loopback bind is the only boundary.
+        assert!(env.get("FLOWSTATE_AUTH_TOKEN").is_none());
+        // Parent pid is stamped so the subprocess can self-terminate
+        // when flowstate dies (see `mcp-server`'s parent watchdog).
+        let pid = env
+            .get("FLOWSTATE_PID")
+            .expect("FLOWSTATE_PID must be present")
+            .parse::<u32>()
+            .expect("FLOWSTATE_PID must be numeric");
+        assert_eq!(pid, std::process::id());
     }
 
     #[test]
