@@ -91,16 +91,20 @@ export function BranchSwitcher({
     enabled: open,
   });
 
-  const invalidateAfterBranchChange = React.useCallback(() => {
+  const invalidateBranchQueries = React.useCallback(() => {
     queryClient.invalidateQueries({
       queryKey: ["git", "branch", projectPath],
     });
     queryClient.invalidateQueries({
       queryKey: ["git", "branch-list", projectPath],
     });
+  }, [projectPath, queryClient]);
+
+  const invalidateAfterBranchChange = React.useCallback(() => {
+    invalidateBranchQueries();
     onCheckedOut();
     setOpen(false);
-  }, [onCheckedOut, projectPath, queryClient]);
+  }, [invalidateBranchQueries, onCheckedOut]);
 
   // Fire-and-forget refresh of the current-branch label whenever the
   // user opens the popover. This catches out-of-band checkouts (e.g.
@@ -182,7 +186,10 @@ export function BranchSwitcher({
     onSuccess: (_data, name) => {
       setPendingBranch(null);
       setCheckoutError(null);
-      invalidateAfterBranchChange();
+      // Don't close the popover or notify parent — we only delete
+      // non-current branches, so the checked-out branch is unchanged
+      // and the user likely wants to keep browsing/deleting.
+      invalidateBranchQueries();
       toast({
         title: `Deleted branch ${name}`,
         duration: 2500,
