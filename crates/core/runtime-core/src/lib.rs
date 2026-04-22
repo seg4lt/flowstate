@@ -1,5 +1,6 @@
 mod internals;
 pub mod orchestration;
+pub mod session_events;
 pub mod session_ops;
 pub mod transport;
 pub mod wakeup;
@@ -311,6 +312,12 @@ pub struct RuntimeCore {
     /// that nobody reads, deadlocking the pipe) dies with the
     /// subprocess. Our persisted wakeup is now the only timer.
     pending_wakeup_invalidations: Arc<Mutex<HashSet<String>>>,
+    /// Per-session bounded ring of recent events for replay on
+    /// webview reconnect (Phase 5.5.7). Populated by [`publish`] for
+    /// events that carry a `session_id`; global events bypass the
+    /// ring and ride the broadcast only. Exposed via the HTTP route
+    /// `GET /session/{id}/events?since=N` in `transport-http`.
+    session_events: Arc<session_events::SessionEventStore>,
 }
 
 impl RuntimeCore {
@@ -376,6 +383,7 @@ impl RuntimeCore {
             ),
             wakeup_scheduler: std::sync::RwLock::new(None),
             pending_wakeup_invalidations: Arc::new(Mutex::new(HashSet::new())),
+            session_events: Arc::new(session_events::SessionEventStore::default_capacity()),
         }
     }
 
@@ -701,7 +709,37 @@ impl RuntimeCore {
     }
 
     pub fn publish(&self, event: RuntimeEvent) {
+        // Phase 5.5.7 — record session-scoped events into the per-
+        // session ring BEFORE broadcasting so a slow subscriber that
+        // misses the broadcast can still recover the event via
+        // `replay_session_events`. Global events (DaemonShuttingDown,
+        // ProviderHealth, etc.) have no session id and ride the
+        // broadcast only.
+        if let Some(sid) = session_events::session_id_of(&event) {
+            self.session_events.record(&sid, event.clone());
+        }
         let _ = self.event_tx.send(event);
+    }
+
+    /// Replay buffered events for `session_id` with `seq > since`.
+    /// Returns the list plus metadata the caller can use to detect
+    /// a replay gap (events evicted between `since` and the oldest
+    /// retained seq). See [`session_events::SessionEventStore`].
+    ///
+    /// Consumed by the HTTP replay route to recover UI state after a
+    /// webview reconnect.
+    pub fn replay_session_events(
+        &self,
+        session_id: &str,
+        since: u64,
+    ) -> session_events::ReplayResult {
+        self.session_events.replay(session_id, since)
+    }
+
+    /// Drop the per-session ring. Called on session delete / archive
+    /// so the store doesn't grow unboundedly over a long uptime.
+    pub fn forget_session_events(&self, session_id: &str) {
+        self.session_events.forget(session_id);
     }
 
     /// Load a session from persistence and splice the in-flight turn (if
