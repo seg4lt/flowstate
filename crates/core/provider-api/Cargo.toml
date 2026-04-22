@@ -25,6 +25,12 @@ tracing.workspace = true
 uuid.workspace = true
 ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"], optional = true }
 
+# `killpg` / `setpgid` for the shared process-group helpers every
+# provider adapter uses at spawn + drop time — see `process_group.rs`.
+# Unix-only by design; non-Unix builds get no-op stubs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 # `test-util` enables `tokio::time::pause` / `#[tokio::test(start_paused = true)]`

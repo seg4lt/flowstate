@@ -18,6 +18,7 @@
 mod adapter;
 mod binary_resolver;
 pub mod capabilities;
+pub mod process_group;
 
 /// Current wire schema version.
 ///
@@ -66,6 +67,7 @@ pub use mcp_config::{
 pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
 pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
+pub use process_group::{enter_own_process_group, kill_process_group_best_effort};
 pub use types::*;
 
 #[cfg(test)]
