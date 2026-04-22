@@ -2039,6 +2039,68 @@ pub fn run() {
 
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
+            // Phase 5 — shared channel for the loopback HTTP base URL.
+            // Every `#[tauri::command]` in the app-layer block reads
+            // its receiver via `DaemonClient`; `loopback_http::spawn`
+            // publishes once the transport has bound.
+            let daemon_base_url = DaemonBaseUrl::new();
+            let daemon_base_url_for_spawn = daemon_base_url.clone();
+            // Register the channel as Tauri state so the command
+            // handlers can obtain a `DaemonClient` per call.
+            app.manage(daemon_base_url.clone());
+
+            // Phase 6 — when `FLOWSTATE_USE_DAEMON=1` is set, spawn
+            // the daemon as a separate process via the supervisor
+            // and skip the embedded bootstrap below. The supervisor
+            // reads the handshake file and publishes the base URL
+            // to `DaemonBaseUrl` so every app-layer Tauri command
+            // (already on `DaemonClient`) transparently routes to
+            // the daemon. The embedded path (below) stays as the
+            // default until the WS relay for the runtime-forwarder
+            // commands (`connect` / `handle_message`) lands —
+            // tracked in the plan's remaining Phase 6 items.
+            let use_daemon_split = std::env::var("FLOWSTATE_USE_DAEMON")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if use_daemon_split {
+                let data_dir = flowstate_root.clone();
+                let base_url_for_supervisor = daemon_base_url.clone();
+                let exe_path = std::env::current_exe()
+                    .expect("resolve current_exe for daemon supervisor");
+                tauri::async_runtime::spawn(async move {
+                    let cfg = daemon_supervisor::SupervisorConfig::defaults(
+                        data_dir,
+                        exe_path,
+                    );
+                    match daemon_supervisor::spawn(cfg, base_url_for_supervisor).await {
+                        Ok(_sup) => {
+                            tracing::info!("daemon supervisor started");
+                            // Drop the returned supervisor — its
+                            // background task retains ownership of
+                            // the Child via kill_on_drop, and the
+                            // broadcast channel lives in the
+                            // runtime's task graph. The shell's
+                            // SIGTERM handler (signal handler
+                            // elsewhere in this setup) calls
+                            // `lifecycle.request_shutdown()` which
+                            // also drops the supervisor reference
+                            // and tears down the child.
+                        }
+                        Err(e) => {
+                            tracing::error!(%e, "daemon supervisor failed to start");
+                        }
+                    }
+                });
+                // With the daemon separate, we don't run the
+                // embedded bootstrap below — return early. The 2
+                // `connect`/`handle_message` Tauri commands still
+                // touch TauriTransport which won't be mounted;
+                // those specific commands will error until the WS
+                // relay lands. Callers who need the full UI today
+                // run without `FLOWSTATE_USE_DAEMON=1`.
+                return Ok(());
+            }
+
             // Run the daemon on Tauri's existing tokio runtime so the
             // process has exactly one thread pool. The previous shape
             // (std::thread::spawn + bootstrap_core's own runtime) was

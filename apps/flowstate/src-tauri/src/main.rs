@@ -28,19 +28,98 @@ fn main() {
                 }
                 return;
             }
+            "daemon" => {
+                // Phase 6 entry point — parses
+                //   flowstate daemon --data-dir <PATH>
+                //                    [--idle-timeout <SECS>]
+                //                    [--drain-grace <SECS>]
+                // and delegates to `flowstate_app_layer::daemon_main::
+                // run_blocking`, which:
+                //   1. Opens SQLite stores under --data-dir (WAL mode).
+                //   2. Constructs the 6 provider adapters.
+                //   3. Binds HttpTransport on 127.0.0.1:0 with the
+                //      app-layer HTTP router merged in.
+                //   4. Writes <data_dir>/daemon.handshake.
+                //   5. Blocks until SIGINT/SIGTERM or /api/shutdown,
+                //      then drain-shutdown + exit.
+                //
+                // The Tauri shell spawns this subcommand as a child
+                // on app startup and reads the handshake file to
+                // discover the base URL for `DaemonClient`. Dev mode
+                // can skip the spawn and run embedded (the
+                // pre-Phase-6 path still works for now).
+                use std::path::PathBuf;
+                use std::time::Duration;
+                let mut data_dir: Option<PathBuf> = None;
+                let mut idle_timeout: Option<Duration> = None;
+                let mut drain_grace: Option<Duration> = None;
+                while let Some(arg) = args.next() {
+                    match arg.as_str() {
+                        "--data-dir" => {
+                            data_dir = args.next().map(PathBuf::from);
+                        }
+                        "--idle-timeout" => {
+                            idle_timeout = args
+                                .next()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .map(Duration::from_secs);
+                        }
+                        "--drain-grace" => {
+                            drain_grace = args
+                                .next()
+                                .and_then(|s| s.parse::<u64>().ok())
+                                .map(Duration::from_secs);
+                        }
+                        "--help" | "-h" => {
+                            eprintln!(
+                                "flowstate daemon — standalone long-running daemon\n\
+                                 \n\
+                                 Usage: flowstate daemon --data-dir PATH [--idle-timeout SECS] [--drain-grace SECS]\n\
+                                 \n\
+                                 Writes <data_dir>/daemon.handshake with the loopback URL\n\
+                                 and PID once bound. Blocks until SIGINT/SIGTERM."
+                            );
+                            return;
+                        }
+                        other => {
+                            eprintln!("flowstate daemon: unknown flag {other}");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                let data_dir = match data_dir {
+                    Some(d) => d,
+                    None => {
+                        eprintln!(
+                            "flowstate daemon: --data-dir <PATH> is required\n\
+                             Run with --help for usage."
+                        );
+                        std::process::exit(2);
+                    }
+                };
+                let res = flowstate_app_layer::daemon_main::run_blocking(
+                    flowstate_app_layer::daemon_main::DaemonMainArgs {
+                        data_dir,
+                        idle_timeout,
+                        drain_grace,
+                    },
+                );
+                if let Err(err) = res {
+                    eprintln!("flowstate daemon: {err:?}");
+                    std::process::exit(1);
+                }
+                return;
+            }
             "--help" | "-h" | "help" => {
-                // Preserve Tauri's default launch for bare invocation;
-                // only intercept when we recognise a subcommand. Help
-                // for known subcommands is printed by the subcommand
-                // itself when it parses `--help` from its own argv.
                 eprintln!(
                     "flowstate — multi-agent orchestration app\n\
                      \n\
                      Usage:\n\
-                       flowstate                 Launch the UI (default)\n\
+                       flowstate                 Launch the UI (default; daemon embedded)\n\
+                       flowstate daemon ...      Run the standalone daemon (Phase 6 WIP)\n\
                        flowstate mcp-server ...  Run the cross-provider MCP stdio server\n\
                      \n\
-                     `flowstate mcp-server --help` for subcommand flags."
+                     `flowstate <subcommand> --help` for subcommand flags."
                 );
                 return;
             }
