@@ -41,37 +41,45 @@ use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 /// add it to `run_blocking`'s transport list, and daemon-core handles
 /// the rest of the lifecycle.
 ///
-/// When an `auth_token` is supplied, every route except `/api/health`
-/// and `/api/version` requires `Authorization: Bearer <token>`. The
-/// token is expected to be written to a 0600 handshake file by the
-/// embedder (Tauri app or daemon binary) so local subprocesses that
-/// need to talk back to the runtime can fetch it without ever
-/// appearing on a command line or in an environment variable.
+/// # No authentication
+///
+/// The transport has no bearer-token or cookie auth. It relies on
+/// the loopback bind (`127.0.0.1`) being the only access path — on
+/// a single-user desktop every local process that can reach the
+/// port already runs with the user's credentials and has unrestricted
+/// access to the flowstate SQLite store and attachments directory
+/// regardless. If flowstate is ever deployed on a multi-user host,
+/// reintroduce a bearer-token middleware here (see the git log for
+/// the prior shape — a `require_bearer_token` layer gated off an
+/// `auth_token: Option<String>` field on this struct).
 pub struct HttpTransport {
     bind_addr: SocketAddr,
-    auth_token: Option<String>,
+    /// Extra axum Router merged into the main router just before
+    /// `serve()` returns. Used by Phase 4 to attach the flowstate-
+    /// app-layer HTTP handlers (user_config / usage / …) under the
+    /// same loopback port that serves `/api/orchestration/*`. Kept
+    /// `Router<()>` so it doesn't leak app-layer state types into
+    /// the transport crate — callers `.with_state(...)` on their
+    /// inner routes before handing the Router here.
+    extra_router: Option<Router<()>>,
 }
 
 impl HttpTransport {
-    /// Unauthenticated transport. Use only for dev / tests where you
-    /// explicitly want any local process to reach the runtime.
     pub fn new(bind_addr: SocketAddr) -> Self {
         Self {
             bind_addr,
-            auth_token: None,
+            extra_router: None,
         }
     }
 
-    /// Token-gated transport. Every route except liveness/version
-    /// demands `Authorization: Bearer <token>` and returns 401 on
-    /// mismatch. Pair with a 0600 handshake file for the token
-    /// channel — do not ship the token through stdout or env vars
-    /// that a crash-reporter might capture.
-    pub fn new_with_auth(bind_addr: SocketAddr, auth_token: String) -> Self {
-        Self {
-            bind_addr,
-            auth_token: Some(auth_token),
-        }
+    /// Builder-style chain: merge an additional axum Router into the
+    /// main transport router. Added Phase 4; used by the flowstate
+    /// Tauri app to expose app-layer REST handlers alongside the
+    /// orchestration surface without adding those app-specific
+    /// routes into this transport crate.
+    pub fn with_extra_router(mut self, router: Router<()>) -> Self {
+        self.extra_router = Some(router);
+        self
     }
 }
 
@@ -93,7 +101,7 @@ impl Transport for HttpTransport {
         Ok(Box::new(HttpBound {
             std_listener: Some(std_listener),
             address,
-            auth_token: self.auth_token,
+            extra_router: self.extra_router,
         }))
     }
 }
@@ -103,7 +111,9 @@ impl Transport for HttpTransport {
 pub struct HttpBound {
     std_listener: Option<StdTcpListener>,
     address: SocketAddr,
-    auth_token: Option<String>,
+    /// Carries the `with_extra_router`-supplied Router through bind
+    /// → serve so it can be merged in just before the server boots.
+    extra_router: Option<Router<()>>,
 }
 
 impl Bound for HttpBound {
@@ -137,26 +147,14 @@ impl Bound for HttpBound {
             runtime,
             ws_url,
             observer,
-            auth_token: self.auth_token.clone(),
         };
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+        let extra_router = self.extra_router.take();
         let task = tokio::spawn(async move {
-            // Routes below are split into two bands so auth can be
-            // applied layer-wise.
-            //
-            // PUBLIC: `/api/health`, `/api/version`. Liveness + schema
-            // handshake. Always reachable so a supervisor / updater
-            // can probe the daemon without holding the token.
-            //
-            // AUTHED: everything else. When `auth_token` is set,
-            // every request must carry `Authorization: Bearer <t>`.
-            // When unset (dev / tests) the middleware is a no-op.
-            let public = Router::new()
+            let router = Router::new()
                 .route("/api/health", get(health_handler))
-                .route("/api/version", get(version_handler));
-
-            let authed = Router::new()
+                .route("/api/version", get(version_handler))
                 .route("/api/bootstrap", get(bootstrap_handler))
                 .route("/api/snapshot", get(snapshot_handler))
                 .route("/api/status", get(status_handler))
@@ -178,13 +176,27 @@ impl Bound for HttpBound {
                     "/api/orchestration/dispatch",
                     post(orchestration_dispatch_handler),
                 )
+                // Phase 5.5.7 — webview replay route. A just-reconnected
+                // UI passes its last-seen seq as `?since=N`; we return
+                // every buffered event with seq > N for that session.
+                // Combined with subscribing to the live WS, this gives
+                // a gapless reconnect.
+                .route(
+                    "/api/sessions/{session_id}/events",
+                    get(session_events_replay_handler),
+                )
                 .route("/ws", get(ws_handler))
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    require_bearer_token,
-                ));
-
-            let router = public.merge(authed).with_state(state);
+                .with_state(state);
+            // Merge caller-supplied routes (Phase 4 app-layer
+            // handlers) AFTER `.with_state(state)` so our own
+            // handlers remain keyed on `ApiState` while the extra
+            // router carries its own `State` already baked in by
+            // the caller.
+            let router = if let Some(extra) = extra_router {
+                router.merge(extra)
+            } else {
+                router
+            };
 
             let server = axum::serve(
                 listener,
@@ -271,45 +283,12 @@ struct ApiState {
     runtime: Arc<RuntimeCore>,
     ws_url: String,
     observer: Arc<dyn ConnectionObserver>,
-    /// Bearer token required on every authed route. `None` in dev /
-    /// test binds where we deliberately want the port to be open.
-    auth_token: Option<String>,
-}
-
-/// Bearer-token middleware for the authed router branch. Absence of
-/// a configured token on the transport (`auth_token == None`) bypasses
-/// the check so the same code path works for dev builds. Otherwise we
-/// do a constant-time-enough comparison against the `Authorization`
-/// header and 401 on mismatch. The handshake-file delivery channel
-/// for the token lives in the embedder (flowstate Tauri app), not
-/// here — this transport only knows "a client either presents the
-/// expected token or it doesn't."
-async fn require_bearer_token(
-    State(state): State<ApiState>,
-    headers: axum::http::HeaderMap,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let Some(expected) = state.auth_token.as_deref() else {
-        return next.run(request).await;
-    };
-    let header = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let provided = header.strip_prefix("Bearer ").unwrap_or("");
-    if provided == expected && !provided.is_empty() {
-        next.run(request).await
-    } else {
-        tracing::debug!("rejecting request with missing/invalid bearer token");
-        (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()
-    }
 }
 
 /// GET /api/version — stable handshake payload consumed by daemon
 /// clients (the flowstate Tauri proxy, the MCP subprocess) to detect
-/// mismatched shell ↔ daemon versions after an auto-update. Public so
-/// a supervisor can probe it without the bearer token.
+/// mismatched shell ↔ daemon versions after an auto-update. Always
+/// reachable; no auth on the loopback transport.
 ///
 /// `schema_version` bumps only on breaking changes to the HTTP/WS
 /// wire shape; `build_sha` is a commit-sha stamp for debugging / bug
@@ -324,7 +303,10 @@ struct VersionPayload {
 
 async fn version_handler() -> Json<VersionPayload> {
     Json(VersionPayload {
-        schema_version: 1,
+        // Pulled from the single source of truth in `provider-api`
+        // so shell + daemon + mcp-server can't drift. Bump the
+        // constant there, not here.
+        schema_version: zenui_provider_api::SCHEMA_VERSION,
         // `option_env!` returns `Option<&'static str>` — so default
         // to "dev" for local builds that don't set the env var.
         build_sha: option_env!("FLOWSTATE_BUILD_SHA").unwrap_or("dev"),
@@ -367,15 +349,25 @@ async fn status_handler(State(state): State<ApiState>) -> Response {
 /// currently only the `flowstate-mcp-server` binary — supplies the
 /// originating session id (passed in via env var when the provider
 /// adapter spawned the MCP server subprocess) plus the `RuntimeCall`
-/// shape the agent wants to execute. `turn_id` is optional: external
-/// callers without a real turn context should omit it so the server
-/// synthesizes a per-call id, which means orchestration budget is
-/// scoped per call rather than per turn.
+/// shape the agent wants to execute. `origin_turn_id` is optional:
+/// external callers without a real turn context should omit it so
+/// the server synthesizes a per-call id, which means orchestration
+/// budget is scoped per call rather than per turn.
+///
+/// **Do not** rename these fields to `session_id` / `turn_id`.
+/// `RuntimeCall` variants (`Send`, `Poll`, `SendAndAwait`, etc.) have
+/// their own `session_id` that targets a *different* session — the
+/// peer to message or poll. With `#[serde(flatten)]`, a naming
+/// collision made the outer field swallow the JSON `session_id`
+/// before the inner variant could see it, producing a cryptic
+/// `missing field "session_id"` deserialization error on every poll
+/// / send / send_and_await call. The `origin_*` prefix keeps the two
+/// axes distinct on the wire.
 #[derive(Debug, Deserialize)]
 pub struct OrchestrationDispatchRequest {
-    pub session_id: String,
+    pub origin_session_id: String,
     #[serde(default)]
-    pub turn_id: Option<String>,
+    pub origin_turn_id: Option<String>,
     #[serde(flatten)]
     pub call: RuntimeCall,
 }
@@ -417,14 +409,14 @@ async fn orchestration_dispatch_handler(
     Json(body): Json<OrchestrationDispatchRequest>,
 ) -> Json<OrchestrationDispatchResponse> {
     let origin = RuntimeCallOrigin {
-        session_id: body.session_id,
+        session_id: body.origin_session_id,
         // Synthesize a per-call turn id when the external caller
         // doesn't have one. Budgets key off `turn_id`, so this gives
         // each external call its own fresh budget — equivalent to the
         // in-process "one tool call per turn" bound when the call
         // isn't riding on a real agent turn.
         turn_id: body
-            .turn_id
+            .origin_turn_id
             .unwrap_or_else(|| format!("ext-{}", uuid::Uuid::new_v4())),
     };
     match state
@@ -442,6 +434,69 @@ async fn orchestration_dispatch_handler(
             error: Some(error),
         }),
     }
+}
+
+/// Query params for the replay route.
+#[derive(Debug, Deserialize, Default)]
+struct EventsReplayQuery {
+    /// Last seq the client has already seen. `0` (or omitted) asks
+    /// for the full ring from the earliest retained event.
+    #[serde(default)]
+    since: u64,
+}
+
+/// JSON body of the replay response.
+#[derive(Debug, Serialize)]
+struct EventsReplayResponse {
+    /// Events with `seq > since`, in seq order.
+    events: Vec<EventsReplayEntry>,
+    /// Oldest seq still retained in the ring. `null` if the ring is
+    /// empty for this session.
+    oldest_retained_seq: Option<u64>,
+    /// Next seq the ring will assign on the next `publish`. Lets the
+    /// client know "if you subscribe to the live stream now, the
+    /// first event you'll see will have seq ≥ this number."
+    next_seq: u64,
+    /// True iff the caller's `since` was older than what the ring
+    /// still has. Client MUST fall back to a full
+    /// `LoadSession` + fresh live subscription; the events field
+    /// alone is not enough to reconstruct state.
+    gap_detected: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct EventsReplayEntry {
+    seq: u64,
+    event: zenui_provider_api::RuntimeEvent,
+}
+
+/// GET /api/sessions/:session_id/events?since=N
+///
+/// Phase 5.5.7 replay route. Returns every buffered event for
+/// `session_id` with seq > since plus metadata the client uses to
+/// detect gaps. Never streams — it's a snapshot. For live events,
+/// use the WS.
+async fn session_events_replay_handler(
+    State(state): State<ApiState>,
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<EventsReplayQuery>,
+) -> Json<EventsReplayResponse> {
+    let result = state.runtime.replay_session_events(&session_id, query.since);
+    let gap = result.gap_detected(query.since);
+    let entries = result
+        .events
+        .into_iter()
+        .map(|e| EventsReplayEntry {
+            seq: e.seq,
+            event: e.event,
+        })
+        .collect();
+    Json(EventsReplayResponse {
+        events: entries,
+        oldest_retained_seq: result.oldest_retained_seq,
+        next_seq: result.next_seq,
+        gap_detected: gap,
+    })
 }
 
 /// POST /api/shutdown — loopback-only endpoint that asks the daemon to
