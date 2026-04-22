@@ -14,6 +14,7 @@ use zenui_runtime_core::{
     AppMetadataProvider, RuntimeCore, WorktreeBlueprint, WorktreeProvisioner,
 };
 
+use crate::git_worktree::create_git_worktree_internal;
 use crate::user_config::UserConfigStore;
 
 /// Reads user-set titles / project names from the app-owned
@@ -222,7 +223,7 @@ impl WorktreeProvisioner for WorktreeProvisionerImpl {
         let branch_clone = branch.clone();
         let base_ref_clone = base_ref.clone();
         let git_result = tokio::task::spawn_blocking(move || {
-            crate::create_git_worktree_internal(
+            create_git_worktree_internal(
                 &parent_clone,
                 &wt_clone,
                 &branch_clone,

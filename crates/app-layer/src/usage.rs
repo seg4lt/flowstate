@@ -1529,12 +1529,20 @@ mod tests {
     #[test]
     fn duplicate_turn_ids_are_no_ops() {
         let store = UsageStore::in_memory().unwrap();
+        // Use a timestamp 1 day ago (always inside the Last7Days
+        // window) so the test isn't date-sensitive — the previous
+        // hardcoded `2026-04-15` silently aged out of the window the
+        // moment the calendar crossed +7d, making the test a flaky
+        // time-bomb.
+        let recent = (Utc::now() - Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
         let event = sample_event(
             "t1",
             "s1",
             ProviderKind::Claude,
             Some("claude-sonnet"),
-            "2026-04-15T12:00:00Z",
+            &recent,
             100,
             200,
             Some(0.01),

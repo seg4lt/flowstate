@@ -1,0 +1,102 @@
+[package]
+name = "flowstate-app-layer"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Flowstate app-owned state that neither the core runtime SDK nor the
+# provider adapters should care about: user-facing config, usage
+# analytics, and the concrete implementations of the runtime's
+# `AppMetadataProvider` / `WorktreeProvisioner` traits that translate
+# flowstate project metadata into something the runtime understands.
+#
+# Why its own crate:
+#   - Phase 3 of the architecture plan pulls these out of the Tauri
+#     binary so the future `flowstate-daemon` process (Phase 6) can
+#     consume them verbatim. Today the Tauri app is the only consumer
+#     and the crate gets mod-included; once the daemon splits, *it*
+#     owns the SQLite files and the Tauri shell proxies via HTTP.
+#   - Keeps Tauri out of the dependency graph of anything that isn't
+#     strictly UI. Projects embedding flowstate's runtime headless
+#     (tests, CLIs, the eventual daemon bin) can depend on this crate
+#     without pulling the entire Tauri stack.
+#
+# The actual per-user databases (user_config.sqlite, usage.sqlite)
+# live alongside the runtime's own SQLite under the Tauri-resolved
+# app_data_dir. Callers inject the dir; this crate never resolves it.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# SDK surface for the orchestration adapter impls (ProjectMetadata,
+# WorktreeSpec, trait definitions). Same crate the runtime uses, so
+# the conversion here is zero-cost and type-checked.
+zenui-provider-api = { path = "../core/provider-api" }
+zenui-runtime-core = { path = "../core/runtime-core" }
+
+# Serde for the analytics / config wire shapes. Tauri commands and
+# (Phase 4+) HTTP handlers both serialize these; owning them here
+# keeps the schemas in one place.
+serde.workspace = true
+serde_json.workspace = true
+
+# Usage analytics needs timezone-aware timestamps for the bucketed
+# timeseries. Default features are fine — we use the `clock` feature
+# for `Utc::now()` and the `serde` integration for wire types.
+chrono = { workspace = true }
+
+# SQLite. Bundled feature builds libsqlite3 in-tree so we don't
+# depend on whatever version ships with the host OS. Version matches
+# what the rest of the workspace links (rusqlite 0.37 bundled) so
+# libsqlite3-sys is shared across the dependency graph — cargo
+# refuses two crates linking to the same native library at different
+# versions, and it's easier to just pin.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# The orchestration-adapter impls are `async_trait`-decorated so they
+# can satisfy the runtime's `WorktreeProvisioner` trait.
+async-trait.workspace = true
+
+# The orchestration adapters offload blocking SQLite / `git worktree
+# add` work onto `tokio::task::spawn_blocking` so the async runtime
+# stays responsive even when rusqlite contends or git is slow.
+tokio = { workspace = true }
+
+# HTTP surface for the Phase 4 dual-surface milestone — same
+# functions the `#[tauri::command]` wrappers delegate to, exposed as
+# REST handlers on the loopback transport. Tauri crate mounts the
+# returned `Router` into `HttpTransport::with_extra_router` so both
+# surfaces share the same ephemeral loopback port.
+axum = { workspace = true }
+
+# Phase 6 — the daemon binary entry point lives in this crate so both
+# the Tauri embedded mode and the standalone `flowstate daemon`
+# subcommand can construct the same set of provider adapters from
+# the same data dir. Pulling the provider crates in here means the
+# adapter-construction boilerplate that used to live in `lib.rs`
+# (6 providers × ~4 lines each) now has exactly one definition.
+zenui-provider-claude-sdk = { path = "../core/provider-claude-sdk" }
+zenui-provider-claude-cli = { path = "../core/provider-claude-cli" }
+zenui-provider-codex = { path = "../core/provider-codex" }
+zenui-provider-github-copilot = { path = "../core/provider-github-copilot" }
+zenui-provider-github-copilot-cli = { path = "../core/provider-github-copilot-cli" }
+zenui-provider-opencode = { path = "../core/provider-opencode" }
+
+# Daemon bootstrap + transport plumbing for the `flowstate daemon`
+# subcommand. Same crates the Tauri embedded mode used; consolidating
+# here keeps the entry-point code short and makes the daemon binary
+# a real process rather than a placeholder.
+zenui-daemon-core = { path = "../middleman/daemon-core" }
+zenui-transport-http = { path = "../middleman/transport-http" }
+
+# Logging + error surfaces for the daemon entry point. `tracing-
+# subscriber` initializes the subscriber before bootstrap so startup
+# errors get logged with timestamps.
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# In-memory SQLite for unit tests (no temp files on disk).
+tempfile.workspace = true

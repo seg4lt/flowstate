@@ -22,18 +22,29 @@ use pty::{PtyId, PtyManager};
 
 mod shell_env;
 
+mod daemon_client;
+mod daemon_supervisor;
 mod loopback_http;
-mod orchestration_adapters;
-mod user_config;
-use orchestration_adapters::{AppMetadataProviderImpl, WorktreeProvisionerImpl};
-use user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
-
-mod usage;
-use tokio::sync::broadcast::error::RecvError;
-use usage::{
+mod orphan_scan;
+use daemon_client::{DaemonBaseUrl, DaemonClient};
+// Phase 3 — user_config / usage / orchestration_adapters / git_worktree
+// moved into `flowstate-app-layer` so the future daemon bin can link
+// them without pulling Tauri. The Tauri crate now depends on the
+// app-layer crate instead of mod-ing the files in-tree.
+use flowstate_app_layer::git_worktree::{
+    GitWorktree, create_git_worktree_internal, list_git_worktrees_sync, resolve_git_root_sync,
+};
+use flowstate_app_layer::orchestration_adapters::{
+    AppMetadataProviderImpl, WorktreeProvisionerImpl,
+};
+use flowstate_app_layer::user_config::{
+    ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore,
+};
+use flowstate_app_layer::usage::{
     TopSessionRow, UsageAgentPayload, UsageBucket, UsageEvent, UsageGroupBy, UsageRange,
     UsageStore, UsageSummaryPayload, UsageTimeseriesPayload,
 };
+use tokio::sync::broadcast::error::RecvError;
 use zenui_provider_api::{OrchestrationIpcHandle, ProviderAdapter, RuntimeEvent};
 use zenui_provider_claude_cli::ClaudeCliAdapter;
 use zenui_provider_claude_sdk::ClaudeSdkAdapter;
@@ -69,33 +80,12 @@ async fn resolve_git_root(path: String) -> Option<String> {
         .flatten()
 }
 
-fn resolve_git_root_sync(path: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["-C", path, "rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if root.is_empty() {
-        None
-    } else {
-        Some(root)
-    }
-}
-
-/// When git reports a worktree path inside a `.git/` directory
-/// (submodule gitdir), resolve it back to the actual working
-/// directory. For normal paths this is a cheap no-op string check.
-fn resolve_worktree_path(path: &str) -> String {
-    if path.contains("/.git/") {
-        if let Some(resolved) = resolve_git_root_sync(path) {
-            return resolved;
-        }
-    }
-    path.to_string()
-}
+// `resolve_git_root_sync`, `resolve_worktree_path`, `list_git_worktrees_sync`,
+// `create_git_worktree_internal`, and the `GitWorktree` struct now live in
+// `flowstate-app-layer::git_worktree`. The Tauri command wrappers below
+// import and call them via the `use` at the top of this file; only the
+// async `#[tauri::command]` wrappers remain here because they're what
+// Tauri's `generate_handler!` macro registers.
 
 /// Return the current git branch for `path`, or `None` if `path` is not
 /// inside a git repo (or git itself fails). Used by the chat header to
@@ -217,27 +207,14 @@ fn list_git_branches_sync(path: String) -> Result<GitBranchList, String> {
     })
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GitWorktree {
-    path: String,
-    head: Option<String>,
-    branch: Option<String>,
-}
+// `GitWorktree` struct lives in `flowstate-app-layer::git_worktree`.
+// Re-exported via the `use` at the top of this file.
 
 /// List every worktree attached to the repo containing `path`,
-/// parsed from `git worktree list --porcelain`. The porcelain format
-/// is newline-delimited key/value pairs grouped into blank-line
-/// separated records — one record per worktree. Each record has a
-/// mandatory `worktree <path>` header, and may carry `HEAD <sha>`,
-/// `branch refs/heads/<name>`, `detached`, or `bare`. We ignore
-/// `bare` records (they have no working tree to show) and strip the
-/// `refs/heads/` prefix so the UI can render the short branch name
-/// directly.
-///
-/// Async wrapper dispatches the subprocess wait through
-/// `spawn_blocking`. Internal callers (e.g. `create_git_worktree`)
-/// use `list_git_worktrees_sync` directly.
+/// parsed from `git worktree list --porcelain`. Async wrapper that
+/// runs the blocking `list_git_worktrees_sync` from the app-layer on
+/// a blocking thread so the Tauri IPC handler never stalls on a slow
+/// git subprocess.
 #[tauri::command]
 async fn list_git_worktrees(path: String) -> Result<Vec<GitWorktree>, String> {
     tauri::async_runtime::spawn_blocking(move || list_git_worktrees_sync(path))
@@ -245,96 +222,11 @@ async fn list_git_worktrees(path: String) -> Result<Vec<GitWorktree>, String> {
         .map_err(|e| format!("spawn_blocking join: {e}"))?
 }
 
-fn list_git_worktrees_sync(path: String) -> Result<Vec<GitWorktree>, String> {
-    let output = Command::new("git")
-        .args(["-C", &path, "worktree", "list", "--porcelain"])
-        .output()
-        .map_err(|e| format!("failed to run git: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            format!(
-                "git worktree list failed (status {:?})",
-                output.status.code()
-            )
-        } else {
-            stderr
-        });
-    }
-    let stdout =
-        String::from_utf8(output.stdout).map_err(|e| format!("git output not utf-8: {e}"))?;
-
-    let mut worktrees: Vec<GitWorktree> = Vec::new();
-    let mut current_path: Option<String> = None;
-    let mut current_head: Option<String> = None;
-    let mut current_branch: Option<String> = None;
-    let mut current_bare = false;
-
-    let flush = |worktrees: &mut Vec<GitWorktree>,
-                 path: &mut Option<String>,
-                 head: &mut Option<String>,
-                 branch: &mut Option<String>,
-                 bare: &mut bool| {
-        if let Some(p) = path.take() {
-            if !*bare {
-                worktrees.push(GitWorktree {
-                    path: p,
-                    head: head.take(),
-                    branch: branch.take(),
-                });
-            } else {
-                head.take();
-                branch.take();
-            }
-        }
-        *bare = false;
-    };
-
-    for line in stdout.lines() {
-        if line.is_empty() {
-            flush(
-                &mut worktrees,
-                &mut current_path,
-                &mut current_head,
-                &mut current_branch,
-                &mut current_bare,
-            );
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            // A new record started without a blank separator — flush
-            // whatever we accumulated to stay tolerant of git versions
-            // that elide the trailing newline.
-            flush(
-                &mut worktrees,
-                &mut current_path,
-                &mut current_head,
-                &mut current_branch,
-                &mut current_bare,
-            );
-            current_path = Some(resolve_worktree_path(rest));
-        } else if let Some(rest) = line.strip_prefix("HEAD ") {
-            current_head = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            current_branch = Some(rest.strip_prefix("refs/heads/").unwrap_or(rest).to_string());
-        } else if line == "bare" {
-            current_bare = true;
-        }
-        // "detached" and other single-word markers are ignored; a
-        // detached worktree just ends up with branch = None.
-    }
-    // Flush the final record (git's porcelain output may or may not
-    // end with a trailing blank line).
-    flush(
-        &mut worktrees,
-        &mut current_path,
-        &mut current_head,
-        &mut current_branch,
-        &mut current_bare,
-    );
-
-    Ok(worktrees)
-}
+// `list_git_worktrees_sync` + `create_git_worktree_internal` +
+// `resolve_git_root_sync` + `resolve_worktree_path` + `GitWorktree`
+// all moved into `flowstate-app-layer::git_worktree` during Phase 3.
+// The Tauri `#[tauri::command]` wrappers import them via the `use`
+// at the top of this file.
 
 /// Create a brand-new local branch based on the current HEAD and
 /// switch to it. Separate from `git_checkout` because the call shape
@@ -429,77 +321,9 @@ fn create_git_worktree(
     )
 }
 
-/// Synchronous internal helper — same logic as `create_git_worktree`
-/// but callable from non-Tauri contexts (orchestration dispatcher).
-pub(crate) fn create_git_worktree_internal(
-    project_path: &str,
-    worktree_path: &str,
-    branch: &str,
-    base_ref: &str,
-    checkout_existing: bool,
-) -> Result<GitWorktree, String> {
-    if branch.trim().is_empty() {
-        return Err("empty branch name".into());
-    }
-    if worktree_path.trim().is_empty() {
-        return Err("empty worktree path".into());
-    }
-    let output = if checkout_existing {
-        // Check out an existing branch into the new worktree.
-        Command::new("git")
-            .args(["-C", project_path, "worktree", "add", worktree_path, branch])
-            .output()
-            .map_err(|e| format!("failed to run git: {e}"))?
-    } else {
-        // Create a new branch and check it out into the new worktree.
-        Command::new("git")
-            .args([
-                "-C",
-                project_path,
-                "worktree",
-                "add",
-                "-b",
-                branch,
-                worktree_path,
-                base_ref,
-            ])
-            .output()
-            .map_err(|e| format!("failed to run git: {e}"))?
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Err(if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!(
-                "git worktree add exited with status {:?}",
-                output.status.code()
-            )
-        });
-    }
-
-    // Re-read the list so the caller gets the new entry with the
-    // canonical fields the porcelain parser produces (in particular
-    // the HEAD sha, which we don't otherwise have on the create
-    // side). Linear scan — the list is short. Call the sync helper
-    // directly so we don't need to make this command async just to
-    // chain an `.await`.
-    //
-    // Resolve the git root first — when the project path is a
-    // submodule directory git may report worktree paths relative to
-    // the resolved repo root rather than the raw project path.
-    let effective_path =
-        resolve_git_root_sync(project_path).unwrap_or_else(|| project_path.to_string());
-    let all = list_git_worktrees_sync(effective_path)?;
-    all.into_iter()
-        .find(|w| w.path.trim_end_matches('/') == worktree_path.trim_end_matches('/'))
-        .ok_or_else(|| {
-            format!("worktree add succeeded but {worktree_path} not found in subsequent list")
-        })
-}
+// `create_git_worktree_internal` body moved into
+// `flowstate-app-layer::git_worktree`; the Tauri command above
+// delegates to it via the `use` at the top of this file.
 
 /// Remove the worktree rooted at `worktree_path`. When `force` is
 /// false, git refuses if the worktree has uncommitted changes or

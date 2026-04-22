@@ -44,6 +44,13 @@ zenui-daemon-core = { path = "../../../crates/middleman/daemon-core", features =
 # dir. Not reachable from other hosts on the LAN.
 zenui-transport-http = { path = "../../../crates/middleman/transport-http" }
 
+# App-owned state (user_config, usage analytics, orchestration adapter
+# impls, git-worktree helpers). Extracted in Phase 3 — the future
+# `flowstate-daemon` binary (Phase 6) will link the same crate, so
+# flowstate and the daemon agree on SQLite schemas and worktree
+# provisioning logic without either depending on Tauri.
+flowstate-app-layer = { path = "../../../crates/app-layer" }
+
 # Provider adapters the app wants to expose. Construction happens in
 # `src/lib.rs`; keeping the path deps here makes the set of supported
 # providers a single-file edit for downstream apps.

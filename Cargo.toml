@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "apps/flowstate/src-tauri",
+  "crates/app-layer",
   "crates/core/runtime-core",
   "crates/core/provider-api",
   "crates/core/persistence",
