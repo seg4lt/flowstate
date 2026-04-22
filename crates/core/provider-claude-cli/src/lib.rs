@@ -25,8 +25,24 @@ const TURN_TIMEOUT_SECS: u64 = 600;
 
 struct ClaudeCliProcess {
     child: Child,
+    /// Process-group id the `claude` CLI child leads. Captured right
+    /// after spawn; used by `Drop` + the idle watchdog's `kill_fn`
+    /// to `killpg(pgid, SIGTERM)` the whole subtree. The CLI forks
+    /// subshells + MCP proxies per tool call — without this, those
+    /// grandchildren reparent to PID 1 when the cached process is
+    /// reaped. See `zenui_provider_api::process_group`.
+    pgid: Option<i32>,
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Lines<BufReader<ChildStdout>>,
+}
+
+impl Drop for ClaudeCliProcess {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            zenui_provider_api::kill_process_group_best_effort(pgid);
+        }
+        let _ = self.child.start_kill();
+    }
 }
 
 // ── stream-json events emitted by the CLI on stdout ─────────────────────────
@@ -357,8 +373,8 @@ impl ClaudeCliAdapter {
         info!("Spawning claude CLI: {} {:?}", binary, args);
 
         let cwd = session_cwd(session, &self.working_directory);
-        let mut child = Command::new(&binary)
-            .args(&args)
+        let mut cmd = Command::new(&binary);
+        cmd.args(&args)
             .current_dir(&cwd)
             .env("CLAUDE_CODE_ENTRYPOINT", "zenui")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -366,9 +382,15 @@ impl ClaudeCliAdapter {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // `claude` CLI forks subshells + MCP servers per tool call;
+        // place them all in this child's process group so `killpg`
+        // at teardown reaps the subtree atomically.
+        zenui_provider_api::enter_own_process_group(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn claude CLI ('{binary}'): {e}"))?;
+        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
 
         let stdin = child
             .stdin
@@ -394,6 +416,7 @@ impl ClaudeCliAdapter {
 
         Ok(ClaudeCliProcess {
             child,
+            pgid,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
         })

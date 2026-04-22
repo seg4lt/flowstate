@@ -21,6 +21,16 @@ use crate::wire::BridgeRequest;
 #[derive(Debug)]
 pub(crate) struct ClaudeBridgeProcess {
     pub(crate) child: Child,
+    /// Process-group id the Node bridge leads. Captured right after
+    /// spawn via `child.id()` — on Unix that equals the pgid because
+    /// `enter_own_process_group` made the child its own group leader
+    /// in a `pre_exec` hook. Stored alongside `child` so Drop can
+    /// `killpg(pgid, SIGTERM)` to reap the whole subtree (the Node
+    /// bridge, plus any `claude` CLI subprocess the
+    /// `@anthropic-ai/claude-agent-sdk` may fork for tool use).
+    /// `None` on non-Unix or if the child exited before we read its
+    /// id; in both cases we fall back to tokio's `kill_on_drop`.
+    pub(crate) pgid: Option<i32>,
     pub(crate) stdin: Arc<Mutex<ChildStdin>>,
     pub(crate) stdout: Lines<BufReader<ChildStdout>>,
     pub(crate) bridge_session_id: String,
@@ -77,6 +87,21 @@ impl ClaudeBridgeProcess {
                 }
             }
         }
+    }
+}
+
+impl Drop for ClaudeBridgeProcess {
+    fn drop(&mut self) {
+        // Kill the entire process-group subtree (the Node bridge and
+        // any `claude` CLI subprocess the SDK forked for tool use)
+        // atomically, so no grandchild reparents to PID 1 when
+        // flowstate exits or the idle watchdog reaps the bridge.
+        // `start_kill` on `child` is the existing belt; the
+        // `killpg` is the suspenders.
+        if let Some(pgid) = self.pgid {
+            zenui_provider_api::kill_process_group_best_effort(pgid);
+        }
+        let _ = self.child.start_kill();
     }
 }
 

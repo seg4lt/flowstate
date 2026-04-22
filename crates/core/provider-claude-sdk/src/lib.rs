@@ -120,6 +120,14 @@ impl ClaudeSdkAdapter {
                     pending.retain(|_, v| !Arc::ptr_eq(v, &pending_arc));
                 }
                 let mut process = cached.inner().lock().await;
+                // Kill the whole process group first so any `claude`
+                // CLI child the SDK forked for tool use dies with
+                // the bridge. Drop order on the `ClaudeBridgeProcess`
+                // handles the same case on scope exit, but the idle
+                // watchdog gets here before the struct is dropped.
+                if let Some(pgid) = process.pgid {
+                    zenui_provider_api::kill_process_group_best_effort(pgid);
+                }
                 let _ = process.child.start_kill();
             }
         });
@@ -255,16 +263,24 @@ impl ClaudeSdkAdapter {
             format!("{}{sep}{}", node.bin_dir.display(), existing_path)
         };
 
-        let mut child = Command::new(&node.node_bin)
-            .arg(&bridge.script)
+        let mut cmd = Command::new(&node.node_bin);
+        cmd.arg(&bridge.script)
             .current_dir(&bridge.dir)
             .env("PATH", new_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Put the Node bridge (and anything it forks) in its own
+        // process group so Drop can `killpg` the whole subtree —
+        // the SDK can spawn the `claude` CLI internally for tool
+        // use, and tokio's `kill_on_drop` only terminates the
+        // direct child. See `zenui_provider_api::process_group`.
+        zenui_provider_api::enter_own_process_group(&mut cmd);
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn bridge: {e}"))?;
+        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
 
         let stdin = child
             .stdin
@@ -293,6 +309,7 @@ impl ClaudeSdkAdapter {
 
         let mut process = ClaudeBridgeProcess {
             child,
+            pgid,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
             bridge_session_id: String::new(),

@@ -15,12 +15,29 @@ use crate::wire::{BridgeRequest, BridgeResponse};
 
 pub(crate) struct CopilotBridgeProcess {
     pub(crate) child: Child,
+    /// Process-group id the Node bridge leads. Captured right after
+    /// spawn; used by `Drop` + the idle watchdog's kill_fn to
+    /// `killpg(pgid, SIGTERM)` so the `copilot` CLI subprocess the
+    /// bridge spawns via `new CopilotClient({ useStdio: true })`
+    /// dies alongside the bridge. Without this the CLI grandchild
+    /// reparents to PID 1 when flowstate exits. See
+    /// `zenui_provider_api::process_group`.
+    pub(crate) pgid: Option<i32>,
     // Wrapped in Arc<Mutex> so a background writer task can forward
     // permission/user-input answers back to the bridge concurrently with the
     // main read loop. Mirrors the pattern in provider-claude-sdk/src/lib.rs.
     pub(crate) stdin: Arc<Mutex<ChildStdin>>,
     pub(crate) stdout: Lines<BufReader<ChildStdout>>,
     pub(crate) bridge_session_id: String,
+}
+
+impl Drop for CopilotBridgeProcess {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            zenui_provider_api::kill_process_group_best_effort(pgid);
+        }
+        let _ = self.child.start_kill();
+    }
 }
 
 /// Idle timeout: a cached bridge with no in-flight turn is killed after
