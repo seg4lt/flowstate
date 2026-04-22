@@ -17,7 +17,7 @@
 //! forward-compatibility stance the other provider adapters take.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -117,17 +117,18 @@ pub struct EventRouter {
     /// Keyed by opencode's native session id — *not* flowstate's
     /// internal session id. The SSE events carry the opencode id so
     /// we index on that directly.
+    ///
+    /// Shared across per-flowstate-session `opencode serve` children
+    /// because opencode mints globally-unique native ids (UUIDs), so
+    /// a single HashMap can demux events from every running server
+    /// without key collisions.
     sessions: Mutex<HashMap<String, SessionState>>,
-    /// Marks whether the background SSE reader has been spawned.
-    /// Toggled once; subsequent `spawn_reader` calls are no-ops.
-    reader_started: Mutex<bool>,
 }
 
 impl EventRouter {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            reader_started: Mutex::new(false),
         }
     }
 
@@ -163,33 +164,46 @@ impl EventRouter {
         guard.remove(native_session_id);
     }
 
-    /// Spawn the background SSE reader if it isn't already running.
-    /// Idempotent — the first `subscribe` kicks this off and later
-    /// calls are cheap.
+    /// Spawn an SSE reader bound to one specific `opencode serve`
+    /// child. In the per-flowstate-session architecture there is one
+    /// reader per server — every server mints its own URL, and each
+    /// reader drives only that URL's `/event` stream. The reader
+    /// exits automatically when its `OpenCodeServer` is dropped (see
+    /// [`read_forever`] — a `Weak<OpenCodeServer>` lets it detect
+    /// shutdown without an explicit cancel channel).
+    ///
+    /// NOT idempotent per server — callers must only spawn one
+    /// reader per server, which `ensure_session_server` already
+    /// guarantees by spawning the reader inside the same
+    /// lock-guarded initialisation path.
     pub fn spawn_reader(
         self: &Arc<Self>,
-        _server: Arc<OpenCodeServer>,
+        server: Arc<OpenCodeServer>,
         client: Arc<OpenCodeClient>,
     ) {
         let router = self.clone();
+        let weak_server = Arc::downgrade(&server);
+        // Drop our Arc before spawning — the reader holds a `Weak` so
+        // its existence doesn't keep the server alive past
+        // `end_session`.
+        drop(server);
         tokio::spawn(async move {
-            {
-                let mut guard = router.reader_started.lock().await;
-                if *guard {
-                    return;
-                }
-                *guard = true;
-            }
-            read_forever(router, client).await;
+            read_forever(router, client, weak_server).await;
         });
     }
 }
 
-/// Long-lived SSE reader. Reconnects on transient failures with a
-/// short backoff so a momentary network blip doesn't orphan every
-/// in-flight turn. When the enclosing `OpenCodeServer` is dropped
-/// the underlying TCP connection closes and we exit.
-async fn read_forever(router: Arc<EventRouter>, client: Arc<OpenCodeClient>) {
+/// SSE reader bound to one `opencode serve` child. Reconnects on
+/// transient failures with a short backoff so a momentary byte-stream
+/// blip doesn't orphan an in-flight turn. Exits cleanly the moment
+/// the `Weak<OpenCodeServer>` fails to upgrade — i.e. when
+/// `shutdown_session_server` drops the last strong ref — so we don't
+/// leak a retry loop hammering a dead port after `end_session`.
+async fn read_forever(
+    router: Arc<EventRouter>,
+    client: Arc<OpenCodeClient>,
+    server: Weak<OpenCodeServer>,
+) {
     let (user, pass) = client.credentials();
     let user = user.to_string();
     let pass = pass.to_string();
@@ -204,6 +218,15 @@ async fn read_forever(router: Arc<EventRouter>, client: Arc<OpenCodeClient>) {
         .expect("reqwest SSE client build should not fail");
 
     loop {
+        // Per-session servers: the moment the caller drops the last
+        // strong ref (session delete, adapter tear-down), exit. Kept
+        // above the actual connect so a server that dies mid-retry
+        // loop doesn't generate a storm of connect-refused logs.
+        if server.upgrade().is_none() {
+            debug!(%url, "opencode server dropped; SSE reader exiting");
+            return;
+        }
+
         let response = match http
             .get(&url)
             .basic_auth(&user, Some(&pass))
@@ -639,7 +662,7 @@ async fn handle_permission_asked(
         .cloned()
         .unwrap_or_else(|| props.clone());
 
-    let (decision, _mode_override) = sink
+    let (decision, _mode_override, _denial_reason) = sink
         .request_permission(tool_name, input, PermissionDecision::Allow)
         .await;
 

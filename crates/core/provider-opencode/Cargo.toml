@@ -18,3 +18,12 @@ futures-util = "0.3"
 
 # Small, dependency-light random for the server password.
 rand = "0.8"
+
+# Process-group control for `opencode serve`: the child is placed in
+# its own process group so shutdown can `killpg(SIGTERM)` the whole
+# subtree (opencode + any mcp-server subprocesses opencode spawned for
+# its own agent sessions). Without this the Drop handler only reaps
+# the direct child and the grandchildren orphan. Unix-only; Windows
+# opencode deployments don't exist yet.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

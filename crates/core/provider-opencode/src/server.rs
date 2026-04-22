@@ -41,6 +41,16 @@ pub struct OpenCodeServer {
     /// in an `Option` so `shutdown()` can take ownership of the handle
     /// and join it without leaving the mutex in a moved-out state.
     child: Mutex<Option<Child>>,
+    /// Process-group id that `opencode serve` leads. Captured right
+    /// after spawn — we pass `.process_group(0)` so the child becomes
+    /// its own group leader (pgid == child pid). Stored separately so
+    /// Drop / shutdown can `killpg(pgid, SIGTERM)` even if the child
+    /// handle was already moved out of the mutex.
+    ///
+    /// `None` on non-Unix builds (no process-group concept) or if the
+    /// child died before we could read its pid. Both cases degrade to
+    /// the tokio `kill_on_drop` behaviour.
+    child_pgid: Option<i32>,
 }
 
 impl OpenCodeServer {
@@ -62,30 +72,72 @@ impl OpenCodeServer {
             "spawning opencode serve"
         );
 
-        let mut child = Command::new(binary)
-            .args([
-                "serve",
-                "--hostname",
-                hostname,
-                "--port",
-                &port.to_string(),
-            ])
-            .current_dir(working_directory)
-            // Opencode's server reads this to gate requests. We
-            // regenerate it on every spawn so a lingering stale
-            // process from a previous crash can't answer for us.
-            .env("OPENCODE_SERVER_PASSWORD", &password)
-            // Keep the default username — opencode's docs default to
-            // `"opencode"` when `OPENCODE_SERVER_USERNAME` is unset,
-            // and we match that in the HTTP client.
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ASKPASS", "")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+        let mut cmd = Command::new(binary);
+        cmd.args([
+            "serve",
+            "--hostname",
+            hostname,
+            "--port",
+            &port.to_string(),
+        ])
+        .current_dir(working_directory)
+        // Opencode's server reads this to gate requests. We
+        // regenerate it on every spawn so a lingering stale
+        // process from a previous crash can't answer for us.
+        .env("OPENCODE_SERVER_PASSWORD", &password)
+        // Keep the default username — opencode's docs default to
+        // `"opencode"` when `OPENCODE_SERVER_USERNAME` is unset,
+        // and we match that in the HTTP client.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+        // Put opencode in its own process group so shutdown can kill
+        // the whole subtree atomically. `process_group(0)` tells the
+        // kernel to `setpgid(child_pid, child_pid)` after fork — the
+        // child becomes group leader and any grandchildren it spawns
+        // (per-session agent workers, its own mcp-server subprocesses)
+        // inherit the group. One `killpg(pgid, SIGTERM)` later
+        // reaps everything; the `Drop` path below uses exactly that.
+        //
+        // Without this, a SIGKILL of flowstate would trigger
+        // `kill_on_drop` only on the immediate `opencode serve` PID;
+        // children opencode had spawned would reparent to PID 1 and
+        // leak. (In practice opencode is good about tearing down its
+        // own children, but relying on that is fragile — the belt is
+        // cheap.) See Phase 2.5.c in the plan.
+        // tokio's `Command::pre_exec` is Unix-only; the `#[cfg(unix)]`
+        // gate keeps non-Unix builds compiling by simply skipping the
+        // pre-exec hook.
+        #[cfg(unix)]
+        // Safety: `setpgid(0, 0)` is an async-signal-safe syscall
+        // and is the documented pre-exec use case.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn `{binary} serve`: {e}"))?;
+
+        // Capture pgid now — after `setpgid(0,0)` in pre_exec the
+        // child's pid equals its pgid, and `child.id()` is Some until
+        // the child is awaited. `Option<u32> → Option<i32>` with an
+        // explicit `try_into` fall-back so stub builds on unsupported
+        // platforms compile cleanly.
+        #[cfg(unix)]
+        let child_pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        #[cfg(not(unix))]
+        let child_pgid: Option<i32> = None;
 
         let stdout = child
             .stdout
@@ -143,6 +195,7 @@ impl OpenCodeServer {
             password,
             client,
             child: Mutex::new(Some(child)),
+            child_pgid,
         })
     }
 
@@ -159,10 +212,34 @@ impl OpenCodeServer {
 
 impl Drop for OpenCodeServer {
     fn drop(&mut self) {
-        // Best-effort tear-down. `kill_on_drop(true)` on the Command
-        // handles the common case automatically, but we do an explicit
-        // `start_kill()` through the mutex too so the child gets
-        // signalled even if the tokio reactor is on its way out.
+        // Tear down the *whole* opencode subtree, not just the direct
+        // child. Opencode spawns its own grandchildren (per-session
+        // agent workers, the flowstate mcp-server subprocess we
+        // registered in opencode.json). Killing only the parent leaks
+        // grandchildren — we've observed ~22 orphan `flowstate
+        // mcp-server` processes accumulating during `tauri dev`
+        // restart cycles.
+        //
+        // Order of operations:
+        //   1. `killpg(pgid, SIGTERM)` — polite signal to the whole
+        //      group, gives opencode a chance to flush writes.
+        //   2. `start_kill()` on the direct child — redundant on the
+        //      leader but ensures tokio's internal state reflects that
+        //      the child is on its way out.
+        // We deliberately do NOT `killpg(SIGKILL)`: SIGTERM followed
+        // by the kernel reaping on actual exit is the clean path.
+        // Hard SIGKILL escalation lives in the startup orphan scan
+        // (runs before the next flowstate binds its port, so any
+        // stubborn survivors get reaped there).
+        #[cfg(unix)]
+        if let Some(pgid) = self.child_pgid {
+            // Safety: `killpg` with a valid pgid is a standard POSIX
+            // syscall. ESRCH (group already empty) is expected on
+            // clean shutdown and silently ignored.
+            unsafe {
+                libc::killpg(pgid, libc::SIGTERM);
+            }
+        }
         if let Ok(mut guard) = self.child.try_lock() {
             if let Some(mut child) = guard.take() {
                 let _ = child.start_kill();
