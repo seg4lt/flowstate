@@ -105,3 +105,25 @@ ignore = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 grep-matcher = "0.1"
+
+# Process enumeration for the startup orphan scan (see
+# `src/orphan_scan.rs`). The scan walks every running process at
+# startup and SIGTERMs any `opencode serve` / `flowstate mcp-server`
+# whose parent is PID 1 — these are leftovers from a prior flowstate
+# that was SIGKILL'd (common during `tauri dev` hot-reload). Default
+# features off keeps the binary size hit minimal; we only need
+# process enumeration, not CPU/memory/disk stats.
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
+# HTTP client for Phase 5 — the DaemonClient proxies Tauri commands
+# over the loopback HTTP surface (phase 6 flips the base URL from
+# in-process to a separate daemon without touching the command
+# bodies). rustls avoids a system OpenSSL dependency and matches
+# what every other in-tree reqwest user pins.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# `libc::kill(pid, SIGTERM)` for the orphan scan. Unix-only — Windows
+# process trees don't orphan in the same way, and flowstate doesn't
+# ship a Windows dev-reload SIGKILL path to worry about.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

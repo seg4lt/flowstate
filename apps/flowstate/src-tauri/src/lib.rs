@@ -1714,21 +1714,30 @@ fn pty_kill(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
 // highlighter pool size. Frontend wraps these as
 // `getUserConfig` / `setUserConfig` in `src/lib/api.ts`.
 
+// Phase 5 — every `#[tauri::command]` in this block flips to the
+// `DaemonClient` proxy: Tauri command body → reqwest POST →
+// loopback HTTP handler (served by the `flowstate_app_layer::http`
+// router) → `UserConfigStore` / `UsageStore`. The Tauri state no
+// longer carries the stores directly for these commands; Phase 6
+// will move them into a separate daemon process and the command
+// bodies won't need any further change, only the base URL they
+// already read from the `DaemonBaseUrl` channel.
+
 #[tauri::command]
-fn get_user_config(
-    store: State<'_, UserConfigStore>,
+async fn get_user_config(
+    base_url: State<'_, DaemonBaseUrl>,
     key: String,
 ) -> Result<Option<String>, String> {
-    store.get(&key)
+    base_url.client().get_user_config(key).await
 }
 
 #[tauri::command]
-fn set_user_config(
-    store: State<'_, UserConfigStore>,
+async fn set_user_config(
+    base_url: State<'_, DaemonBaseUrl>,
     key: String,
     value: String,
 ) -> Result<(), String> {
-    store.set(&key, &value)
+    base_url.client().set_user_config(key, value).await
 }
 
 // Per-session and per-project display metadata: titles, names,
@@ -1740,67 +1749,67 @@ fn set_user_config(
 // for the boundary.
 
 #[tauri::command]
-fn set_session_display(
-    store: State<'_, UserConfigStore>,
+async fn set_session_display(
+    base_url: State<'_, DaemonBaseUrl>,
     session_id: String,
     display: SessionDisplay,
 ) -> Result<(), String> {
-    store.set_session_display(&session_id, &display)
+    base_url.client().set_session_display(session_id, display).await
 }
 
 #[tauri::command]
-fn get_session_display(
-    store: State<'_, UserConfigStore>,
+async fn get_session_display(
+    base_url: State<'_, DaemonBaseUrl>,
     session_id: String,
 ) -> Result<Option<SessionDisplay>, String> {
-    store.get_session_display(&session_id)
+    base_url.client().get_session_display(session_id).await
 }
 
 #[tauri::command]
-fn list_session_display(
-    store: State<'_, UserConfigStore>,
+async fn list_session_display(
+    base_url: State<'_, DaemonBaseUrl>,
 ) -> Result<HashMap<String, SessionDisplay>, String> {
-    store.list_session_display()
+    base_url.client().list_session_display().await
 }
 
 #[tauri::command]
-fn delete_session_display(
-    store: State<'_, UserConfigStore>,
+async fn delete_session_display(
+    base_url: State<'_, DaemonBaseUrl>,
     session_id: String,
 ) -> Result<(), String> {
-    store.delete_session_display(&session_id)
+    base_url.client().delete_session_display(session_id).await
 }
 
 #[tauri::command]
-fn set_project_display(
-    store: State<'_, UserConfigStore>,
+async fn set_project_display(
+    base_url: State<'_, DaemonBaseUrl>,
     project_id: String,
     display: ProjectDisplay,
 ) -> Result<(), String> {
-    store.set_project_display(&project_id, &display)
+    base_url.client().set_project_display(project_id, display).await
 }
 
 #[tauri::command]
-fn get_project_display(
-    store: State<'_, UserConfigStore>,
+async fn get_project_display(
+    base_url: State<'_, DaemonBaseUrl>,
     project_id: String,
 ) -> Result<Option<ProjectDisplay>, String> {
-    store.get_project_display(&project_id)
+    base_url.client().get_project_display(project_id).await
 }
 
 #[tauri::command]
-fn list_project_display(
-    store: State<'_, UserConfigStore>,
+async fn list_project_display(
+    base_url: State<'_, DaemonBaseUrl>,
 ) -> Result<HashMap<String, ProjectDisplay>, String> {
-    store.list_project_display()
+    base_url.client().list_project_display().await
 }
 
 #[tauri::command]
-fn delete_project_display(
-    store: State<'_, UserConfigStore>,
+async fn delete_project_display(
+    base_url: State<'_, DaemonBaseUrl>,
     project_id: String,
 ) -> Result<(), String> {
-    store.delete_project_display(&project_id)
+    base_url.client().delete_project_display(project_id).await
 }
 
 // Parent/child worktree links — a flowstate-app concept, not an SDK
@@ -1811,36 +1820,39 @@ fn delete_project_display(
 // under the parent project visually.
 
 #[tauri::command]
-fn set_project_worktree(
-    store: State<'_, UserConfigStore>,
+async fn set_project_worktree(
+    base_url: State<'_, DaemonBaseUrl>,
     project_id: String,
     parent_project_id: String,
     branch: Option<String>,
 ) -> Result<(), String> {
-    store.set_project_worktree(&project_id, &parent_project_id, branch.as_deref())
+    base_url
+        .client()
+        .set_project_worktree(project_id, parent_project_id, branch)
+        .await
 }
 
 #[tauri::command]
-fn get_project_worktree(
-    store: State<'_, UserConfigStore>,
+async fn get_project_worktree(
+    base_url: State<'_, DaemonBaseUrl>,
     project_id: String,
 ) -> Result<Option<ProjectWorktree>, String> {
-    store.get_project_worktree(&project_id)
+    base_url.client().get_project_worktree(project_id).await
 }
 
 #[tauri::command]
-fn list_project_worktree(
-    store: State<'_, UserConfigStore>,
+async fn list_project_worktree(
+    base_url: State<'_, DaemonBaseUrl>,
 ) -> Result<HashMap<String, ProjectWorktree>, String> {
-    store.list_project_worktree()
+    base_url.client().list_project_worktree().await
 }
 
 #[tauri::command]
-fn delete_project_worktree(
-    store: State<'_, UserConfigStore>,
+async fn delete_project_worktree(
+    base_url: State<'_, DaemonBaseUrl>,
     project_id: String,
 ) -> Result<(), String> {
-    store.delete_project_worktree(&project_id)
+    base_url.client().delete_project_worktree(project_id).await
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -1854,56 +1866,54 @@ fn delete_project_worktree(
 // `setup` writes rows into it on every `RuntimeEvent::TurnCompleted`.
 
 #[tauri::command]
-fn get_usage_summary(
-    store: State<'_, UsageStore>,
+async fn get_usage_summary(
+    base_url: State<'_, DaemonBaseUrl>,
     range: UsageRange,
     group_by: Option<UsageGroupBy>,
 ) -> Result<UsageSummaryPayload, String> {
-    store.summary(range, group_by.unwrap_or_default())
+    base_url.client().get_usage_summary(range, group_by).await
 }
 
 #[tauri::command]
-fn get_usage_timeseries(
-    store: State<'_, UsageStore>,
+async fn get_usage_timeseries(
+    base_url: State<'_, DaemonBaseUrl>,
     range: UsageRange,
     bucket: UsageBucket,
     split_by: Option<UsageGroupBy>,
 ) -> Result<UsageTimeseriesPayload, String> {
-    store.timeseries(range, bucket, split_by)
+    base_url
+        .client()
+        .get_usage_timeseries(range, bucket, split_by)
+        .await
 }
 
 #[tauri::command]
-fn get_top_sessions(
-    store: State<'_, UsageStore>,
+async fn get_top_sessions(
+    base_url: State<'_, DaemonBaseUrl>,
     range: UsageRange,
     limit: Option<u32>,
 ) -> Result<Vec<TopSessionRow>, String> {
-    store.top_sessions(range, limit.unwrap_or(10))
+    base_url.client().get_top_sessions(range, limit).await
 }
 
-/// Per-agent dashboard breakdown: returns one row per (agent_type)
-/// aggregated over the range, with the synthetic "main" key for the
-/// parent agent. Cost is pre-allocated at insert time, so this is a
-/// plain GROUP BY against `usage_event_agents` — cheap even on a
-/// couple hundred thousand rows.
+/// Per-agent dashboard breakdown. See the app-layer `UsageStore`
+/// method for the SQL shape.
 #[tauri::command]
-fn get_usage_by_agent(
-    store: State<'_, UsageStore>,
+async fn get_usage_by_agent(
+    base_url: State<'_, DaemonBaseUrl>,
     range: UsageRange,
 ) -> Result<UsageAgentPayload, String> {
-    store.summary_by_agent(range)
+    base_url.client().get_usage_by_agent(range).await
 }
 
-/// Two-row rollup of `usage_event_agents`: one row for the main
-/// (parent) agent, one row aggregating every subagent invocation.
-/// Same payload shape as `get_usage_by_agent` but the SQL collapses
-/// all non-NULL `agent_type` values into a single `"subagent"` key.
+/// Two-row rollup of `usage_event_agents`. See the app-layer method
+/// for the SQL shape.
 #[tauri::command]
-fn get_usage_by_agent_role(
-    store: State<'_, UsageStore>,
+async fn get_usage_by_agent_role(
+    base_url: State<'_, DaemonBaseUrl>,
     range: UsageRange,
 ) -> Result<UsageAgentPayload, String> {
-    store.summary_by_agent_role(range)
+    base_url.client().get_usage_by_agent_role(range).await
 }
 
 /// Resolved cross-platform app data dir for Flowstate — the same
@@ -1946,6 +1956,20 @@ pub fn run() {
         .manage(DiffTasks::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // Orphan scan — first thing in setup, BEFORE we bind the
+            // loopback HTTP port. If a previous flowstate was SIGKILL'd
+            // (routine during `tauri dev` reload), its `opencode serve`
+            // and `flowstate mcp-server` grandchildren reparent to PID
+            // 1 and keep running on their old ports. Reap them now so
+            // this flowstate's new-port allocation can't collide and
+            // so zombie MCP proxies pointing at a dead port don't hang
+            // the next orchestration turn. Unix-only; on non-Unix this
+            // is a no-op returning 0.
+            let reaped = orphan_scan::reap_orphaned_subprocesses();
+            if reaped > 0 {
+                tracing::info!(reaped, "startup orphan scan reaped stale subprocesses");
+            }
 
             // Cross-platform per-user data directory. Tauri resolves
             // this to:
@@ -2040,6 +2064,18 @@ pub fn run() {
                 // which is the pre-refactor behaviour.
                 let ipc_handle = OrchestrationIpcHandle::new();
 
+                // Phase 5 — publisher for the DaemonClient channel.
+                // The DaemonClient held in Tauri state reads the
+                // receiver side; `loopback_http::spawn` below
+                // publishes the base URL once the transport binds,
+                // at which point the app-layer Tauri commands start
+                // routing via HTTP. Pre-bind, they return a
+                // "base URL not yet available" error — the webview
+                // already handles that shape as a command error, so
+                // a race during startup surfaces as a visible retry
+                // rather than a silent corruption.
+                let daemon_base_url = daemon_base_url_for_spawn.clone();
+
                 // Construct the provider adapters the app wants to
                 // expose. Adding or removing providers now lives in a
                 // single call site here — `daemon-core` stays
@@ -2074,6 +2110,17 @@ pub fn run() {
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                     )),
+                    // Opencode runs as a shared-server singleton for
+                    // startup-latency reasons (one `opencode serve`
+                    // child reused across every flowstate-opencode
+                    // session). The shared server's `opencode.json`
+                    // registers the flowstate MCP with a sentinel
+                    // session id so opencode-side agents DO see
+                    // the orchestration tools. Tradeoff: every
+                    // opencode-side tool call arrives at the runtime
+                    // with the same origin.session_id — see the
+                    // docstring on `OPENCODE_SHARED_SESSION_ID` for
+                    // the implications.
                     Arc::new(OpenCodeAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
@@ -2154,11 +2201,32 @@ pub fn run() {
                 // (which itself lives for the life of the app). When
                 // the task returns, dropping `_loopback` aborts the
                 // HTTP accept loop cleanly.
+                // Phase 4 — open a dedicated UsageStore for the HTTP
+                // handlers. Each `UsageStore::open` allocates a
+                // fresh rusqlite `Connection`; SQLite handles the
+                // concurrency via WAL + per-connection locks, so
+                // this third handle sits alongside the writer (in
+                // the analytics subscriber above) and the reader
+                // (managed by Tauri's `app.manage`) without
+                // contention.
+                let usage_http: Option<Arc<flowstate_app_layer::usage::UsageStore>> =
+                    match flowstate_app_layer::usage::UsageStore::open(&flowstate_root) {
+                        Ok(s) => Some(Arc::new(s)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to open HTTP usage store: {e}; /api/usage/* will 503"
+                            );
+                            None
+                        }
+                    };
                 let _loopback = match loopback_http::spawn(
                     &flowstate_root,
                     core.runtime_core.clone(),
                     observer.clone(),
                     ipc_handle.clone(),
+                    user_config_for_orch.clone(),
+                    usage_http,
+                    daemon_base_url.clone(),
                 ) {
                     Ok(l) => Some(l),
                     Err(err) => {
@@ -2191,7 +2259,80 @@ pub fn run() {
 
             // Block until serve() is done and TauriDaemonState is managed.
             let lifecycle = ready_rx.recv().expect("daemon failed to start");
-            app.manage(AppLifecycle { lifecycle });
+            app.manage(AppLifecycle {
+                lifecycle: lifecycle.clone(),
+            });
+
+            // SIGTERM / SIGINT handler.
+            //
+            // Why this exists: without it, SIGTERM (e.g. `tauri dev`
+            // hot-reload, `pkill`, systemd stop, macOS Activity Monitor
+            // "Quit") terminates flowstate without running any Drop
+            // code — `opencode serve` and its grandchildren (including
+            // the `flowstate mcp-server` proxies) orphan to PID 1 and
+            // keep running, pointing at the now-dead loopback port.
+            // Users observed ~22 such orphans accumulating during a
+            // normal dev session.
+            //
+            // This handler intercepts both signals and walks the
+            // existing graceful-shutdown path:
+            //   1. `lifecycle.request_shutdown()` tips the daemon task
+            //      out of its `wait_for_shutdown()` await.
+            //   2. Daemon proceeds to `graceful_shutdown()` → drops
+            //      `DaemonConfig::adapters` → drops `OpenCodeAdapter`
+            //      → drops `OpenCodeServer` → its Drop impl sends
+            //      `killpg(pgid, SIGTERM)` to the whole opencode
+            //      process group (opencode + its mcp-server kids).
+            //   3. `app_handle.exit(0)` breaks the Tauri event loop so
+            //      the process actually exits instead of hanging.
+            //
+            // SIGKILL is still uncatchable — the startup orphan scan
+            // (see `loopback_http::spawn` / orphan-scan helper)
+            // handles that case. This handler covers every signal the
+            // kernel lets us touch.
+            {
+                let app_handle = app.handle().clone();
+                let lifecycle_for_signal = lifecycle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut sigterm = match tokio::signal::unix::signal(
+                        tokio::signal::unix::SignalKind::terminate(),
+                    ) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            tracing::warn!(
+                                %err,
+                                "failed to install SIGTERM handler; graceful shutdown on \
+                                 external signals will be unavailable"
+                            );
+                            return;
+                        }
+                    };
+                    let mut sigint = match tokio::signal::unix::signal(
+                        tokio::signal::unix::SignalKind::interrupt(),
+                    ) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            tracing::warn!(%err, "failed to install SIGINT handler");
+                            return;
+                        }
+                    };
+                    let signal_name = tokio::select! {
+                        _ = sigterm.recv() => "SIGTERM",
+                        _ = sigint.recv() => "SIGINT",
+                    };
+                    tracing::info!(
+                        signal = signal_name,
+                        "received termination signal; requesting daemon shutdown"
+                    );
+                    lifecycle_for_signal.request_shutdown();
+                    // Tauri's `exit()` runs `RunEvent::Exit` handlers
+                    // and returns control from `.run()`. Combined with
+                    // `request_shutdown()` above, the Drop chain runs
+                    // (killing opencode via process group) before the
+                    // process actually exits.
+                    app_handle.exit(0);
+                });
+            }
 
             Ok(())
         })

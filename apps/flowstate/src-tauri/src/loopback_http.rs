@@ -4,10 +4,10 @@
 //! (opencode, Copilot SDK, Claude CLI, Codex, Copilot CLI) spawns a
 //! per-session `flowstate mcp-server` subprocess that needs to call
 //! back into the runtime for orchestration dispatch. This module is
-//! the server side of that loopback: binds `127.0.0.1:0`, generates a
-//! random bearer token, writes a 0600 handshake file under the app
-//! data dir, and shares the same `Arc<RuntimeCore>` with the primary
-//! Tauri transport so every route reflects live runtime state.
+//! the server side of that loopback: binds `127.0.0.1:0`, writes a
+//! 0600 handshake file under the app data dir, and shares the same
+//! `Arc<RuntimeCore>` with the primary Tauri transport so every
+//! route reflects live runtime state.
 //!
 //! # Why not reuse daemon-core's `run_blocking`?
 //!
@@ -21,38 +21,45 @@
 //!
 //! - Binds `127.0.0.1:0` (ephemeral loopback port). Never reachable
 //!   from another host.
-//! - Every route except `/api/health` and `/api/version` demands
-//!   `Authorization: Bearer <token>`. Token is a 32-byte hex string
-//!   generated fresh on each app launch.
-//! - The token is written to `<data_dir>/daemon.handshake` with
-//!   `0600` permissions. Any same-user process that can read the file
-//!   can talk to the runtime — this is the explicit contract, since
-//!   the MCP subprocess is such a process.
-//! - The handshake file is overwritten atomically on each launch so
-//!   a stale token from a previous run is never valid against the
-//!   current server.
+//! - **No bearer-token auth.** On a single-user desktop every local
+//!   process that can reach the loopback port already runs with the
+//!   user's credentials and has unrestricted access to the flowstate
+//!   SQLite store, session attachments, and `~/.claude.json`. A token
+//!   on top of the loopback bind would be theater. If flowstate is
+//!   ever deployed on a multi-user host, reintroduce
+//!   `HttpTransport::new_with_auth` (see git history for the prior
+//!   shape) and add a `token` field to `Handshake` below.
+//! - The handshake file publishes `base_url` + `pid` +
+//!   `schema_version` + `build_sha` for supervisors / version-skew
+//!   detection. Permissions are `0600` to match where the token used
+//!   to live — cheap and harmless.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use flowstate_app_layer::http::{AppLayerApiState, router as app_layer_router};
+use flowstate_app_layer::usage::UsageStore;
+use flowstate_app_layer::user_config::UserConfigStore;
 use serde::Serialize;
 use zenui_daemon_core::{Transport, TransportHandle};
 use zenui_provider_api::{OrchestrationIpcHandle, OrchestrationIpcInfo};
 use zenui_runtime_core::{ConnectionObserver, RuntimeCore};
 use zenui_transport_http::HttpTransport;
 
-/// Contents of `<data_dir>/daemon.handshake`. Every subprocess that
-/// needs to talk to the runtime reads this file after launch, uses
-/// `base_url` + `token` to make its first request, and verifies
-/// `schema_version` against what it was built for.
+/// Contents of `<data_dir>/daemon.handshake`. Subprocesses that need
+/// to call back into the runtime read this file to discover the
+/// loopback port. `pid` lets a caller verify the daemon is still the
+/// one that wrote this file; `schema_version` is for future HTTP-API
+/// version-skew detection (a supervisor can refuse to proceed on
+/// mismatch). `build_sha` is a debugging aid.
 ///
-/// Keep field names stable — the MCP subprocess parses this JSON.
+/// Keep field names stable — the MCP subprocess (and any future
+/// Tauri-proxy client) parses this JSON.
 #[derive(Debug, Serialize)]
 pub struct Handshake {
     pub base_url: String,
-    pub token: String,
     pub pid: u32,
     pub schema_version: u32,
     pub build_sha: &'static str,
@@ -66,65 +73,14 @@ pub struct Handshake {
 #[allow(dead_code)]
 pub struct LoopbackHttp {
     pub base_url: String,
-    pub token: String,
     pub handshake_path: PathBuf,
     handle: Box<dyn TransportHandle>,
 }
 
-/// Generate a fresh 32-byte hex token for the handshake file. Uses
-/// the OS RNG via `tauri::Uuid`-adjacent crates would pull extra
-/// deps; instead we reuse what's already in the tree: `chrono` is
-/// present but not a CSPRNG. We lean on `std::process::id` +
-/// `SystemTime` mixed through SHA-ish isn't cryptographic either —
-/// so use a small inline CSPRNG from `/dev/urandom` via `std::fs`.
-/// Cross-platform variant: read from
-/// `getrandom` once it lands — for now, `/dev/urandom` on Unix and a
-/// time+pid fallback on Windows is acceptable for a loopback token
-/// that an attacker would already need local-user access to read.
-fn generate_token() -> String {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 32];
-            if f.read_exact(&mut buf).is_ok() {
-                return hex_encode(&buf);
-            }
-        }
-    }
-    // Fallback: mix pid, time, and a counter. Not cryptographic, but
-    // the handshake file's 0600 permission is the real gate — this
-    // only defeats a trivially-predicted guess by a rogue process
-    // that couldn't read the file anyway.
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let mut bytes = [0u8; 32];
-    for (i, chunk) in bytes.chunks_mut(8).enumerate() {
-        let n = nanos.wrapping_mul(1103515245).wrapping_add(pid as u128 + i as u128);
-        let bs = n.to_le_bytes();
-        chunk.copy_from_slice(&bs[..chunk.len()]);
-    }
-    hex_encode(&bytes)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
-}
-
 /// Write the handshake atomically with 0600 perms. Atomic means:
 /// write to a temp sibling, fsync, rename over the final path.
-/// Readers either see the old or the new token — never a truncated
-/// file.
+/// Readers either see the old or the new contents — never a
+/// truncated file.
 fn write_handshake_atomic(path: &Path, hs: &Handshake) -> Result<()> {
     let body =
         serde_json::to_string_pretty(hs).context("serialize daemon handshake to JSON")?;
@@ -161,20 +117,29 @@ fn write_handshake_atomic(path: &Path, hs: &Handshake) -> Result<()> {
 /// is shared with the Tauri transport — no duplicated state.
 ///
 /// Writes the handshake file at `<data_dir>/daemon.handshake` with
-/// 0600 perms. Callers read this file from subprocess-spawn sites
-/// (provider adapters) to discover `base_url` + `token` at session
-/// start.
+/// 0600 perms.
 pub fn spawn(
     data_dir: &Path,
     runtime: Arc<RuntimeCore>,
     observer: Arc<dyn ConnectionObserver>,
     ipc_handle: OrchestrationIpcHandle,
+    user_config: UserConfigStore,
+    usage: Option<Arc<UsageStore>>,
+    daemon_base_url: crate::daemon_client::DaemonBaseUrl,
 ) -> Result<LoopbackHttp> {
-    let token = generate_token();
     let bind_addr: SocketAddr = "127.0.0.1:0"
         .parse()
         .expect("static loopback addr must parse");
-    let transport: Box<dyn Transport> = Box::new(HttpTransport::new_with_auth(bind_addr, token.clone()));
+    // Phase 4 — mount the app-layer REST handlers on the same
+    // loopback port the transport-http orchestration routes use.
+    // The router is pre-`.with_state()`-stamped, so the HttpTransport
+    // just needs to merge the raw `Router<()>` at serve time.
+    let extra_router = app_layer_router(AppLayerApiState {
+        user_config,
+        usage,
+    });
+    let transport: Box<dyn Transport> =
+        Box::new(HttpTransport::new(bind_addr).with_extra_router(extra_router));
     let bound = transport.bind().context("bind loopback HTTP listener")?;
 
     // `address_info()` on the bound handle gives us the actual port
@@ -194,9 +159,9 @@ pub fn spawn(
         .context("serve loopback HTTP transport")?;
 
     // Populate the shared IPC handle so every adapter that was
-    // constructed with a clone of it can now see the base URL +
-    // token. Use `current_exe()` for the binary path — that's the
-    // running `flowstate` binary which handles both the UI and the
+    // constructed with a clone of it can now see the base URL. Use
+    // `current_exe()` for the binary path — that's the running
+    // `flowstate` binary which handles both the UI and the
     // `mcp-server` subcommand. Failures here are non-fatal: if the
     // cell was already populated (double-spawn, shouldn't happen
     // outside dev), we log and continue with the existing value.
@@ -204,20 +169,23 @@ pub fn spawn(
         .context("resolve current_exe for orchestration IPC handle")?;
     let info = OrchestrationIpcInfo {
         base_url: base_url.clone(),
-        auth_token: token.clone(),
         executable_path,
     };
-    if let Err(_already) = ipc_handle.set(info) {
-        tracing::warn!(
-            "orchestration IPC handle already populated; \
-             keeping the earlier value and ignoring this one"
-        );
-    }
+    // Phase 5.5.1 — handle is now a `watch::Sender`-backed channel,
+    // so `publish` replaces any prior value rather than rejecting.
+    // Respawn cycles (Phase 6 daemon restart) publish the new port
+    // and adapters on the next session-spawn read the fresh URL.
+    ipc_handle.publish(info);
+
+    // Phase 5 — publish the base URL to the DaemonClient channel so
+    // the 22 app-layer Tauri commands can now reach the matching
+    // HTTP handler (served on this same listener by the
+    // `HttpTransport::with_extra_router` merge).
+    daemon_base_url.publish(base_url.clone());
 
     let handshake_path = data_dir.join("daemon.handshake");
     let hs = Handshake {
         base_url: base_url.clone(),
-        token: token.clone(),
         pid: std::process::id(),
         schema_version: 1,
         build_sha: option_env!("FLOWSTATE_BUILD_SHA").unwrap_or("dev"),
@@ -232,7 +200,6 @@ pub fn spawn(
 
     Ok(LoopbackHttp {
         base_url,
-        token,
         handshake_path,
         handle,
     })
