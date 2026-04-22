@@ -47,7 +47,7 @@ use zenui_runtime_core::{OrchestrationService, RuntimeCore, TurnLifecycleObserve
 pub use config::DaemonConfig;
 pub use lifecycle::{DaemonLifecycle, DaemonStatus, IdleShutdownReason, idle_watchdog};
 pub use ready_file::{ReadyFile, ReadyFileContent};
-pub use shutdown::graceful_shutdown;
+pub use shutdown::{drain_shutdown, graceful_shutdown};
 // Transport traits now live in `runtime-core` so transport crates can
 // depend on them without pulling in daemon-core (which would create a
 // cycle when daemon-core takes optional deps on concrete transports).
@@ -167,7 +167,16 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
     // audit.
 
     let working_directory = config.project_root.clone();
-    let database_path = working_directory.join(".zenui").join(&config.database_name);
+    // Phase 5.5.6 — honour `DaemonConfig::explicit_data_dir` when the
+    // hosting app (Phase 6 Tauri shell, or standalone daemon bin)
+    // has resolved the data dir itself and wants us not to
+    // re-resolve. Falls back to the pre-existing `<project_root>/.zenui`
+    // layout when unset so in-process embedders behave unchanged.
+    let database_path = config
+        .explicit_data_dir
+        .clone()
+        .map(|dir| dir.join(&config.database_name))
+        .unwrap_or_else(|| working_directory.join(".zenui").join(&config.database_name));
 
     let lifecycle = DaemonLifecycle::new(config.idle_timeout);
 

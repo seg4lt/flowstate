@@ -98,6 +98,50 @@ impl DaemonLifecycle {
     pub fn is_idle(&self) -> bool {
         self.connected_clients() == 0 && self.in_flight_turns() == 0
     }
+
+    /// "No turns are in flight" — stricter than [`is_idle`](Self::is_idle)
+    /// in that it ignores the client counter, looser in that a daemon
+    /// with connected clients but no active turns IS quiescent.
+    ///
+    /// Introduced in Phase 5.5.4 of the architecture plan. Before the
+    /// daemon split, `is_idle`'s dual check was fine because client
+    /// disconnect == "no UI, shut down." After the split, the Tauri
+    /// shell disconnects frequently (window close, app relaunch
+    /// while daemon persists) and those events must NOT count toward
+    /// shutdown if turns are still running. Drain shutdown and the
+    /// UI-close-during-turn scenarios both gate on `is_quiescent()`.
+    pub fn is_quiescent(&self) -> bool {
+        self.in_flight_turns() == 0
+    }
+
+    /// Await until `is_quiescent()` holds OR `max_wait` elapses.
+    /// Returns `true` if quiescent, `false` on timeout.
+    ///
+    /// Polls the `activity_notify` channel so this is cheap — no
+    /// busy-loop. Used by [`crate::shutdown::drain_shutdown`] to wait
+    /// out in-flight turns gracefully before killing adapters.
+    pub async fn wait_for_quiescent(&self, max_wait: Duration) -> bool {
+        let deadline = Instant::now() + max_wait;
+        loop {
+            if self.is_quiescent() {
+                return true;
+            }
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(r) if !r.is_zero() => r,
+                _ => return self.is_quiescent(),
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(remaining) => {
+                    return self.is_quiescent();
+                }
+                _ = self.activity_notify.notified() => {
+                    // Re-check; either a turn ended (win) or a new
+                    // turn started (keep waiting until the deadline).
+                    continue;
+                }
+            }
+        }
+    }
 }
 
 impl TurnLifecycleObserver for DaemonLifecycle {
