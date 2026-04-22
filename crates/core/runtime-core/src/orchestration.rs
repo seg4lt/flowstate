@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, oneshot};
 use zenui_provider_api::{
-    PermissionMode, PollOutcome, RuntimeCall, RuntimeCallError, RuntimeCallOrigin,
+    PermissionMode, PollOutcome, ReasoningEffort, RuntimeCall, RuntimeCallError, RuntimeCallOrigin,
     RuntimeCallResult, TurnEventSink, TurnStatus,
 };
 
@@ -245,11 +245,18 @@ pub fn poll_result_from_turn(turn_id: &str, output: &str) -> RuntimeCallResult {
 /// Fire-and-forget: the calling dispatcher path typically holds a
 /// separate oneshot awaiter (or doesn't care about completion for
 /// async `Spawn`/`Send`); if `send_turn` fails we just log.
+/// Fire a turn on a peer session off-thread. `permission_mode` and
+/// `reasoning_effort` control the opening turn; the `send`/`send_and_await`
+/// paths pass `PermissionMode::Default` + `None` to preserve historical
+/// behavior, while the spawn dispatchers forward the caller-chosen
+/// values coming off `RuntimeCall::Spawn{,AndAwait,InWorktree}`.
 pub fn spawn_peer_turn(
     rc: Arc<RuntimeCore>,
     session_id: String,
     message: String,
     label: &'static str,
+    permission_mode: PermissionMode,
+    reasoning_effort: Option<ReasoningEffort>,
 ) {
     tokio::spawn(async move {
         if let Err(err) = rc
@@ -257,8 +264,8 @@ pub fn spawn_peer_turn(
                 session_id,
                 message,
                 Vec::new(),
-                PermissionMode::Default,
-                None,
+                permission_mode,
+                reasoning_effort,
                 None,
             )
             .await

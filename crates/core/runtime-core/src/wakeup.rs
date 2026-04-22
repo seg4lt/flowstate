@@ -64,7 +64,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 use zenui_persistence::{PersistenceService, ScheduledWakeupRow};
-use zenui_provider_api::RuntimeEvent;
+use zenui_provider_api::{PermissionMode, RuntimeEvent};
 
 use crate::RuntimeCore;
 
@@ -200,7 +200,18 @@ impl WakeupFireHandler for RuntimeCoreFireHandler {
             return;
         };
         publish_wakeup_fired(&rc, &fired.session_id, &fired.wakeup_id);
-        crate::orchestration::spawn_peer_turn(rc, fired.session_id, fired.prompt, "wakeup");
+        // Wakeups re-deliver a prompt to the same session — they
+        // don't carry mode/effort overrides, so run the turn with
+        // the session's strictest permission mode and no effort
+        // override (historical behavior pre-spawn-config refactor).
+        crate::orchestration::spawn_peer_turn(
+            rc,
+            fired.session_id,
+            fired.prompt,
+            "wakeup",
+            PermissionMode::Default,
+            None,
+        );
     }
 }
 
