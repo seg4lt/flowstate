@@ -18,6 +18,20 @@
 mod adapter;
 mod binary_resolver;
 pub mod capabilities;
+
+/// Current wire schema version.
+///
+/// Bump this number when the HTTP / WS wire shape changes in a way
+/// that would break a shell built against an older daemon (or vice
+/// versa). The Phase 6 daemon handshake embeds this value in
+/// `GET /api/version`; the Tauri shell compares its own bundled
+/// `SCHEMA_VERSION` against what the running daemon reports and
+/// refuses to proceed on mismatch with a "Restart flowstate to
+/// finish updating" dialog. Keeping the constant here keeps a single
+/// source of truth; transports (`transport-http`, future
+/// `transport-tauri` replacements) and consumers (Tauri shell,
+/// mcp-server) import this rather than hardcode the integer.
+pub const SCHEMA_VERSION: u32 = 1;
 mod events;
 pub mod helpers;
 pub mod mcp_config;

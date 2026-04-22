@@ -28,6 +28,32 @@ pub trait ProviderAdapter: Send + Sync {
 
     async fn health(&self) -> ProviderStatus;
 
+    /// Called once by the daemon at startup (and after any respawn
+    /// triggered by the Phase 6 supervisor) to let the adapter clean
+    /// up state carried over from a prior process. Concrete things
+    /// adapters might do here:
+    ///
+    /// - Clear in-memory session caches that are stale after a
+    ///   restart (Claude SDK bridge `query` map, Copilot SDK session
+    ///   object refs).
+    /// - Reap orphaned subprocess children that somehow survived the
+    ///   startup orphan scan (belt and suspenders).
+    /// - Reconnect to long-lived upstream services the adapter owns
+    ///   (opencode's `opencode serve`; a crashed daemon leaves the
+    ///   child running, the startup orphan scan kills it, and
+    ///   reconcile_state is where the adapter acknowledges a fresh
+    ///   slate is expected).
+    ///
+    /// Default impl is a no-op so every adapter compiles unchanged.
+    /// Adapters override as they gain reconciliation logic; there is
+    /// no contract that reconcile must run before `start_session`, so
+    /// lazy/just-in-time reconciliation inside `start_session` is
+    /// also fine and may be preferred for adapters with many
+    /// sessions (avoid a startup-time foreach).
+    async fn reconcile_state(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Fetch the live model catalog from the upstream CLI / SDK.
     /// Adapters override this; the default returns an empty list (which the
     /// runtime treats as "use the cached or hardcoded fallback").
