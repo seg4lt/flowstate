@@ -161,41 +161,6 @@ impl UserConfigStore {
         Ok(())
     }
 
-    /// Resolve the opencode idle-kill TTL.
-    ///
-    /// Reads `opencode.idle_ttl_seconds` from `user_config` and maps
-    /// it to a [`std::time::Duration`]. Semantics:
-    ///
-    /// - Unset / malformed → `Some(DEFAULT)` — idle-kill defaults ON
-    ///   (Phase C). Callers that want to bypass the default pass an
-    ///   explicit override to the adapter constructor.
-    /// - `"0"` → `Some(Duration::ZERO)`. The adapter treats this as
-    ///   "disabled" internally; distinguishing ZERO from None lets a
-    ///   user explicitly opt out via config without falling back to
-    ///   the default.
-    /// - Positive integer → `Some(Duration::from_secs(n))`.
-    ///
-    /// Default is 10 minutes — long enough to absorb tab-switching
-    /// patterns without cold-start pain, short enough that an idle
-    /// laptop doesn't keep `opencode serve` resident indefinitely.
-    pub fn opencode_idle_ttl(&self) -> std::time::Duration {
-        const DEFAULT_SECS: u64 = 600;
-        match self.get("opencode.idle_ttl_seconds") {
-            Ok(Some(raw)) => match raw.trim().parse::<u64>() {
-                Ok(secs) => std::time::Duration::from_secs(secs),
-                Err(_) => std::time::Duration::from_secs(DEFAULT_SECS),
-            },
-            _ => std::time::Duration::from_secs(DEFAULT_SECS),
-        }
-    }
-
-    /// Persist the opencode idle-kill TTL. `0` disables idle-kill;
-    /// any positive value sets the window. Errors propagate so a
-    /// Settings-UI save path can surface them to the user.
-    pub fn set_opencode_idle_ttl_seconds(&self, secs: u64) -> Result<(), String> {
-        self.set("opencode.idle_ttl_seconds", &secs.to_string())
-    }
-
     pub fn set_session_display(
         &self,
         session_id: &str,

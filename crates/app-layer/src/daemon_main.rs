@@ -68,16 +68,16 @@ use crate::user_config::UserConfigStore;
 pub fn build_adapters(
     data_dir: PathBuf,
     ipc_handle: OrchestrationIpcHandle,
-    user_config: Option<&UserConfigStore>,
+    // Kept in the signature for forward compatibility — when an
+    // adapter grows a tunable the user can override from Settings,
+    // thread it through here. Currently every adapter uses its own
+    // crate-local default, so this argument is unused.
+    _user_config: Option<&UserConfigStore>,
 ) -> Vec<Arc<dyn ProviderAdapter>> {
-    // Opencode alone needs per-provider config today: its shared
-    // `opencode serve` supports idle-kill, with a TTL persisted in
-    // `user_config`. Other adapters don't take tunables yet; when
-    // they do, read them here and thread them through their
-    // constructors the same way.
-    let opencode_idle_ttl = user_config
-        .map(UserConfigStore::opencode_idle_ttl)
-        .unwrap_or_else(|| std::time::Duration::from_secs(600));
+    // Every adapter uses its crate-local default tunable. Opencode's
+    // `new_with_orchestration` internally applies `DEFAULT_IDLE_TTL`
+    // for idle-kill. If a tunable ever needs a user override, thread
+    // it through from `user_config` here.
 
     vec![
         Arc::new(ClaudeSdkAdapter::new(data_dir.clone())) as Arc<dyn ProviderAdapter>,
@@ -97,10 +97,9 @@ pub fn build_adapters(
             data_dir.clone(),
             Some(ipc_handle.clone()),
         )),
-        Arc::new(OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
+        Arc::new(OpenCodeAdapter::new_with_orchestration(
             data_dir,
             Some(ipc_handle),
-            Some(opencode_idle_ttl),
         )),
     ]
 }

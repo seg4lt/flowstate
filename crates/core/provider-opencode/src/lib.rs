@@ -120,13 +120,11 @@ const OPENCODE_SHARED_SESSION_ID: &str = "opencode-shared";
 /// would needlessly churn conversation state.
 const GENERATION_METADATA_KEY: &str = "opencode_generation";
 
-/// Default idle TTL baked into the adapter when none is supplied
-/// explicitly. 3 minutes — long enough to absorb "close a tab,
-/// open another" cycles without a cold start, short enough that
-/// an idle laptop returns the opencode child's memory promptly.
-/// Override per deployment via `UserConfigStore` key
-/// `opencode.idle_ttl_seconds`; a value of 0 disables idle-kill
-/// entirely.
+/// Default idle TTL baked into the adapter. 3 minutes — long enough
+/// to absorb "close a tab, open another" cycles without a cold
+/// start, short enough that an idle laptop returns the opencode
+/// child's memory promptly. Hosts can pass an explicit override via
+/// `new_with_orchestration_and_idle_ttl` (zero disables idle-kill).
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(180);
 
 /// Cadence at which the idle watcher re-checks the lease tracker
