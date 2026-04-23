@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 use tracing_subscriber::EnvFilter;
@@ -23,10 +24,9 @@ use pty::{PtyId, PtyManager};
 mod shell_env;
 
 mod daemon_client;
-mod daemon_supervisor;
 mod loopback_http;
 mod orphan_scan;
-use daemon_client::{DaemonBaseUrl, DaemonClient};
+use daemon_client::DaemonBaseUrl;
 // Phase 3 — user_config / usage / orchestration_adapters / git_worktree
 // moved into `flowstate-app-layer` so the future daemon bin can link
 // them without pulling Tauri. The Tauri crate now depends on the
@@ -2049,57 +2049,12 @@ pub fn run() {
             // handlers can obtain a `DaemonClient` per call.
             app.manage(daemon_base_url.clone());
 
-            // Phase 6 — when `FLOWSTATE_USE_DAEMON=1` is set, spawn
-            // the daemon as a separate process via the supervisor
-            // and skip the embedded bootstrap below. The supervisor
-            // reads the handshake file and publishes the base URL
-            // to `DaemonBaseUrl` so every app-layer Tauri command
-            // (already on `DaemonClient`) transparently routes to
-            // the daemon. The embedded path (below) stays as the
-            // default until the WS relay for the runtime-forwarder
-            // commands (`connect` / `handle_message`) lands —
-            // tracked in the plan's remaining Phase 6 items.
-            let use_daemon_split = std::env::var("FLOWSTATE_USE_DAEMON")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if use_daemon_split {
-                let data_dir = flowstate_root.clone();
-                let base_url_for_supervisor = daemon_base_url.clone();
-                let exe_path = std::env::current_exe()
-                    .expect("resolve current_exe for daemon supervisor");
-                tauri::async_runtime::spawn(async move {
-                    let cfg = daemon_supervisor::SupervisorConfig::defaults(
-                        data_dir,
-                        exe_path,
-                    );
-                    match daemon_supervisor::spawn(cfg, base_url_for_supervisor).await {
-                        Ok(_sup) => {
-                            tracing::info!("daemon supervisor started");
-                            // Drop the returned supervisor — its
-                            // background task retains ownership of
-                            // the Child via kill_on_drop, and the
-                            // broadcast channel lives in the
-                            // runtime's task graph. The shell's
-                            // SIGTERM handler (signal handler
-                            // elsewhere in this setup) calls
-                            // `lifecycle.request_shutdown()` which
-                            // also drops the supervisor reference
-                            // and tears down the child.
-                        }
-                        Err(e) => {
-                            tracing::error!(%e, "daemon supervisor failed to start");
-                        }
-                    }
-                });
-                // With the daemon separate, we don't run the
-                // embedded bootstrap below — return early. The 2
-                // `connect`/`handle_message` Tauri commands still
-                // touch TauriTransport which won't be mounted;
-                // those specific commands will error until the WS
-                // relay lands. Callers who need the full UI today
-                // run without `FLOWSTATE_USE_DAEMON=1`.
-                return Ok(());
-            }
+            // Clone the app handle once for the provisioning reporter
+            // below. The spawn block moves the original; this clone
+            // lives inside the spawn_blocking closure so each
+            // ProvisionEvent can be forwarded to the webview via
+            // `emit("provision", …)`.
+            let provision_app_handle = app.handle().clone();
 
             // Run the daemon on Tauri's existing tokio runtime so the
             // process has exactly one thread pool. The previous shape
@@ -2108,6 +2063,59 @@ pub fn run() {
             // runtime"; bootstrap_core_async removes that need by
             // letting us share the host runtime.
             tauri::async_runtime::spawn(async move {
+                // Front-load Node.js + provider-SDK node_modules
+                // hydration BEFORE any adapter construction so the
+                // first user-initiated turn can't be the thing that
+                // pays for a 30–90 second first-launch download. On
+                // warm caches every step is a sentinel hit — sub-
+                // millisecond.
+                //
+                // Events get emitted to the webview as a Tauri
+                // `provision` event; the `<ProvisioningSplash />`
+                // component listens and renders a full-screen loading
+                // overlay until the runtime's own `welcome` message
+                // arrives and the app flips to `ready: true`.
+                //
+                // Runs on `spawn_blocking` because everything inside
+                // (`ureq::get`, tar extract, `npm install`) is sync IO
+                // that would otherwise block the tokio worker this
+                // task was scheduled on.
+                let reporter_app_handle = provision_app_handle.clone();
+                let provision_result = tokio::task::spawn_blocking(move || {
+                    let reporter: Box<
+                        flowstate_app_layer::provision::ProvisionReporter,
+                    > = Box::new(move |event| {
+                        // Errors here are not actionable (webview may
+                        // not be fully wired yet during early boot).
+                        // We still log so a missing splash transition
+                        // is debuggable.
+                        if let Err(e) = reporter_app_handle.emit("provision", &event) {
+                            tracing::debug!(%e, "emit provision event failed");
+                        }
+                    });
+                    flowstate_app_layer::provision::provision_runtimes(&reporter)
+                })
+                .await;
+
+                match provision_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::error!(%e, "provision_runtimes failed; daemon will not start");
+                        // The splash already received a `Failed`
+                        // event for the phase that broke — the
+                        // webview stays on the splash showing the
+                        // error rather than advancing to a broken
+                        // `ready` state. Exit the spawn task here so
+                        // we don't try to bootstrap with broken
+                        // runtimes.
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "provision_runtimes task panicked");
+                        return;
+                    }
+                }
+
                 let mut config = DaemonConfig::with_project_root(flowstate_root.clone());
                 config.idle_timeout = Duration::MAX;
                 // Advertised to every connected client via the

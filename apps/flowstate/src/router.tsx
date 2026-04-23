@@ -27,6 +27,7 @@ import { SettingsView } from "@/components/settings/settings-view";
 import { UsageView } from "@/components/usage/usage-view";
 import { Toaster } from "@/components/ui/toaster";
 import { UpdateBanner } from "@/components/update-banner";
+import { ProvisioningSplash } from "@/components/provisioning-splash";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
@@ -252,6 +253,13 @@ function AppShell() {
       </SidebarProvider>
       <Toaster />
       <UpdateBanner />
+      {/*
+        First-launch loading overlay. Rendered last so it sits above
+        every sibling via its own z-[9999] — the app UI stays mounted
+        behind it so any late-arriving state (welcome message,
+        sessions) is already hydrated when the splash unmounts.
+      */}
+      <ProvisioningSplash />
     </TooltipProvider>
   );
 }

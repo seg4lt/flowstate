@@ -346,10 +346,10 @@ impl OpenCodeAdapter {
     /// Construct without cross-provider orchestration wiring and
     /// with idle-kill **disabled**. Used by headless tests and dev
     /// builds that don't want a background watcher task running.
-    /// Production paths (`daemon_main::build_adapters`, Tauri
-    /// `setup`) use [`Self::new_with_orchestration_and_idle_ttl`]
-    /// with the TTL resolved from [`UserConfigStore`], which
-    /// defaults ON at 10 minutes.
+    /// The Tauri `setup` closure uses
+    /// [`Self::new_with_orchestration_and_idle_ttl`] with the TTL
+    /// resolved from [`UserConfigStore`], which defaults ON at 10
+    /// minutes.
     pub fn new(working_directory: PathBuf) -> Self {
         Self::new_with_orchestration_and_idle_ttl(
             working_directory,

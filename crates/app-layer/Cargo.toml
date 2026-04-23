@@ -6,20 +6,15 @@ publish = false
 
 # Flowstate app-owned state that neither the core runtime SDK nor the
 # provider adapters should care about: user-facing config, usage
-# analytics, and the concrete implementations of the runtime's
-# `AppMetadataProvider` / `WorktreeProvisioner` traits that translate
-# flowstate project metadata into something the runtime understands.
+# analytics, the concrete implementations of the runtime's
+# `AppMetadataProvider` / `WorktreeProvisioner` traits, and the
+# startup provisioning helper that extracts / downloads bundled
+# runtimes before the Tauri shell bootstraps the daemon code.
 #
-# Why its own crate:
-#   - Phase 3 of the architecture plan pulls these out of the Tauri
-#     binary so the future `flowstate-daemon` process (Phase 6) can
-#     consume them verbatim. Today the Tauri app is the only consumer
-#     and the crate gets mod-included; once the daemon splits, *it*
-#     owns the SQLite files and the Tauri shell proxies via HTTP.
-#   - Keeps Tauri out of the dependency graph of anything that isn't
-#     strictly UI. Projects embedding flowstate's runtime headless
-#     (tests, CLIs, the eventual daemon bin) can depend on this crate
-#     without pulling the entire Tauri stack.
+# Keeps Tauri out of the dependency graph of anything that isn't
+# strictly UI. Projects embedding flowstate's runtime headless (tests,
+# CLIs) can depend on this crate without pulling the entire Tauri
+# stack.
 #
 # The actual per-user databases (user_config.sqlite, usage.sqlite)
 # live alongside the runtime's own SQLite under the Tauri-resolved
@@ -27,6 +22,20 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+# Default: provider bridges and the Node.js runtime are downloaded on
+# first launch.
+default = []
+# Opt-in: bake Node.js + every provider's bridge tree into the final
+# binary via `include_bytes!` / `rust-embed`. Forwarded to each
+# provider crate so their per-crate `embed` feature lights up.
+# Consumed by the Tauri app's `embed-all` feature, which is the
+# user-facing switch.
+embed-all = [
+    "zenui-provider-claude-sdk/embed",
+    "zenui-provider-github-copilot/embed",
+]
 
 [dependencies]
 # SDK surface for the orchestration adapter impls (ProjectMetadata,
@@ -36,8 +45,8 @@ zenui-provider-api = { path = "../core/provider-api" }
 zenui-runtime-core = { path = "../core/runtime-core" }
 
 # Serde for the analytics / config wire shapes. Tauri commands and
-# (Phase 4+) HTTP handlers both serialize these; owning them here
-# keeps the schemas in one place.
+# HTTP handlers both serialize these; owning them here keeps the
+# schemas in one place.
 serde.workspace = true
 serde_json.workspace = true
 
@@ -63,39 +72,29 @@ async-trait.workspace = true
 # stays responsive even when rusqlite contends or git is slow.
 tokio = { workspace = true }
 
-# HTTP surface for the Phase 4 dual-surface milestone — same
-# functions the `#[tauri::command]` wrappers delegate to, exposed as
-# REST handlers on the loopback transport. Tauri crate mounts the
-# returned `Router` into `HttpTransport::with_extra_router` so both
-# surfaces share the same ephemeral loopback port.
+# HTTP surface for the loopback REST handlers — same functions the
+# `#[tauri::command]` wrappers delegate to, exposed as routes mounted
+# on `HttpTransport::with_extra_router` so both surfaces share the
+# same ephemeral loopback port.
 axum = { workspace = true }
 
-# Phase 6 — the daemon binary entry point lives in this crate so both
-# the Tauri embedded mode and the standalone `flowstate daemon`
-# subcommand can construct the same set of provider adapters from
-# the same data dir. Pulling the provider crates in here means the
-# adapter-construction boilerplate that used to live in `lib.rs`
-# (6 providers × ~4 lines each) now has exactly one definition.
+# Bundled Node.js + provider bridges that `provision_runtimes()`
+# pre-warms at Tauri setup time. The two embed-feature-flagged SDK
+# bridges both transitively depend on `zenui-embedded-node`, but the
+# provision call site wants its own direct dep so ordering in the
+# splash telemetry (Node first, then bridges) is explicit.
+zenui-embedded-node = { path = "../core/embedded-node", default-features = false }
 zenui-provider-claude-sdk = { path = "../core/provider-claude-sdk" }
-zenui-provider-claude-cli = { path = "../core/provider-claude-cli" }
-zenui-provider-codex = { path = "../core/provider-codex" }
 zenui-provider-github-copilot = { path = "../core/provider-github-copilot" }
-zenui-provider-github-copilot-cli = { path = "../core/provider-github-copilot-cli" }
-zenui-provider-opencode = { path = "../core/provider-opencode" }
 
-# Daemon bootstrap + transport plumbing for the `flowstate daemon`
-# subcommand. Same crates the Tauri embedded mode used; consolidating
-# here keeps the entry-point code short and makes the daemon binary
-# a real process rather than a placeholder.
-zenui-daemon-core = { path = "../middleman/daemon-core" }
-zenui-transport-http = { path = "../middleman/transport-http" }
-
-# Logging + error surfaces for the daemon entry point. `tracing-
-# subscriber` initializes the subscriber before bootstrap so startup
-# errors get logged with timestamps.
+# Error handling for `provision_runtimes()` and the orchestration
+# adapter impls.
 anyhow.workspace = true
+
+# Used by `tracing::info!` markers in provision telemetry + the
+# orchestration adapters. The subscriber itself is initialised by
+# the Tauri shell; this crate only emits.
 tracing.workspace = true
-tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # In-memory SQLite for unit tests (no temp files on disk).

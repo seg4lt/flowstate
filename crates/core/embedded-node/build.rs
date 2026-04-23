@@ -10,21 +10,30 @@ fn main() {
     // The Node.js version is hardcoded above, so there are no other
     // inputs that could invalidate the download.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EMBED");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
 
-    let (platform, arch) = match detect_platform(&target) {
+    // Platform detection runs unconditionally — the runtime download path
+    // (when `embed` is off) needs the same values and we forward them via
+    // `cargo:rustc-env` so the runtime doesn't duplicate the logic.
+    let platform_info = detect_platform(&target);
+    let (platform, arch) = match platform_info {
         Some(p) => p,
         None => {
-            // Create empty markers so `include_bytes!` at least finds a
-            // file. The runtime will fail loudly when it tries to use an
-            // empty archive, which is better than a build failure on an
-            // unsupported target.
-            fs::write(out_dir.join("node.tar.gz"), &[] as &[u8])
-                .expect("failed to write empty node.tar.gz marker");
-            fs::write(out_dir.join("node.zip"), &[] as &[u8])
-                .expect("failed to write empty node.zip marker");
+            // Emit empty env vars so `env!()` in src/lib.rs still resolves.
+            println!("cargo:rustc-env=NODE_TARGET_PLATFORM=");
+            println!("cargo:rustc-env=NODE_TARGET_ARCH=");
+            println!("cargo:rustc-env=NODE_TARGET_EXT=");
+            // When `embed` is on, `include_bytes!` still needs files to
+            // resolve to. Write empty stubs so the compile succeeds.
+            if feature_enabled("embed") {
+                fs::write(out_dir.join("node.tar.gz"), &[] as &[u8])
+                    .expect("failed to write empty node.tar.gz marker");
+                fs::write(out_dir.join("node.zip"), &[] as &[u8])
+                    .expect("failed to write empty node.zip marker");
+            }
             println!(
                 "cargo:warning=Unsupported target {}; zenui-embedded-node will be non-functional",
                 target
@@ -35,6 +44,25 @@ fn main() {
 
     let is_windows = platform == "win";
     let ext = if is_windows { "zip" } else { "tar.gz" };
+
+    // Forward platform identifiers to the runtime crate. `src/lib.rs`
+    // reads these via `env!()` so both the embed and download paths
+    // resolve against the same strings baked into the binary.
+    println!("cargo:rustc-env=NODE_TARGET_PLATFORM={platform}");
+    println!("cargo:rustc-env=NODE_TARGET_ARCH={arch}");
+    println!("cargo:rustc-env=NODE_TARGET_EXT={ext}");
+
+    // Feature off → nothing to bake into the binary. The runtime will
+    // download on first use.
+    if !feature_enabled("embed") {
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // Embed path: download the Node.js archive at build time and stage
+    // it in OUT_DIR so `include_bytes!` in src/lib.rs picks it up.
+    // ------------------------------------------------------------------
+
     let out_filename = format!("node.{ext}");
     let archive_path = out_dir.join(&out_filename);
 
@@ -95,6 +123,11 @@ fn main() {
     // Persist to cache for future builds / cargo clean cycles.
     fs::create_dir_all(&cache_dir).ok();
     fs::copy(&archive_path, &cached_archive).ok();
+}
+
+fn feature_enabled(name: &str) -> bool {
+    let key = format!("CARGO_FEATURE_{}", name.to_uppercase().replace('-', "_"));
+    env::var(key).is_ok()
 }
 
 fn download_to(url: &str, dest: &std::path::Path) -> Result<(), String> {

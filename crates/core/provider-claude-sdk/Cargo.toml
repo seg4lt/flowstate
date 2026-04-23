@@ -5,14 +5,31 @@ edition.workspace = true
 publish = false
 build = "build.rs"
 
+[features]
+# Default: only the bridge glue (`index.js` + `package.json` + lockfile —
+# a few KB total) is baked into the binary. On first launch the daemon
+# runs the embedded Node's `npm install --omit=dev` against the staged
+# lockfile to hydrate `node_modules/` from npmjs.org. This avoids
+# shipping ~200 MB of `@anthropic-ai/claude-agent-sdk-<platform>` native
+# binaries inside our binary.
+default = []
+# Opt-in: also bake the full `node_modules/` tree into the binary so
+# first launch needs no network. For offline / air-gapped distribution.
+# Forwards to `zenui-embedded-node/embed` so Node itself is embedded
+# too — an offline `embed-all` build is fully self-contained.
+embed = ["zenui-embedded-node/embed"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
+# Always present — the bridge glue (index.js, package.json, lockfile)
+# is embedded via rust-embed in every build. The `embed` feature just
+# additionally stages `node_modules/` into the asset tree.
 rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zenui-embedded-node = { path = "../embedded-node" }
+zenui-embedded-node = { path = "../embedded-node", default-features = false }
 zenui-provider-api = { path = "../provider-api" }

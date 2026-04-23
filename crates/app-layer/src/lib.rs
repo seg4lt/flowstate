@@ -19,9 +19,9 @@
 //! version is that the future daemon bin needs this state without
 //! pulling Tauri.
 
-pub mod daemon_main;
 pub mod git_worktree;
 pub mod http;
 pub mod orchestration_adapters;
+pub mod provision;
 pub mod user_config;
 pub mod usage;

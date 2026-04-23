@@ -1,5 +1,9 @@
 mod bridge_runtime;
 mod config;
+
+// Public entry point for the daemon's startup `provision_runtimes()`
+// step. Mirrors `zenui_provider_claude_sdk::ensure_bridge_available`.
+pub use bridge_runtime::ensure_bridge_available;
 mod process;
 mod wire;
 

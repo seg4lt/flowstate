@@ -5,6 +5,11 @@ edition.workspace = true
 publish = false
 build = "build.rs"
 
+[features]
+# See `provider-claude-sdk` for the full rationale — this mirrors it.
+default = []
+embed = ["zenui-embedded-node/embed"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -14,5 +19,5 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-zenui-embedded-node = { path = "../embedded-node" }
+zenui-embedded-node = { path = "../embedded-node", default-features = false }
 zenui-provider-api = { path = "../provider-api" }
