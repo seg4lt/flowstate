@@ -75,7 +75,7 @@ function RewindBody({
   rewind: UseRewindFiles;
   onDone: () => void;
 }) {
-  const { state, apply, cancel } = rewind;
+  const { state, apply } = rewind;
 
   if (state.kind === "idle" || state.kind === "loading") {
     return (
@@ -135,7 +135,7 @@ function RewindBody({
           pathsSkipped={paths_skipped}
         />
         <DialogFooter>
-          <Button variant="secondary" onClick={cancel}>
+          <Button variant="secondary" onClick={onDone}>
             Cancel
           </Button>
           <Button
@@ -155,7 +155,7 @@ function RewindBody({
       <>
         <ConflictsBody conflicts={state.outcome.conflicts} />
         <DialogFooter>
-          <Button variant="secondary" onClick={cancel}>
+          <Button variant="secondary" onClick={onDone}>
             Cancel
           </Button>
           <Button variant="destructive" onClick={apply}>
