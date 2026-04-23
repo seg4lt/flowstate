@@ -1,7 +1,16 @@
 use std::env;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+// Pure-data lookup table for the pinned SHA-256 digests. Same file is
+// `pub mod node_checksums;`-ed from src/lib.rs at runtime; this
+// `#[path]` directive shares the source so the build-time and
+// runtime checks can never disagree about what's trusted.
+#[path = "src/node_checksums.rs"]
+mod node_checksums;
 
 const NODE_VERSION: &str = "20.11.1";
 
@@ -92,16 +101,43 @@ fn main() {
     let cache_filename = format!("node-v{}-{}-{}.{}", NODE_VERSION, platform, arch, ext);
     let cached_archive = cache_dir.join(&cache_filename);
 
+    // Look up the pinned digest before touching the network. A stale
+    // checksum table is a hard build failure with a clear message —
+    // not a silent unverified download.
+    let expected_sha = match node_checksums::expected_sha(platform, arch, ext) {
+        Some(sha) => sha,
+        None => {
+            println!(
+                "cargo:error=no pinned SHA-256 in src/node_checksums.rs for \
+                 {platform}-{arch}.{ext} (Node.js v{NODE_VERSION}); refusing to embed \
+                 an unverifiable archive"
+            );
+            std::process::exit(1);
+        }
+    };
+
     if cached_archive.exists() {
-        // Cache hit — just copy to OUT_DIR for include_bytes!.
-        fs::copy(&cached_archive, &archive_path)
-            .expect("failed to copy cached node archive to OUT_DIR");
-        return;
+        // Cache hit — verify before copying. A previous build that
+        // pre-dated checksum-pinning, or a tampered cache, must not be
+        // trusted just because a file with the right name exists.
+        if let Err(err) = verify_file_sha256(&cached_archive, expected_sha) {
+            println!(
+                "cargo:warning=cached Node.js archive at {} failed SHA-256 \
+                 verification ({err}); deleting and re-downloading",
+                cached_archive.display()
+            );
+            fs::remove_file(&cached_archive).ok();
+        } else {
+            fs::copy(&cached_archive, &archive_path)
+                .expect("failed to copy cached node archive to OUT_DIR");
+            return;
+        }
     }
 
-    // Cache miss — download from nodejs.org using a pure-Rust HTTP
-    // client. Avoids the dependency on system `curl` (missing on bare
-    // Windows CI runners, inconsistent across Linux containers).
+    // Cache miss (or evicted by a failed checksum) — download from
+    // nodejs.org using a pure-Rust HTTP client. Avoids the dependency
+    // on system `curl` (missing on bare Windows CI runners,
+    // inconsistent across Linux containers).
     let filename = format!("node-v{}-{}-{}.{}", NODE_VERSION, platform, arch, ext);
     let url = format!("https://nodejs.org/dist/v{}/{}", NODE_VERSION, filename);
 
@@ -120,9 +156,45 @@ fn main() {
         }
     }
 
+    // Verify the freshly-downloaded archive before publishing it to
+    // either OUT_DIR (where include_bytes! picks it up) or the
+    // persistent cache. A mismatch deletes the partial file and aborts
+    // the build with a copy-pasteable error.
+    if let Err(err) = verify_file_sha256(&archive_path, expected_sha) {
+        fs::remove_file(&archive_path).ok();
+        println!(
+            "cargo:error=downloaded Node.js archive from {url} failed \
+             SHA-256 verification: {err}"
+        );
+        std::process::exit(1);
+    }
+
     // Persist to cache for future builds / cargo clean cycles.
     fs::create_dir_all(&cache_dir).ok();
     fs::copy(&archive_path, &cached_archive).ok();
+}
+
+fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let actual = Sha256::digest(&bytes);
+    let actual_hex = hex_encode(actual.as_slice());
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        return Err(format!(
+            "SHA-256 mismatch (expected {expected_hex}, got {actual_hex}, {} bytes)",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 fn feature_enabled(name: &str) -> bool {

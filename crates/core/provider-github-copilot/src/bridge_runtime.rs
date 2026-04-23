@@ -126,7 +126,7 @@ fn extract_embedded_assets(staging: &Path) -> Result<()> {
 
 fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
     let node = zenui_embedded_node::ensure_available()
-        .context("embedded Node is unavailable — cannot run npm install")?;
+        .context("embedded Node is unavailable — cannot run npm")?;
 
     let npm_path = locate_npm(&node.bin_dir).ok_or_else(|| {
         anyhow!(
@@ -135,19 +135,31 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
         )
     })?;
 
+    // Prefer `npm ci` when a lockfile is staged alongside the
+    // extracted bridge — exact versions, SRI-verified tarballs,
+    // no drift. Fall back to `npm install` only when the lockfile
+    // is absent (older builds or future escape hatch).
+    let have_lockfile = cache_root.join("package-lock.json").exists();
+    let install_subcommand = if have_lockfile { "ci" } else { "install" };
+
     tracing::info!(
         cwd = %cache_root.display(),
         npm = %npm_path.display(),
-        "hydrating Copilot bridge node_modules via npm install --omit=dev"
+        mode = install_subcommand,
+        "hydrating Copilot bridge node_modules via npm {install_subcommand} --omit=dev"
     );
     let started = std::time::Instant::now();
 
     let mut cmd = Command::new(&npm_path);
-    cmd.arg("install")
+    cmd.arg(install_subcommand)
         .arg("--omit=dev")
         .arg("--no-audit")
         .arg("--no-fund")
         .arg("--loglevel=error")
+        // Match the Claude SDK bridge: warn-only on peer-dep
+        // mismatches rather than ERESOLVE-fail, so a future
+        // upstream-SDK peer bump doesn't brick first-launch.
+        .arg("--legacy-peer-deps")
         .arg("--cache")
         .arg(npm_cache_dir()?)
         .current_dir(cache_root)
@@ -155,11 +167,11 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
 
     let status = cmd
         .status()
-        .with_context(|| format!("spawn {} install", npm_path.display()))?;
+        .with_context(|| format!("spawn {} {}", npm_path.display(), install_subcommand))?;
 
     if !status.success() {
         anyhow::bail!(
-            "npm install for Copilot bridge failed with {status}; \
+            "npm {install_subcommand} for Copilot bridge failed with {status}; \
              try removing {} and re-launching, or build with `--features embed-all` \
              for an offline-ready binary",
             cache_root.display()

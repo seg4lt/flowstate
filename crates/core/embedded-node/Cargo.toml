@@ -28,9 +28,17 @@ tracing.workspace = true
 # the Node.js tarball on first launch. Kept small (no tls crate features
 # beyond the default rustls) so the non-embedded binary stays lean.
 ureq = "2"
+# SHA-256 verification of the downloaded Node.js archive against the
+# pinned digests in `src/node_checksums.rs`. Already a transitive dep
+# elsewhere in the workspace, so this doesn't grow the dep graph.
+sha2 = "0.10"
 
 [build-dependencies]
 # Same client used by build.rs when `embed` is ON to fetch the Node.js
 # archive for `include_bytes!`. Runtime and build-time paths share the
 # same dependency so Cargo deduplicates.
 ureq = "2"
+# Build-time SHA-256 verification mirrors the runtime check so an
+# `embed`-mode binary can never carry an archive whose bytes don't
+# match what was reviewed in `src/node_checksums.rs`.
+sha2 = "0.10"

@@ -7028,6 +7028,7 @@ dependencies = [
  "anyhow",
  "dirs 5.0.1",
  "flate2",
+ "sha2",
  "tar",
  "tracing",
  "ureq",

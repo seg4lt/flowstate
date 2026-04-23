@@ -14,11 +14,14 @@
 //!   writes it to the cache, done. No network needed → fully offline.
 //!
 //! - **`embed` OFF (default)** — `build.rs` only stages the glue
-//!   (`index.js` + `package.json` + lockfile, ~few KB). First launch
-//!   writes those to the cache, then invokes
-//!   `<embedded-node>/bin/npm install --omit=dev` to hydrate
-//!   `node_modules/` from npmjs.org. Subsequent launches hit the
-//!   sentinel and return immediately — no network needed again.
+//!   (`index.js` + `package.json` + `package-lock.json`, ~few KB).
+//!   First launch writes those to the cache, then invokes
+//!   `<embedded-node>/bin/npm ci --omit=dev` to hydrate
+//!   `node_modules/` from npmjs.org. `npm ci` refuses to drift from
+//!   the committed lockfile and validates each tarball against the
+//!   SRI hashes inside it, so the dep set a user gets on first
+//!   launch is bit-for-bit what we pinned. Subsequent launches hit
+//!   the sentinel and return immediately — no network again.
 //!
 //! The lazy-hydration path trades a one-time ~30–90 s first-launch
 //! install for avoiding ~200 MB of per-platform native-binary embedding
@@ -177,11 +180,12 @@ fn extract_embedded_assets(staging: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run `<embedded-node>/bin/npm install --omit=dev` in `cache_root` to
-/// fetch `@anthropic-ai/claude-agent-sdk` and its per-platform
-/// optional-deps from npmjs.org into `cache_root/node_modules`. Blocks
-/// until the install finishes (caller is already on a spawn_blocking
-/// thread via the daemon's `provision_runtimes`).
+/// Run `<embedded-node>/bin/npm ci --omit=dev` (or `install` as a
+/// fallback when the lockfile is absent) in `cache_root` to fetch
+/// `@anthropic-ai/claude-agent-sdk` and its per-platform optional-deps
+/// from npmjs.org into `cache_root/node_modules`. Blocks until the
+/// install finishes (caller is already on a spawn_blocking thread via
+/// the daemon's `provision_runtimes`).
 fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
     let node = zenui_embedded_node::ensure_available()
         .context("embedded Node is unavailable — cannot run npm install")?;
@@ -191,19 +195,37 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
     let npm_path = locate_npm(&node.bin_dir)
         .ok_or_else(|| anyhow!("npm not found alongside embedded node at {}", node.bin_dir.display()))?;
 
+    // Prefer `npm ci` when a lockfile is staged alongside the
+    // extracted bridge — it enforces exact versions, refuses to
+    // drift, and verifies each tarball against the SRI hashes in
+    // `package-lock.json`. Fall back to `npm install` only when
+    // the lockfile is absent (older bridge builds, or a
+    // future-proofing escape hatch for a broken lockfile).
+    let have_lockfile = cache_root.join("package-lock.json").exists();
+    let install_subcommand = if have_lockfile { "ci" } else { "install" };
+
     tracing::info!(
         cwd = %cache_root.display(),
         npm = %npm_path.display(),
-        "hydrating bridge node_modules via npm install --omit=dev"
+        mode = install_subcommand,
+        "hydrating bridge node_modules via npm {install_subcommand} --omit=dev"
     );
     let started = std::time::Instant::now();
 
     let mut cmd = Command::new(&npm_path);
-    cmd.arg("install")
+    cmd.arg(install_subcommand)
         .arg("--omit=dev")
         .arg("--no-audit")
         .arg("--no-fund")
         .arg("--loglevel=error")
+        // Tolerate peer-dep conflicts in transitive deps. npm 7+
+        // treats unresolved peers as a hard ERESOLVE error, which
+        // would brick first-launch every time one of our pinned
+        // bridge deps lags a peer-dep bump in the Claude Agent SDK.
+        // Our bridge `package.json` already pins the concrete
+        // versions we need, so falling back to the npm-6 behaviour
+        // of warn-only is the safer default for end-user installs.
+        .arg("--legacy-peer-deps")
         // Explicit cache dir under zenui namespace so we don't scribble
         // in the user's personal ~/.npm. Keeps offline cleanup simple.
         .arg("--cache")
@@ -216,11 +238,11 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
 
     let status = cmd
         .status()
-        .with_context(|| format!("spawn {} install", npm_path.display()))?;
+        .with_context(|| format!("spawn {} {}", npm_path.display(), install_subcommand))?;
 
     if !status.success() {
         anyhow::bail!(
-            "npm install for Claude SDK bridge failed with {status}; \
+            "npm {install_subcommand} for Claude SDK bridge failed with {status}; \
              try removing {} and re-launching, or build with `--features embed-all` \
              for an offline-ready binary",
             cache_root.display()
