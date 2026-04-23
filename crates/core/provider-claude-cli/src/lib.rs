@@ -19,7 +19,13 @@ use zenui_provider_api::{
     probe_cli, session_cwd, skills_disk, write_mcp_config_file,
 };
 
-const TURN_TIMEOUT_SECS: u64 = 600;
+// Effectively no turn-level wall clock. The adapter previously
+// enforced a 10-minute cap, but long legitimate agent runs routinely
+// exceed that. Users cancel stuck turns manually via the UI.
+// `u32::MAX` seconds (~136 years) is the sentinel — large enough
+// that real turns never trip it, small enough to keep tokio's
+// deadline math safe from Instant overflow.
+const TURN_TIMEOUT_SECS: u64 = u32::MAX as u64;
 
 // ── subprocess handle ────────────────────────────────────────────────────────
 

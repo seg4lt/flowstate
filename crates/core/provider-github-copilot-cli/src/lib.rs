@@ -22,7 +22,13 @@ use zenui_provider_api::{
     write_mcp_config_file,
 };
 
-pub(crate) const TURN_TIMEOUT_SECS: u64 = 600;
+// Effectively no turn-level wall clock. The adapter previously
+// enforced a 10-minute cap, but long legitimate agent runs routinely
+// exceed that. Users cancel stuck turns manually via the UI.
+// `u32::MAX` seconds (~136 years) is the sentinel — large enough
+// that real turns never trip it, small enough to keep tokio's
+// deadline math safe from Instant overflow.
+pub(crate) const TURN_TIMEOUT_SECS: u64 = u32::MAX as u64;
 const HEALTH_TIMEOUT_SECS: u64 = 10;
 
 use crate::config::{

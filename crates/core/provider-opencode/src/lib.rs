@@ -64,11 +64,15 @@ const OPENCODE_BINARY: &str = "opencode";
 /// bootstrap flow.
 const SERVER_STARTUP_TIMEOUT_SECS: u64 = 10;
 
-/// Upper bound for a single turn. Opencode itself doesn't stop — the
-/// model could loop on tools indefinitely — so the adapter enforces a
-/// wall clock. Matches the `provider-claude-cli` ceiling so the UI's
-/// "stuck?" banner kicks in at the same scale across providers.
-const TURN_TIMEOUT_SECS: u64 = 600;
+/// Effectively no turn-level wall clock. The adapter previously
+/// enforced a 10-minute cap to guard against subprocess wedges, but
+/// long legitimate agent runs (big refactors, multi-step builds)
+/// routinely exceed that. Users cancel stuck turns manually via the
+/// UI. `u32::MAX` seconds (~136 years) is the sentinel — large
+/// enough that real turns never trip it, small enough that tokio's
+/// `Instant::now() + Duration::from_secs(TURN_TIMEOUT_SECS)` math
+/// won't overflow.
+const TURN_TIMEOUT_SECS: u64 = u32::MAX as u64;
 
 /// Sentinel `origin.session_id` used for every flowstate tool call
 /// that comes through the shared opencode server's MCP subprocess.
@@ -117,13 +121,13 @@ const OPENCODE_SHARED_SESSION_ID: &str = "opencode-shared";
 const GENERATION_METADATA_KEY: &str = "opencode_generation";
 
 /// Default idle TTL baked into the adapter when none is supplied
-/// explicitly. 10 minutes matches what Phase C flipped on by default:
-/// long enough to absorb "close a tab, open another" cycles without
-/// a cold start, short enough that an idle laptop doesn't keep the
-/// opencode child resident forever. Override per deployment via
-/// `UserConfigStore` key `opencode.idle_ttl_seconds`; a value of 0
-/// disables idle-kill entirely.
-const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
+/// explicitly. 3 minutes — long enough to absorb "close a tab,
+/// open another" cycles without a cold start, short enough that
+/// an idle laptop returns the opencode child's memory promptly.
+/// Override per deployment via `UserConfigStore` key
+/// `opencode.idle_ttl_seconds`; a value of 0 disables idle-kill
+/// entirely.
+const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(180);
 
 /// Cadence at which the idle watcher re-checks the lease tracker
 /// while the server is idle. Tighter than `DEFAULT_IDLE_TTL` so the
