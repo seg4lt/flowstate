@@ -2447,81 +2447,132 @@ pub fn run() {
                 handle.shutdown().await;
             });
 
-            // Block until serve() is done and TauriDaemonState is managed.
-            let lifecycle = ready_rx.recv().expect("daemon failed to start");
-            app.manage(AppLifecycle {
-                lifecycle: lifecycle.clone(),
-            });
-
-            // SIGTERM / SIGINT handler.
+            // Don't block setup waiting for the daemon to come up.
             //
-            // Why this exists: without it, SIGTERM (e.g. `tauri dev`
-            // hot-reload, `pkill`, systemd stop, macOS Activity Monitor
-            // "Quit") terminates flowstate without running any Drop
-            // code — `opencode serve` and its grandchildren (including
-            // the `flowstate mcp-server` proxies) orphan to PID 1 and
-            // keep running, pointing at the now-dead loopback port.
-            // Users observed ~22 such orphans accumulating during a
-            // normal dev session.
+            // Why: on a first launch (or any launch where the embedded
+            // Node + provider `node_modules` aren't cached yet) the
+            // daemon task above spends 10–90 s downloading Node.js and
+            // running `npm install`. If we `recv()` here we hold the
+            // Tauri setup closure open for that whole window, which
+            // means Tauri never creates the webview window — the user
+            // sees a dock icon and nothing else while provisioning
+            // runs, with no splash and no "the app is doing something"
+            // signal. The whole point of `<ProvisioningSplash />` is
+            // to render during exactly that window, so setup must
+            // return NOW and let the webview mount.
             //
-            // This handler intercepts both signals and walks the
-            // existing graceful-shutdown path:
-            //   1. `lifecycle.request_shutdown()` tips the daemon task
-            //      out of its `wait_for_shutdown()` await.
-            //   2. Daemon proceeds to `graceful_shutdown()` → drops
-            //      `DaemonConfig::adapters` → drops `OpenCodeAdapter`
-            //      → drops `OpenCodeServer` → its Drop impl sends
-            //      `killpg(pgid, SIGTERM)` to the whole opencode
-            //      process group (opencode + its mcp-server kids).
-            //   3. `app_handle.exit(0)` breaks the Tauri event loop so
-            //      the process actually exits instead of hanging.
-            //
-            // SIGKILL is still uncatchable — the startup orphan scan
-            // (see `loopback_http::spawn` / orphan-scan helper)
-            // handles that case. This handler covers every signal the
-            // kernel lets us touch.
+            // We still need the `AppLifecycle` state + the SIGTERM /
+            // SIGINT handler (both depend on the daemon's
+            // `LifecycleHandle`), so offload the wait-and-wire onto a
+            // std thread that owns an `AppHandle` clone. When the
+            // daemon signals ready, the thread calls
+            // `AppHandle::manage` and spawns the signal handler via
+            // `tauri::async_runtime::spawn` exactly as the inline path
+            // used to. Commands that read `State<AppLifecycle>` use
+            // `try_state` (see the `on_window_event` handler below),
+            // so the brief window between setup-return and
+            // daemon-ready is safe: a close before ready simply skips
+            // `request_shutdown()` — the daemon task's own Drop chain
+            // still runs because `tauri::generate_context!().run()`
+            // returning drops every spawned task.
             {
-                let app_handle = app.handle().clone();
-                let lifecycle_for_signal = lifecycle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut sigterm = match tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::terminate(),
-                    ) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            tracing::warn!(
-                                %err,
-                                "failed to install SIGTERM handler; graceful shutdown on \
-                                 external signals will be unavailable"
+                let app_handle_for_wire = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("flowstate-daemon-ready".into())
+                    .spawn(move || {
+                        let lifecycle = match ready_rx.recv() {
+                            Ok(l) => l,
+                            Err(e) => {
+                                // Daemon task early-exited (e.g.
+                                // provisioning failed). The splash
+                                // already rendered a `Failed` phase
+                                // event — leave the webview on it so
+                                // the user sees why, rather than
+                                // panicking the host process as we
+                                // used to.
+                                tracing::error!(
+                                    %e,
+                                    "daemon never signalled ready; SIGTERM handler + \
+                                     AppLifecycle state will not be wired"
+                                );
+                                return;
+                            }
+                        };
+                        app_handle_for_wire.manage(AppLifecycle {
+                            lifecycle: lifecycle.clone(),
+                        });
+
+                        // SIGTERM / SIGINT handler.
+                        //
+                        // Why this exists: without it, SIGTERM (e.g.
+                        // `tauri dev` hot-reload, `pkill`, systemd
+                        // stop, macOS Activity Monitor "Quit")
+                        // terminates flowstate without running any
+                        // Drop code — `opencode serve` and its
+                        // grandchildren (including the
+                        // `flowstate mcp-server` proxies) orphan to
+                        // PID 1 and keep running, pointing at the
+                        // now-dead loopback port. Users observed ~22
+                        // such orphans accumulating during a normal
+                        // dev session.
+                        //
+                        // This handler intercepts both signals and
+                        // walks the existing graceful-shutdown path:
+                        //   1. `lifecycle.request_shutdown()` tips the
+                        //      daemon task out of its
+                        //      `wait_for_shutdown()` await.
+                        //   2. Daemon proceeds to
+                        //      `graceful_shutdown()` → drops
+                        //      `DaemonConfig::adapters` → drops
+                        //      `OpenCodeAdapter` → drops
+                        //      `OpenCodeServer` → its Drop impl
+                        //      sends `killpg(pgid, SIGTERM)` to the
+                        //      whole opencode process group.
+                        //   3. `app_handle.exit(0)` breaks the Tauri
+                        //      event loop so the process actually
+                        //      exits instead of hanging.
+                        //
+                        // SIGKILL is still uncatchable — the startup
+                        // orphan scan (see `loopback_http::spawn` /
+                        // orphan-scan helper) handles that case.
+                        let app_handle_for_signal = app_handle_for_wire.clone();
+                        let lifecycle_for_signal = lifecycle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mut sigterm = match tokio::signal::unix::signal(
+                                tokio::signal::unix::SignalKind::terminate(),
+                            ) {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        %err,
+                                        "failed to install SIGTERM handler; graceful \
+                                         shutdown on external signals will be unavailable"
+                                    );
+                                    return;
+                                }
+                            };
+                            let mut sigint = match tokio::signal::unix::signal(
+                                tokio::signal::unix::SignalKind::interrupt(),
+                            ) {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    tracing::warn!(%err, "failed to install SIGINT handler");
+                                    return;
+                                }
+                            };
+                            let signal_name = tokio::select! {
+                                _ = sigterm.recv() => "SIGTERM",
+                                _ = sigint.recv() => "SIGINT",
+                            };
+                            tracing::info!(
+                                signal = signal_name,
+                                "received termination signal; requesting daemon shutdown"
                             );
-                            return;
-                        }
-                    };
-                    let mut sigint = match tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::interrupt(),
-                    ) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            tracing::warn!(%err, "failed to install SIGINT handler");
-                            return;
-                        }
-                    };
-                    let signal_name = tokio::select! {
-                        _ = sigterm.recv() => "SIGTERM",
-                        _ = sigint.recv() => "SIGINT",
-                    };
-                    tracing::info!(
-                        signal = signal_name,
-                        "received termination signal; requesting daemon shutdown"
-                    );
-                    lifecycle_for_signal.request_shutdown();
-                    // Tauri's `exit()` runs `RunEvent::Exit` handlers
-                    // and returns control from `.run()`. Combined with
-                    // `request_shutdown()` above, the Drop chain runs
-                    // (killing opencode via process group) before the
-                    // process actually exits.
-                    app_handle.exit(0);
-                });
+                            lifecycle_for_signal.request_shutdown();
+                            app_handle_for_signal.exit(0);
+                        });
+                    })
+                    .expect("failed to spawn flowstate-daemon-ready thread");
             }
 
             Ok(())
