@@ -1,5 +1,10 @@
 mod bridge_runtime;
 mod process;
+
+// Re-exported so the daemon's `provision_runtimes()` step can
+// front-load extraction (and, in download-mode builds, fetching) at
+// startup rather than on first provider use.
+pub use bridge_runtime::ensure_bridge_available;
 mod rpc;
 mod stream;
 mod wire;

@@ -9,6 +9,23 @@ edition = "2021"
 name = "flowstate_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Default: lean binary. Node.js + provider SDK bridges download from
+# the release on first launch and cache under `~/.cache/zenui/`. The
+# daemon's `provision_runtimes()` step front-loads this so the first
+# launch blocks once, not piecemeal on every provider's first call.
+default = []
+# Opt-in: bake everything into the binary — useful for offline /
+# air-gapped distribution. Forwards to each provider crate's per-crate
+# `embed` feature via `flowstate-app-layer`. Every downstream
+# consumer that wants the fully-embedded build takes this single
+# feature rather than hand-wiring each provider.
+embed-all = [
+    "flowstate-app-layer/embed-all",
+    "zenui-provider-claude-sdk/embed",
+    "zenui-provider-github-copilot/embed",
+]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

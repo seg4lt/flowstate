@@ -5,6 +5,18 @@ edition.workspace = true
 publish = false
 build = "build.rs"
 
+[features]
+# Default: download Node.js from nodejs.org on first launch and cache it
+# under `~/.cache/zenui/embedded-node-v<version>/`. No binary bloat, at
+# the cost of requiring network on first run.
+default = []
+# Opt-in: bake the Node.js tarball for the build target into the compiled
+# binary via `include_bytes!`. The runtime extraction path still writes to
+# the same per-user cache, so first launch extracts instead of downloading.
+# Use for offline / air-gapped distribution (see the `embed-all` feature
+# on the top-level `flowstate` crate).
+embed = []
+
 [dependencies]
 anyhow.workspace = true
 dirs.workspace = true
@@ -12,9 +24,13 @@ flate2 = "1"
 tar = "0.4"
 zip = "2"
 tracing.workspace = true
+# Pure-Rust HTTP client used at runtime when `embed` is OFF to download
+# the Node.js tarball on first launch. Kept small (no tls crate features
+# beyond the default rustls) so the non-embedded binary stays lean.
+ureq = "2"
 
 [build-dependencies]
-# Pure-Rust HTTP client so the Node.js download in `build.rs` doesn't
-# depend on a system `curl` (which is absent on bare Windows CI runners
-# and inconsistent across Linux containers).
+# Same client used by build.rs when `embed` is ON to fetch the Node.js
+# archive for `include_bytes!`. Runtime and build-time paths share the
+# same dependency so Cargo deduplicates.
 ureq = "2"

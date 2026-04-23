@@ -1,15 +1,26 @@
-//! Self-contained Node.js runtime embedded into the zenui binary.
+//! Self-contained Node.js runtime used by the provider SDK bridges.
 //!
-//! The build script downloads the official Node.js tarball (Unix) or zip
-//! (Windows) for the build target and this crate `include_bytes!`-es it
-//! into the compiled binary. At runtime, [`ensure_extracted`] lazily
-//! unpacks the archive into a per-user cache directory (first call
-//! extracts, subsequent calls are a fast sentinel check) and returns the
-//! paths callers need to spawn the embedded `node` executable.
+//! Two modes, selected at compile time by the `embed` Cargo feature:
 //!
-//! The archive is compressed (~20 MB) and shared by all providers that
-//! need a Node runtime, so embedding it once is much cheaper than each
-//! provider carrying its own copy.
+//! - **`embed` ON** — `build.rs` downloads the official Node.js tarball
+//!   (Unix) or zip (Windows) for the build target and this crate
+//!   `include_bytes!`-es it into the compiled binary. At runtime
+//!   [`ensure_available`] unpacks the embedded bytes into a per-user
+//!   cache directory. No network needed after install. Self-contained /
+//!   air-gapped friendly.
+//!
+//! - **`embed` OFF (default)** — the binary carries no Node.js payload.
+//!   On first launch [`ensure_available`] downloads the same official
+//!   tarball from `nodejs.org` into the same per-user cache directory
+//!   and unpacks it in place. Subsequent launches hit the sentinel
+//!   check and are a no-op.
+//!
+//! In both modes the on-disk layout is identical:
+//! `~/.cache/zenui/embedded-node-v<version>/{bin/node,lib,...}`, so the
+//! downstream provider crates and the spawn code are oblivious to which
+//! mode built the binary.
+
+pub mod download;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,21 +29,32 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, anyhow};
 use tracing::info;
 
-/// Version of Node.js embedded by [`build.rs`]. Must match the version
-/// downloaded there — used below to namespace the cache directory so
-/// bumping the version automatically invalidates any stale extraction.
+/// Version of Node.js this crate targets. Must match the version
+/// embedded by [`build.rs`] (embed mode) and the version downloaded at
+/// runtime (download mode) — used below to namespace the cache
+/// directory so bumping the version automatically invalidates any
+/// stale extraction.
 pub const NODE_VERSION: &str = "20.11.1";
 
-/// The raw Node.js archive bytes, embedded at compile time. Empty if
-/// the build target is unsupported (in which case [`ensure_extracted`]
-/// will return an error).
+/// Build-time platform identifiers forwarded from `build.rs` via
+/// `cargo:rustc-env`. Empty strings when the build target is
+/// unsupported; the runtime check below turns that into a clear error
+/// instead of a silent mis-download.
+const NODE_TARGET_PLATFORM: &str = env!("NODE_TARGET_PLATFORM");
+#[cfg(not(feature = "embed"))]
+const NODE_TARGET_ARCH: &str = env!("NODE_TARGET_ARCH");
+#[cfg(not(feature = "embed"))]
+const NODE_TARGET_EXT: &str = env!("NODE_TARGET_EXT");
+
+/// The raw Node.js archive bytes, embedded at compile time. Only
+/// populated when the `embed` feature is on.
 ///
 /// Unix targets embed a `.tar.gz`, Windows embeds a `.zip`. Both files
 /// are always present in OUT_DIR (the unused one is an empty stub) so
 /// `include_bytes!` resolves on every platform.
-#[cfg(not(windows))]
+#[cfg(all(feature = "embed", not(windows)))]
 const NODE_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node.tar.gz"));
-#[cfg(windows)]
+#[cfg(all(feature = "embed", windows))]
 const NODE_ARCHIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/node.zip"));
 
 /// Resolved paths inside an extracted Node.js runtime.
@@ -49,17 +71,25 @@ pub struct NodeRuntime {
 
 static EXTRACTED: OnceLock<Result<NodeRuntime, String>> = OnceLock::new();
 
-/// Ensure the embedded Node.js runtime has been unpacked into the
-/// per-user cache directory and return its paths. Idempotent and safe
-/// to call from multiple threads — the work runs once, subsequent
-/// callers receive a cached result.
-pub fn ensure_extracted() -> Result<NodeRuntime> {
-    // `OnceLock` gives us "extract once per process". If a previous
-    // call returned an error we clone and re-raise it rather than
-    // silently retrying, because the error is almost always a
-    // deterministic filesystem or unsupported-target problem.
-    let cached = EXTRACTED.get_or_init(|| extract_once().map_err(|e| format!("{e:?}")));
+/// Ensure the Node.js runtime is available on disk and return its
+/// paths. First call per process either extracts the embedded bytes
+/// (embed mode) or downloads+extracts (default). Idempotent and safe
+/// from multiple threads — the work runs once, subsequent callers
+/// receive a cached result.
+pub fn ensure_available() -> Result<NodeRuntime> {
+    // `OnceLock` gives us "run once per process". If a previous call
+    // returned an error we clone and re-raise rather than silently
+    // retrying, because the error is almost always a deterministic
+    // filesystem, network, or unsupported-target problem.
+    let cached = EXTRACTED.get_or_init(|| provision_once().map_err(|e| format!("{e:?}")));
     cached.clone().map_err(|e| anyhow!(e))
+}
+
+/// Back-compat alias — existing call sites use `ensure_extracted()`.
+/// Now just dispatches into [`ensure_available`], which covers both
+/// the embed and download paths.
+pub fn ensure_extracted() -> Result<NodeRuntime> {
+    ensure_available()
 }
 
 /// Platform-specific path to the `node` binary relative to the
@@ -75,10 +105,11 @@ fn node_bin_relative(root: &Path) -> PathBuf {
     root.join("node.exe")
 }
 
-fn extract_once() -> Result<NodeRuntime> {
-    if NODE_ARCHIVE.is_empty() {
+fn provision_once() -> Result<NodeRuntime> {
+    if NODE_TARGET_PLATFORM.is_empty() {
         anyhow::bail!(
-            "zenui-embedded-node was built on an unsupported target; no Node.js archive is embedded"
+            "zenui-embedded-node was built on an unsupported target; \
+             no Node.js archive is embedded and no download URL is known"
         );
     }
 
@@ -102,7 +133,7 @@ fn extract_once() -> Result<NodeRuntime> {
     }
 
     info!(
-        "extracting embedded Node.js v{NODE_VERSION} to {}",
+        "provisioning embedded Node.js v{NODE_VERSION} to {}",
         cache_root.display()
     );
 
@@ -117,7 +148,8 @@ fn extract_once() -> Result<NodeRuntime> {
     fs::create_dir_all(&staging)
         .with_context(|| format!("create staging dir {}", staging.display()))?;
 
-    unpack_archive(NODE_ARCHIVE, &staging)?;
+    let archive_bytes = load_archive_bytes()?;
+    unpack_archive(&archive_bytes, &staging)?;
 
     // The Node.js archive has a top-level `node-v<version>-<os>-<arch>/`
     // directory we need to strip so the final layout is
@@ -177,6 +209,60 @@ fn extract_once() -> Result<NodeRuntime> {
         .expect("node_bin always has a parent")
         .to_path_buf();
     Ok(NodeRuntime { node_bin, bin_dir })
+}
+
+/// Source the raw archive bytes. With `embed` on, read straight from
+/// the baked-in constant. Without `embed`, download to a persistent
+/// cache under `~/.cache/zenui/node-downloads/` (shared with build.rs)
+/// and read from there — so a failed extraction doesn't require a
+/// second network round-trip.
+fn load_archive_bytes() -> Result<Vec<u8>> {
+    #[cfg(feature = "embed")]
+    {
+        if NODE_ARCHIVE.is_empty() {
+            anyhow::bail!(
+                "zenui-embedded-node was built with `embed` on an unsupported target; \
+                 the embedded Node.js archive is empty"
+            );
+        }
+        return Ok(NODE_ARCHIVE.to_vec());
+    }
+
+    #[cfg(not(feature = "embed"))]
+    {
+        let archive_path = download_cache_path()?;
+        if !archive_path.exists() {
+            let url = format!(
+                "https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-{platform}-{arch}.{ext}",
+                platform = NODE_TARGET_PLATFORM,
+                arch = NODE_TARGET_ARCH,
+                ext = NODE_TARGET_EXT,
+            );
+            download::fetch(&url, &archive_path)
+                .with_context(|| format!("download Node.js v{NODE_VERSION} from {url}"))?;
+        }
+        fs::read(&archive_path)
+            .with_context(|| format!("read cached Node.js archive {}", archive_path.display()))
+    }
+}
+
+/// Persistent cache path for the downloaded Node.js archive. Shared
+/// with `build.rs` (which writes to the same location when `embed` is
+/// on) so a dev who flips the feature on after a download doesn't
+/// re-fetch.
+#[cfg(not(feature = "embed"))]
+fn download_cache_path() -> Result<PathBuf> {
+    let dir = dirs::cache_dir()
+        .context("failed to resolve per-user cache directory")?
+        .join("zenui")
+        .join("node-downloads");
+    let filename = format!(
+        "node-v{NODE_VERSION}-{platform}-{arch}.{ext}",
+        platform = NODE_TARGET_PLATFORM,
+        arch = NODE_TARGET_ARCH,
+        ext = NODE_TARGET_EXT,
+    );
+    Ok(dir.join(filename))
 }
 
 // ---------------------------------------------------------------------------
