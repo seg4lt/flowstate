@@ -833,8 +833,18 @@ class ClaudeBridge {
       }
     }
 
-    // Compose the SDKUserMessage (text + optional images) to push
-    // onto the input stream.
+    // Compose the SDKUserMessage (text + optional media) to push
+    // onto the input stream. The attachment channel was originally
+    // image-only; the drag-and-drop feature extended it to carry
+    // audio/video too (same base64 path, different `media_type`).
+    // The SDK's type for `image` content blocks narrows `media_type`
+    // to the four image MIME strings, so we cast — the underlying
+    // Anthropic Messages API may reject non-image media, but passing
+    // the bytes through keeps the bridge honest with what the user
+    // attached and surfaces the provider-side error rather than
+    // silently dropping the payload. TODO: once the SDK grows a
+    // first-class `document` / `audio` / `video` content block,
+    // route those media types through the appropriate block type.
     type SdkImageMediaType =
       | 'image/jpeg'
       | 'image/png'
@@ -853,6 +863,7 @@ class ClaudeBridge {
                   type: 'image' as const,
                   source: {
                     type: 'base64' as const,
+                    // Wider-than-images cast — see block comment above.
                     media_type: img.media_type as SdkImageMediaType,
                     data: img.data_base64,
                   },

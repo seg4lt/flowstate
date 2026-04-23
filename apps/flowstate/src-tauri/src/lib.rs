@@ -65,6 +65,121 @@ fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
 }
 
+/// Payload returned by `read_file_as_base64` — enough for the chat
+/// composer to turn a dropped file into an `AttachedImage`-shaped
+/// attachment without re-guessing the media type on the TS side.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DroppedFilePayload {
+    /// Display filename (basename of the absolute path).
+    name: String,
+    /// Inferred MIME, e.g. `image/png`, `audio/mpeg`, `video/mp4`.
+    /// Best-effort from the extension; empty string when unknown.
+    media_type: String,
+    /// Raw base64 (no `data:` prefix). Mirrors `AttachedImage.dataBase64`.
+    data_base64: String,
+    /// On-disk size in bytes. Reported back so the caller can gate
+    /// oversized drops without reading twice.
+    size_bytes: u64,
+}
+
+/// Upper bound for the frontend drop → base64 pipeline. Larger than
+/// the 5 MB image cap because users reasonably want to drop short
+/// audio clips / screen recordings. The Rust validation is the last
+/// line of defence; the TS side enforces its own limit first so the
+/// UX error is immediate.
+const DROP_MAX_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Read an arbitrary absolute path and return its bytes base64-encoded
+/// alongside a best-effort media type. Backs the chat input's
+/// drag-and-drop flow for media (image / audio / video) files — the
+/// frontend gets enough to mint an `AttachedImage` chip without its
+/// own disk access.
+///
+/// Intentionally unsandboxed — drops from Finder / Explorer / any
+/// other app commonly come from outside the current project root.
+/// This is a local-only desktop app; the user explicitly dragged the
+/// file in, so we trust the path. Non-existent / unreadable paths
+/// surface as an error string the caller can toast.
+#[tauri::command]
+async fn read_file_as_base64(path: String) -> Result<DroppedFilePayload, String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let abs = Path::new(&path);
+        let meta = std::fs::metadata(abs).map_err(|e| format!("metadata: {e}"))?;
+        if !meta.is_file() {
+            return Err("not a regular file".to_string());
+        }
+        let size = meta.len();
+        if size > DROP_MAX_BYTES {
+            return Err(format!(
+                "file exceeds {} byte limit ({} bytes)",
+                DROP_MAX_BYTES, size
+            ));
+        }
+        let bytes = std::fs::read(abs).map_err(|e| format!("read: {e}"))?;
+        let name = abs
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let media_type = media_type_for_extension(abs).unwrap_or_default();
+        Ok(DroppedFilePayload {
+            name,
+            media_type,
+            data_base64: BASE64_STANDARD.encode(&bytes),
+            size_bytes: size,
+        })
+    })
+    .await
+    .map_err(|e| format!("join error: {e}"))?
+}
+
+/// Best-effort MIME inference from a file extension. Only covers
+/// media types the app actually pipes through to the provider —
+/// anything else returns `None` so the caller can route that path
+/// through the `@file` mention flow instead.
+fn media_type_for_extension(path: &Path) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    let mt = match ext.as_str() {
+        // Images — mirror ATTACHMENT_ALLOWED_MEDIA_TYPES.
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        // Audio.
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "opus" => "audio/opus",
+        "webm" if is_probably_audio(path) => "audio/webm",
+        // Video.
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        _ => return None,
+    };
+    Some(mt.to_string())
+}
+
+/// Placeholder hook for future magic-byte sniffing when we want to
+/// disambiguate `.webm` audio from `.webm` video. Currently we just
+/// treat `.webm` as video since that's the overwhelmingly common
+/// case; keeping the hook here so the matcher above reads cleanly
+/// and a follow-up can plug in real sniffing without churn.
+fn is_probably_audio(_path: &Path) -> bool {
+    false
+}
+
 /// Resolve the git repository root for `path` by running
 /// `git rev-parse --show-toplevel`. Returns `None` if `path` is not
 /// inside a git repo. Used by the frontend to normalise the project
@@ -2418,6 +2533,7 @@ pub fn run() {
             remove_git_worktree,
             resolve_git_root,
             path_exists,
+            read_file_as_base64,
             get_git_diff_summary,
             get_git_diff_file,
             watch_git_diff_summary,

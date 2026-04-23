@@ -27,6 +27,7 @@ tauri-plugin-process = "2"
 dirs.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64.workspace = true
 
 # Daemon core with just the Tauri transport. Providers are no longer
 # a daemon-core concern — flowstate constructs its own adapter vector
