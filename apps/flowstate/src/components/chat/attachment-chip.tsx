@@ -1,14 +1,29 @@
-import { Paperclip, X } from "lucide-react";
+import { FileAudio, FileVideo, Paperclip, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { AttachedImage, AttachmentRef } from "@/lib/types";
 
+/** Pick the right fallback icon for a non-image attachment. Drops
+ *  can bring audio / video in addition to images — the chip shows
+ *  a music note or film icon so the user can tell at a glance what
+ *  they attached even without a visual thumbnail. */
+function fallbackIconFor(mediaType: string) {
+  if (mediaType.startsWith("audio/")) return FileAudio;
+  if (mediaType.startsWith("video/")) return FileVideo;
+  return Paperclip;
+}
+
 /**
  * Pre-send (in-flux) chip rendered above the textarea. Shows a tiny
- * thumbnail of the pasted image plus its filename. The `×` remove
- * button is hidden by default and reveals on hover (group-hover).
+ * thumbnail of the attached image plus its filename, or a media icon
+ * fallback for audio / video attachments (which have no renderable
+ * preview). The `×` remove button is hidden by default and reveals on
+ * hover (group-hover).
  *
  * Clicking the chip body opens a lightbox with the local blob URL —
- * no disk read, no network round-trip.
+ * no disk read, no network round-trip. Audio / video chips are click-
+ * through no-ops (the lightbox can't render those formats today), but
+ * the `onOpen` prop is still fired so callers can evolve the preview
+ * surface later without touching this component.
  */
 export function InFluxAttachmentChip({
   image,
@@ -19,6 +34,9 @@ export function InFluxAttachmentChip({
   onRemove: () => void;
   onOpen: () => void;
 }) {
+  const isImage =
+    image.mediaType.startsWith("image/") && image.previewUrl.length > 0;
+  const FallbackIcon = fallbackIconFor(image.mediaType);
   return (
     <button
       type="button"
@@ -28,11 +46,17 @@ export function InFluxAttachmentChip({
       )}
       title={image.name}
     >
-      <img
-        src={image.previewUrl}
-        alt={image.name}
-        className="h-5 w-5 shrink-0 rounded-full object-cover"
-      />
+      {isImage ? (
+        <img
+          src={image.previewUrl}
+          alt={image.name}
+          className="h-5 w-5 shrink-0 rounded-full object-cover"
+        />
+      ) : (
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+          <FallbackIcon className="h-3 w-3" />
+        </span>
+      )}
       <span className="max-w-[160px] truncate">{image.name}</span>
       <span
         role="button"

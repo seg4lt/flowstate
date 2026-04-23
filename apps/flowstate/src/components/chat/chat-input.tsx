@@ -1,6 +1,7 @@
 import * as React from "react";
 import { Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type {
   AttachedImage,
   PermissionMode,
@@ -22,6 +23,7 @@ import {
   rankFileMatches,
   type MentionContext,
 } from "@/lib/mention-utils";
+import { readFileAsBase64 } from "@/lib/api/fs";
 import { SlashCommandPopup } from "./slash-command-popup";
 import { MentionPopup } from "./mention-popup";
 import { InFluxAttachmentChip } from "./attachment-chip";
@@ -112,8 +114,17 @@ export interface QueuedMessage {
   images: AttachedImage[];
 }
 
-/** Per-image cap, mirrors `ATTACHMENT_MAX_BYTES` on the Rust side. */
+/** Per-image cap for clipboard paste — images only. Mirrors the
+ *  original Rust `ATTACHMENT_MAX_BYTES` before it was raised for
+ *  drag-and-drop media. Kept separate so paste can't silently push a
+ *  25 MB screenshot through; drops have their own larger cap below. */
 const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+/** Per-media cap for drag-and-drop. Matches the Rust-side
+ *  `ATTACHMENT_MAX_BYTES` (50 MB) that the runtime enforces when
+ *  writing the attachment to disk. Short audio clips and small
+ *  screen recordings fit; anything larger is rejected before the
+ *  bytes leave the webview. */
+const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 /** Allowed clipboard image MIME types — matches the Rust validator. */
 const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
   "image/png",
@@ -121,6 +132,17 @@ const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
   "image/gif",
   "image/webp",
 ]);
+/** MIME-type prefixes treated as "media" for drag-and-drop. Images,
+ *  audio, and video all ride through the same base64 → attachment
+ *  pipeline as clipboard images; every other dropped file is surfaced
+ *  as an `@file` mention chip instead, so the agent reads it via its
+ *  `Read` tool rather than us bundling the bytes. */
+const MEDIA_MIME_PREFIXES = ["image/", "audio/", "video/"];
+
+/** Does `mediaType` classify as drag-and-drop media (image/audio/video)? */
+function isMediaMimeType(mediaType: string): boolean {
+  return MEDIA_MIME_PREFIXES.some((prefix) => mediaType.startsWith(prefix));
+}
 
 function suggestedFilename(mediaType: string): string {
   switch (mediaType) {
@@ -238,6 +260,13 @@ export function ChatInput({
   );
   const [editingId, setEditingId] = React.useState<string | null>(null);
   const [editText, setEditText] = React.useState("");
+  // `isDragOver` toggles a subtle outline on the composer while the
+  // user is mid-drag over the app window. Cleared by the `leave` /
+  // `drop` Tauri drag events — drops fire regardless of the cursor
+  // position, so we don't do any hit-testing against the composer
+  // rect; any drop anywhere in the window is routed to this composer
+  // while it's mounted and interactive.
+  const [isDragOver, setIsDragOver] = React.useState(false);
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const editTextareaRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -547,6 +576,140 @@ export function ChatInput({
         .replace(/[ \t]+$/g, ""),
     );
   }
+
+  /** Append an `@<path>` token to the draft text, de-duplicating
+   *  against the existing chip list. Used by the drop handler for
+   *  non-media files — the path is surfaced to the agent verbatim so
+   *  it can invoke its `Read` tool against the absolute path.
+   *
+   *  Unlike `acceptMention`, this doesn't assume there's an open
+   *  partial `@query` at the caret — drops come from outside the
+   *  textarea. We just append at the end (with a leading space) so
+   *  whatever the user was typing is preserved. */
+  function appendPathMention(absPath: string) {
+    setAttachedFiles((prev) =>
+      prev.includes(absPath) ? prev : [...prev, absPath],
+    );
+    setValue((v) => {
+      const needsSpace = v.length > 0 && !/\s$/.test(v);
+      return `${v}${needsSpace ? " " : ""}@${absPath} `;
+    });
+    requestAnimationFrame(() => {
+      const node = textareaRef.current;
+      if (!node) return;
+      node.focus();
+      node.selectionStart = node.selectionEnd = node.value.length;
+      node.style.height = "auto";
+      node.style.height = `${Math.min(node.scrollHeight, 200)}px`;
+    });
+  }
+
+  /** Handle a batch of absolute paths dropped onto the window. Media
+   *  (image / audio / video) files are read into base64 via the Rust
+   *  `read_file_as_base64` command and attached as `AttachedImage`
+   *  chips so they ride through the same pipeline as clipboard
+   *  images. Every other file type is surfaced as an `@file` mention
+   *  chip containing the absolute path — the agent sees the path in
+   *  the message text and can `Read` it.
+   *
+   *  Any-path policy: dropped files don't have to live inside the
+   *  session's project root. This is a local-only desktop app; the
+   *  user explicitly dragged the file into the composer, so we pass
+   *  the absolute path straight through. */
+  async function handleDroppedPaths(paths: string[]) {
+    if (providerDisabled || archived || disabled) return;
+    for (const absPath of paths) {
+      try {
+        const payload = await readFileAsBase64(absPath);
+        if (payload.mediaType && isMediaMimeType(payload.mediaType)) {
+          if (payload.sizeBytes > MEDIA_MAX_BYTES) {
+            toast({
+              description: `${payload.name} exceeds ${Math.round(
+                MEDIA_MAX_BYTES / (1024 * 1024),
+              )} MB, skipping.`,
+              duration: 3000,
+            });
+            continue;
+          }
+          // Rebuild a blob so we get an object URL for the chip
+          // thumbnail — base64 → bytes → Blob → URL. Only images get a
+          // visible preview; audio/video chips fall back to the
+          // generic icon path in `InFluxAttachmentChip`.
+          let previewUrl = "";
+          if (payload.mediaType.startsWith("image/")) {
+            try {
+              const bin = atob(payload.dataBase64);
+              const bytes = new Uint8Array(bin.length);
+              for (let i = 0; i < bin.length; i++) {
+                bytes[i] = bin.charCodeAt(i);
+              }
+              const blob = new Blob([bytes], { type: payload.mediaType });
+              previewUrl = URL.createObjectURL(blob);
+            } catch {
+              // Preview is best-effort — a failed decode just means
+              // the chip renders the icon fallback.
+              previewUrl = "";
+            }
+          }
+          setAttachedImages((prev) => [
+            ...prev,
+            {
+              id: newQueueId(),
+              mediaType: payload.mediaType,
+              dataBase64: payload.dataBase64,
+              name: payload.name,
+              previewUrl,
+            },
+          ]);
+        } else {
+          // Non-media file — route through the `@file` mention
+          // system so the agent can `Read` the absolute path.
+          appendPathMention(absPath);
+        }
+      } catch (err) {
+        // Fallback: if Rust couldn't read the bytes for whatever
+        // reason (permissions, binary fs handle, too big), we can
+        // still surface the path as a mention so the user isn't left
+        // with nothing. The Read tool will hit the same error later,
+        // but at least the user sees the path they dropped.
+        toast({
+          description: `Couldn't attach ${absPath}: ${String(err)}`,
+          duration: 4000,
+        });
+        appendPathMention(absPath);
+      }
+    }
+  }
+
+  // Wire the window-wide Tauri drag/drop listener. Tauri 2 only fires
+  // these events when `dragDropEnabled: true` is set on the window
+  // (see `tauri.conf.json`). We intentionally don't hit-test against
+  // the composer's bounding rect — dropping anywhere in the app is
+  // treated as "attach to the next message", which matches the
+  // familiar Slack / Discord / iMessage UX.
+  React.useEffect(() => {
+    if (providerDisabled || archived) return;
+    const webview = getCurrentWebviewWindow();
+    let disposed = false;
+    const unlistenPromise = webview.onDragDropEvent((event) => {
+      if (disposed) return;
+      const payload = event.payload;
+      if (payload.type === "enter" || payload.type === "over") {
+        setIsDragOver(true);
+      } else if (payload.type === "leave") {
+        setIsDragOver(false);
+      } else if (payload.type === "drop") {
+        setIsDragOver(false);
+        const paths = (payload as unknown as { paths?: string[] }).paths ?? [];
+        if (paths.length > 0) void handleDroppedPaths(paths);
+      }
+    });
+    return () => {
+      disposed = true;
+      unlistenPromise.then((un) => un()).catch(() => {});
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [providerDisabled, archived, disabled]);
 
   /** Paste handler — picks up clipboard images and turns them into
    * `AttachedImage` chips. Falls through to the default text paste
@@ -911,7 +1074,17 @@ export function ChatInput({
           </div>
         </div>
       )}
-      <div className="border-t border-border px-3 pb-2 pt-3">
+      <div
+        className={cn(
+          "border-t border-border px-3 pb-2 pt-3 transition-colors",
+          // While a drag is over the window we paint a subtle
+          // primary-tinted tint + border over the composer surface
+          // to signal "drop here to attach". Cleared on leave/drop
+          // via the Tauri `onDragDropEvent` listener above.
+          isDragOver &&
+            "border-primary/70 bg-primary/5 ring-1 ring-primary/40",
+        )}
+      >
         <div>
           {(attachedImages.length > 0 ||
             attachedFiles.length > 0 ||

@@ -21,15 +21,41 @@ use zenui_provider_api::{
     SessionSummary, SubagentRecord, ToolCall, TurnRecord,
 };
 
-/// Hard cap on the size of a single image attachment, in bytes. Mirrors
-/// the frontend cap so an oversized payload is rejected before we touch
-/// the disk.
-pub const ATTACHMENT_MAX_BYTES: usize = 5 * 1024 * 1024;
+/// Hard cap on the size of a single media attachment, in bytes.
+/// Raised from the original 5 MB image cap to 50 MB so short audio
+/// clips and small screen recordings can ride through the same
+/// pipeline as images. The frontend enforces a matching limit so an
+/// oversized payload is rejected before we touch the disk.
+pub const ATTACHMENT_MAX_BYTES: usize = 50 * 1024 * 1024;
 
-/// Allowed image MIME types. Anything else is rejected at the runtime
-/// boundary so the on-disk file extension is always one of these.
-pub const ATTACHMENT_ALLOWED_MEDIA_TYPES: &[&str] =
-    &["image/png", "image/jpeg", "image/gif", "image/webp"];
+/// Allowed attachment MIME types. Images were the only supported
+/// category initially; audio and video were added for the drag-and-
+/// drop feature — the user drags an `.mp3` / `.mp4` and it rides
+/// through the same base64-inline pipeline as an image. Anything
+/// else is rejected at the runtime boundary so the on-disk file
+/// extension is always one of a known set.
+pub const ATTACHMENT_ALLOWED_MEDIA_TYPES: &[&str] = &[
+    // Images.
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    // Audio.
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
+    "audio/mp4",
+    "audio/flac",
+    "audio/aac",
+    "audio/opus",
+    "audio/webm",
+    // Video.
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+    "video/x-matroska",
+    "video/x-msvideo",
+];
 
 mod codecs;
 

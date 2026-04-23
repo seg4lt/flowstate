@@ -15,10 +15,28 @@ use zenui_provider_api::{
 
 pub(crate) fn ext_for_media_type(media_type: &str) -> &'static str {
     match media_type {
+        // Images.
         "image/png" => "png",
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        // Audio — keyed off the MIME strings accepted by
+        // `ATTACHMENT_ALLOWED_MEDIA_TYPES` so the on-disk suffix is
+        // always faithful to the file's actual format.
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "audio/ogg" => "ogg",
+        "audio/mp4" => "m4a",
+        "audio/flac" => "flac",
+        "audio/aac" => "aac",
+        "audio/opus" => "opus",
+        "audio/webm" => "weba",
+        // Video.
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "video/x-msvideo" => "avi",
         _ => "bin",
     }
 }

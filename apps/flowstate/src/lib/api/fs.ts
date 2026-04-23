@@ -22,6 +22,31 @@ export function readProjectFile(path: string, file: string): Promise<string> {
   return invoke<string>("read_project_file", { path, file });
 }
 
+/** Payload returned by `read_file_as_base64`. Mirrors the Rust
+ *  `DroppedFilePayload` struct — the camelCase names come from
+ *  serde's `rename_all = "camelCase"`. */
+export interface DroppedFilePayload {
+  name: string;
+  mediaType: string;
+  dataBase64: string;
+  sizeBytes: number;
+}
+
+/** Read an arbitrary absolute path and return its bytes base64-
+ *  encoded along with a best-effort MIME type. Backs the chat
+ *  composer's drag-and-drop flow — when the user drops an image /
+ *  audio / video file, the bytes are lifted through this call and
+ *  attached as an `AttachedImage` chip. For non-media files
+ *  (source code, pdfs, csvs, etc.) the chat composer skips this
+ *  helper entirely and just inserts the path as an `@file` mention
+ *  chip so the agent can read it via its `Read` tool.
+ *
+ *  Rejects on: non-regular-file paths, unreadable paths, or files
+ *  above the Rust-side 50 MB cap. */
+export function readFileAsBase64(path: string): Promise<DroppedFilePayload> {
+  return invoke<DroppedFilePayload>("read_file_as_base64", { path });
+}
+
 export interface BlockLine {
   // 1-based line number, matching ripgrep / editor convention.
   line: number;
