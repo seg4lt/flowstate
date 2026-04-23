@@ -37,6 +37,7 @@ import {
   type PaneIndex,
   type Pane as PaneState,
 } from "./use-editor-tabs";
+import { useEnsurePierrePoolActive } from "@/lib/pierre-pool-controller";
 
 // Read-only editor view: file tree + Cmd+P / content search picker
 // + single-file viewer. Layout:
@@ -122,6 +123,11 @@ interface CodeViewProps {
 export function CodeView(props: CodeViewProps) {
   const { state } = useApp();
   const navigate = useNavigate();
+
+  // Participate in the Pierre worker-pool lifecycle: wake the pool
+  // if it was killed during long idle, and keep it alive while this
+  // view is mounted. See pierre-pool-controller.tsx.
+  useEnsurePierrePoolActive();
 
   // Derive projectPath from the session when not provided directly.
   const session = props.sessionId

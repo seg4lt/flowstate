@@ -49,13 +49,17 @@ export function getMaxPoolSize(): number {
   return Math.max(POOL_SIZE_MIN, cores * 2);
 }
 
-// Default if the user hasn't touched the setting. min(8, max) so:
-//   - 1-2 core machines get 2-4 workers (their max), not 8
-//   - 4-8 core machines get 8 workers (the comfort cap)
-//   - 16+ core machines also get 8 workers — we don't go big-by-
-//     default; users can opt in to higher via Settings.
+// Default if the user hasn't touched the setting. Starts at 1 —
+// one worker handles any single diff fine, and most users never
+// see a queue of concurrent tokenization requests. The pool
+// controller (see pierre-pool-controller.tsx) scales up on demand
+// when queued tasks pile up, up to getMaxPoolSize(). This keeps
+// startup memory low while preserving headroom for heavy diff
+// workloads. Users who prefer a fixed-size pool can still set
+// a specific value via Settings → Performance; that value is
+// treated as the ceiling by the controller.
 export function getDefaultPoolSize(): number {
-  return Math.min(8, getMaxPoolSize());
+  return POOL_SIZE_MIN;
 }
 
 function clampPoolSize(value: number): number {

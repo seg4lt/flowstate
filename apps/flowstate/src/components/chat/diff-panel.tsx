@@ -7,6 +7,7 @@ import type { DiffStreamStatus } from "@/lib/git-diff-stream";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 import { useTheme } from "@/hooks/use-theme";
 import { hashContent } from "@/lib/content-hash";
+import { useEnsurePierrePoolActive } from "@/lib/pierre-pool-controller";
 import { DiffCommentOverlay } from "./diff-comment-overlay";
 
 export type DiffStyle = "split" | "unified";
@@ -86,6 +87,11 @@ export function DiffPanel({
   isFullscreen,
   onToggleFullscreen,
 }: DiffPanelProps) {
+  // Participate in the Pierre worker-pool lifecycle: wake the pool
+  // if it was killed during long idle, and keep it alive while this
+  // panel is mounted. See pierre-pool-controller.tsx.
+  useEnsurePierrePoolActive();
+
   // Cache lives in a ref so mutations don't force re-renders of the
   // whole tree. `cacheVersion` state triggers the re-render we DO
   // want when a particular entry changes status. Crucially,

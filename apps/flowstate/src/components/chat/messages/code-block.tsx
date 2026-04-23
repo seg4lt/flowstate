@@ -12,31 +12,23 @@ import { CopyButton } from "./copy-button";
 // individually via `shiki/langs/<name>` (fine-grained bundle)
 // instead of `import("shiki")` (full bundle). Full-bundle pulls
 // every grammar Shiki ships — several MB parsed — into the app's
-// graph even though we'd only register ~16. Fine-grained means
-// the app chunk only carries what's listed here.
+// graph even though we'd only register a handful. Fine-grained
+// means the app chunk only carries what's listed here.
 //
-// This set covers ~95% of code blocks we see in chat. Rarer
-// languages (c/cpp/ruby/php/sql) fall back to "text" — the block
-// still renders, just without per-token colors. If a user
+// The set is deliberately small: each grammar adds to the
+// highlighter's resident memory (compiled Oniguruma regex state +
+// tokenizer tables). Everything else falls back to "text" — the
+// block still renders, just without per-token colors. If a user
 // consistently hits an uncommon language, add an import below
 // and push it into PRELOAD_LANGS.
 const PRELOAD_LANGS = [
   { name: "typescript", load: () => import("shiki/langs/typescript.mjs") },
   { name: "tsx", load: () => import("shiki/langs/tsx.mjs") },
-  { name: "javascript", load: () => import("shiki/langs/javascript.mjs") },
-  { name: "jsx", load: () => import("shiki/langs/jsx.mjs") },
+  { name: "java", load: () => import("shiki/langs/java.mjs") },
   { name: "rust", load: () => import("shiki/langs/rust.mjs") },
   { name: "python", load: () => import("shiki/langs/python.mjs") },
-  { name: "go", load: () => import("shiki/langs/go.mjs") },
   { name: "bash", load: () => import("shiki/langs/bash.mjs") },
-  { name: "shell", load: () => import("shiki/langs/shellscript.mjs") },
   { name: "json", load: () => import("shiki/langs/json.mjs") },
-  { name: "html", load: () => import("shiki/langs/html.mjs") },
-  { name: "css", load: () => import("shiki/langs/css.mjs") },
-  { name: "markdown", load: () => import("shiki/langs/markdown.mjs") },
-  { name: "yaml", load: () => import("shiki/langs/yaml.mjs") },
-  { name: "toml", load: () => import("shiki/langs/toml.mjs") },
-  { name: "java", load: () => import("shiki/langs/java.mjs") },
 ] as const;
 
 // Set of lang names for O(1) "is this language supported?" checks
