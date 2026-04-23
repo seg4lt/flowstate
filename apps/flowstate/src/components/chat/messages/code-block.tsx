@@ -1,6 +1,7 @@
 import * as React from "react";
 import type {
   HighlighterCore,
+  LanguageRegistration,
   ThemeRegistrationAny,
 } from "shiki/core";
 import pierreDark from "@pierre/theme/pierre-dark";
@@ -8,19 +9,14 @@ import pierreLight from "@pierre/theme/pierre-light";
 import { useTheme } from "@/hooks/use-theme";
 import { CopyButton } from "./copy-button";
 
-// Languages preloaded into the highlighter. We import grammars
-// individually via `shiki/langs/<name>` (fine-grained bundle)
-// instead of `import("shiki")` (full bundle). Full-bundle pulls
-// every grammar Shiki ships — several MB parsed — into the app's
-// graph even though we'd only register a handful. Fine-grained
-// means the app chunk only carries what's listed here.
+// Languages preloaded into the highlighter at creation. Kept small
+// to keep resident memory low — each grammar adds compiled
+// Oniguruma regex state + tokenizer tables (~50-200 KB each). Any
+// other language lazily loads on first use via LAZY_LANGS below.
 //
-// The set is deliberately small: each grammar adds to the
-// highlighter's resident memory (compiled Oniguruma regex state +
-// tokenizer tables). Everything else falls back to "text" — the
-// block still renders, just without per-token colors. If a user
-// consistently hits an uncommon language, add an import below
-// and push it into PRELOAD_LANGS.
+// Fine-grained imports (`shiki/langs/<name>.mjs`) instead of
+// `import("shiki")` keep the app chunk light: only these specific
+// grammars ship in the initial bundle.
 const PRELOAD_LANGS = [
   { name: "typescript", load: () => import("shiki/langs/typescript.mjs") },
   { name: "tsx", load: () => import("shiki/langs/tsx.mjs") },
@@ -31,21 +27,61 @@ const PRELOAD_LANGS = [
   { name: "json", load: () => import("shiki/langs/json.mjs") },
 ] as const;
 
-// Set of lang names for O(1) "is this language supported?" checks
-// inside the render hot path. Built once from PRELOAD_LANGS above
-// so drift between the two stays impossible.
-const PRELOAD_LANG_NAMES: ReadonlySet<string> = new Set(
-  PRELOAD_LANGS.map((l) => l.name),
-);
+// Type of a Shiki language grammar module's default export.
+type GrammarModule = { default: LanguageRegistration[] };
 
-// Tiny snippet used to force the first tokenize + regex JIT pass.
-// `createHighlighterCore` registers grammars eagerly, but Oniguruma
-// still compiles its regex bytecode lazily on first match. One
-// throwaway `codeToHtml` during boot idle time moves that cost off
-// the render path so the first real <CodeBlock> render is a cache
-// hit.
-const PREWARM_SNIPPET = "const x = 1;";
-const PREWARM_LANG = "typescript";
+// Lazy-loaded grammars. Each entry is a dynamic import — Vite code-
+// splits one chunk per unique module specifier, so two entries
+// pointing to the same `.mjs` file dedupe automatically. The key
+// is whatever the user might type in a code fence (` ```md `,
+// ` ```go `, etc.); Shiki's own alias handling covers additional
+// forms once the grammar is registered.
+//
+// Trade-off: a block in one of these langs renders as plain
+// uncolored text for ~50-200 ms on first encounter (dynamic import
+// + grammar compile), then re-renders colored. Subsequent blocks
+// in the same lang are instant. Unseen langs never load — the app
+// only pays memory for what the user actually views.
+//
+// Grow this list when a user commonly hits an uncommon language.
+const LAZY_LANGS: Record<string, () => Promise<GrammarModule>> = {
+  javascript: () => import("shiki/langs/javascript.mjs"),
+  js: () => import("shiki/langs/javascript.mjs"),
+  jsx: () => import("shiki/langs/jsx.mjs"),
+  go: () => import("shiki/langs/go.mjs"),
+  golang: () => import("shiki/langs/go.mjs"),
+  markdown: () => import("shiki/langs/markdown.mjs"),
+  md: () => import("shiki/langs/markdown.mjs"),
+  yaml: () => import("shiki/langs/yaml.mjs"),
+  yml: () => import("shiki/langs/yaml.mjs"),
+  toml: () => import("shiki/langs/toml.mjs"),
+  html: () => import("shiki/langs/html.mjs"),
+  css: () => import("shiki/langs/css.mjs"),
+  scss: () => import("shiki/langs/scss.mjs"),
+  sql: () => import("shiki/langs/sql.mjs"),
+  xml: () => import("shiki/langs/xml.mjs"),
+  c: () => import("shiki/langs/c.mjs"),
+  cpp: () => import("shiki/langs/cpp.mjs"),
+  "c++": () => import("shiki/langs/cpp.mjs"),
+  csharp: () => import("shiki/langs/csharp.mjs"),
+  "c#": () => import("shiki/langs/csharp.mjs"),
+  ruby: () => import("shiki/langs/ruby.mjs"),
+  rb: () => import("shiki/langs/ruby.mjs"),
+  php: () => import("shiki/langs/php.mjs"),
+  shell: () => import("shiki/langs/shellscript.mjs"),
+  shellscript: () => import("shiki/langs/shellscript.mjs"),
+  sh: () => import("shiki/langs/shellscript.mjs"),
+  zsh: () => import("shiki/langs/shellscript.mjs"),
+  dockerfile: () => import("shiki/langs/dockerfile.mjs"),
+  docker: () => import("shiki/langs/dockerfile.mjs"),
+  kotlin: () => import("shiki/langs/kotlin.mjs"),
+  swift: () => import("shiki/langs/swift.mjs"),
+  lua: () => import("shiki/langs/lua.mjs"),
+  nix: () => import("shiki/langs/nix.mjs"),
+  zig: () => import("shiki/langs/zig.mjs"),
+  makefile: () => import("shiki/langs/make.mjs"),
+  make: () => import("shiki/langs/make.mjs"),
+};
 
 // Both themes are bundled into the singleton highlighter so swapping
 // between light and dark on theme toggle is a synchronous re-highlight
@@ -58,17 +94,14 @@ const DARK_THEME = pierreDark as unknown as ThemeRegistrationAny;
 
 // Singleton highlighter promise. The first <CodeBlock> on the page
 // triggers the dynamic import of shiki/core + the Oniguruma WASM +
-// each registered grammar, every subsequent block reuses the same
+// each preloaded grammar; every subsequent block reuses the same
 // instance synchronously.
 //
 // We use `createHighlighterCore` (not the default `createHighlighter`
 // from `shiki`) so only the grammars we actually register land in
 // the bundle. The engine is Oniguruma WASM — same engine the worker
-// pool uses with `preferredHighlighter: "shiki-wasm"` — so tokenize
-// timings are consistent between main-thread code blocks and worker-
-// based diffs, and work identically in WKWebView (JavaScriptCore's
-// regex JIT is slower than V8's, which is why the default JS regex
-// engine underperforms in Tauri).
+// pool used to use with `preferredHighlighter: "shiki-wasm"` — giving
+// consistent perf in WKWebView where JSC's regex JIT is weaker than V8's.
 let highlighterPromise: Promise<HighlighterCore> | null = null;
 
 function getHighlighter(): Promise<HighlighterCore> {
@@ -92,34 +125,46 @@ function getHighlighter(): Promise<HighlighterCore> {
   return highlighterPromise;
 }
 
-// Kick off the highlighter init + one tokenize pass. Safe to call
-// multiple times; the singleton promise dedupes the real work and
-// the prewarm step is a no-op after the first success. Intended to
-// be called from main.tsx at app boot on an idle callback so the
-// first real <CodeBlock> render doesn't pay the cold-start cost.
-//
-// Swallows errors — if prewarm fails (e.g. the dynamic import
-// 404s in a dev environment), the lazy path in CodeBlockInner will
-// surface the error when the user actually hits a code block.
-let prewarmedOnce = false;
-export function prewarmCodeBlockHighlighter(): void {
-  if (prewarmedOnce) return;
-  prewarmedOnce = true;
-  getHighlighter()
-    .then((highlighter) => {
-      try {
-        highlighter.codeToHtml(PREWARM_SNIPPET, {
-          lang: PREWARM_LANG,
-          theme: DARK_THEME,
-        });
-      } catch {
-        /* prewarm is best-effort */
-      }
-    })
-    .catch(() => {
-      // Reset so a later real render can retry the import.
-      prewarmedOnce = false;
-    });
+// In-flight / completed lazy-load promises, keyed by the lookup
+// name the caller used. Dedupes concurrent requests for the same
+// language and makes repeat calls a cheap no-op after success.
+const lazyLoadPromises = new Map<string, Promise<void>>();
+
+// Load a grammar into the highlighter if it isn't already there.
+// Resolves to `true` if the language can be tokenized afterward,
+// `false` if it's truly unsupported (not preloaded, not in
+// LAZY_LANGS) — caller should fall back to plain-text rendering.
+async function ensureLanguageLoaded(
+  highlighter: HighlighterCore,
+  lang: string,
+): Promise<boolean> {
+  // Preloaded grammars + any lang we've already lazy-loaded show up
+  // in getLoadedLanguages() (including Shiki's own aliases like
+  // "md" for markdown). Cheap Array.includes — the list stays
+  // small for our setup.
+  if (highlighter.getLoadedLanguages().includes(lang)) return true;
+
+  const loader = LAZY_LANGS[lang];
+  if (!loader) return false;
+
+  let p = lazyLoadPromises.get(lang);
+  if (!p) {
+    p = loader()
+      .then((mod) => highlighter.loadLanguage(mod.default))
+      .catch((err) => {
+        // Drop the cache entry so a later retry can attempt again.
+        lazyLoadPromises.delete(lang);
+        throw err;
+      });
+    lazyLoadPromises.set(lang, p);
+  }
+  try {
+    await p;
+    return true;
+  } catch (err) {
+    console.error(`[shiki] lazy-load failed for "${lang}":`, err);
+    return false;
+  }
 }
 
 interface CodeBlockProps {
@@ -134,30 +179,34 @@ function CodeBlockInner({ code, language }: CodeBlockProps) {
   React.useEffect(() => {
     let cancelled = false;
     const theme = resolvedTheme === "dark" ? DARK_THEME : LIGHT_THEME;
-    getHighlighter()
-      .then((highlighter) => {
-        if (cancelled) return;
-        // `getLoadedLanguages()` would also work but allocates an
-        // array every render; the PRELOAD_LANG_NAMES Set is O(1)
-        // and allocated once at module init. Unsupported or unset
-        // language → fall back to "text" and render uncolored — the
-        // block still appears, just without grammar colors.
-        const lang =
-          language && PRELOAD_LANG_NAMES.has(language) ? language : "text";
-        try {
-          const result = highlighter.codeToHtml(code, {
-            lang,
-            theme,
-          });
-          setHtml(result);
-        } catch (err) {
-          console.error("[shiki] highlight error:", err);
-          setHtml(null);
-        }
-      })
-      .catch((err) => {
+    (async () => {
+      let highlighter: HighlighterCore;
+      try {
+        highlighter = await getHighlighter();
+      } catch (err) {
         console.error("[shiki] highlighter init failed:", err);
-      });
+        return;
+      }
+      if (cancelled) return;
+
+      // Resolve the language: preloaded → tokenize immediately.
+      // Lazy-loadable → render plain text now, load grammar in the
+      // background, then swap to colored. Unknown → plain text
+      // forever for this block.
+      const hasLang = language
+        ? await ensureLanguageLoaded(highlighter, language)
+        : false;
+      if (cancelled) return;
+
+      const lang = hasLang && language ? language : "text";
+      try {
+        const result = highlighter.codeToHtml(code, { lang, theme });
+        if (!cancelled) setHtml(result);
+      } catch (err) {
+        console.error("[shiki] highlight error:", err);
+        if (!cancelled) setHtml(null);
+      }
+    })();
     return () => {
       cancelled = true;
     };
