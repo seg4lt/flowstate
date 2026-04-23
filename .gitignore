@@ -15,9 +15,15 @@ perf.data.old
 
 # ── JS bridges (bun/tsc output + deps) ───────────────────────
 crates/core/*/bridge/dist/
-crates/core/*/bridge/node_modules/
 apps/*/frontend/dist/
-apps/*/frontend/node_modules/
+# Catch every node_modules anywhere in the tree: repo root, each
+# crate's bridge dir, each Tauri app's frontend dir. Previously the
+# two scoped globs only covered `crates/core/*/bridge/node_modules/`
+# and `apps/*/frontend/node_modules/`, missing the repo-root
+# `/node_modules/` and the current Tauri layout
+# `apps/flowstate/node_modules/` — those started leaking into
+# editor diff views (vitest / npx drop caches there).
+**/node_modules/
 **/*.tsbuildinfo
 
 # ── Build artifacts ──────────────────────────────────────────
