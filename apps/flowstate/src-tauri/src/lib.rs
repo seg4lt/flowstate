@@ -2712,18 +2712,29 @@ pub fn run() {
         ])
         .on_window_event(|window, event| {
             match event {
-                // User clicked the red traffic light (or frontend-initiated
-                // `getCurrentWindow().close()`). On macOS the NSApp keeps
-                // the process alive after the last window closes — so
-                // without an explicit `exit(0)` here flowstate's dock icon
-                // stays lit and the daemon keeps running with no UI to
-                // drive it, which is exactly the "does not get killed"
-                // symptom users hit. Force the process down: fire the
-                // graceful-shutdown path (so `opencode serve` +
-                // `flowstate mcp-server` children get SIGTERM before the
-                // event loop tears down) then call `exit(0)`, which
-                // dispatches `RunEvent::ExitRequested` into the run
-                // closure below.
+                // Red traffic light (or frontend-initiated
+                // `getCurrentWindow().close()`).
+                //
+                // On macOS we follow platform convention: closing the
+                // window *hides* it instead of quitting the process.
+                // The daemon, `opencode serve`, PTY shells, and any
+                // running sessions keep going in the background. The
+                // user brings the window back by clicking the dock
+                // icon (handled by `RunEvent::Reopen` in the run
+                // closure below) and actually quits with Cmd+Q, which
+                // goes straight to `RunEvent::ExitRequested`.
+                //
+                // On other platforms closing really does mean quit —
+                // there's no dock-style reopen affordance, so keeping
+                // a hidden window around would just orphan the
+                // process. Fall through to the original shutdown path
+                // there.
+                #[cfg(target_os = "macos")]
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                #[cfg(not(target_os = "macos"))]
                 tauri::WindowEvent::CloseRequested { .. } => {
                     if let Some(pty) = window.try_state::<PtyManager>() {
                         pty.kill_all();
@@ -2751,6 +2762,26 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            // macOS dock-icon click. When all windows are hidden (which
+            // is what the `CloseRequested` arm above does on macOS)
+            // clicking the dock icon should restore the main window —
+            // otherwise there's no way back in short of Cmd+Tab +
+            // Cmd+N-style tricks. `has_visible_windows` is false after
+            // our hide, so iterate every window and show+focus it.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows, ..
+            } = &event
+            {
+                if !*has_visible_windows {
+                    for (_, window) in app_handle.webview_windows() {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+
             // Two-phase exit gate. The full sequence for a red-traffic
             // light / Cmd+Q / SIGTERM close is:
             //
