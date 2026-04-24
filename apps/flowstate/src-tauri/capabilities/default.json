@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": ["main"],
+  "description": "Capability for the main window and thread popouts (label `thread-<session_id>`, opened via the `popout_thread` command)",
+  "windows": ["main", "thread-*"],
   "permissions": [
     "core:app:default",
     "core:event:default",

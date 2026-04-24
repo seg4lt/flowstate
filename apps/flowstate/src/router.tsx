@@ -29,6 +29,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { UpdateBanner } from "@/components/update-banner";
 import { ProvisioningSplash } from "@/components/provisioning-splash";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { isPopoutWindow } from "@/lib/popout";
 
 const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -209,6 +210,26 @@ function useZoomShortcuts() {
   }, []);
 }
 
+// Stripped shell used by thread popouts (the Rust `popout_thread`
+// command opens a webview at `/chat/<id>?popout=1`). No sidebar,
+// no terminal dock, no update banner, no provisioning splash —
+// those belong only to the main window. The popout still needs
+// TooltipProvider + Toaster + zoom shortcuts, and sits inside the
+// same provider stack (see AppLayout) so its AppProvider opens
+// its own `connectStream` subscription and hydrates from the
+// broadcast.
+function PopoutShell() {
+  useZoomShortcuts();
+  return (
+    <TooltipProvider>
+      <div className="h-svh w-svw">
+        <Outlet />
+      </div>
+      <Toaster />
+    </TooltipProvider>
+  );
+}
+
 function AppShell() {
   useTerminalShortcut();
   useZoomShortcuts();
@@ -265,13 +286,19 @@ function AppShell() {
 }
 
 function AppLayout() {
+  // Decide once per window, not per render: the popout flag is
+  // set by the Rust-side `popout_thread` command on URL creation
+  // and never flips after mount. Computing it at module scope
+  // would run before the test environment can stub `window`, so
+  // lazy-initialize inside the component instead.
+  const popout = React.useMemo(() => isPopoutWindow(), []);
   return (
     <ThemeProvider>
       <ContextDisplaySettingProvider>
         <ProviderEnabledProvider>
           <AppProvider>
             <TerminalProvider>
-              <AppShell />
+              {popout ? <PopoutShell /> : <AppShell />}
             </TerminalProvider>
           </AppProvider>
         </ProviderEnabledProvider>

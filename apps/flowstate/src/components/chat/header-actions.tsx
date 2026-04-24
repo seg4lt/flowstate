@@ -6,7 +6,10 @@ import {
   ChevronDown,
   Compass,
   Diff,
+  ExternalLink,
   FolderOpen,
+  Pin,
+  PinOff,
   Search,
   Terminal,
 } from "lucide-react";
@@ -22,6 +25,12 @@ import { prefetchProjectFiles } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
 import { selectDockOpen, useTerminal } from "@/stores/terminal-store";
+import {
+  isPopoutWindow,
+  popoutThread,
+  readPopoutPinPref,
+  setPopoutPinned,
+} from "@/lib/popout";
 
 interface HeaderActionsProps {
   sessionId: string;
@@ -97,6 +106,41 @@ export function HeaderActions({
   // sync via `selectDockOpen`.
   const { state: terminalState, dispatch: terminalDispatch } = useTerminal();
   const dockOpen = selectDockOpen(terminalState, sessionId);
+
+  // Thread popout: "Pop out" button only shown in the main window;
+  // a Pin toggle is only shown when we *are* the popout. The two
+  // branches never coexist, so the header row never doubles in
+  // width. Decide once at mount — a window's role (main vs popout)
+  // never flips after creation.
+  const inPopout = React.useMemo(() => isPopoutWindow(), []);
+  const [pinned, setPinned] = React.useState<boolean>(() =>
+    readPopoutPinPref(),
+  );
+  const handlePopout = React.useCallback(async () => {
+    try {
+      await popoutThread(sessionId);
+    } catch (err) {
+      toast({
+        description: `Could not pop out thread: ${String(err)}`,
+        duration: 4000,
+      });
+    }
+  }, [sessionId]);
+  const handleTogglePin = React.useCallback(async () => {
+    const next = !pinned;
+    setPinned(next);
+    try {
+      await setPopoutPinned(next);
+    } catch (err) {
+      // Roll back the optimistic flip if the OS rejected the
+      // request — keeps the toggle's visual state honest.
+      setPinned(pinned);
+      toast({
+        description: `Could not ${next ? "pin" : "unpin"} window: ${String(err)}`,
+        duration: 4000,
+      });
+    }
+  }, [pinned]);
   // Hover-driven prefetch for the /code view's file list. Wired to
   // both onMouseEnter and onFocus on the Search button so mouse and
   // keyboard users get the same head-start: by the time the click
@@ -252,6 +296,34 @@ export function HeaderActions({
       >
         <Terminal className="h-3 w-3" />
       </Button>
+      {inPopout ? (
+        <Button
+          variant={pinned ? "secondary" : "outline"}
+          size="xs"
+          onClick={handleTogglePin}
+          aria-pressed={pinned}
+          title={
+            pinned
+              ? "Unpin — window returns to normal z-order"
+              : "Pin — keep this window above other apps"
+          }
+        >
+          {pinned ? (
+            <PinOff className="h-3 w-3" />
+          ) : (
+            <Pin className="h-3 w-3" />
+          )}
+        </Button>
+      ) : (
+        <Button
+          variant="outline"
+          size="xs"
+          onClick={handlePopout}
+          title="Pop out this thread into its own window"
+        >
+          <ExternalLink className="h-3 w-3" />
+        </Button>
+      )}
       <Button
         variant="outline"
         size="xs"

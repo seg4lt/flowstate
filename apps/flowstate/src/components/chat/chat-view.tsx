@@ -3,6 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
+import { isPopoutWindow } from "@/lib/popout";
 import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
@@ -1940,7 +1941,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   return (
     <div className="flex h-svh min-w-0 flex-col overflow-hidden">
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
-        <SidebarTrigger />
+        {/* SidebarTrigger has no sidebar to toggle when rendered in
+            a thread popout (the stripped PopoutShell in router.tsx
+            doesn't mount AppSidebar), so hide it there. */}
+        {!isPopoutWindow() && <SidebarTrigger />}
         <div className="flex min-w-0 flex-col leading-tight">
           {editingTitle ? (
             <input
