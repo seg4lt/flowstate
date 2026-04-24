@@ -513,20 +513,6 @@ class ClaudeBridge {
   private cwd: string = process.cwd();
   private model?: string;
   /**
-   * Per-task token budget surfaced to the SDK as `taskBudget`. The
-   * SDK passes this to the underlying CLI as `--task-budget N`,
-   * which the CLI sends to Anthropic as `output_config.task_budget`
-   * with the `task-budgets-2026-03-13` beta header. The model sees
-   * a running countdown and self-paces. Set once at create_session
-   * time from the host's `defaults.max_tokens` user_config; baked
-   * into the persistent Query at openPersistentQuery time.
-   *
-   * Distinct from the Messages-API `max_tokens` hard cap, which the
-   * Agent SDK doesn't expose — taskBudget is the closest equivalent
-   * the SDK surfaces. Undefined → no taskBudget passed → SDK default.
-   */
-  private maxTokens?: number;
-  /**
    * The SDK session id to `resume:` from when we next need to (re)open
    * a Query — typically only on bridge cold-start / respawn. Persisted
    * back to Rust as `provider_state.native_thread_id`.
@@ -717,15 +703,9 @@ class ClaudeBridge {
    */
   private lastContextWindow: number | null = null;
 
-  createSession(
-    cwd: string,
-    model?: string,
-    resumeSessionId?: string,
-    maxTokens?: number,
-  ): string {
+  createSession(cwd: string, model?: string, resumeSessionId?: string): string {
     this.cwd = cwd;
     this.model = model;
-    this.maxTokens = maxTokens;
     // Hydrate the SDK resume id from persisted state when zenui restarts or
     // this bridge is a fresh respawn. The SDK's `resume:` option on the next
     // send_prompt picks this up and replays the prior conversation.
@@ -1109,13 +1089,6 @@ class ClaudeBridge {
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
       ...(effortLevel ? { effort: effortLevel } : {}),
-      // Per-task token budget. SDK requires `{ total: number }`;
-      // baked into the Query at open time and not mutable mid-session
-      // (a subsequent settings change only takes effect on the NEXT
-      // session, matching how `model` and `effort` behave here).
-      ...(this.maxTokens && this.maxTokens > 0
-        ? { taskBudget: { total: this.maxTokens } }
-        : {}),
       ...(RESOLVED_LOCAL_CLAUDE_PATH
         ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
         : {}),
@@ -2426,23 +2399,8 @@ async function main(): Promise<void> {
         const cwd = (msg.cwd as string) ?? process.cwd();
         const model = msg.model as string | undefined;
         const resumeSessionId = msg.resume_session_id as string | undefined;
-        const rawMaxTokens = msg.max_tokens;
-        // Defensive parse — Rust skips serializing when None, but
-        // accept a stringified number too in case a different host
-        // ever drives the bridge directly.
-        const maxTokens =
-          typeof rawMaxTokens === 'number'
-            ? rawMaxTokens
-            : typeof rawMaxTokens === 'string'
-              ? Number.parseInt(rawMaxTokens, 10)
-              : undefined;
         try {
-          const sessionId = bridge.createSession(
-            cwd,
-            model,
-            resumeSessionId,
-            Number.isFinite(maxTokens as number) ? (maxTokens as number) : undefined,
-          );
+          const sessionId = bridge.createSession(cwd, model, resumeSessionId);
           writeJson({ type: 'session_created', session_id: sessionId });
         } catch (err) {
           writeJson({

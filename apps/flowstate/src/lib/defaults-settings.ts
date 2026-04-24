@@ -20,15 +20,6 @@ const CONFIG_KEY_MODEL_PREFIX = "defaults.model.";
 const CONFIG_KEY_PROVIDER_ENABLED_PREFIX = "provider.enabled.";
 const CONFIG_KEY_DEFAULT_PROVIDER = "defaults.provider";
 const CONFIG_KEY_STRICT_PLAN_MODE = "defaults.strict_plan_mode";
-const CONFIG_KEY_MAX_TOKENS = "defaults.max_tokens";
-
-// Mirrors crates/core/provider-claude-sdk/src/config.rs constants.
-// Kept here so the Settings UI can validate before round-tripping
-// through the Tauri command (and so the placeholder/help text reads
-// off the same source of truth).
-export const MAX_TOKENS_MIN = 20_000;
-export const MAX_TOKENS_MAX = 128_000;
-export const MAX_TOKENS_DEFAULT = 64_000;
 
 // --- Provider-enabled defaults ---
 
@@ -217,46 +208,6 @@ export async function readStrictPlanMode(): Promise<boolean> {
 export async function writeStrictPlanMode(enabled: boolean): Promise<void> {
   try {
     await setUserConfig(CONFIG_KEY_STRICT_PLAN_MODE, String(enabled));
-  } catch {
-    /* storage may be unavailable */
-  }
-}
-
-// --- Default max tokens (Claude SDK taskBudget) ---
-//
-// The Claude Agent SDK doesn't expose a Messages-API `max_tokens`
-// directly — the equivalent knob is `taskBudget`, an advisory cap
-// across the agentic loop that the model self-paces against. The
-// Rust side reads this on every session create and pushes it into
-// the bridge as `taskBudget: { total: N }`. UI label is "Max tokens
-// per task" since that's the user-facing concept.
-
-/** Returns the stored value clamped to the supported range, or
- *  `null` when missing / invalid. The UI falls back to
- *  `MAX_TOKENS_DEFAULT` when null. */
-export async function readDefaultMaxTokens(): Promise<number | null> {
-  try {
-    const raw = await getUserConfig(CONFIG_KEY_MAX_TOKENS);
-    if (raw === null) return null;
-    const n = Number.parseInt(raw, 10);
-    if (!Number.isFinite(n)) return null;
-    if (n < MAX_TOKENS_MIN || n > MAX_TOKENS_MAX) return null;
-    return n;
-  } catch {
-    return null;
-  }
-}
-
-/** Persist the value. Caller is responsible for invoking the
- *  `set_claude_max_tokens` Tauri command afterwards so the change
- *  takes effect on the next session spawn without a restart. */
-export async function writeDefaultMaxTokens(value: number): Promise<void> {
-  const clamped = Math.min(
-    MAX_TOKENS_MAX,
-    Math.max(MAX_TOKENS_MIN, Math.round(value)),
-  );
-  try {
-    await setUserConfig(CONFIG_KEY_MAX_TOKENS, String(clamped));
   } catch {
     /* storage may be unavailable */
   }

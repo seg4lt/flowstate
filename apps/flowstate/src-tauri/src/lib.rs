@@ -1955,26 +1955,6 @@ async fn set_user_config(
     base_url.client().set_user_config(key, value).await
 }
 
-/// Push the active "max tokens per task" default into the
-/// Claude SDK adapter's process-wide slot. Pass `None` (omitted in
-/// the JS call) to clear the override and let the SDK fall back to
-/// its built-in default.
-///
-/// Called from the frontend in two places:
-///   1. AppProvider mount, after reading
-///      `user_config["defaults.max_tokens"]`. Seeds the value before
-///      any session spawn.
-///   2. The Settings page save handler. Live-updates every subsequent
-///      session-create call (existing sessions keep their original
-///      taskBudget — the SDK bakes it in at Query open time).
-///
-/// See `crates/core/provider-claude-sdk/src/config.rs` for the
-/// underlying static + clamp range.
-#[tauri::command]
-fn set_claude_max_tokens(value: Option<u64>) {
-    zenui_provider_claude_sdk::config::set_max_tokens(value);
-}
-
 // Per-session and per-project display metadata: titles, names,
 // previews, ordering. Lives in the same `user_config.sqlite`
 // file as the kv table above, in dedicated tables. The agent
@@ -3098,7 +3078,6 @@ pub fn run() {
             set_window_always_on_top,
             get_user_config,
             set_user_config,
-            set_claude_max_tokens,
             set_session_display,
             get_session_display,
             list_session_display,

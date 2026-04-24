@@ -1,5 +1,4 @@
 mod bridge_runtime;
-pub mod config;
 mod process;
 
 // Re-exported so the daemon's `provision_runtimes()` step can
@@ -391,10 +390,6 @@ impl ClaudeSdkAdapter {
                 .to_string(),
             model: session.summary.model.clone(),
             resume_session_id,
-            // Read live so the user can change the value in Settings
-            // without restarting — affects every new session spawned
-            // after they hit save.
-            max_tokens: config::current_max_tokens(),
         };
         write_request(&bridge.stdin, &request).await?;
 
