@@ -30,6 +30,7 @@ use tauri::ipc::Channel;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tracing_subscriber::EnvFilter;
 use transport_tauri::TauriTransport;
 use zenui_daemon_core::{
@@ -2087,6 +2088,10 @@ pub fn run() {
         // repo and verified against the embedded pubkey.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Global hotkey toggle (Cmd+Option+Shift+O). Registration of
+        // the accelerator itself happens in the `.setup()` block below
+        // once we have an `AppHandle` to clone into the callback.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PtyManager::new())
         .manage(DiffTasks::default())
         .setup(|app| {
@@ -2121,6 +2126,64 @@ pub fn run() {
                     }
                     Err(e) => tracing::warn!(%e, "failed to build default app menu"),
                 }
+            }
+
+            // Global toggle hotkey: Cmd+Option+Shift+O.
+            //
+            // - Pressed while flowstate owns focus -> hide() (same path
+            //   as the red traffic light on macOS).
+            // - Pressed while flowstate is hidden / minimized / behind
+            //   another app -> show() + unminimize() + set_focus().
+            //   `set_focus()` calls [NSApp activateIgnoringOtherApps:YES]
+            //   under the hood, so we steal focus from the frontmost
+            //   app automatically — no extra NSApp.activate call.
+            //
+            // `is_focused()` (not `is_visible()`) is the right predicate:
+            // if the window is visible but the user alt-tabbed to
+            // another app, pressing the hotkey should bring flowstate
+            // forward, not hide it.
+            //
+            // The plugin fires the callback for both Pressed AND
+            // Released — gate on `ShortcutState::Pressed` so one
+            // keystroke toggles exactly once.
+            //
+            // Cross-platform: the plugin handles macOS / Linux / Windows
+            // differences internally (on macOS it uses Carbon's
+            // `RegisterEventHotKey`, which needs no Accessibility
+            // permission). Registration failure is non-fatal — if some
+            // other app already owns the combo we log and continue so
+            // the rest of startup proceeds.
+            let toggle_shortcut = Shortcut::new(
+                Some(Modifiers::META | Modifiers::ALT | Modifiers::SHIFT),
+                Code::KeyO,
+            );
+            let shortcut_handle = app.handle().clone();
+            if let Err(e) = app.global_shortcut().on_shortcut(
+                toggle_shortcut,
+                move |_app, _shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    let Some(window) = shortcut_handle.get_webview_window("main") else {
+                        return;
+                    };
+                    match window.is_focused() {
+                        Ok(true) => {
+                            let _ = window.hide();
+                        }
+                        _ => {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                },
+            ) {
+                tracing::warn!(
+                    %e,
+                    "failed to register global toggle shortcut (Cmd+Opt+Shift+O); \
+                     likely held by another app — continuing without it"
+                );
             }
 
             // Orphan scan — first thing in setup, BEFORE we bind the
