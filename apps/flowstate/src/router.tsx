@@ -218,13 +218,29 @@ function useZoomShortcuts() {
 // same provider stack (see AppLayout) so its AppProvider opens
 // its own `connectStream` subscription and hydrates from the
 // broadcast.
+//
+// `SidebarProvider` is mounted as a safety net even though no
+// `AppSidebar` is rendered here. Reason: several routes the user
+// can navigate into while inside the popout (CodeView, SettingsView,
+// ProjectHomeView, UsageView, the index route) render
+// `<SidebarTrigger />` unconditionally in their header. A client-side
+// navigation inside the popout (e.g. the "Search" button in the chat
+// header -> /code/<id>) drops the `?popout=1` query string, but the
+// shell choice in `AppLayout` is memoized at mount, so we stay in
+// `PopoutShell` — and those unguarded SidebarTriggers would throw
+// `useSidebar must be used within a SidebarProvider`. With the
+// provider in scope the triggers degrade to harmless no-ops (there's
+// no AppSidebar to show/hide) instead of crashing the whole popout
+// into the TanStack Router error boundary.
 function PopoutShell() {
   useZoomShortcuts();
   return (
     <TooltipProvider>
-      <div className="h-svh w-svw">
-        <Outlet />
-      </div>
+      <SidebarProvider>
+        <div className="h-svh w-svw">
+          <Outlet />
+        </div>
+      </SidebarProvider>
       <Toaster />
     </TooltipProvider>
   );

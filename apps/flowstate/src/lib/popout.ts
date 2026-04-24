@@ -21,10 +21,23 @@ const PIN_STORAGE_KEY = "flowstate:popout-pin";
 /** True when the current webview was opened as a thread popout.
  *  The Rust `popout_thread` command appends `?popout=1` to the
  *  URL it hands to `WebviewWindowBuilder`, so the flag is visible
- *  from the first render — no IPC round-trip required. */
+ *  from the first render — no IPC round-trip required.
+ *
+ *  Cached at first call: a window's role (main vs popout) is fixed
+ *  at creation by Tauri and never flips. Without the cache, a
+ *  client-side navigation inside the popout (e.g. TanStack Router
+ *  `navigate({ to: "/code/$sessionId" })`) would drop the
+ *  `?popout=1` query string and subsequent calls would wrongly
+ *  return `false` — causing guarded `SidebarTrigger`s to suddenly
+ *  reappear and header toggles (Pin vs Pop-out) to flip. */
+let cachedIsPopout: boolean | null = null;
 export function isPopoutWindow(): boolean {
   if (typeof window === "undefined") return false;
-  return new URLSearchParams(window.location.search).get("popout") === "1";
+  if (cachedIsPopout === null) {
+    cachedIsPopout =
+      new URLSearchParams(window.location.search).get("popout") === "1";
+  }
+  return cachedIsPopout;
 }
 
 /** Read the user's last pin preference. Defaults to `false` so
