@@ -66,8 +66,27 @@ export function ModelSelector({
     return null;
   }
 
+  // Label resolution fallback chain:
+  //   1. exact match on the session's stored model → its catalog label
+  //      (the usual case once the model is resolved)
+  //   2. the raw model id itself — e.g. when the SDK pinned a
+  //      date-stamped variant we haven't catalogued yet
+  //   3. the first entry in the provider's model list — populated from
+  //      the Claude SDK bridge's `q.supportedModels()`, whose first
+  //      entry IS the SDK's default, so a freshly spawned session
+  //      with `session.model === undefined` shows the real default
+  //      label (e.g. "Claude Opus 4.7") immediately instead of the
+  //      generic "Default" placeholder that used to linger until the
+  //      `model_resolved` event arrived after the first turn.
+  //   4. literal "Default" — only if the provider hasn't enumerated
+  //      any models yet (the `models.length === 0` branch above has
+  //      already short-circuited for that case, so this is belt-and-
+  //      braces).
   const currentLabel =
-    models.find((m) => m.value === currentModel)?.label ?? currentModel ?? "Default";
+    models.find((m) => m.value === currentModel)?.label ??
+    currentModel ??
+    models[0]?.label ??
+    "Default";
   const showSearch = models.length >= SEARCH_RELEVANT_MODEL_COUNT;
 
   async function handleSelect(model: string) {

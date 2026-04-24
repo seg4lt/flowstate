@@ -140,6 +140,34 @@ function WorktreeDropdownInner({
     };
   }, [state.providers, isProviderEnabled]);
 
+  // Resolution priority for the session's starting model:
+  //   1. explicit pick from the submenu,
+  //   2. user's saved default for this provider (`readDefaultModel`),
+  //   3. the provider catalog's first entry — which, for the Claude
+  //      SDK bridge, is exactly what `q.supportedModels()` returns
+  //      first and therefore the SDK's own default.
+  //
+  // Step 3 is what fixes the "model chip shows 'Default' until the
+  // first message" bug: passing an explicit value here means
+  // `session.summary.model` is populated at spawn time, so the
+  // toolbar renders the real model label on first paint instead of
+  // waiting for the `model_resolved` event on turn 1.
+  //
+  // Plain function (not useCallback) because `providerMap` is
+  // recreated on every render — a memoised callback wouldn't give a
+  // stable identity anyway, and no consumer depends on reference
+  // equality here.
+  function resolveStartModel(
+    provider: ProviderKind,
+    explicit?: string,
+  ): string | undefined {
+    return (
+      explicit ??
+      defaultModels.get(provider) ??
+      providerMap.get(provider)?.models[0]?.value
+    );
+  }
+
   // User's configured default provider (Settings → Defaults → Default
   // provider). Used when starting a thread on a freshly-created
   // worktree where we have no ambient session/provider to inherit.
@@ -233,7 +261,7 @@ function WorktreeDropdownInner({
   // Direct thread on the main project (no worktree provisioning).
   async function createThreadDirect(provider: ProviderKind, model?: string) {
     refreshBranchAsync(projectPath);
-    const resolvedModel = model ?? defaultModels.get(provider);
+    const resolvedModel = resolveStartModel(provider, model);
     const res = await send({
       type: "start_session",
       provider,
@@ -336,7 +364,7 @@ function WorktreeDropdownInner({
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
               {renderProviderItems((provider, model) => {
-                const resolvedModel = model ?? defaultModels.get(provider);
+                const resolvedModel = resolveStartModel(provider, model);
                 void createThreadDirect(provider, resolvedModel);
               })}
             </>
@@ -348,7 +376,7 @@ function WorktreeDropdownInner({
             !hasMultipleWorktrees && (
               <>
                 {renderProviderItems((provider, model) => {
-                  const resolvedModel = model ?? defaultModels.get(provider);
+                  const resolvedModel = resolveStartModel(provider, model);
                   void createThreadDirect(provider, resolvedModel);
                 })}
                 <DropdownMenuSeparator />
@@ -389,8 +417,10 @@ function WorktreeDropdownInner({
                       </DropdownMenuSubTrigger>
                       <DropdownMenuSubContent className="w-56">
                         {renderProviderItems((provider, model) => {
-                          const resolvedModel =
-                            model ?? defaultModels.get(provider);
+                          const resolvedModel = resolveStartModel(
+                            provider,
+                            model,
+                          );
                           setOpen(false);
                           void startThreadOnWorktree(
                             wt,
@@ -426,8 +456,11 @@ function WorktreeDropdownInner({
         onCreated={(wt) => {
           // Respect the user's configured default provider (with
           // ready/enabled fallbacks handled by the `defaultProvider`
-          // memo above).
-          const model = defaultModels.get(defaultProvider);
+          // memo above). `resolveStartModel` additionally falls back
+          // to the provider catalog's first entry when the user has no
+          // saved default, so the spawned session always carries an
+          // explicit model id.
+          const model = resolveStartModel(defaultProvider);
           void startThreadOnWorktree(wt, defaultProvider, model);
         }}
       />

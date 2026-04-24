@@ -84,6 +84,18 @@ export function ChatToolbar({
         <ThinkingModeSelector
           value={thinkingMode}
           onChange={onThinkingModeChange}
+          // Per-model gate on top of the provider-level
+          // `thinkingEffort` flag. When the active model doesn't
+          // advertise `supportsAdaptiveThinking`, the Adaptive pill
+          // renders disabled (see ThinkingModeSelector) — and
+          // chat-view's clamp effect auto-flips a stale `adaptive`
+          // stored value to `always` on model change, so the
+          // disabled pill never ends up looking "selected".
+          // Defaults to `false` when we don't have a catalog entry
+          // yet (bootstrap) to fail safe — showing Adaptive enabled
+          // for a model whose capability we don't know risks a
+          // silent SDK rejection on the next turn.
+          supportsAdaptive={modelEntry?.supportsAdaptiveThinking ?? false}
         />
       )}
       <ModeSelector

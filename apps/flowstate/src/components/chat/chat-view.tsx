@@ -36,6 +36,11 @@ import {
   readStrictPlanMode,
 } from "@/lib/defaults-settings";
 import {
+  clampEffortToModel,
+  clampThinkingModeToModel,
+} from "@/lib/model-settings";
+import { resolveModelDisplay } from "@/lib/model-lookup";
+import {
   mergeCommandsWithCatalog,
   resolveCommand,
   type SlashCommandContext,
@@ -934,6 +939,45 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const session =
     state.sessions.get(sessionId) ??
     state.archivedSessions.find((s) => s.sessionId === sessionId);
+
+  // Re-clamp composer settings whenever the active model changes, so
+  // X-High / Adaptive / etc. don't silently linger when the user
+  // switches to a model that doesn't support them. Covers all three
+  // ways the model field can change:
+  //   1. user picks a new model via `ModelSelector`,
+  //   2. the Claude SDK emits `model_resolved` on turn 1 (which can
+  //      replace an alias with a pinned date-stamped id whose
+  //      capability flags may differ), and
+  //   3. session hydration from sessionStorage after an app restart —
+  //      the stored effort/mode may outlive a later model change.
+  //
+  // Skipped when the catalog hasn't loaded the session's model yet
+  // (`resolveModelDisplay(...).entry === undefined`): we'd rather
+  // leave the user's stored preference alone than flip it prematurely
+  // on a bootstrap that's about to resolve the entry anyway. The
+  // effect re-runs when `state.providers` updates, so the clamp
+  // eventually fires once the catalog lands.
+  React.useEffect(() => {
+    if (!session?.model) return;
+    const { entry } = resolveModelDisplay(
+      session.model,
+      session.provider,
+      state.providers,
+    );
+    if (!entry) return;
+    const nextEffort = clampEffortToModel(effort, entry);
+    if (nextEffort !== effort) setEffort(nextEffort);
+    const nextMode = clampThinkingModeToModel(thinkingMode, entry);
+    if (nextMode !== thinkingMode) setThinkingMode(nextMode);
+  }, [
+    session?.model,
+    session?.provider,
+    state.providers,
+    effort,
+    thinkingMode,
+    setEffort,
+    setThinkingMode,
+  ]);
 
   // Provider feature flags — drives capability-gated UI (mode
   // selector, effort selector, etc.). Used locally to exclude `auto`

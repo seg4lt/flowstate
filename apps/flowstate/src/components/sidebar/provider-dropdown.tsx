@@ -90,7 +90,22 @@ export function ProviderDropdown({
         queryKey: ["git", "branch", projectPath],
       });
     }
-    const resolvedModel = model ?? defaultModels.get(provider);
+    // Resolution priority for the session's starting model:
+    //   1. explicit pick from the submenu,
+    //   2. user's saved default for this provider (`readDefaultModel`),
+    //   3. the provider catalog's first entry — which, for the Claude
+    //      SDK bridge, is exactly what `q.supportedModels()` returns
+    //      first and therefore the SDK's own default.
+    //
+    // Step 3 is what fixes the "model chip shows 'Default' until the
+    // first message" bug: passing an explicit value here means
+    // `session.summary.model` is populated at spawn time, so the
+    // toolbar renders the real model label on first paint instead of
+    // waiting for the `model_resolved` event on turn 1.
+    const resolvedModel =
+      model ??
+      defaultModels.get(provider) ??
+      providerMap.get(provider)?.models[0]?.value;
     if (onSelect) {
       onSelect(provider, resolvedModel);
       return;

@@ -26,11 +26,23 @@ const OPTIONS: { value: ThinkingMode; label: string; title: string }[] = [
 interface ThinkingModeSelectorProps {
   value: ThinkingMode;
   onChange: (mode: ThinkingMode) => void;
+  /** Whether the active model honours `thinking: { type: 'adaptive' }`
+   *  (Claude Agent SDK's `ModelInfo.supportsAdaptiveThinking`). When
+   *  false, the Adaptive pill renders *disabled* (not hidden) so the
+   *  toolbar geometry stays stable across model switches and the user
+   *  gets a tooltip explaining why the option is unavailable. The
+   *  parent is responsible for auto-flipping `value` to `"always"`
+   *  when the active model stops supporting adaptive — see the
+   *  `clampThinkingModeToModel` effect in `chat-view.tsx`. Defaults
+   *  to `true` for backward compatibility with callers that haven't
+   *  been updated to wire through the model's capability flag. */
+  supportsAdaptive?: boolean;
 }
 
 export function ThinkingModeSelector({
   value,
   onChange,
+  supportsAdaptive = true,
 }: ThinkingModeSelectorProps) {
   return (
     <div
@@ -40,19 +52,32 @@ export function ThinkingModeSelector({
     >
       {OPTIONS.map((option) => {
         const selected = value === option.value;
+        // `adaptive` is the only model-gated option today. If a future
+        // mode gets gated, extend this check rather than special-casing
+        // each call site.
+        const disabled = option.value === "adaptive" && !supportsAdaptive;
+        const title = disabled
+          ? "This model doesn't support adaptive thinking"
+          : option.title;
         return (
           <button
             key={option.value}
             type="button"
             role="radio"
             aria-checked={selected}
-            title={option.title}
-            onClick={() => onChange(option.value)}
+            aria-disabled={disabled}
+            disabled={disabled}
+            title={title}
+            onClick={() => {
+              if (disabled) return;
+              onChange(option.value);
+            }}
             className={cn(
               "rounded px-2 py-0.5 transition-colors",
               selected
                 ? "bg-accent text-accent-foreground"
                 : "text-muted-foreground hover:text-foreground",
+              disabled && "cursor-not-allowed opacity-50 hover:text-muted-foreground",
             )}
           >
             {option.label}
