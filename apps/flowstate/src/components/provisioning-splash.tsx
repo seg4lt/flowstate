@@ -118,12 +118,9 @@ export function ProvisioningSplash() {
         )}
         {error && (
           <div className="text-xs leading-relaxed text-neutral-500">
-            Try relaunching the app. If the error persists, the daemon log
-            under&nbsp;
-            <code className="rounded bg-neutral-800 px-1 py-0.5 text-[10px]">
-              ~/Library/Logs/Flowstate
-            </code>
-            &nbsp;has the full stack.
+            Flowstate will start anyway. Open Settings to retry the failed
+            step or copy the full error — the on-disk log path lives there
+            too under <em>Diagnostics</em>.
           </div>
         )}
       </div>

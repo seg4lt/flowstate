@@ -18,6 +18,8 @@ import {
 } from "@/lib/api";
 import { useDockBadge } from "@/hooks/use-dock-badge";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   CheckpointSettings,
   ClientMessage,
@@ -47,6 +49,20 @@ export interface PendingPermission {
 export interface PendingQuestion {
   requestId: string;
   questions: UserInputQuestion[];
+}
+
+/** One failed runtime-provisioning phase, mirrored from the Rust
+ *  `flowstate_app_layer::provision::ProvisionFailure` payload. Lives
+ *  in app state so the sidebar Settings icon can render a red dot
+ *  and the Settings page can render per-phase Retry banners after
+ *  the splash dismisses (or on a warm reload that missed the live
+ *  events). */
+export interface ProvisionFailure {
+  /** Wire-format phase id: "node" | "claude-sdk" | "copilot-sdk". */
+  phase: string;
+  /** Full multi-line anyhow error string. UI typically shows the
+   *  first line and exposes the rest behind a disclosure. */
+  error: string;
 }
 
 interface AppState {
@@ -133,6 +149,13 @@ interface AppState {
    *  (b) on refocus we clear the active thread from doneSessionIds
    *  because the user is now watching it. */
   isWindowFocused: boolean;
+  /** Snapshot of runtime-provisioning failures (Node download, SDK
+   *  bridge npm install). Seeded on mount via `get_provision_failures`
+   *  to cover the warm-reload case where the live `provision` events
+   *  fired before AppProvider mounted; updated live via the same
+   *  `provision` Tauri event the splash screen listens to. Empty in
+   *  the happy path. */
+  provisionFailures: ProvisionFailure[];
   ready: boolean;
 }
 
@@ -187,7 +210,18 @@ type AppAction =
       type: "set_session_permission_mode";
       sessionId: string;
       mode: PermissionMode;
-    };
+    }
+  /** Replace the entire provisioning-failures list — used to seed
+   *  state from `invoke("get_provision_failures")` on mount. */
+  | { type: "set_provision_failures"; failures: ProvisionFailure[] }
+  /** Add a new provisioning failure (or replace one for the same
+   *  phase). Driven by `provision` events with `kind === "failed"`. */
+  | { type: "upsert_provision_failure"; failure: ProvisionFailure }
+  /** Remove a provisioning failure for a given phase. Driven by
+   *  `provision` events with `kind === "completed"` (so a successful
+   *  retry clears the banner without an extra round-trip) and by the
+   *  `retry_provision_phase` command on success. */
+  | { type: "clear_provision_failure"; phase: string };
 
 /** Recompute whether a session still has any pending input after a
  *  consume action. If both the permissions queue and the question
@@ -363,6 +397,25 @@ function appReducer(state: AppState, action: AppAction): AppState {
         projectWorktrees.set(action.projectId, action.record);
       }
       return { ...state, projectWorktrees };
+    }
+    case "set_provision_failures": {
+      return { ...state, provisionFailures: action.failures };
+    }
+    case "upsert_provision_failure": {
+      const others = state.provisionFailures.filter(
+        (f) => f.phase !== action.failure.phase,
+      );
+      return { ...state, provisionFailures: [...others, action.failure] };
+    }
+    case "clear_provision_failure": {
+      const next = state.provisionFailures.filter(
+        (f) => f.phase !== action.phase,
+      );
+      // Avoid producing a new array (and triggering subscribers) if
+      // the phase wasn't tracked — `completed` events fire on every
+      // successful phase, including the warm-cache happy path.
+      if (next.length === state.provisionFailures.length) return state;
+      return { ...state, provisionFailures: next };
     }
     default:
       return state;
@@ -876,6 +929,7 @@ const initialState: AppState = {
   // focus change, so initialising false would incorrectly treat the
   // first turn as "user isn't watching" until they alt-tabbed.
   isWindowFocused: true,
+  provisionFailures: [],
   ready: false,
 };
 
@@ -990,6 +1044,75 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         });
       } catch (err) {
         console.warn("[app-store] window focus subscription failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Subscribe to runtime-provisioning events so the sidebar Settings
+  // icon can paint a red dot and the Settings page can render Retry
+  // banners after the splash dismisses. The splash listens to the
+  // same `provision` event for its own purposes (showing the active
+  // phase / first-line error); duplicating the subscription is fine —
+  // both consumers run in independent React subtrees.
+  //
+  // Two paths into state:
+  //   1. Initial seed — `get_provision_failures` returns whatever the
+  //      Tauri shell collected during `provision_runtimes()` BEFORE
+  //      AppProvider mounted. Covers warm reload + the case where the
+  //      user opens Settings long after boot.
+  //   2. Live updates — `provision` events with `kind: "failed"` /
+  //      `kind: "completed"` keep the slice in sync as the user
+  //      retries phases or successive phases land.
+  React.useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    (async () => {
+      try {
+        const seed = await invoke<ProvisionFailure[]>("get_provision_failures");
+        if (cancelled) return;
+        if (seed.length > 0) {
+          dispatchRef.current({
+            type: "set_provision_failures",
+            failures: seed,
+          });
+        }
+      } catch (err) {
+        // Non-fatal — older Tauri shells without the command will
+        // fall through to the live-event path. We don't surface
+        // this anywhere; the absence of a red dot is the right UX
+        // when we can't tell whether anything failed.
+        console.warn("[app-store] get_provision_failures failed:", err);
+      }
+      try {
+        const u = await listen<
+          | { kind: "started"; phase: string; message: string }
+          | { kind: "completed"; phase: string; duration_ms: number }
+          | { kind: "all-done"; duration_ms: number }
+          | { kind: "failed"; phase: string; error: string }
+        >("provision", ({ payload }) => {
+          if (payload.kind === "failed") {
+            dispatchRef.current({
+              type: "upsert_provision_failure",
+              failure: { phase: payload.phase, error: payload.error },
+            });
+          } else if (payload.kind === "completed") {
+            dispatchRef.current({
+              type: "clear_provision_failure",
+              phase: payload.phase,
+            });
+          }
+        });
+        if (cancelled) {
+          u();
+        } else {
+          unlisten = u;
+        }
+      } catch (err) {
+        console.warn("[app-store] provision event subscription failed:", err);
       }
     })();
     return () => {
@@ -1444,6 +1567,15 @@ export function useApp() {
   const ctx = React.useContext(AppContext);
   if (!ctx) throw new Error("useApp must be used within AppProvider");
   return ctx;
+}
+
+/** Snapshot of runtime-provisioning failures (Node.js download,
+ *  provider-SDK npm installs). Empty in the happy path. Consumers
+ *  use it for the sidebar Settings red dot and the Settings-page
+ *  Retry banners. */
+export function useProvisionFailures(): ProvisionFailure[] {
+  const { state } = useApp();
+  return state.provisionFailures;
 }
 
 /** Subscribe to the per-session command catalog (slash commands,

@@ -19,11 +19,33 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+/// One failed provisioning phase. Returned as part of
+/// [`ProvisionOutcome`] so the Tauri shell can stash failures in
+/// shared state and the Settings page can render per-phase Retry
+/// banners after the splash dismisses.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisionFailure {
+    pub phase: ProvisionPhase,
+    /// Full anyhow debug string (multi-line). Frontend usually shows
+    /// only the first line in a banner and exposes the rest behind
+    /// a "Show full error" disclosure.
+    pub error: String,
+}
+
+/// Result of [`provision_runtimes`]. Always returned as `Ok(_)` —
+/// individual phase failures populate `failures` instead of
+/// short-circuiting the daemon boot. The caller decides whether to
+/// surface the failures (we do, via Tauri state + the Settings UI).
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ProvisionOutcome {
+    pub failures: Vec<ProvisionFailure>,
+}
+
 /// One of the runtime-provisioning phases the Tauri shell renders as
 /// splash text during first launch. Kept as an enum rather than free
 /// strings so the frontend can switch on `phase` without string-
 /// matching against English copy that may change.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProvisionPhase {
     /// Downloading + extracting the Node.js runtime from nodejs.org.
@@ -33,6 +55,31 @@ pub enum ProvisionPhase {
     ClaudeSdk,
     /// Hydrating `@github/copilot-sdk` node_modules via npm.
     CopilotSdk,
+}
+
+impl ProvisionPhase {
+    /// Wire-format string used by the `provision` Tauri event and the
+    /// `retry_provision_phase` command (matches `serde(rename_all =
+    /// "kebab-case")`). Centralised so the Tauri shell parses incoming
+    /// retry requests without re-spelling the variants.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::ClaudeSdk => "claude-sdk",
+            Self::CopilotSdk => "copilot-sdk",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]. Returns `None` for unknown strings
+    /// so the Tauri command can return a typed error to the frontend.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "node" => Some(Self::Node),
+            "claude-sdk" => Some(Self::ClaudeSdk),
+            "copilot-sdk" => Some(Self::CopilotSdk),
+            _ => None,
+        }
+    }
 }
 
 impl ProvisionPhase {
@@ -105,38 +152,93 @@ pub type ProvisionReporter = dyn Fn(ProvisionEvent) + Send + Sync;
 ///
 /// Runs synchronously (blocking IO) — the caller bridges via
 /// `spawn_blocking`.
-pub fn provision_runtimes(reporter: &ProvisionReporter) -> Result<()> {
+pub fn provision_runtimes(reporter: &ProvisionReporter) -> ProvisionOutcome {
     let started_all = std::time::Instant::now();
     tracing::info!("provisioning bundled runtimes");
 
-    // Node.js runtime. Shared by every SDK-style provider; do it first
-    // so a failure here short-circuits bridge extraction that would
-    // also need Node.
-    run_phase(reporter, ProvisionPhase::Node, || {
-        zenui_embedded_node::ensure_available().context("provision embedded Node.js")
-    })?;
+    let mut failures: Vec<ProvisionFailure> = Vec::new();
 
-    // Provider bridges. Each returns a cached `BridgeRuntime` struct
-    // we discard here — the point of this call is the side effect of
-    // populating the cache directory (and running `npm install` in
-    // download mode) before any adapter reaches for it.
-    run_phase(reporter, ProvisionPhase::ClaudeSdk, || {
-        zenui_provider_claude_sdk::ensure_bridge_available()
-            .context("provision Claude SDK bridge")
-    })?;
-    run_phase(reporter, ProvisionPhase::CopilotSdk, || {
-        zenui_provider_github_copilot::ensure_bridge_available()
-            .context("provision Copilot bridge")
-    })?;
+    // Each phase runs independently. A failure in one (e.g. Node
+    // download blocked by a corporate proxy) no longer prevents the
+    // others from being attempted, and the daemon still boots so the
+    // user can recover via the Settings → Diagnostics retry buttons.
+    //
+    // Order is preserved (Node first) because the SDK bridges call
+    // `ensure_available()` internally; if Node failed they will fail
+    // too, which is fine — the Settings page will show two banners
+    // and retrying Node first will unblock the rest.
+    run_phase_collect(
+        reporter,
+        ProvisionPhase::Node,
+        &mut failures,
+        || zenui_embedded_node::ensure_available().context("provision embedded Node.js"),
+    );
+    run_phase_collect(
+        reporter,
+        ProvisionPhase::ClaudeSdk,
+        &mut failures,
+        || zenui_provider_claude_sdk::ensure_bridge_available().context("provision Claude SDK bridge"),
+    );
+    run_phase_collect(
+        reporter,
+        ProvisionPhase::CopilotSdk,
+        &mut failures,
+        || zenui_provider_github_copilot::ensure_bridge_available().context("provision Copilot bridge"),
+    );
 
     let duration_ms = started_all.elapsed().as_millis() as u64;
-    tracing::info!(duration_ms, "bundled runtimes provisioned");
+    if failures.is_empty() {
+        tracing::info!(duration_ms, "bundled runtimes provisioned");
+    } else {
+        tracing::warn!(
+            duration_ms,
+            failed = failures.len(),
+            "bundled runtimes provisioned with failures; daemon will boot but affected providers are unavailable"
+        );
+    }
+    // Always emit AllDone so the splash advances even if one or more
+    // phases failed. The Failed events were emitted inline by
+    // run_phase_collect; the splash decides whether to dismiss based
+    // on the `welcome` message, not on this event.
     reporter(ProvisionEvent::AllDone { duration_ms });
-    Ok(())
+    ProvisionOutcome { failures }
 }
 
-fn run_phase<F, T>(reporter: &ProvisionReporter, phase: ProvisionPhase, f: F) -> Result<T>
-where
+/// Re-run a single provisioning phase. Used by the Tauri command
+/// `retry_provision_phase` so the user can recover from a transient
+/// failure (no network on first launch, then Wi-Fi reconnects)
+/// without restarting the app.
+///
+/// Emits the same `Started` / `Completed` / `Failed` events as the
+/// initial pass so any open Settings UI listening to `provision`
+/// updates live.
+pub fn retry_phase(phase: ProvisionPhase, reporter: &ProvisionReporter) -> Result<()> {
+    let mut failures: Vec<ProvisionFailure> = Vec::new();
+    match phase {
+        ProvisionPhase::Node => run_phase_collect(reporter, phase, &mut failures, || {
+            zenui_embedded_node::ensure_available().context("provision embedded Node.js")
+        }),
+        ProvisionPhase::ClaudeSdk => run_phase_collect(reporter, phase, &mut failures, || {
+            zenui_provider_claude_sdk::ensure_bridge_available()
+                .context("provision Claude SDK bridge")
+        }),
+        ProvisionPhase::CopilotSdk => run_phase_collect(reporter, phase, &mut failures, || {
+            zenui_provider_github_copilot::ensure_bridge_available()
+                .context("provision Copilot bridge")
+        }),
+    }
+    match failures.into_iter().next() {
+        Some(f) => Err(anyhow::anyhow!(f.error)),
+        None => Ok(()),
+    }
+}
+
+fn run_phase_collect<F, T>(
+    reporter: &ProvisionReporter,
+    phase: ProvisionPhase,
+    failures: &mut Vec<ProvisionFailure>,
+    f: F,
+) where
     F: FnOnce() -> Result<T>,
 {
     reporter(ProvisionEvent::Started {
@@ -145,22 +247,21 @@ where
     });
     let started = std::time::Instant::now();
     match f() {
-        Ok(v) => {
+        Ok(_) => {
             reporter(ProvisionEvent::Completed {
                 phase,
                 duration_ms: started.elapsed().as_millis() as u64,
             });
-            Ok(v)
         }
         Err(e) => {
-            // Emit the typed Failed event BEFORE returning so a splash
-            // can show the failure context; the caller still sees the
-            // original anyhow error.
+            let error = format!("{e:?}");
+            // Emit the typed Failed event so the splash and any
+            // open Settings UI can render the failure immediately.
             reporter(ProvisionEvent::Failed {
                 phase,
-                error: format!("{e:?}"),
+                error: error.clone(),
             });
-            Err(e)
+            failures.push(ProvisionFailure { phase, error });
         }
     }
 }

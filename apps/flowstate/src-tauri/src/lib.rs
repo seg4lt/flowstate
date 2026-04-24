@@ -1775,7 +1775,14 @@ fn init_tracing() {
         return;
     }
 
-    let log_dir = std::env::temp_dir().join("flowstate").join("logs");
+    // Platform-conventional log dir — `~/Library/Logs/Flowstate` on
+    // macOS, XDG state on Linux, %LOCALAPPDATA% on Windows. Earlier
+    // builds wrote to `$TMPDIR/flowstate/logs`, which is sandboxed
+    // per-user and pruned by macOS, and the splash screen still
+    // tells users to look in `~/Library/Logs/Flowstate`. Honouring
+    // that path here keeps the splash text honest and gives users a
+    // stable place to find logs across reboots.
+    let log_dir = default_log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("flowstate.log");
 
@@ -2144,6 +2151,201 @@ fn get_app_data_dir(app: tauri::AppHandle) -> Result<String, String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// Path to the directory tracing writes `flowstate.log` into. On
+/// macOS this is `~/Library/Logs/Flowstate`; on Linux it follows
+/// XDG_STATE_HOME (or XDG_DATA_HOME); on Windows it lives under
+/// %LOCALAPPDATA%. Used by Settings → Diagnostics for the "Logs dir"
+/// row + Reveal-in-Finder button.
+#[tauri::command]
+fn get_log_dir() -> Result<String, String> {
+    Ok(default_log_dir().to_string_lossy().to_string())
+}
+
+/// Path to the cache directory holding the embedded Node.js runtime
+/// and the provider-SDK `node_modules/` trees (~350 MB after first
+/// launch). Surfaced in Settings so users can find / wipe the cache
+/// when troubleshooting a botched first install.
+#[tauri::command]
+fn get_cache_dir() -> Result<String, String> {
+    Ok(runtime_cache_dir()?.to_string_lossy().to_string())
+}
+
+/// Delete the entire runtime cache directory (`~/Library/Caches/zenui`
+/// on macOS — embedded Node, both SDK bridges, and the npm cache).
+/// Used by Settings → Diagnostics → Clear cache when a botched
+/// first install left the cache in a bad state.
+///
+/// Important caveat: the in-process `OnceLock`s in `embedded-node`
+/// and the bridge runtimes still hold paths into the now-deleted
+/// directory, so a relaunch is required before any provider-SDK
+/// session will work again. The frontend surfaces this in the
+/// "restart required" toast.
+///
+/// Returns Ok with the byte count freed (best-effort) so the toast
+/// can show how much was reclaimed; falls through to Ok(0) if the
+/// directory was already gone.
+#[tauri::command]
+fn clear_runtime_cache() -> Result<u64, String> {
+    let dir = runtime_cache_dir()?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let freed = dir_size_best_effort(&dir);
+    std::fs::remove_dir_all(&dir).map_err(|e| {
+        format!(
+            "remove cache dir {}: {e}",
+            dir.display()
+        )
+    })?;
+    tracing::info!(
+        bytes = freed,
+        path = %dir.display(),
+        "runtime cache cleared on user request"
+    );
+    Ok(freed)
+}
+
+/// Shared resolver for both `get_cache_dir` and `clear_runtime_cache`
+/// so the path-shown and the path-deleted can never disagree.
+fn runtime_cache_dir() -> Result<std::path::PathBuf, String> {
+    Ok(dirs::cache_dir()
+        .ok_or_else(|| "could not resolve per-user cache dir".to_string())?
+        .join("zenui"))
+}
+
+/// Recursively sum file sizes under `dir`. Best-effort — IO errors
+/// (permission denied on a stray file, broken symlink, etc.) are
+/// swallowed so a partial measurement never blocks the user-facing
+/// "Clear cache" action.
+fn dir_size_best_effort(dir: &std::path::Path) -> u64 {
+    fn walk(p: &std::path::Path, acc: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(p) else { return };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                walk(&entry.path(), acc);
+            } else {
+                *acc = acc.saturating_add(meta.len());
+            }
+        }
+    }
+    let mut total = 0u64;
+    walk(dir, &mut total);
+    total
+}
+
+/// Snapshot of provisioning failures held by the Tauri shell. Each
+/// entry is one phase that failed during `provision_runtimes` (or a
+/// subsequent retry). The Settings page consumes this on mount via
+/// `get_provision_failures` and listens to live `provision` events
+/// thereafter.
+#[derive(Default)]
+struct ProvisionState {
+    inner: std::sync::Mutex<Vec<flowstate_app_layer::provision::ProvisionFailure>>,
+}
+
+impl ProvisionState {
+    fn snapshot(&self) -> Vec<flowstate_app_layer::provision::ProvisionFailure> {
+        self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+    fn set(&self, v: Vec<flowstate_app_layer::provision::ProvisionFailure>) {
+        if let Ok(mut g) = self.inner.lock() {
+            *g = v;
+        }
+    }
+    fn remove(&self, phase: flowstate_app_layer::provision::ProvisionPhase) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.retain(|f| f.phase != phase);
+        }
+    }
+    fn upsert(&self, failure: flowstate_app_layer::provision::ProvisionFailure) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.retain(|f| f.phase != failure.phase);
+            g.push(failure);
+        }
+    }
+}
+
+/// Read the current set of provisioning failures the Tauri shell is
+/// holding. Returned as plain serializable structs so the React store
+/// can seed `provisionFailures` on mount (covers the case where the
+/// frontend mounts after the splash already dismissed and the live
+/// `provision` events were missed).
+#[tauri::command]
+fn get_provision_failures(
+    state: State<'_, ProvisionState>,
+) -> Vec<flowstate_app_layer::provision::ProvisionFailure> {
+    state.snapshot()
+}
+
+/// Re-run a single provisioning phase on user request (Settings page
+/// "Retry" button). Resolves with `Ok(())` on success and updates
+/// `ProvisionState` accordingly; resolves with `Err(string)` on
+/// failure (the entry stays in the state). Live progress is also
+/// emitted via the `provision` event so any open UI updates inline.
+#[tauri::command]
+async fn retry_provision_phase(
+    app: tauri::AppHandle,
+    state: State<'_, ProvisionState>,
+    phase: String,
+) -> Result<(), String> {
+    let phase = flowstate_app_layer::provision::ProvisionPhase::from_str(&phase)
+        .ok_or_else(|| format!("unknown provisioning phase: {phase}"))?;
+
+    let reporter_handle = app.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let reporter: Box<flowstate_app_layer::provision::ProvisionReporter> =
+            Box::new(move |event| {
+                if let Err(e) = reporter_handle.emit("provision", &event) {
+                    tracing::debug!(%e, "emit provision retry event failed");
+                }
+            });
+        flowstate_app_layer::provision::retry_phase(phase, &reporter)
+    })
+    .await
+    .map_err(|e| format!("retry task panicked: {e}"))?;
+
+    match result {
+        Ok(()) => {
+            state.remove(phase);
+            Ok(())
+        }
+        Err(e) => {
+            let error = format!("{e:?}");
+            state.upsert(flowstate_app_layer::provision::ProvisionFailure {
+                phase,
+                error: error.clone(),
+            });
+            Err(error)
+        }
+    }
+}
+
+/// Platform-appropriate default location for Flowstate's release-build
+/// log file. Centralised so `init_tracing` and the
+/// `get_log_dir` Tauri command never disagree.
+fn default_log_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Library/Logs/Flowstate")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        dirs::state_dir()
+            .or_else(dirs::data_local_dir)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("flowstate/logs")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        dirs::data_local_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Flowstate/logs")
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     init_tracing();
@@ -2174,6 +2376,11 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(PtyManager::new())
         .manage(DiffTasks::default())
+        // Holds the snapshot of provisioning failures seen during
+        // `provision_runtimes()` (and any subsequent retries from the
+        // Settings page). Frontend pulls via `get_provision_failures`
+        // on mount and keeps in sync via `provision` events.
+        .manage(ProvisionState::default())
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -2415,22 +2622,52 @@ pub fn run() {
                 })
                 .await;
 
+                // Provisioning is non-fatal: failures (no network,
+                // npm registry hiccup, etc.) populate the
+                // `ProvisionState` shared with the frontend so the
+                // Settings page can render Retry banners + a red dot
+                // on the sidebar Settings icon. Even with every phase
+                // failed we still boot the daemon — CLI-style providers
+                // (claude-code, etc.) and the rest of the app stay
+                // usable, and the user gets a one-click recovery path
+                // instead of a frozen splash screen.
                 match provision_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::error!(%e, "provision_runtimes failed; daemon will not start");
-                        // The splash already received a `Failed`
-                        // event for the phase that broke — the
-                        // webview stays on the splash showing the
-                        // error rather than advancing to a broken
-                        // `ready` state. Exit the spawn task here so
-                        // we don't try to bootstrap with broken
-                        // runtimes.
-                        return;
+                    Ok(outcome) => {
+                        if outcome.failures.is_empty() {
+                            tracing::info!("provision_runtimes completed cleanly");
+                        } else {
+                            for f in &outcome.failures {
+                                tracing::error!(
+                                    phase = %f.phase.as_str(),
+                                    error = %f.error,
+                                    "provisioning phase failed; daemon will boot but provider is unavailable until retried"
+                                );
+                            }
+                        }
+                        if let Some(state) =
+                            provision_app_handle.try_state::<ProvisionState>()
+                        {
+                            state.set(outcome.failures);
+                        }
                     }
                     Err(e) => {
+                        // Spawn task panicked — different from a phase
+                        // failure. We still boot but record a synthetic
+                        // failure entry so the user sees something in
+                        // Settings rather than the symptom (every SDK
+                        // provider broken with no explanation).
                         tracing::error!(%e, "provision_runtimes task panicked");
-                        return;
+                        if let Some(state) =
+                            provision_app_handle.try_state::<ProvisionState>()
+                        {
+                            state.set(vec![
+                                flowstate_app_layer::provision::ProvisionFailure {
+                                    phase:
+                                        flowstate_app_layer::provision::ProvisionPhase::Node,
+                                    error: format!("provisioning task panicked: {e}"),
+                                },
+                            ]);
+                        }
                     }
                 }
 
@@ -2854,6 +3091,11 @@ pub fn run() {
             get_usage_by_agent,
             get_usage_by_agent_role,
             get_app_data_dir,
+            get_log_dir,
+            get_cache_dir,
+            clear_runtime_cache,
+            get_provision_failures,
+            retry_provision_phase,
         ])
         .on_window_event(|window, event| {
             match event {

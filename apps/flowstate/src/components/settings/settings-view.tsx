@@ -1,12 +1,32 @@
 import * as React from "react";
-import { Loader2, Monitor, Moon, RefreshCw, Sun } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronUp,
+  FolderOpen,
+  Loader2,
+  Monitor,
+  Moon,
+  RefreshCw,
+  Sun,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Switch } from "@/components/ui/switch";
-import { useApp } from "@/stores/app-store";
+import { useApp, useProvisionFailures } from "@/stores/app-store";
 import { useTheme, type ThemePreference } from "@/hooks/use-theme";
 import { toast } from "@/hooks/use-toast";
-import { getAppDataDir } from "@/lib/api";
+import {
+  clearRuntimeCache,
+  getAppDataDir,
+  getCacheDir,
+  getLogDir,
+  retryProvisionPhase,
+} from "@/lib/api";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { confirm } from "@tauri-apps/plugin-dialog";
+import { Trash2 } from "lucide-react";
 import {
   checkForUpdate,
   resetUpdaterStatus,
@@ -872,6 +892,301 @@ function CheckForUpdatesRow() {
   );
 }
 
+// User-facing labels for the wire-format provisioning phase ids.
+// Centralised so the banner copy and toast messages stay consistent.
+const PROVISION_PHASE_LABELS: Record<string, string> = {
+  node: "Node.js runtime",
+  "claude-sdk": "Claude SDK",
+  "copilot-sdk": "GitHub Copilot SDK",
+};
+
+function provisionPhaseLabel(phase: string): string {
+  return PROVISION_PHASE_LABELS[phase] ?? phase;
+}
+
+// One row inside <ProvisionErrorsBanner /> — renders the failure
+// summary, a Retry button, and a disclosure that reveals the full
+// multi-line anyhow error string. Local state for retry-in-flight so
+// each row spins independently when the user retries multiple
+// failures back-to-back.
+function ProvisionFailureRow({
+  phase,
+  error,
+}: {
+  phase: string;
+  error: string;
+}) {
+  const [retrying, setRetrying] = React.useState(false);
+  const [showFull, setShowFull] = React.useState(false);
+  // Show only the first line in the collapsed state. The Rust side
+  // formats anyhow's `{:?}` which is multi-line with cause chains;
+  // the first line is the most actionable summary.
+  const firstLine = React.useMemo(
+    () => error.split("\n")[0]?.trim() || "Unknown error",
+    [error],
+  );
+
+  async function handleRetry() {
+    setRetrying(true);
+    try {
+      await retryProvisionPhase(phase);
+      // Success — the `provision` event listener in app-store will
+      // dispatch `clear_provision_failure`, which removes this row.
+      toast({
+        description: `${provisionPhaseLabel(phase)} provisioned successfully.`,
+        duration: 3000,
+      });
+    } catch (err) {
+      toast({
+        description: `Retry failed: ${(err as Error).message ?? String(err)}`,
+        duration: 5000,
+      });
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  return (
+    <div className="border-b border-destructive/20 px-4 py-3 last:border-b-0">
+      <div className="flex items-start gap-3">
+        <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">
+            {provisionPhaseLabel(phase)} install failed
+          </div>
+          <div className="mt-0.5 break-words text-xs text-muted-foreground">
+            {firstLine}
+          </div>
+          {showFull && (
+            <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-muted/40 p-2 font-mono text-[11px] text-foreground">
+              {error}
+            </pre>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setShowFull((v) => !v)}
+            aria-label={showFull ? "Hide full error" : "Show full error"}
+          >
+            {showFull ? (
+              <ChevronUp className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronDown className="h-3.5 w-3.5" />
+            )}
+          </Button>
+          <Button
+            variant="default"
+            size="sm"
+            onClick={handleRetry}
+            disabled={retrying}
+          >
+            {retrying ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
+            Retry
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Top-of-page banner listing every runtime-provisioning failure
+// from the most recent boot (or from a user-initiated retry that
+// itself failed). Renders nothing when everything provisioned
+// cleanly, so the warm-launch case has zero visual cost.
+function ProvisionErrorsBanner() {
+  const failures = useProvisionFailures();
+  if (failures.length === 0) return null;
+  return (
+    <section className="mb-8">
+      <div className="mb-3">
+        <h2 className="text-sm font-semibold text-destructive">
+          Setup issues
+        </h2>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          One or more runtime components failed to install. The rest of
+          Flowstate still works, but the affected providers won&apos;t be
+          usable until you retry successfully.
+        </p>
+      </div>
+      <div className="overflow-hidden rounded-lg border border-destructive/40 bg-destructive/5">
+        {failures.map((f) => (
+          <ProvisionFailureRow key={f.phase} phase={f.phase} error={f.error} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// Single read-only path row with a Reveal-in-Finder button. Used by
+// the Diagnostics section for app-data, logs, and cache directories.
+// The reveal button degrades gracefully: if the directory doesn't
+// exist yet (e.g. logs dir on first launch before any line was
+// written), `revealItemInDir` errors and we surface a toast.
+function PathRow({
+  label,
+  description,
+  resolve,
+  extraActions,
+}: {
+  label: string;
+  description: string;
+  resolve: () => Promise<string>;
+  /** Optional render slot for action buttons rendered to the right
+   *  of the path input, after the Reveal button. Receives the
+   *  resolved path so actions can target it (or `null` while still
+   *  loading / on resolve error). */
+  extraActions?: (path: string | null) => React.ReactNode;
+}) {
+  const [path, setPath] = React.useState<string | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    resolve()
+      .then((p) => {
+        if (!cancelled) setPath(p);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+    // resolve is intentionally unmemoized at call sites — these rows
+    // mount once and never refetch. Including it in deps would
+    // re-run the effect on every parent render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleReveal() {
+    if (!path) return;
+    try {
+      await revealItemInDir(path);
+    } catch (err) {
+      toast({
+        description: `Couldn't open ${label}: ${(err as Error).message ?? String(err)}`,
+        duration: 4000,
+      });
+    }
+  }
+
+  return (
+    <div className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">{label}</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          {description}
+        </div>
+        <div className="mt-2 flex items-center gap-2">
+          {error ? (
+            <div className="text-[11px] text-destructive">{error}</div>
+          ) : (
+            <input
+              type="text"
+              readOnly
+              value={path ?? "Loading…"}
+              onFocus={(e) => e.currentTarget.select()}
+              onClick={(e) => e.currentTarget.select()}
+              className="w-full min-w-0 rounded-md border border-input bg-muted/30 px-2 py-1 font-mono text-[11px] text-foreground"
+              aria-label={`${label} path`}
+            />
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleReveal}
+            disabled={!path || !!error}
+            aria-label={`Reveal ${label} in file manager`}
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+            Reveal
+          </Button>
+          {extraActions?.(path)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Format `bytes` as a human-readable size — matches macOS Finder's
+// "About Mac" style (binary divisor, two-decimal precision once we
+// pass MB so a 354 MB cache shows as "354.21 MB" not "0.35 GB").
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(0)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(2)} MB`;
+  return `${(mb / 1024).toFixed(2)} GB`;
+}
+
+// "Clear cache" button rendered on the Runtime cache row. Confirms
+// (the cache is non-trivial to rebuild — ~30s Node download +
+// ~60s npm install per provider on a typical connection), invokes
+// the Rust `clear_runtime_cache` command, and offers a one-click
+// relaunch. Relaunch is necessary because the in-process OnceLocks
+// in `embedded-node` and the bridge runtimes still hold paths into
+// the now-deleted directory; without a relaunch the next session
+// spawn would fail mid-flight rather than re-downloading cleanly.
+function ClearCacheButton({ path }: { path: string | null }) {
+  const [busy, setBusy] = React.useState(false);
+
+  async function handleClear() {
+    if (!path) return;
+    const ok = await confirm(
+      `Delete the runtime cache at ${path}?\n\nFlowstate will need to redownload Node.js (~30 MB) and reinstall the provider SDKs (~300 MB) on next launch.`,
+      { title: "Clear runtime cache", kind: "warning", okLabel: "Delete" },
+    );
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const freed = await clearRuntimeCache();
+      const restart = await confirm(
+        `Cleared ${formatBytes(freed)} from the runtime cache.\n\nRelaunch Flowstate now to redownload? (Provider SDK sessions won't work until you do.)`,
+        { title: "Cache cleared", kind: "info", okLabel: "Relaunch" },
+      );
+      if (restart) {
+        await relaunch();
+      } else {
+        toast({
+          description: `Cleared ${formatBytes(freed)}. Relaunch when ready.`,
+          duration: 4000,
+        });
+      }
+    } catch (err) {
+      toast({
+        description: `Couldn't clear cache: ${(err as Error).message ?? String(err)}`,
+        duration: 5000,
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={handleClear}
+      disabled={!path || busy}
+      aria-label="Clear runtime cache"
+    >
+      {busy ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : (
+        <Trash2 className="h-3.5 w-3.5" />
+      )}
+      Clear
+    </Button>
+  );
+}
+
 export function SettingsView() {
   const { state, send } = useApp();
   const { setProviderEnabled } = useProviderEnabled();
@@ -942,6 +1257,11 @@ export function SettingsView() {
       </header>
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-6 py-8">
+          {/* Provisioning failures (Node download, SDK npm install)
+              live at the very top so they're impossible to miss when
+              the sidebar's red dot draws the user here. Renders
+              nothing in the happy path — zero visual cost. */}
+          <ProvisionErrorsBanner />
           <SettingsGroup
             title="Appearance"
             description="Customize how Flowstate looks."
@@ -993,10 +1313,21 @@ export function SettingsView() {
             <WorktreeBasePathRow />
           </SettingsGroup>
           <SettingsGroup
-            title="Storage"
-            description="Where Flowstate keeps its data on disk."
+            title="Diagnostics"
+            description="On-disk locations Flowstate uses. Click Reveal to open the folder in Finder / Explorer / your file manager — useful when troubleshooting or sharing logs."
           >
             <AppDataDirRow />
+            <PathRow
+              label="Logs"
+              description="`flowstate.log` is appended here. Send this file when reporting bugs."
+              resolve={getLogDir}
+            />
+            <PathRow
+              label="Runtime cache"
+              description="Embedded Node.js + provider SDK node_modules (~350 MB after first launch). Clear this if a botched first install left the cache in a bad state — Flowstate will redownload on next launch."
+              resolve={getCacheDir}
+              extraActions={(path) => <ClearCacheButton path={path} />}
+            />
           </SettingsGroup>
           <SettingsGroup
             title="Updates"

@@ -60,7 +60,7 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { useApp } from "@/stores/app-store";
+import { useApp, useProvisionFailures } from "@/stores/app-store";
 import { useAttentionTone } from "@/hooks/use-attention-tone";
 import { cn } from "@/lib/utils";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
@@ -152,6 +152,12 @@ function AppSidebarBody() {
   const { state, send, createProject, reorderProjects } = useApp();
   const navigate = useNavigate();
   const location = useLocation();
+  // Red dot on the footer Settings icon when one or more
+  // runtime-provisioning phases failed at boot. Drives only the
+  // visual indicator below; the Settings page itself renders the
+  // banner + Retry buttons.
+  const provisionFailures = useProvisionFailures();
+  const hasProvisionFailures = provisionFailures.length > 0;
   // Aggregate "wants attention" tone across all non-active threads.
   // Drives the dot rendered next to the "flowstate" wordmark below
   // so a long thread list still has a persistent cue when the
@@ -724,13 +730,30 @@ function AppSidebarBody() {
           </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton
-              tooltip="Settings"
+              tooltip={
+                hasProvisionFailures
+                  ? `Settings (${provisionFailures.length} provisioning issue${provisionFailures.length === 1 ? "" : "s"})`
+                  : "Settings"
+              }
               onClick={() => {
                 navigate({ to: "/settings" });
                 closeIfMobile();
               }}
             >
-              <Settings />
+              {/* Wrap the icon in a relative span so the absolute
+                  red dot is positioned to the icon's top-right rather
+                  than the SidebarMenuButton's. The dot is purely
+                  decorative — the banner inside Settings tells the
+                  user what actually broke. */}
+              <span className="relative inline-flex">
+                <Settings />
+                {hasProvisionFailures && (
+                  <span
+                    aria-hidden="true"
+                    className="absolute -right-0.5 -top-0.5 inline-block h-2 w-2 rounded-full bg-red-500 ring-1 ring-background"
+                  />
+                )}
+              </span>
               <span>Settings</span>
             </SidebarMenuButton>
           </SidebarMenuItem>

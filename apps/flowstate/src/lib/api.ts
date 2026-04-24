@@ -472,6 +472,38 @@ export function getAppDataDir(): Promise<string> {
   return invoke<string>("get_app_data_dir");
 }
 
+// Platform-conventional log directory — `~/Library/Logs/Flowstate`
+// on macOS, XDG state on Linux, %LOCALAPPDATA%/Flowstate/logs on
+// Windows. Surfaced in Settings → Diagnostics next to a Reveal
+// button so users can find `flowstate.log` when troubleshooting.
+export function getLogDir(): Promise<string> {
+  return invoke<string>("get_log_dir");
+}
+
+// Cache directory holding the embedded Node.js runtime + provider
+// SDK `node_modules/` trees (~350 MB after first launch). Surfaced
+// so users can find / wipe the cache when troubleshooting a botched
+// first install.
+export function getCacheDir(): Promise<string> {
+  return invoke<string>("get_cache_dir");
+}
+
+// Recursively delete the runtime cache directory. Resolves with the
+// number of bytes freed (best-effort). Process-wide OnceLocks still
+// hold paths into the now-deleted dir, so the UI nudges the user to
+// relaunch. Resolves with 0 if the dir was already gone.
+export function clearRuntimeCache(): Promise<number> {
+  return invoke<number>("clear_runtime_cache");
+}
+
+// Re-run a single runtime-provisioning phase ("node" | "claude-sdk"
+// | "copilot-sdk"). Used by the Settings page Retry buttons.
+// Resolves on success; rejects with the error string from Rust on
+// failure (which is what the toast surfaces).
+export function retryProvisionPhase(phase: string): Promise<void> {
+  return invoke<void>("retry_provision_phase", { phase });
+}
+
 // Usage analytics — reads of the flowstate-app-owned
 // `<app_data_dir>/usage.sqlite`. Writes happen on the Rust side
 // via a subscriber task on `RuntimeEvent::TurnCompleted`; the
