@@ -120,12 +120,128 @@ export async function setCheckpointsGlobalEnabled(
   throw new Error("unexpected response to set_checkpoints_enabled");
 }
 
+/** Result handle returned by [`connectStream`]. Call `cancel()` from
+ *  the caller's React effect cleanup so a StrictMode double-invoke
+ *  (or unmount mid-handshake) doesn't leak a retry timer or a
+ *  half-open channel. */
+export interface ConnectStreamHandle {
+  /** Stop any in-flight retry timer. Idempotent. After cancel the
+   *  loop will not call `onConnected` / `onGiveUp` even if a stale
+   *  timer fires. Has no effect on a channel that already connected
+   *  successfully — that channel keeps streaming until the daemon
+   *  closes it or the page unloads. */
+  cancel(): void;
+}
+
+/** Optional lifecycle callbacks `connectStream` will fire as it works
+ *  through its retry loop. The default-export contract (calling
+ *  `connectStream(onMessage)` with no options) keeps the legacy
+ *  fire-and-forget shape for the few non-AppProvider callers. */
+export interface ConnectStreamOptions {
+  /** Fires once when `invoke("connect")` resolves successfully and
+   *  the channel is live. Distinct from `welcome` arriving — that's
+   *  delivered through `onMessage` like any other ServerMessage. */
+  onConnected?: () => void;
+  /** Fires if the retry budget is exhausted without ever connecting.
+   *  The splash uses this to swap to a "couldn't reach daemon" error
+   *  card so the user has something actionable instead of a forever
+   *  spinner. `attempts` and `elapsedMs` are passed for telemetry. */
+  onGiveUp?: (info: { attempts: number; elapsedMs: number; lastError: unknown }) => void;
+  /** Called on every failed attempt (NOT the final give-up). Useful
+   *  for `console.debug` so a long-but-eventually-successful boot
+   *  leaves a breadcrumb trail in the devtools console. */
+  onAttemptFailed?: (info: { attempt: number; nextDelayMs: number; error: unknown }) => void;
+}
+
+// Backoff schedule. The first few short retries cover the race where
+// AppProvider mounts a few hundred ms before `transport.serve()`
+// manages `TauriDaemonState` (warm-cache case). The longer steady-
+// state retries cover the cold-cache case where `provision_runtimes`
+// is grinding through `npm ci` for ~30-90s.
+//
+// Total budget = sum + steady-state * (CONNECT_MAX_ATTEMPTS - len) =
+//   250 + 500 + 1000 + 2000 + 5000 + 5000*55 ≈ 5min 8s. Long enough
+// to outlast the slowest first-launch install we've measured (~3 min)
+// without trapping the user behind a stuck splash forever if the
+// daemon never comes up at all.
+const CONNECT_BACKOFF_MS = [250, 500, 1000, 2000, 5000] as const;
+const CONNECT_STEADY_DELAY_MS = 5000;
+const CONNECT_MAX_ATTEMPTS = 60;
+
+/** Subscribe to the daemon's ServerMessage stream. Retries the
+ *  `connect` Tauri command until it succeeds, with capped backoff,
+ *  so a cold-cache first launch (where `provision_runtimes` blocks
+ *  the daemon spawn for ~60s) doesn't leave the splash stuck on
+ *  "Finishing up…" forever — the previous single-shot version
+ *  silently dropped the rejected promise and never reattempted.
+ *
+ *  Each attempt builds a fresh `Channel`. Tauri rejects the invoke
+ *  before reaching the Rust command body when `TauriDaemonState`
+ *  isn't yet managed, so a failed attempt has no Rust-side state to
+ *  clean up — the unused channel is GC'd by JS. Once one invoke
+ *  resolves we stop retrying; the live channel keeps streaming until
+ *  the daemon closes it.
+ *
+ *  Returns a handle whose `cancel()` should be called from the
+ *  React effect cleanup. */
 export function connectStream(
   onMessage: (message: ServerMessage) => void,
-): Promise<void> {
-  const channel = new Channel<ServerMessage>();
-  channel.onmessage = onMessage;
-  return invoke("connect", { onEvent: channel });
+  options: ConnectStreamOptions = {},
+): ConnectStreamHandle {
+  let cancelled = false;
+  let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  const startedAt = Date.now();
+
+  const attempt = async (n: number): Promise<void> => {
+    if (cancelled) return;
+    const channel = new Channel<ServerMessage>();
+    channel.onmessage = onMessage;
+    try {
+      await invoke("connect", { onEvent: channel });
+      if (cancelled) {
+        // Caller went away mid-handshake. We can't recall the channel
+        // from Rust, but the daemon will notice the disconnect when
+        // the webview tears down. Don't fire onConnected.
+        return;
+      }
+      options.onConnected?.();
+    } catch (err) {
+      if (cancelled) return;
+      if (n + 1 >= CONNECT_MAX_ATTEMPTS) {
+        options.onGiveUp?.({
+          attempts: n + 1,
+          elapsedMs: Date.now() - startedAt,
+          lastError: err,
+        });
+        return;
+      }
+      const delay =
+        n < CONNECT_BACKOFF_MS.length
+          ? CONNECT_BACKOFF_MS[n]!
+          : CONNECT_STEADY_DELAY_MS;
+      options.onAttemptFailed?.({
+        attempt: n + 1,
+        nextDelayMs: delay,
+        error: err,
+      });
+      pendingTimer = setTimeout(() => {
+        pendingTimer = null;
+        void attempt(n + 1);
+      }, delay);
+    }
+  };
+
+  void attempt(0);
+
+  return {
+    cancel() {
+      cancelled = true;
+      if (pendingTimer !== null) {
+        clearTimeout(pendingTimer);
+        pendingTimer = null;
+      }
+    },
+  };
 }
 
 export function getGitBranch(path: string): Promise<string | null> {

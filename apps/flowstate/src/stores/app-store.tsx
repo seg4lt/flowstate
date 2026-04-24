@@ -161,6 +161,13 @@ interface AppState {
    *  `provision` Tauri event the splash screen listens to. Empty in
    *  the happy path. */
   provisionFailures: ProvisionFailure[];
+  /** Status of the daemon `connect` IPC handshake. Drives the splash
+   *  screen's "couldn't reach daemon" copy. Default `"connecting"`;
+   *  flips to `"connected"` once `connectStream` resolves a successful
+   *  invoke (distinct from `ready`, which gates on the `welcome`
+   *  ServerMessage); flips to `"failed"` if the retry budget is
+   *  exhausted (~5 minutes of failed connect attempts). */
+  daemonConnectStatus: "connecting" | "connected" | "failed";
   ready: boolean;
 }
 
@@ -226,7 +233,12 @@ type AppAction =
    *  `provision` events with `kind === "completed"` (so a successful
    *  retry clears the banner without an extra round-trip) and by the
    *  `retry_provision_phase` command on success. */
-  | { type: "clear_provision_failure"; phase: string };
+  | { type: "clear_provision_failure"; phase: string }
+  /** Daemon `connect` IPC handshake transition. Dispatched by the
+   *  `connectStream` lifecycle callbacks in AppProvider. The splash
+   *  reads this to decide between "Finishing up…" and the
+   *  "couldn't reach daemon" error card. */
+  | { type: "set_daemon_connect_status"; status: "connecting" | "connected" | "failed" };
 
 /** Recompute whether a session still has any pending input after a
  *  consume action. If both the permissions queue and the question
@@ -421,6 +433,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
       // successful phase, including the warm-cache happy path.
       if (next.length === state.provisionFailures.length) return state;
       return { ...state, provisionFailures: next };
+    }
+    case "set_daemon_connect_status": {
+      if (state.daemonConnectStatus === action.status) return state;
+      return { ...state, daemonConnectStatus: action.status };
     }
     default:
       return state;
@@ -935,6 +951,7 @@ const initialState: AppState = {
   // first turn as "user isn't watching" until they alt-tabbed.
   isWindowFocused: true,
   provisionFailures: [],
+  daemonConnectStatus: "connecting",
   ready: false,
 };
 
@@ -1153,7 +1170,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     let active = true;
-    connectStream((message) => {
+    // `connectStream` now retries with capped backoff so a cold-cache
+    // first launch (where the daemon spawn task is busy running
+    // `npm ci` for ~60s before `transport.serve()` registers
+    // `TauriDaemonState`) doesn't leave the splash stuck on
+    // "Finishing up…" forever. Lifecycle callbacks dispatch into the
+    // `daemonConnectStatus` slice so the splash can swap to a
+    // "couldn't reach daemon" error card if the retry budget is
+    // exhausted. Effect cleanup calls the returned `cancel()` to
+    // tear down a pending retry timer on StrictMode double-invoke /
+    // unmount.
+    const handle = connectStream(
+      (message) => {
       if (!active) return;
       dispatchRef.current({ type: "server_message", message });
       // After the daemon signals readiness, ensure all providers are
@@ -1242,7 +1270,35 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           console.error("[app-store] stream listener threw", err);
         }
       }
-    });
+      },
+      {
+        onConnected: () => {
+          if (!active) return;
+          dispatchRef.current({
+            type: "set_daemon_connect_status",
+            status: "connected",
+          });
+        },
+        onAttemptFailed: ({ attempt, nextDelayMs }) => {
+          // Debug-only — a long-but-eventually-successful boot leaves
+          // a breadcrumb trail without spamming the user-visible log.
+          console.debug(
+            `[app-store] connect attempt ${attempt} failed; retrying in ${nextDelayMs}ms`,
+          );
+        },
+        onGiveUp: ({ attempts, elapsedMs, lastError }) => {
+          if (!active) return;
+          console.error(
+            `[app-store] connectStream gave up after ${attempts} attempts (${elapsedMs}ms)`,
+            lastError,
+          );
+          dispatchRef.current({
+            type: "set_daemon_connect_status",
+            status: "failed",
+          });
+        },
+      },
+    );
 
     // Hydrate the display maps in parallel with the stream. These live
     // in `user_config.sqlite` (app-owned), not in the SDK's daemon
@@ -1268,6 +1324,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
 
     return () => {
       active = false;
+      // Cancel any pending retry timer so a StrictMode double-invoke
+      // doesn't leak two parallel handshake loops (and the Tauri
+      // channel from a previous attempt doesn't end up unowned).
+      handle.cancel();
     };
   }, []);
 
@@ -1606,6 +1666,16 @@ export function useApp() {
 export function useProvisionFailures(): ProvisionFailure[] {
   const { state } = useApp();
   return state.provisionFailures;
+}
+
+/** Status of the daemon `connect` IPC handshake. The splash uses
+ *  this to render a "couldn't reach daemon" error after the
+ *  retry budget in `connectStream` is exhausted. Most consumers
+ *  should read `state.ready` instead — this hook is for the boot-
+ *  time recovery UI specifically. */
+export function useDaemonConnectStatus(): "connecting" | "connected" | "failed" {
+  const { state } = useApp();
+  return state.daemonConnectStatus;
 }
 
 /** Subscribe to the per-session command catalog (slash commands,

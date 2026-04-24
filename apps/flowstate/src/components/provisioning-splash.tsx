@@ -1,6 +1,6 @@
 import * as React from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useApp } from "@/stores/app-store";
+import { useApp, useDaemonConnectStatus } from "@/stores/app-store";
 
 // Shape of the `provision` events emitted by the Tauri shell during
 // first launch. Matches `flowstate_app_layer::provision::ProvisionEvent`
@@ -31,10 +31,20 @@ type ProvisionEvent =
  */
 export function ProvisioningSplash() {
   const { state } = useApp();
+  // `connectStream` flips this to `"failed"` after exhausting its
+  // ~5 minute retry budget. Drives the bottom-of-splash error card
+  // when the daemon never came up — covers crashes inside the
+  // daemon spawn task that would otherwise leave the splash on
+  // "Finishing up…" indefinitely.
+  const daemonConnectStatus = useDaemonConnectStatus();
+  const connectFailed = daemonConnectStatus === "failed";
   const [phaseMessage, setPhaseMessage] = React.useState<string>(
     "Starting flowstate…",
   );
-  const [error, setError] = React.useState<string | null>(null);
+  const [provisionError, setProvisionError] = React.useState<string | null>(null);
+  const error = connectFailed
+    ? "Couldn't reach the Flowstate daemon."
+    : provisionError;
   const [showAfter, setShowAfter] = React.useState(false);
 
   // Subscribe to `provision` events from the Rust side. We accept that
@@ -48,11 +58,11 @@ export function ProvisioningSplash() {
         const u = await listen<ProvisionEvent>("provision", ({ payload }) => {
           if (payload.kind === "started") {
             setPhaseMessage(payload.message);
-            setError(null);
+            setProvisionError(null);
           } else if (payload.kind === "all-done") {
             setPhaseMessage("Finishing up…");
           } else if (payload.kind === "failed") {
-            setError(
+            setProvisionError(
               `Failed during ${payload.phase}: ${payload.error.split("\n")[0]}`,
             );
           }
@@ -116,11 +126,19 @@ export function ProvisioningSplash() {
             the provider SDKs. Future launches are instant.
           </div>
         )}
-        {error && (
+        {error && !connectFailed && (
           <div className="text-xs leading-relaxed text-neutral-500">
             Flowstate will start anyway. Open Settings to retry the failed
             step or copy the full error — the on-disk log path lives there
             too under <em>Diagnostics</em>.
+          </div>
+        )}
+        {connectFailed && (
+          <div className="text-xs leading-relaxed text-neutral-500">
+            The daemon never finished starting. Quit and relaunch
+            Flowstate; if the problem persists, the daemon log under
+            <em> ~/Library/Logs/Flowstate/flowstate.log</em> has the
+            details.
           </div>
         )}
       </div>

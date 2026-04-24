@@ -2887,6 +2887,15 @@ pub fn run() {
 
                 // Signal main thread AFTER serve() has managed TauriDaemonState.
                 // This guarantees the connect command can access it.
+                //
+                // Marker logged at info so a future "splash stuck on
+                // Finishing up…" report can be triaged by reading the
+                // daemon log: if this line is present the daemon came
+                // up cleanly and the issue is on the frontend connect
+                // path; if it's absent the daemon spawn task crashed
+                // somewhere upstream (e.g. an `expect` in
+                // `bootstrap_core_async`).
+                tracing::info!("daemon ready; connect command available");
                 ready_tx
                     .send(core.lifecycle.clone())
                     .expect("failed to signal ready");
