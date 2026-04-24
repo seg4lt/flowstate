@@ -110,10 +110,11 @@ export function MessageList({
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
   // `suppressJump` hides the "Jump to latest" affordance while a user-
-  // initiated send is actively being scrolled to the bottom. Without
-  // this, Virtuoso's `atBottomStateChange` fires `false` the moment the
-  // optimistic pending row grows the list past the 80px threshold, and
-  // the button flashes for the duration of the smooth scroll animation.
+  // initiated scroll-to-bottom is in flight. Without this, Virtuoso's
+  // `atBottomStateChange` fires `false` the moment the list grows past
+  // the atBottom threshold (e.g., an optimistic pending row after a
+  // send, or tokens streaming in), and the button flashes until the
+  // next `atBottomStateChange(true)` lands. See `scrollToLatest` below.
   const [suppressJump, setSuppressJump] = React.useState(false);
   const suppressTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -132,6 +133,35 @@ export function MessageList({
     }
     return items;
   }, [turns, pendingInput, providerKind, sessionModel]);
+
+  // Single user-initiated "scroll to latest" implementation. Consolidates
+  // the four invariants every user-driven jump needs:
+  //   1. Bail if the list is transiently empty — otherwise Virtuoso
+  //      resolves `index: "LAST"` against a zero-length data array and
+  //      can land on index 0 (the TOP of the list).
+  //   2. Suppress the "Jump to latest" affordance for 400ms so the
+  //      button doesn't flash while Virtuoso's atBottomStateChange
+  //      settles, and a double-click is a no-op.
+  //   3. Defer the scroll one frame so Virtuoso has a layout pass —
+  //      without the rAF the scrollToIndex fires before measurement
+  //      and silently no-ops.
+  //   4. `behavior: "auto"` (instant). Smooth scroll across Virtuoso's
+  //      virtualized list leaves the in-between items unrendered
+  //      during the animation, which is what made "Jump to latest"
+  //      look like it was dumping users at the top.
+  const scrollToLatest = React.useCallback(() => {
+    if (displayItems.length === 0) return;
+    setSuppressJump(true);
+    if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
+    suppressTimerRef.current = setTimeout(() => setSuppressJump(false), 400);
+    requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: "LAST",
+        align: "end",
+        behavior: "auto",
+      });
+    });
+  }, [displayItems.length]);
 
   // Jump to the latest message whenever the user navigates to a
   // new thread. MessageList doesn't remount between sessions (that
@@ -166,35 +196,14 @@ export function MessageList({
   // should always pop them back to the bottom so they can see their
   // own input land. The ref guard makes the "skip initial mount" intent
   // explicit and protects against StrictMode double-invocation in dev.
-  // The rAF defer matches the thread-open effect: Virtuoso needs a
-  // layout pass after `displayItems` grows by the optimistic pending row.
+  // The actual scroll + suppress + rAF pattern lives in scrollToLatest
+  // so the button-click path and this effect stay in lockstep.
   const lastSendTickRef = React.useRef(userSendTick);
   React.useEffect(() => {
     if (userSendTick === lastSendTickRef.current) return;
     lastSendTickRef.current = userSendTick;
-    // Hide the "Jump to latest" affordance briefly while we jump. 400ms
-    // is plenty for an instant scroll to settle and for Virtuoso's
-    // `atBottomStateChange(true)` to fire; after the timer clears,
-    // `atBottom` is trustworthy again.
-    setSuppressJump(true);
-    if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
-    suppressTimerRef.current = setTimeout(() => setSuppressJump(false), 400);
-    const raf = requestAnimationFrame(() => {
-      // `behavior: "auto"` (instant) is required here. A smooth scroll
-      // across Virtuoso's virtualized list leaves the in-between items
-      // unrendered during the animation — the user sees a blank/black
-      // viewport until a re-render is triggered (e.g., by manual
-      // scroll). Instant scroll teleports to the new position and
-      // Virtuoso immediately renders the items in the destination
-      // window. This matches the thread-open effect above.
-      virtuosoRef.current?.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: "auto",
-      });
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [userSendTick]);
+    scrollToLatest();
+  }, [userSendTick, scrollToLatest]);
 
   // Clear any pending suppression timer on unmount so we don't
   // setState on a torn-down component (e.g., if the user navigates
@@ -254,7 +263,7 @@ export function MessageList({
           </div>
         )}
         followOutput={(isAtBottom) => (isAtBottom ? "auto" : false)}
-        atBottomThreshold={80}
+        atBottomThreshold={120}
         atBottomStateChange={setAtBottom}
         initialTopMostItemIndex={Math.max(0, displayItems.length - 1)}
         increaseViewportBy={{ top: 600, bottom: 600 }}
@@ -264,13 +273,7 @@ export function MessageList({
       {!atBottom && !suppressJump && displayItems.length > 0 && (
         <button
           type="button"
-          onClick={() => {
-            virtuosoRef.current?.scrollToIndex({
-              index: "LAST",
-              align: "end",
-              behavior: "smooth",
-            });
-          }}
+          onClick={scrollToLatest}
           className="absolute right-4 bottom-4 inline-flex items-center gap-1 rounded-full border border-border bg-background px-3 py-1.5 text-xs shadow-md hover:bg-accent"
         >
           <ArrowDown className="h-3 w-3" />
