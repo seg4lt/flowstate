@@ -688,13 +688,34 @@ impl RuntimeCore {
     /// expensive health probe on a toggle. If there's no cached status
     /// yet (first-boot edge case), we synthesise a minimal one.
     async fn set_provider_enabled(&self, kind: ProviderKind, enabled: bool) {
+        // Remember the previous state BEFORE we mutate it — we need
+        // the off→on transition signal below to tell a real user
+        // toggle apart from a redundant "sync my config" broadcast
+        // from the frontend. The frontend currently sends
+        // `set_provider_enabled(kind, true)` for every provider on
+        // every `welcome` message (one per daemon connection), so
+        // without the transition check every launch would refire the
+        // health + model probe for all providers and defeat the 24h
+        // TTL that `bootstrap()` carefully enforces.
+        let was_enabled = self
+            .provider_enablement
+            .read()
+            .ok()
+            .and_then(|m| m.get(&kind).copied())
+            .unwrap_or(false);
+        let just_enabled = enabled && !was_enabled;
+
         self.persistence.set_provider_enabled(kind, enabled).await;
         if let Ok(mut lock) = self.provider_enablement.write() {
             lock.insert(kind, enabled);
         }
 
-        let status = match self.persistence.get_cached_health(kind).await {
-            Some((_, mut status)) => {
+        // Fetch the cached health once and reuse for both the
+        // broadcast status and the staleness check below.
+        let cached_health = self.persistence.get_cached_health(kind).await;
+        let status = match &cached_health {
+            Some((_, status)) => {
+                let mut status = status.clone();
                 status.enabled = enabled;
                 status
             }
@@ -713,22 +734,37 @@ impl RuntimeCore {
         };
         self.publish(RuntimeEvent::ProviderHealthUpdated { status });
 
-        // Kick a fresh probe on enable. Bootstrap only probes
-        // providers whose enablement flag is already `true`, so a
-        // provider that ships disabled-by-default (or was turned off
-        // previously and never probed) has no cached health to show
-        // the moment the user flips it on. Without this the UI would
-        // be stuck on the synthesised `"No health check yet"` status
-        // until the next daemon restart.
+        // Only probe on an actual off→on transition OR when the
+        // cached data is missing/stale. A redundant "sync" broadcast
+        // from the client (same `enabled` as we already had, with a
+        // fresh cache on disk) no longer triggers a bridge spawn —
+        // the cache is authoritative until the 24h TTL elapses.
+        // This is what stops the every-launch phantom-spawn burst
+        // the user was seeing in Activity Monitor.
         //
-        // `spawn_health_check` dedupes via `in_flight_health_checks`
-        // so a fast toggle off→on→off can't stack probes, and it
-        // re-checks enablement inside itself — if the user has
-        // already toggled back off by the time the task runs it will
-        // bail. The matching model refresh is gated the same way.
+        // `spawn_health_check` / `spawn_model_refresh` still dedupe
+        // via `in_flight_*` guards so a rapid re-toggle can't stack
+        // probes, and both re-check enablement inside themselves —
+        // if the user toggles back off by the time the task runs it
+        // will bail.
         if enabled {
-            self.spawn_health_check(kind);
-            self.spawn_model_refresh(kind);
+            let health_stale = cached_health
+                .as_ref()
+                .map(|(checked_at, _)| is_cache_stale(checked_at))
+                .unwrap_or(true);
+            let models_stale = self
+                .persistence
+                .get_cached_models(kind)
+                .await
+                .map(|(fetched_at, _)| is_cache_stale(&fetched_at))
+                .unwrap_or(true);
+
+            if just_enabled || health_stale {
+                self.spawn_health_check(kind);
+            }
+            if just_enabled || models_stale {
+                self.spawn_model_refresh(kind);
+            }
         }
     }
 
@@ -5533,6 +5569,145 @@ mod tests {
             .expect("refreshed model cache row");
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].value, "refreshed-model");
+    }
+
+    /// Redundant `set_provider_enabled(kind, true)` broadcasts from the
+    /// frontend (one per provider on every `welcome`) must NOT refire
+    /// `fetch_models` when the cache is fresh and the provider was
+    /// already enabled. This is the regression that caused the
+    /// every-launch phantom-spawn burst: bootstrap correctly skipped
+    /// the stale-cache check, but the client's post-welcome sync
+    /// fired `set_provider_enabled` for all six providers right after
+    /// and the old code probed unconditionally on every call.
+    #[tokio::test]
+    async fn set_provider_enabled_skips_probe_when_cache_fresh_and_state_unchanged() {
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
+
+        // Seed fresh health + model caches (both stamped now()).
+        persistence
+            .set_cached_health(
+                ProviderKind::Codex,
+                &fake_status_with_models(vec![model("fresh-model", "Fresh")]),
+            )
+            .await;
+        persistence
+            .set_cached_models(ProviderKind::Codex, &[model("fresh-model", "Fresh")])
+            .await;
+        // Record Codex as already-enabled in persisted enablement so
+        // RuntimeCore::new picks it up on construction.
+        persistence
+            .set_provider_enabled(ProviderKind::Codex, true)
+            .await;
+
+        let adapter = Arc::new(ModelFetchCountingAdapter {
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter.clone()],
+            Arc::new(OrchestrationService::new()),
+            persistence.clone(),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ));
+        // Mirror the daemon-core boot path: seed the in-memory
+        // enablement map from persistence before the client gets a
+        // chance to talk. Without this, `was_enabled` reads `false`
+        // and every redundant `SetProviderEnabled(true)` looks like
+        // an off→on transition.
+        runtime.seed_provider_enablement().await;
+
+        // Simulate the frontend's post-welcome "sync my config"
+        // broadcast: Codex is already enabled, cache is fresh.
+        runtime
+            .handle_client_message(ClientMessage::SetProviderEnabled {
+                provider: ProviderKind::Codex,
+                enabled: true,
+            })
+            .await;
+
+        // Give any (incorrectly-)spawned task room to run so a bug
+        // would have a chance to bump the counter.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            adapter
+                .fetch_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "fetch_models must NOT be called when the cache is fresh and \
+             the provider was already enabled — this is the regression \
+             that caused the every-launch phantom-spawn burst",
+        );
+    }
+
+    /// Counterpart to the above: an actual off→on toggle DOES probe,
+    /// because the user just enabled a provider that may have been
+    /// installed / authenticated / updated while it was disabled.
+    /// Same cache freshness, but the enablement flag transitioned.
+    #[tokio::test]
+    async fn set_provider_enabled_probes_on_actual_off_to_on_transition() {
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
+
+        // Fresh caches — what would otherwise suppress the probe.
+        persistence
+            .set_cached_health(
+                ProviderKind::Codex,
+                &fake_status_with_models(vec![model("old-model", "Old")]),
+            )
+            .await;
+        persistence
+            .set_cached_models(ProviderKind::Codex, &[model("old-model", "Old")])
+            .await;
+        // But Codex starts disabled.
+        persistence
+            .set_provider_enabled(ProviderKind::Codex, false)
+            .await;
+
+        let adapter = Arc::new(ModelFetchCountingAdapter {
+            fetch_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter.clone()],
+            Arc::new(OrchestrationService::new()),
+            persistence.clone(),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ));
+        runtime.seed_provider_enablement().await;
+
+        runtime
+            .handle_client_message(ClientMessage::SetProviderEnabled {
+                provider: ProviderKind::Codex,
+                enabled: true,
+            })
+            .await;
+
+        // Off→on transition must probe, even with a fresh cache —
+        // the provider may have been installed/authenticated during
+        // the disabled window.
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if adapter
+                .fetch_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1
+            {
+                break;
+            }
+        }
+        assert!(
+            adapter
+                .fetch_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1,
+            "fetch_models must fire on an actual off→on transition",
+        );
     }
 
     /// Adapter that emits exactly one `ScheduleWakeup` tool call with
