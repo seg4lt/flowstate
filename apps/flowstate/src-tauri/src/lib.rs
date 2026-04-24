@@ -53,17 +53,17 @@ use daemon_client::DaemonBaseUrl;
 // them without pulling Tauri. The Tauri crate now depends on the
 // app-layer crate instead of mod-ing the files in-tree.
 use flowstate_app_layer::git_worktree::{
-    GitWorktree, create_git_worktree_internal, list_git_worktrees_sync, resolve_git_root_sync,
+    create_git_worktree_internal, list_git_worktrees_sync, resolve_git_root_sync, GitWorktree,
 };
 use flowstate_app_layer::orchestration_adapters::{
     AppMetadataProviderImpl, WorktreeProvisionerImpl,
 };
-use flowstate_app_layer::user_config::{
-    ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore,
-};
 use flowstate_app_layer::usage::{
     TopSessionRow, UsageAgentPayload, UsageBucket, UsageEvent, UsageGroupBy, UsageRange,
     UsageStore, UsageSummaryPayload, UsageTimeseriesPayload,
+};
+use flowstate_app_layer::user_config::{
+    ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore,
 };
 use tokio::sync::broadcast::error::RecvError;
 use zenui_provider_api::{OrchestrationIpcHandle, ProviderAdapter, RuntimeEvent};
@@ -124,7 +124,7 @@ const DROP_MAX_BYTES: u64 = 50 * 1024 * 1024;
 /// surface as an error string the caller can toast.
 #[tauri::command]
 async fn read_file_as_base64(path: String) -> Result<DroppedFilePayload, String> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
     tauri::async_runtime::spawn_blocking(move || {
         let abs = Path::new(&path);
@@ -1353,8 +1353,7 @@ fn list_directory(path: String, sub_path: String) -> Result<Vec<DirEntry>, Strin
     // us which ones the gitignore rules would have hidden. We skip
     // symlinks and the `.git` dir itself (always noise in the tree).
     let mut entries: Vec<DirEntry> = Vec::new();
-    let iter =
-        std::fs::read_dir(&target_canon).map_err(|e| format!("read_dir: {e}"))?;
+    let iter = std::fs::read_dir(&target_canon).map_err(|e| format!("read_dir: {e}"))?;
     for entry in iter {
         let Ok(entry) = entry else { continue };
         let file_type = match entry.file_type() {
@@ -1576,10 +1575,7 @@ impl grep_searcher::Sink for BlockSink {
         Ok(self.line_budget_remaining > 0)
     }
 
-    fn context_break(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-    ) -> Result<bool, Self::Error> {
+    fn context_break(&mut self, _searcher: &grep_searcher::Searcher) -> Result<bool, Self::Error> {
         self.flush_current();
         Ok(self.line_budget_remaining > 0)
     }
@@ -1902,18 +1898,14 @@ async fn popout_thread(
     // query string is what the frontend keys off to render the
     // stripped shell — see `isPopoutWindow` in `src/lib/popout.ts`.
     let url = format!("/chat/{session_id}?popout=1");
-    tauri::WebviewWindowBuilder::new(
-        &app,
-        &label,
-        tauri::WebviewUrl::App(url.into()),
-    )
-    .title("flowstate — thread")
-    .inner_size(480.0, 720.0)
-    .min_inner_size(360.0, 480.0)
-    .always_on_top(always_on_top)
-    .build()
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+        .title("flowstate — thread")
+        .inner_size(480.0, 720.0)
+        .min_inner_size(360.0, 480.0)
+        .always_on_top(always_on_top)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1997,7 +1989,10 @@ async fn set_session_display(
     session_id: String,
     display: SessionDisplay,
 ) -> Result<(), String> {
-    base_url.client().set_session_display(session_id, display).await
+    base_url
+        .client()
+        .set_session_display(session_id, display)
+        .await
 }
 
 #[tauri::command]
@@ -2029,7 +2024,10 @@ async fn set_project_display(
     project_id: String,
     display: ProjectDisplay,
 ) -> Result<(), String> {
-    base_url.client().set_project_display(project_id, display).await
+    base_url
+        .client()
+        .set_project_display(project_id, display)
+        .await
 }
 
 #[tauri::command]
@@ -2211,12 +2209,8 @@ fn clear_runtime_cache() -> Result<u64, String> {
         return Ok(0);
     }
     let freed = dir_size_best_effort(&dir);
-    std::fs::remove_dir_all(&dir).map_err(|e| {
-        format!(
-            "remove cache dir {}: {e}",
-            dir.display()
-        )
-    })?;
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| format!("remove cache dir {}: {e}", dir.display()))?;
     tracing::info!(
         bytes = freed,
         path = %dir.display(),
@@ -2239,7 +2233,9 @@ fn runtime_cache_dir() -> Result<std::path::PathBuf, String> {
 /// "Clear cache" action.
 fn dir_size_best_effort(dir: &std::path::Path) -> u64 {
     fn walk(p: &std::path::Path, acc: &mut u64) {
-        let Ok(entries) = std::fs::read_dir(p) else { return };
+        let Ok(entries) = std::fs::read_dir(p) else {
+            return;
+        };
         for entry in entries.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {

@@ -73,27 +73,21 @@ impl OpenCodeServer {
         );
 
         let mut cmd = Command::new(binary);
-        cmd.args([
-            "serve",
-            "--hostname",
-            hostname,
-            "--port",
-            &port.to_string(),
-        ])
-        .current_dir(working_directory)
-        // Opencode's server reads this to gate requests. We
-        // regenerate it on every spawn so a lingering stale
-        // process from a previous crash can't answer for us.
-        .env("OPENCODE_SERVER_PASSWORD", &password)
-        // Keep the default username — opencode's docs default to
-        // `"opencode"` when `OPENCODE_SERVER_USERNAME` is unset,
-        // and we match that in the HTTP client.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        cmd.args(["serve", "--hostname", hostname, "--port", &port.to_string()])
+            .current_dir(working_directory)
+            // Opencode's server reads this to gate requests. We
+            // regenerate it on every spawn so a lingering stale
+            // process from a previous crash can't answer for us.
+            .env("OPENCODE_SERVER_PASSWORD", &password)
+            // Keep the default username — opencode's docs default to
+            // `"opencode"` when `OPENCODE_SERVER_USERNAME` is unset,
+            // and we match that in the HTTP client.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
         // Put opencode in its own process group so shutdown can kill
         // the whole subtree atomically. `process_group(0)` tells the
@@ -155,11 +149,7 @@ impl OpenCodeServer {
         // there, not on stderr (stderr carries misconfiguration and
         // runtime error noise).
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(drain_stream(
-            "opencode.stdout",
-            stdout,
-            Some(ready_tx),
-        ));
+        tokio::spawn(drain_stream("opencode.stdout", stdout, Some(ready_tx)));
         tokio::spawn(drain_stream("opencode.stderr", stderr, None));
 
         match timeout(startup_timeout, ready_rx).await {
@@ -253,21 +243,13 @@ impl OpenCodeServer {
             // signal-handler path takes to flush state on a SIGTERM —
             // generous but not so long it lets a wedged server block
             // the idle-kill path.
-            let wait_result = tokio::time::timeout(
-                Duration::from_secs(3),
-                child.wait(),
-            )
-            .await;
+            let wait_result = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
             if wait_result.is_err() {
                 warn!("opencode serve did not exit within 3s of SIGTERM; escalating to SIGKILL");
                 let _ = child.start_kill();
                 // One more bounded wait so the caller doesn't return
                 // while the child is still mid-reap.
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    child.wait(),
-                )
-                .await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             }
         }
     }

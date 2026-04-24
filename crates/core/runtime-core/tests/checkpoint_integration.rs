@@ -25,8 +25,8 @@ use zenui_checkpoints::FsCheckpointStore;
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
     ClientMessage, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
-    ProviderStatusLevel, ProviderTurnOutput, ReasoningEffort, RewindOutcomeWire,
-    RuntimeEvent, ServerMessage, SessionDetail, TurnEventSink, UserInput,
+    ProviderStatusLevel, ProviderTurnOutput, ReasoningEffort, RewindOutcomeWire, RuntimeEvent,
+    ServerMessage, SessionDetail, TurnEventSink, UserInput,
 };
 use zenui_runtime_core::{OrchestrationService, RuntimeCore};
 
@@ -93,8 +93,7 @@ impl ProviderAdapter for FsWritingAdapter {
                 .ok_or_else(|| "session has no cwd".to_string())?;
             let abs = Path::new(cwd).join(&rel);
             if let Some(parent) = abs.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create parent: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("create parent: {e}"))?;
             }
             std::fs::write(&abs, &bytes).map_err(|e| format!("write: {e}"))?;
         }
@@ -119,8 +118,7 @@ fn setup() -> Harness {
     let workspace = TempDir::new().unwrap();
 
     let persistence = Arc::new(
-        PersistenceService::new(persistence_dir.path().join("daemon.db"))
-            .expect("open sqlite"),
+        PersistenceService::new(persistence_dir.path().join("daemon.db")).expect("open sqlite"),
     );
     let checkpoints = Arc::new(
         FsCheckpointStore::open(data_dir.path(), persistence.clone())
@@ -321,9 +319,10 @@ async fn rewind_returns_unavailable_for_missing_turn() {
         .await;
     match response {
         Some(ServerMessage::RewindFilesResult {
-            outcome: RewindOutcomeWire::Unavailable {
-                reason: zenui_provider_api::RewindUnavailableReason::NoCheckpoint,
-            },
+            outcome:
+                RewindOutcomeWire::Unavailable {
+                    reason: zenui_provider_api::RewindUnavailableReason::NoCheckpoint,
+                },
             ..
         }) => {}
         other => panic!("expected NoCheckpoint Unavailable, got {other:?}"),
@@ -346,9 +345,9 @@ async fn rewind_returns_unavailable_for_disabled_checkpoints() {
     assert_eq!(read(h.workspace.path(), "a.rs"), b"v2");
 
     // No CheckpointCaptured event for this turn.
-    let any_captured = events.iter().any(|e| {
-        matches!(e, RuntimeEvent::CheckpointCaptured { turn_id: tid, .. } if tid == &turn_id)
-    });
+    let any_captured = events.iter().any(
+        |e| matches!(e, RuntimeEvent::CheckpointCaptured { turn_id: tid, .. } if tid == &turn_id),
+    );
     assert!(
         !any_captured,
         "CheckpointCaptured should not fire when checkpoints are disabled",
@@ -371,7 +370,10 @@ async fn rewind_returns_unavailable_for_disabled_checkpoints() {
             outcome: RewindOutcomeWire::Unavailable { reason },
             ..
         }) => {
-            assert_eq!(reason, zenui_provider_api::RewindUnavailableReason::Disabled);
+            assert_eq!(
+                reason,
+                zenui_provider_api::RewindUnavailableReason::Disabled
+            );
         }
         other => panic!("expected Unavailable Disabled, got {other:?}"),
     }

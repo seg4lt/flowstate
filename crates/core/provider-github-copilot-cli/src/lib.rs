@@ -18,8 +18,7 @@ use zenui_provider_api::{
     PermissionMode, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion, flowstate_mcp_config_file, session_cwd, skills_disk,
-    write_mcp_config_file,
+    UserInputQuestion, flowstate_mcp_config_file, session_cwd, skills_disk, write_mcp_config_file,
 };
 
 // Effectively no turn-level wall clock. The adapter previously

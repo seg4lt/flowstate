@@ -199,6 +199,9 @@ mod tests {
         let mut rx = h.subscribe();
         h.publish(sample("http://127.0.0.1:55"));
         rx.changed().await.unwrap();
-        assert_eq!(rx.borrow().as_ref().unwrap().base_url, "http://127.0.0.1:55");
+        assert_eq!(
+            rx.borrow().as_ref().unwrap().base_url,
+            "http://127.0.0.1:55"
+        );
     }
 }

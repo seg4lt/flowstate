@@ -132,10 +132,7 @@ impl GitHubCopilotAdapter {
         // No auth token — the loopback bind is the only boundary.
         if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
             cmd.env("FLOWSTATE_HTTP_BASE", &ipc.base_url);
-            cmd.env(
-                "FLOWSTATE_EXECUTABLE_PATH",
-                ipc.executable_path.as_os_str(),
-            );
+            cmd.env("FLOWSTATE_EXECUTABLE_PATH", ipc.executable_path.as_os_str());
             // Plumb flowstate's pid so the TS bridge can forward it
             // into the MCP subprocess env. See the `FLOWSTATE_PID`
             // note in `crates/core/provider-api/src/mcp_config.rs`.

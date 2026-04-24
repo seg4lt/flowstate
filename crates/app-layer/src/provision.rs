@@ -124,7 +124,10 @@ pub enum ProvisionEvent {
     /// A phase failed. Splash renders the error until the daemon
     /// either retries or the user restarts. `error` is the full
     /// anyhow debug string; the React side decides what to show.
-    Failed { phase: ProvisionPhase, error: String },
+    Failed {
+        phase: ProvisionPhase,
+        error: String,
+    },
 }
 
 /// Callback type the caller supplies to receive provisioning progress.
@@ -167,24 +170,15 @@ pub fn provision_runtimes(reporter: &ProvisionReporter) -> ProvisionOutcome {
     // `ensure_available()` internally; if Node failed they will fail
     // too, which is fine — the Settings page will show two banners
     // and retrying Node first will unblock the rest.
-    run_phase_collect(
-        reporter,
-        ProvisionPhase::Node,
-        &mut failures,
-        || zenui_embedded_node::ensure_available().context("provision embedded Node.js"),
-    );
-    run_phase_collect(
-        reporter,
-        ProvisionPhase::ClaudeSdk,
-        &mut failures,
-        || zenui_provider_claude_sdk::ensure_bridge_available().context("provision Claude SDK bridge"),
-    );
-    run_phase_collect(
-        reporter,
-        ProvisionPhase::CopilotSdk,
-        &mut failures,
-        || zenui_provider_github_copilot::ensure_bridge_available().context("provision Copilot bridge"),
-    );
+    run_phase_collect(reporter, ProvisionPhase::Node, &mut failures, || {
+        zenui_embedded_node::ensure_available().context("provision embedded Node.js")
+    });
+    run_phase_collect(reporter, ProvisionPhase::ClaudeSdk, &mut failures, || {
+        zenui_provider_claude_sdk::ensure_bridge_available().context("provision Claude SDK bridge")
+    });
+    run_phase_collect(reporter, ProvisionPhase::CopilotSdk, &mut failures, || {
+        zenui_provider_github_copilot::ensure_bridge_available().context("provision Copilot bridge")
+    });
 
     let duration_ms = started_all.elapsed().as_millis() as u64;
     if failures.is_empty() {

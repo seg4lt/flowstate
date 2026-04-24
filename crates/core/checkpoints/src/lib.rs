@@ -42,7 +42,7 @@ pub mod walker;
 mod noop_tests;
 
 pub use errors::CheckpointError;
-pub use manifest::{BlobHash, Manifest, ManifestEntry, MANIFEST_VERSION};
+pub use manifest::{BlobHash, MANIFEST_VERSION, Manifest, ManifestEntry};
 pub use store::FsCheckpointStore;
 
 /// Handle returned by a successful [`CheckpointStore::capture`]. Carries
@@ -198,10 +198,7 @@ pub trait CheckpointStore: Send + Sync + 'static {
     /// with `session_id`. Called on session delete and — separately —
     /// from the worktree destroy hook in the Tauri app layer. Safe to call
     /// multiple times.
-    async fn delete_for_session(
-        &self,
-        session_id: &str,
-    ) -> Result<(), CheckpointError>;
+    async fn delete_for_session(&self, session_id: &str) -> Result<(), CheckpointError>;
 
     /// Sweep the blob store and remove blobs that are no longer referenced
     /// by any live manifest, plus any manifest files with no
@@ -262,10 +259,7 @@ impl CheckpointStore for NoopCheckpointStore {
         Ok(false)
     }
 
-    async fn delete_for_session(
-        &self,
-        _session_id: &str,
-    ) -> Result<(), CheckpointError> {
+    async fn delete_for_session(&self, _session_id: &str) -> Result<(), CheckpointError> {
         Ok(())
     }
 

@@ -67,10 +67,7 @@ pub fn flowstate_mcp_entry(info: &OrchestrationIpcInfo, session_id: &str) -> Mcp
     // only lets them set one (env vs args) still work. Loopback
     // HTTP is unauthenticated (see the note in
     // `orchestration_ipc.rs`), so no bearer token rides here.
-    env.insert(
-        "FLOWSTATE_SESSION_ID".to_string(),
-        session_id.to_string(),
-    );
+    env.insert("FLOWSTATE_SESSION_ID".to_string(), session_id.to_string());
     env.insert("FLOWSTATE_HTTP_BASE".to_string(), info.base_url.clone());
     // `FLOWSTATE_PID` lets the stdio proxy subprocess watchdog its
     // grand-parent (flowstate) liveness. When flowstate dies the
@@ -78,10 +75,7 @@ pub fn flowstate_mcp_entry(info: &OrchestrationIpcInfo, session_id: &str) -> Mcp
     // starts failing — either signal causes the proxy to self-exit
     // within ~2 s, so no zombie mcp-server processes survive the app.
     // See `crates/core/mcp-server/src/lib.rs::spawn_parent_watchdog`.
-    env.insert(
-        "FLOWSTATE_PID".to_string(),
-        std::process::id().to_string(),
-    );
+    env.insert("FLOWSTATE_PID".to_string(), std::process::id().to_string());
 
     McpServerConfig {
         transport: "stdio".to_string(),
@@ -99,10 +93,7 @@ pub fn flowstate_mcp_entry(info: &OrchestrationIpcInfo, session_id: &str) -> Mcp
 
 /// Convenience: wrap a single flowstate entry in the full
 /// `{mcpServers: {flowstate: …}}` envelope.
-pub fn flowstate_mcp_config_file(
-    info: &OrchestrationIpcInfo,
-    session_id: &str,
-) -> McpConfigFile {
+pub fn flowstate_mcp_config_file(info: &OrchestrationIpcInfo, session_id: &str) -> McpConfigFile {
     let mut servers = std::collections::BTreeMap::new();
     servers.insert(
         "flowstate".to_string(),

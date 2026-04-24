@@ -12,8 +12,8 @@ pub use wakeup::{
 };
 
 use internals::{
-    InFlightPermissionModeGuard, TurnCounterGuard, is_cache_stale,
-    spawn_model_refresh_detached, write_in_flight_snapshot,
+    InFlightPermissionModeGuard, TurnCounterGuard, is_cache_stale, spawn_model_refresh_detached,
+    write_in_flight_snapshot,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -376,11 +376,9 @@ impl RuntimeCore {
             // `PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT` so the
             // brief window between `new` and `seed` doesn't silently
             // skip captures.
-            global_checkpoints_enabled: Arc::new(
-                std::sync::atomic::AtomicBool::new(
-                    zenui_persistence::PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT,
-                ),
-            ),
+            global_checkpoints_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                zenui_persistence::PersistenceService::CHECKPOINTS_GLOBAL_DEFAULT,
+            )),
             wakeup_scheduler: std::sync::RwLock::new(None),
             pending_wakeup_invalidations: Arc::new(Mutex::new(HashSet::new())),
             session_events: Arc::new(session_events::SessionEventStore::default_capacity()),
@@ -496,8 +494,7 @@ impl RuntimeCore {
             Arc::new(wakeup::RuntimeCoreFireHandler {
                 runtime: Arc::downgrade(self),
             });
-        let scheduler =
-            wakeup::WakeupScheduler::spawn(Arc::clone(&self.persistence), fire_handler);
+        let scheduler = wakeup::WakeupScheduler::spawn(Arc::clone(&self.persistence), fire_handler);
         scheduler.reload_pending(&self.persistence).await;
         if let Ok(mut slot) = self.wakeup_scheduler.write() {
             *slot = Some(scheduler);
@@ -1583,11 +1580,15 @@ impl RuntimeCore {
                     outcome,
                 })
             }
-            ClientMessage::GetCheckpointSettings => Some(ServerMessage::CheckpointSettingsSnapshot {
-                settings: self.current_checkpoint_settings(),
-            }),
+            ClientMessage::GetCheckpointSettings => {
+                Some(ServerMessage::CheckpointSettingsSnapshot {
+                    settings: self.current_checkpoint_settings(),
+                })
+            }
             ClientMessage::SetCheckpointsEnabled { enabled } => {
-                self.persistence.set_checkpoints_global_enabled(enabled).await;
+                self.persistence
+                    .set_checkpoints_global_enabled(enabled)
+                    .await;
                 self.global_checkpoints_enabled
                     .store(enabled, std::sync::atomic::Ordering::Relaxed);
                 // Broadcast the new snapshot so every connected client
@@ -5773,9 +5774,8 @@ mod tests {
 
     #[tokio::test]
     async fn observes_schedule_wakeup_tool_call_and_persists_row() {
-        let persistence = Arc::new(
-            PersistenceService::in_memory().expect("in-memory db should initialize"),
-        );
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
         let runtime = Arc::new(RuntimeCore::new(
             vec![Arc::new(WakeupObservingAdapter {
                 prompt: "continue polling".to_string(),
@@ -5897,9 +5897,8 @@ mod tests {
             }
         }
 
-        let persistence = Arc::new(
-            PersistenceService::in_memory().expect("in-memory db should initialize"),
-        );
+        let persistence =
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize"));
         let runtime = Arc::new(RuntimeCore::new(
             vec![Arc::new(BoringToolAdapter)],
             Arc::new(OrchestrationService::new()),

@@ -219,8 +219,7 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
     {
         let checkpoints_gc = checkpoints.clone();
         tokio::spawn(async move {
-            let mut ticker =
-                tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the first immediate tick; `interval` fires one right
             // at boot which would collide with startup reconciliation.

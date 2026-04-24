@@ -62,11 +62,9 @@ impl Subscription {
 
         let outcome = match timeout(max, completion).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(
-                "opencode SSE channel closed before the turn completed \
+            Ok(Err(_)) => Err("opencode SSE channel closed before the turn completed \
                  (server may have restarted)"
-                    .to_string(),
-            ),
+                .to_string()),
             Err(_) => Err(format!(
                 "opencode turn exceeded {}s with no completion event",
                 max.as_secs()
@@ -356,7 +354,10 @@ async fn dispatch_frame(
     // Drop them — they'll come through the daemon log via stderr
     // forwarding if the operator needs them.
     let Some(session_id) = session_id else {
-        debug!(event_type, "opencode SSE event without session id; skipping");
+        debug!(
+            event_type,
+            "opencode SSE event without session id; skipping"
+        );
         return Ok(());
     };
 
@@ -453,10 +454,7 @@ async fn dispatch_frame(
                 Some(p) => p,
                 None => return Ok(()),
             };
-            let part_type = part
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let part_type = part.get("type").and_then(Value::as_str).unwrap_or_default();
 
             match part_type {
                 // Text parts can arrive via `updated` too (final
@@ -493,8 +491,7 @@ async fn dispatch_frame(
                             // subsequent in-progress updates so the
                             // runtime doesn't log a fresh tool card
                             // per heartbeat.
-                            if !call_id.is_empty()
-                                && state.open_tool_calls.insert(call_id.clone())
+                            if !call_id.is_empty() && state.open_tool_calls.insert(call_id.clone())
                             {
                                 let args = tool_state
                                     .get("input")
@@ -583,10 +580,7 @@ async fn dispatch_frame(
                     .and_then(Value::as_str)
                     .unwrap_or("opencode is retrying")
                     .to_string();
-                state
-                    .sink
-                    .send(ProviderTurnEvent::Info { message })
-                    .await;
+                state.sink.send(ProviderTurnEvent::Info { message }).await;
             }
         }
 
@@ -616,14 +610,8 @@ async fn dispatch_frame(
         // against opencode 1.4.3 — update this arm if a new event
         // type warrants real handling rather than a silent
         // fallthrough.
-        "message.updated"
-        | "message.removed"
-        | "session.updated"
-        | "session.diff"
-        | "server.connected"
-        | "server.heartbeat"
-        | "question.rejected"
-        | "session.started"
+        "message.updated" | "message.removed" | "session.updated" | "session.diff"
+        | "server.connected" | "server.heartbeat" | "question.rejected" | "session.started"
         | "session.exited" => {
             debug!(event_type, "opencode lifecycle event acknowledged");
         }
@@ -744,11 +732,7 @@ async fn handle_permission_asked(
 /// Body: `{ "requestID": id, "answers": [ ["Yes"], ... ] }` — one
 /// inner array per question. Each inner array is the selected option
 /// labels (multi-select aware).
-async fn handle_question_asked(
-    client: Arc<OpenCodeClient>,
-    sink: TurnEventSink,
-    props: Value,
-) {
+async fn handle_question_asked(client: Arc<OpenCodeClient>, sink: TurnEventSink, props: Value) {
     let request_id = props
         .get("id")
         .and_then(Value::as_str)
@@ -778,11 +762,12 @@ async fn handle_question_asked(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let header = q
-            .get("header")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let opts = q.get("options").and_then(Value::as_array).cloned().unwrap_or_default();
+        let header = q.get("header").and_then(Value::as_str).map(str::to_string);
+        let opts = q
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let options: Vec<UserInputOption> = opts
             .into_iter()
             .filter_map(|o| {
@@ -997,10 +982,13 @@ mod tests {
             }
         });
         let events = drive(&[frame]).await;
-        assert!(matches!(
-            events.as_slice(),
-            [ProviderTurnEvent::AssistantTextDelta { delta }] if delta == " Hello"
-        ), "got {events:?}");
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ProviderTurnEvent::AssistantTextDelta { delta }] if delta == " Hello"
+            ),
+            "got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1114,7 +1102,10 @@ mod tests {
                 ProviderTurnEvent::ToolCallCompleted { output, error: None, .. }
                 if output == "ok")
         });
-        assert!(completed, "expected ToolCallCompleted with output='ok'; got {events:?}");
+        assert!(
+            completed,
+            "expected ToolCallCompleted with output='ok'; got {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1224,7 +1215,10 @@ mod tests {
         let (request_id, questions) = user_q.expect("expected UserQuestion event");
         assert!(!request_id.is_empty());
         assert_eq!(questions.len(), 1);
-        assert_eq!(questions[0].text, "Do you want me to proceed with the cleanup?");
+        assert_eq!(
+            questions[0].text,
+            "Do you want me to proceed with the cleanup?"
+        );
         assert_eq!(questions[0].options.len(), 2);
         assert_eq!(questions[0].options[0].label, "Yes");
     }

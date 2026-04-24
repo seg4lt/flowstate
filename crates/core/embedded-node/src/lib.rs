@@ -232,18 +232,15 @@ fn load_archive_bytes() -> Result<Vec<u8>> {
     #[cfg(not(feature = "embed"))]
     {
         let archive_path = download_cache_path()?;
-        let expected_sha = node_checksums::expected_sha(
-            NODE_TARGET_PLATFORM,
-            NODE_TARGET_ARCH,
-            NODE_TARGET_EXT,
-        )
-        .ok_or_else(|| {
-            anyhow!(
-                "no pinned SHA-256 in src/node_checksums.rs for \
+        let expected_sha =
+            node_checksums::expected_sha(NODE_TARGET_PLATFORM, NODE_TARGET_ARCH, NODE_TARGET_EXT)
+                .ok_or_else(|| {
+                anyhow!(
+                    "no pinned SHA-256 in src/node_checksums.rs for \
                  {NODE_TARGET_PLATFORM}-{NODE_TARGET_ARCH}.{NODE_TARGET_EXT} \
                  (Node.js v{NODE_VERSION}); refusing to download an unverifiable archive"
-            )
-        })?;
+                )
+            })?;
 
         if !archive_path.exists() {
             let url = format!(
@@ -261,9 +258,8 @@ fn load_archive_bytes() -> Result<Vec<u8>> {
         // cache, a downgrade attempt that swapped the file behind our
         // back, or a stale archive left over from a previous
         // NODE_VERSION whose name happened to collide.
-        let bytes = fs::read(&archive_path).with_context(|| {
-            format!("read cached Node.js archive {}", archive_path.display())
-        })?;
+        let bytes = fs::read(&archive_path)
+            .with_context(|| format!("read cached Node.js archive {}", archive_path.display()))?;
         download::verify_sha256(&bytes, expected_sha).with_context(|| {
             format!(
                 "cached Node.js archive at {} failed SHA-256 verification — \

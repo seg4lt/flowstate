@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use ignore::{DirEntry, WalkBuilder};
 
-use crate::errors::{io_err, CheckpointError};
+use crate::errors::{CheckpointError, io_err};
 
 /// Per-file size cap. Applied AFTER the walker's ignore rules — so a
 /// 6 MB file that's already in `.gitignore` never gets statted for
@@ -89,9 +89,7 @@ pub fn walk(root: &Path) -> Result<Vec<WalkItem>, CheckpointError> {
             reason: "not a directory".to_string(),
         });
     }
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| io_err(root.clone(), e))?;
+    let canonical_root = root.canonicalize().map_err(|e| io_err(root.clone(), e))?;
 
     let mut builder = WalkBuilder::new(&canonical_root);
     // Respect `.gitignore`, `.ignore`, and global VCS ignore files.

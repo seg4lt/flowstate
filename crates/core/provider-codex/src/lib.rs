@@ -10,10 +10,10 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use zenui_provider_api::{
-    OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProbeCliOptions,
-    ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState, ProviderStatus,
-    ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink,
-    UserInput, UserInputAnswer, UserInputOption, UserInputQuestion, probe_cli, session_cwd,
+    OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProbeCliOptions, ProviderAdapter,
+    ProviderKind, ProviderModel, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
+    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputAnswer,
+    UserInputOption, UserInputQuestion, probe_cli, session_cwd,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -175,9 +175,9 @@ impl CodexAdapter {
         // with `~/.codex/config.toml`, so user-authored MCP servers
         // keep working. Session-scoped (this codex process only).
         if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
-            let toml_value =
-                render_flowstate_toml_override(&ipc, &session.summary.session_id);
-            cmd.arg("-c").arg(format!("mcp_servers.flowstate={toml_value}"));
+            let toml_value = render_flowstate_toml_override(&ipc, &session.summary.session_id);
+            cmd.arg("-c")
+                .arg(format!("mcp_servers.flowstate={toml_value}"));
         }
         cmd.current_dir(&cwd)
             .stdin(std::process::Stdio::piped())

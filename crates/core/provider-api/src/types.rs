@@ -849,9 +849,9 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
         // Claude CLI, GitHub Copilot (SaaS and CLI) don't expose any
         // of the flagged capabilities today — the UI hides the
         // corresponding affordances when selected.
-        ProviderKind::ClaudeCli
-        | ProviderKind::GitHubCopilot
-        | ProviderKind::GitHubCopilotCli => ProviderFeatures::default(),
+        ProviderKind::ClaudeCli | ProviderKind::GitHubCopilot | ProviderKind::GitHubCopilotCli => {
+            ProviderFeatures::default()
+        }
 
         // Opencode accepts a `variant` on the prompt body which maps
         // onto flowstate's reasoning-effort scale (low/medium/high/

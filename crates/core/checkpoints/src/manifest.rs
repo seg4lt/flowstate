@@ -12,7 +12,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::errors::{io_err, CheckpointError};
+use crate::errors::{CheckpointError, io_err};
 
 /// On-disk format version. Bump when changing the manifest shape in a way
 /// that older daemons can't read. Readers must reject unknown versions
@@ -163,19 +163,16 @@ impl Manifest {
     /// rely on the file either being absent or fully-formed — never
     /// partially written — even across a daemon crash.
     pub fn write_atomic(&self, path: &Path) -> Result<(), CheckpointError> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| CheckpointError::InvalidRoot {
-                root: path.to_path_buf(),
-                reason: "manifest path has no parent directory".to_string(),
-            })?;
+        let parent = path.parent().ok_or_else(|| CheckpointError::InvalidRoot {
+            root: path.to_path_buf(),
+            reason: "manifest path has no parent directory".to_string(),
+        })?;
         std::fs::create_dir_all(parent).map_err(|e| io_err(parent.to_path_buf(), e))?;
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            CheckpointError::ManifestCorrupt {
+        let bytes =
+            serde_json::to_vec_pretty(self).map_err(|e| CheckpointError::ManifestCorrupt {
                 path: path.to_path_buf(),
                 reason: format!("serialize manifest: {e}"),
-            }
-        })?;
+            })?;
         let tmp_name = format!(
             ".{}.tmp",
             path.file_name()

@@ -25,11 +25,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{error, warn};
-use serde::{Deserialize, Serialize};
 use zenui_provider_api::{
     AppSnapshot, BootstrapPayload, ClientMessage, HealthPayload, RuntimeCall, RuntimeCallError,
     RuntimeCallOrigin, RuntimeCallResult, ServerMessage, ToolCatalogEntry, capability_tools_wire,
@@ -494,7 +494,9 @@ async fn session_events_replay_handler(
     axum::extract::Path(session_id): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<EventsReplayQuery>,
 ) -> Json<EventsReplayResponse> {
-    let result = state.runtime.replay_session_events(&session_id, query.since);
+    let result = state
+        .runtime
+        .replay_session_events(&session_id, query.since);
     let gap = result.gap_detected(query.since);
     let entries = result
         .events

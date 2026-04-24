@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use flowstate_app_layer::http::{AppLayerApiState, router as app_layer_router};
+use flowstate_app_layer::http::{router as app_layer_router, AppLayerApiState};
 use flowstate_app_layer::usage::UsageStore;
 use flowstate_app_layer::user_config::UserConfigStore;
 use serde::Serialize;
@@ -82,18 +82,15 @@ pub struct LoopbackHttp {
 /// Readers either see the old or the new contents — never a
 /// truncated file.
 fn write_handshake_atomic(path: &Path, hs: &Handshake) -> Result<()> {
-    let body =
-        serde_json::to_string_pretty(hs).context("serialize daemon handshake to JSON")?;
+    let body = serde_json::to_string_pretty(hs).context("serialize daemon handshake to JSON")?;
     let dir = path.parent().context("handshake path has no parent dir")?;
-    std::fs::create_dir_all(dir).with_context(|| {
-        format!("failed to create handshake dir {}", dir.display())
-    })?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create handshake dir {}", dir.display()))?;
     let tmp = path.with_extension("handshake.tmp");
     {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp).with_context(|| {
-            format!("failed to open handshake tmp file {}", tmp.display())
-        })?;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("failed to open handshake tmp file {}", tmp.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -134,10 +131,7 @@ pub fn spawn(
     // loopback port the transport-http orchestration routes use.
     // The router is pre-`.with_state()`-stamped, so the HttpTransport
     // just needs to merge the raw `Router<()>` at serve time.
-    let extra_router = app_layer_router(AppLayerApiState {
-        user_config,
-        usage,
-    });
+    let extra_router = app_layer_router(AppLayerApiState { user_config, usage });
     let transport: Box<dyn Transport> =
         Box::new(HttpTransport::new(bind_addr).with_extra_router(extra_router));
     let bound = transport.bind().context("bind loopback HTTP listener")?;
@@ -149,9 +143,7 @@ pub fn spawn(
     let address_info = bound.address_info();
     let base_url = match &address_info {
         zenui_daemon_core::TransportAddressInfo::Http { http_base, .. } => http_base.clone(),
-        other => anyhow::bail!(
-            "expected HTTP transport address info, got {other:?}"
-        ),
+        other => anyhow::bail!("expected HTTP transport address info, got {other:?}"),
     };
 
     let handle = bound
@@ -165,8 +157,8 @@ pub fn spawn(
     // `mcp-server` subcommand. Failures here are non-fatal: if the
     // cell was already populated (double-spawn, shouldn't happen
     // outside dev), we log and continue with the existing value.
-    let executable_path = std::env::current_exe()
-        .context("resolve current_exe for orchestration IPC handle")?;
+    let executable_path =
+        std::env::current_exe().context("resolve current_exe for orchestration IPC handle")?;
     let info = OrchestrationIpcInfo {
         base_url: base_url.clone(),
         executable_path,

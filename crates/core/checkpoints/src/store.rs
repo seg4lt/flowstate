@@ -14,8 +14,8 @@ use uuid::Uuid;
 use zenui_persistence::{CheckpointRow, FileStateRow, PersistenceService};
 
 use crate::blob_store::BlobStore;
-use crate::errors::{io_err, CheckpointError};
-use crate::manifest::{BlobHash, Manifest, ManifestEntry, MANIFEST_VERSION};
+use crate::errors::{CheckpointError, io_err};
+use crate::manifest::{BlobHash, MANIFEST_VERSION, Manifest, ManifestEntry};
 use crate::walker::{self, WalkItem};
 use crate::{
     CheckpointHandle, CheckpointStore, ConflictPath, ConflictReport, GcReport, RestoreOptions,
@@ -53,8 +53,7 @@ impl FsCheckpointStore {
         std::fs::create_dir_all(&data_dir).map_err(|e| io_err(data_dir.clone(), e))?;
         let blob_store = BlobStore::new(data_dir.join("blobs"))?;
         let manifests_dir = data_dir.join("manifests");
-        std::fs::create_dir_all(&manifests_dir)
-            .map_err(|e| io_err(manifests_dir.clone(), e))?;
+        std::fs::create_dir_all(&manifests_dir).map_err(|e| io_err(manifests_dir.clone(), e))?;
         Ok(Self {
             blob_store,
             manifests_dir,
@@ -129,9 +128,7 @@ impl FsCheckpointStore {
         // Detect deletions: any file_state row under this root that we
         // didn't encounter on disk must have been deleted. Record it as
         // a touched entry with post_hash=None, then drop the cache row.
-        let deletions = self
-            .collect_deletions(&canonical_root, &seen_paths)
-            .await?;
+        let deletions = self.collect_deletions(&canonical_root, &seen_paths).await?;
         for (rel_path, pre_hash) in deletions {
             touched.push(ManifestEntry {
                 path: rel_path.clone(),
@@ -201,8 +198,7 @@ impl FsCheckpointStore {
         }
 
         // Cache miss or stale — read and hash.
-        let bytes = std::fs::read(&item.abs_path)
-            .map_err(|e| io_err(item.abs_path.clone(), e))?;
+        let bytes = std::fs::read(&item.abs_path).map_err(|e| io_err(item.abs_path.clone(), e))?;
         let post = self.blob_store.write_if_absent(&bytes)?;
         let pre = cached
             .as_ref()

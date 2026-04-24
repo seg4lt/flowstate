@@ -8,9 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tempfile::TempDir;
-use zenui_checkpoints::{
-    CheckpointStore, FsCheckpointStore, RestoreOptions, RestoreResult,
-};
+use zenui_checkpoints::{CheckpointStore, FsCheckpointStore, RestoreOptions, RestoreResult};
 use zenui_persistence::PersistenceService;
 
 fn new_store() -> (FsCheckpointStore, Arc<PersistenceService>, TempDir, TempDir) {
@@ -286,18 +284,22 @@ async fn delete_for_session_removes_manifests_and_index_rows() {
     let handle = store.capture("s1", "t1", ws.path()).await.unwrap().unwrap();
 
     // Pre-check: manifest exists on disk and in the index.
-    assert!(persistence
-        .get_checkpoint_by_turn("s1", "t1")
-        .await
-        .is_some());
+    assert!(
+        persistence
+            .get_checkpoint_by_turn("s1", "t1")
+            .await
+            .is_some()
+    );
 
     store.delete_for_session("s1").await.unwrap();
 
     // Post: index empty, manifest file gone.
-    assert!(persistence
-        .get_checkpoint_by_turn("s1", "t1")
-        .await
-        .is_none());
+    assert!(
+        persistence
+            .get_checkpoint_by_turn("s1", "t1")
+            .await
+            .is_none()
+    );
     assert!(!store.has_checkpoint("s1", "t1").await.unwrap());
     // The handle we captured is opaque — assert it at least had the
     // id we expected (sanity check the ID shape).

@@ -47,8 +47,7 @@ use crate::server::OpenCodeServer;
 /// Install hint surfaced in `health()` when the `opencode` binary is
 /// missing. Kept as a constant so the diagnostic message stays
 /// consistent between the pre-flight probe and any runtime errors.
-const OPENCODE_INSTALL_HINT: &str =
-    "Install opencode. macOS: `brew install sst/tap/opencode`  \u{2022}  \
+const OPENCODE_INSTALL_HINT: &str = "Install opencode. macOS: `brew install sst/tap/opencode`  \u{2022}  \
      Linux/macOS: `curl -fsSL https://opencode.ai/install | bash`  \u{2022}  \
      any platform: `npm i -g opencode-ai`";
 
@@ -349,11 +348,7 @@ impl OpenCodeAdapter {
     /// resolved from [`UserConfigStore`], which defaults ON at 10
     /// minutes.
     pub fn new(working_directory: PathBuf) -> Self {
-        Self::new_with_orchestration_and_idle_ttl(
-            working_directory,
-            None,
-            None,
-        )
+        Self::new_with_orchestration_and_idle_ttl(working_directory, None, None)
     }
 
     /// Construct with an optional [`OrchestrationIpcHandle`]. Uses
@@ -659,10 +654,7 @@ impl OpenCodeAdapter {
     /// existing session's cached native id is valid. Invalidating
     /// them all would force every opencode session to lose its
     /// conversation history on upgrade, for no correctness benefit.
-    async fn native_id_if_current_generation(
-        &self,
-        session: &SessionDetail,
-    ) -> Option<String> {
+    async fn native_id_if_current_generation(&self, session: &SessionDetail) -> Option<String> {
         let state = session.provider_state.as_ref()?;
         let native = state.native_thread_id.as_deref()?;
         let current = self.current_generation().await?;
@@ -728,7 +720,10 @@ impl IdleWatcher {
     }
 
     async fn run(self) {
-        debug!(ttl_ms = self.ttl.as_millis(), "opencode idle watcher started");
+        debug!(
+            ttl_ms = self.ttl.as_millis(),
+            "opencode idle watcher started"
+        );
         loop {
             // Upgrade everything we need. If any of these fail the
             // adapter has been dropped and the watcher should exit.
@@ -981,9 +976,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                             authenticated: false,
                             version,
                             status: ProviderStatusLevel::Warning,
-                            message: Some(format!(
-                                "opencode server responded unhealthily: {err}"
-                            )),
+                            message: Some(format!("opencode server responded unhealthily: {err}")),
                             models: Vec::new(),
                             enabled: true,
                             features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
@@ -1003,9 +996,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                     authenticated: true,
                     version,
                     status: ProviderStatusLevel::Ready,
-                    message: Some(format!(
-                        "{label} idle; will resume on next use."
-                    )),
+                    message: Some(format!("{label} idle; will resume on next use.")),
                     models: Vec::new(),
                     enabled: true,
                     features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
@@ -1163,7 +1154,8 @@ impl ProviderAdapter for OpenCodeAdapter {
         let native_id = match self.native_id_if_current_generation(session).await {
             Some(id) => id,
             None => {
-                let cwd = zenui_provider_api::helpers::session_cwd(session, &self.working_directory);
+                let cwd =
+                    zenui_provider_api::helpers::session_cwd(session, &self.working_directory);
                 client
                     .create_session(
                         cwd.to_string_lossy().as_ref(),
@@ -1374,11 +1366,8 @@ mod tests {
         // First drop: count goes 2 -> 1; no notify.
         drop(a);
         // Poll the future briefly — it must NOT be ready.
-        let not_yet = tokio::time::timeout(
-            std::time::Duration::from_millis(25),
-            notified.as_mut(),
-        )
-        .await;
+        let not_yet =
+            tokio::time::timeout(std::time::Duration::from_millis(25), notified.as_mut()).await;
         assert!(
             not_yet.is_err(),
             "notify fired prematurely on non-zero transition"
@@ -1386,15 +1375,9 @@ mod tests {
 
         // Second drop: count goes 1 -> 0; notify expected.
         drop(b);
-        let fired = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            notified.as_mut(),
-        )
-        .await;
-        assert!(
-            fired.is_ok(),
-            "notify did NOT fire on transition to zero"
-        );
+        let fired =
+            tokio::time::timeout(std::time::Duration::from_millis(100), notified.as_mut()).await;
+        assert!(fired.is_ok(), "notify did NOT fire on transition to zero");
     }
 
     #[tokio::test]
@@ -1455,11 +1438,8 @@ mod tests {
         // return None as well — a fresh native id must be minted at
         // the next ensure_server. This protects against a respawn
         // invalidating every cached id.
-        let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
-            std::env::temp_dir(),
-            None,
-            None,
-        );
+        let adapter =
+            OpenCodeAdapter::new_with_orchestration_and_idle_ttl(std::env::temp_dir(), None, None);
         let session = SessionDetail {
             summary: zenui_provider_api::SessionSummary {
                 session_id: "s1".into(),
@@ -1479,6 +1459,9 @@ mod tests {
         // Server is Stopped — no current generation, cached id must
         // NOT be returned.
         let resolved = adapter.native_id_if_current_generation(&session).await;
-        assert_eq!(resolved, None, "stale id must not be reused when server is down");
+        assert_eq!(
+            resolved, None,
+            "stale id must not be reused when server is down"
+        );
     }
 }

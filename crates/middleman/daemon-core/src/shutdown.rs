@@ -121,10 +121,7 @@ pub async fn drain_shutdown(
             "drain shutdown: max_wait elapsed; escalating to interrupt"
         );
         let interrupted = runtime.shutdown_all_turns(interrupt_grace).await;
-        tracing::info!(
-            interrupted,
-            "drain shutdown: interrupt phase completed"
-        );
+        tracing::info!(interrupted, "drain shutdown: interrupt phase completed");
     }
     // Always sweep adapters after the turns settle (either naturally
     // or via interrupt). Matches the explicit-kill contract in

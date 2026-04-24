@@ -1787,22 +1787,18 @@ fn load_session_from(
          FROM {sessions_table} WHERE session_id = ?1"
     );
     let summary = connection
-        .query_row(
-            &summary_sql,
-            params![session_id],
-            |row| {
-                Ok(SessionSummary {
-                    session_id: row.get(0)?,
-                    provider: provider_kind_from_str(&row.get::<_, String>(1)?),
-                    status: session_status_from_str(&row.get::<_, String>(2)?),
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                    turn_count: row.get::<_, i64>(5)? as usize,
-                    model: row.get(7)?,
-                    project_id: row.get(8)?,
-                })
-            },
-        )
+        .query_row(&summary_sql, params![session_id], |row| {
+            Ok(SessionSummary {
+                session_id: row.get(0)?,
+                provider: provider_kind_from_str(&row.get::<_, String>(1)?),
+                status: session_status_from_str(&row.get::<_, String>(2)?),
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+                turn_count: row.get::<_, i64>(5)? as usize,
+                model: row.get(7)?,
+                project_id: row.get(8)?,
+            })
+        })
         .optional()
         .context("failed to load session summary")?;
 
@@ -1953,15 +1949,12 @@ fn load_session_from(
         }
     }
 
-    let provider_state_sql = format!(
-        "SELECT provider_state_json FROM {sessions_table} WHERE session_id = ?1"
-    );
+    let provider_state_sql =
+        format!("SELECT provider_state_json FROM {sessions_table} WHERE session_id = ?1");
     let provider_state = connection
-        .query_row(
-            &provider_state_sql,
-            params![session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
+        .query_row(&provider_state_sql, params![session_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
         .optional()
         .context("failed to load provider session state")?
         .flatten()
@@ -2132,18 +2125,15 @@ mod tests {
 
         let pending = service.list_pending_wakeups().await;
         assert_eq!(
-            pending.iter().map(|r| r.wakeup_id.as_str()).collect::<Vec<_>>(),
+            pending
+                .iter()
+                .map(|r| r.wakeup_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["w-1", "w-2", "w-3"],
             "pending must be ordered by fire_at_unix ASC"
         );
-        assert_eq!(
-            service.count_pending_wakeups_for_session("s-1").await,
-            2
-        );
-        assert_eq!(
-            service.count_pending_wakeups_for_session("s-2").await,
-            1
-        );
+        assert_eq!(service.count_pending_wakeups_for_session("s-1").await, 2);
+        assert_eq!(service.count_pending_wakeups_for_session("s-2").await, 1);
     }
 
     #[tokio::test]
@@ -2181,10 +2171,7 @@ mod tests {
         let mut cancelled = service.cancel_wakeups_for_session("s-1").await;
         cancelled.sort();
         assert_eq!(cancelled, vec!["w-b".to_string(), "w-c".to_string()]);
-        assert_eq!(
-            service.count_pending_wakeups_for_session("s-1").await,
-            0
-        );
+        assert_eq!(service.count_pending_wakeups_for_session("s-1").await, 0);
         assert!(service.cancel_wakeups_for_session("s-1").await.is_empty());
     }
 }

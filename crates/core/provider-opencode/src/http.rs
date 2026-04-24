@@ -154,9 +154,7 @@ impl OpenCodeClient {
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(format!(
-                "opencode session create returned {status}: {body}"
-            ));
+            return Err(format!("opencode session create returned {status}: {body}"));
         }
 
         let payload: Value = response
@@ -239,9 +237,7 @@ impl OpenCodeClient {
             Ok(())
         } else {
             let body = response.text().await.unwrap_or_default();
-            Err(format!(
-                "opencode prompt returned {status}: {body}"
-            ))
+            Err(format!("opencode prompt returned {status}: {body}"))
         }
     }
 
@@ -257,10 +253,7 @@ impl OpenCodeClient {
         if response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
             Ok(())
         } else {
-            Err(format!(
-                "opencode abort returned {}",
-                response.status()
-            ))
+            Err(format!("opencode abort returned {}", response.status()))
         }
     }
 
@@ -291,9 +284,7 @@ impl OpenCodeClient {
         } else {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Err(format!(
-                "opencode question.reply returned {status}: {body}"
-            ))
+            Err(format!("opencode question.reply returned {status}: {body}"))
         }
     }
 
@@ -380,10 +371,7 @@ impl OpenCodeClient {
             // `{ "model-id": { name, ... } }` over time. Handle both.
             if let Some(arr) = model_map.as_array() {
                 for model in arr {
-                    let id = model
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
+                    let id = model.get("id").and_then(Value::as_str).unwrap_or("");
                     if id.is_empty() {
                         continue;
                     }
@@ -798,7 +786,10 @@ mod tests {
 
     #[test]
     fn variant_keys_empty_when_variants_is_not_object() {
-        assert_eq!(variant_keys(&json!({ "variants": [] })), Vec::<String>::new());
+        assert_eq!(
+            variant_keys(&json!({ "variants": [] })),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

@@ -60,11 +60,9 @@ fn is_opencode_available() -> bool {
 
 fn dummy_session(native_thread_id: Option<String>) -> SessionDetail {
     let now = "1970-01-01T00:00:00Z".to_string();
-    let provider_state = native_thread_id.map(|id| {
-        zenui_provider_api::ProviderSessionState {
-            native_thread_id: Some(id),
-            metadata: None,
-        }
+    let provider_state = native_thread_id.map(|id| zenui_provider_api::ProviderSessionState {
+        native_thread_id: Some(id),
+        metadata: None,
     });
     SessionDetail {
         summary: SessionSummary {

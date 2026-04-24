@@ -14,7 +14,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{PermissionMode, ProjectRecord, ProviderKind, ReasoningEffort, SessionDetail, SessionSummary};
+use crate::{
+    PermissionMode, ProjectRecord, ProviderKind, ReasoningEffort, SessionDetail, SessionSummary,
+};
 
 /// Lean peek at a session — what the agent gets back from
 /// `flowstate_list_sessions`. Wraps [`SessionSummary`] with short

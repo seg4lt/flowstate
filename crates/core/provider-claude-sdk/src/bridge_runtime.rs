@@ -192,8 +192,12 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
 
     // `npm` on Unix is a shim script that shebangs to node. On Windows
     // the shim is `npm.cmd`. Both live alongside `node` in bin_dir.
-    let npm_path = locate_npm(&node.bin_dir)
-        .ok_or_else(|| anyhow!("npm not found alongside embedded node at {}", node.bin_dir.display()))?;
+    let npm_path = locate_npm(&node.bin_dir).ok_or_else(|| {
+        anyhow!(
+            "npm not found alongside embedded node at {}",
+            node.bin_dir.display()
+        )
+    })?;
 
     // Prefer `npm ci` when a lockfile is staged alongside the
     // extracted bridge — it enforces exact versions, refuses to

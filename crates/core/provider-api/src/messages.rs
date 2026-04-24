@@ -540,7 +540,9 @@ pub enum ClientMessage {
     /// enforces the new value at capture time; disabled skips
     /// capture entirely, and `RewindFiles` surfaces `Disabled` so
     /// the UI can nudge the user back to the settings toggle.
-    SetCheckpointsEnabled { enabled: bool },
+    SetCheckpointsEnabled {
+        enabled: bool,
+    },
     /// Read the current checkpoint-settings snapshot. The same data
     /// ships on the `BootstrapPayload`, so the frontend only needs
     /// this for explicit re-syncs (e.g. after a settings dialog reopens

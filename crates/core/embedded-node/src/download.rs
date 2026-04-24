@@ -160,8 +160,14 @@ mod tests {
         let err = verify_sha256(b"not empty", &wrong)
             .expect_err("non-empty input must not hash to all-zeroes");
         let msg = format!("{err:#}");
-        assert!(msg.contains("mismatch"), "error should name the mismatch: {msg}");
-        assert!(msg.contains(&wrong), "error should echo the expected digest: {msg}");
+        assert!(
+            msg.contains("mismatch"),
+            "error should name the mismatch: {msg}"
+        );
+        assert!(
+            msg.contains(&wrong),
+            "error should echo the expected digest: {msg}"
+        );
     }
 
     #[test]

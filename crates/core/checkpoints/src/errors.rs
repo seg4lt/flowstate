@@ -40,10 +40,7 @@ pub enum CheckpointError {
     /// unreadable and rewind to that checkpoint will surface as
     /// `NoCheckpoint` to the caller.
     #[error("manifest at {path:?} is corrupt or unknown version: {reason}")]
-    ManifestCorrupt {
-        path: PathBuf,
-        reason: String,
-    },
+    ManifestCorrupt { path: PathBuf, reason: String },
 
     /// A blob referenced by a manifest is missing from the blob store.
     /// Usually indicates GC ran too eagerly (a bug) or manual tampering
@@ -56,10 +53,7 @@ pub enum CheckpointError {
     /// Most commonly: the session predates the feature, the capture failed
     /// silently, or the caller is using a stale turn id.
     #[error("no checkpoint found for session {session_id} turn {turn_id}")]
-    NoCheckpoint {
-        session_id: String,
-        turn_id: String,
-    },
+    NoCheckpoint { session_id: String, turn_id: String },
 
     /// A blake3 hash string did not parse as `blake3:<64 hex chars>`. Only
     /// raised by the `BlobHash` newtype constructor; the capture path
@@ -71,18 +65,12 @@ pub enum CheckpointError {
     /// The `root` passed to `capture` or `restore` is not a directory, or
     /// canonicalization failed.
     #[error("workspace root {root:?} is not a usable directory: {reason}")]
-    InvalidRoot {
-        root: PathBuf,
-        reason: String,
-    },
+    InvalidRoot { root: PathBuf, reason: String },
 }
 
 impl From<io::Error> for CheckpointError {
     fn from(source: io::Error) -> Self {
-        Self::Io {
-            path: None,
-            source,
-        }
+        Self::Io { path: None, source }
     }
 }
 

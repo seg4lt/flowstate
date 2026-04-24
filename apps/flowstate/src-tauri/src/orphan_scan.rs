@@ -174,9 +174,7 @@ fn is_orphan_signature(cmd: &[String]) -> bool {
         .and_then(|s| std::path::Path::new(s).file_name())
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    if exe_basename == "opencode"
-        && cmd.get(1).map(|s| s.as_str() == "serve").unwrap_or(false)
-    {
+    if exe_basename == "opencode" && cmd.get(1).map(|s| s.as_str() == "serve").unwrap_or(false) {
         return true;
     }
     false
@@ -228,9 +226,8 @@ mod tests {
         ];
         assert!(!is_orphan_signature(&opencode_without_serve));
 
-        let flowstate_bare = vec![
-            "/Applications/flowstate.app/Contents/MacOS/flowstate".to_string(),
-        ];
+        let flowstate_bare =
+            vec!["/Applications/flowstate.app/Contents/MacOS/flowstate".to_string()];
         assert!(!is_orphan_signature(&flowstate_bare));
 
         let empty: Vec<String> = vec![];

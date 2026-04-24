@@ -25,17 +25,15 @@
 use std::sync::Arc;
 
 use reqwest::Client;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
 
 use flowstate_app_layer::usage::{
-    TopSessionRow, UsageAgentPayload, UsageBucket, UsageGroupBy, UsageRange,
-    UsageSummaryPayload, UsageTimeseriesPayload,
+    TopSessionRow, UsageAgentPayload, UsageBucket, UsageGroupBy, UsageRange, UsageSummaryPayload,
+    UsageTimeseriesPayload,
 };
-use flowstate_app_layer::user_config::{
-    ProjectDisplay, ProjectWorktree, SessionDisplay,
-};
+use flowstate_app_layer::user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay};
 use std::collections::HashMap;
 
 /// Shared client. Holds a `reqwest::Client` + a `watch::Receiver`
@@ -311,12 +309,12 @@ impl DaemonClient {
         .await
     }
 
-    pub async fn get_usage_by_agent(
-        &self,
-        range: UsageRange,
-    ) -> Result<UsageAgentPayload, String> {
-        self.post("/api/usage/by_agent", &serde_json::json!({ "range": range }))
-            .await
+    pub async fn get_usage_by_agent(&self, range: UsageRange) -> Result<UsageAgentPayload, String> {
+        self.post(
+            "/api/usage/by_agent",
+            &serde_json::json!({ "range": range }),
+        )
+        .await
     }
 
     pub async fn get_usage_by_agent_role(
@@ -344,7 +342,10 @@ pub struct DaemonBaseUrl {
 impl DaemonBaseUrl {
     pub fn new() -> Self {
         let (tx, rx) = watch::channel(None);
-        Self { tx: Arc::new(tx), rx }
+        Self {
+            tx: Arc::new(tx),
+            rx,
+        }
     }
 
     pub fn publish(&self, base_url: String) {

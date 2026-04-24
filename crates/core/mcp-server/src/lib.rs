@@ -111,10 +111,7 @@ impl Config {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--http-base" => {
-                    http_base = Some(
-                        args.next()
-                            .context("--http-base requires a URL argument")?,
-                    );
+                    http_base = Some(args.next().context("--http-base requires a URL argument")?);
                 }
                 "--session-id" => {
                     session_id = Some(
@@ -147,12 +144,10 @@ impl Config {
                 other => bail!("unknown flag: {other}"),
             }
         }
-        let http_base = http_base.context(
-            "http base URL required (--http-base URL or FLOWSTATE_HTTP_BASE env var)",
-        )?;
-        let session_id = session_id.context(
-            "session id required (--session-id ID or FLOWSTATE_SESSION_ID env var)",
-        )?;
+        let http_base = http_base
+            .context("http base URL required (--http-base URL or FLOWSTATE_HTTP_BASE env var)")?;
+        let session_id = session_id
+            .context("session id required (--session-id ID or FLOWSTATE_SESSION_ID env var)")?;
         Ok(Self {
             http_base,
             session_id,
@@ -442,10 +437,7 @@ impl Server {
 // stdio event loop
 // ---------------------------------------------------------------------------
 
-async fn write_response(
-    stdout: &mut tokio::io::Stdout,
-    response: JsonRpcResponse,
-) -> Result<()> {
+async fn write_response(stdout: &mut tokio::io::Stdout, response: JsonRpcResponse) -> Result<()> {
     let line = serde_json::to_string(&response).context("serialize response")?;
     stdout.write_all(line.as_bytes()).await?;
     stdout.write_all(b"\n").await?;
@@ -491,7 +483,10 @@ fn spawn_parent_watchdog(flowstate_pid: u32) {
         // harnesses the value would be wrong anyway). Short-circuit
         // rather than tripping false positives.
         if flowstate_pid <= 1 {
-            warn!(pid = flowstate_pid, "FLOWSTATE_PID unusable; watchdog disabled");
+            warn!(
+                pid = flowstate_pid,
+                "FLOWSTATE_PID unusable; watchdog disabled"
+            );
             return;
         }
         let flowstate_pid = flowstate_pid as libc::pid_t;
@@ -567,11 +562,7 @@ pub async fn run() -> Result<()> {
     let mut reader = BufReader::new(stdin).lines();
     let mut stdout = tokio::io::stdout();
 
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .context("read from stdin")?
-    {
+    while let Some(line) = reader.next_line().await.context("read from stdin")? {
         if line.trim().is_empty() {
             continue;
         }

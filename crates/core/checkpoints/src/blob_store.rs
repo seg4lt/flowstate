@@ -14,7 +14,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::errors::{io_err, CheckpointError};
+use crate::errors::{CheckpointError, io_err};
 use crate::manifest::BlobHash;
 
 /// Thin wrapper around a directory where blobs live. Stateless by
@@ -76,8 +76,7 @@ impl BlobStore {
             // Ours is redundant. Best-effort cleanup of the temp.
             let _ = fs::remove_file(&tmp_path);
         } else {
-            fs::rename(&tmp_path, &final_path)
-                .map_err(|e| io_err(final_path.clone(), e))?;
+            fs::rename(&tmp_path, &final_path).map_err(|e| io_err(final_path.clone(), e))?;
         }
         Ok(hash)
     }
@@ -138,9 +137,7 @@ impl BlobStore {
                 if tail_name.starts_with('.') {
                     continue;
                 }
-                if tail_name.len() != 62
-                    || !tail_name.chars().all(|c| c.is_ascii_hexdigit())
-                {
+                if tail_name.len() != 62 || !tail_name.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue;
                 }
                 let full_hex = format!("{head_name}{tail_name}");
@@ -219,10 +216,7 @@ mod tests {
         let hash = BlobHash::from_hex(&"a".repeat(64)).unwrap();
         let p = store.path_for(&hash);
         let rel = p.strip_prefix(dir.path()).unwrap();
-        assert_eq!(
-            rel,
-            Path::new(&format!("aa/{}", "a".repeat(62)))
-        );
+        assert_eq!(rel, Path::new(&format!("aa/{}", "a".repeat(62))));
     }
 
     #[test]

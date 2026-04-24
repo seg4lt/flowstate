@@ -180,9 +180,7 @@ async fn get_session_display_h(
     into_response(state.user_config.get_session_display(&body.session_id))
 }
 
-async fn list_session_display_h(
-    State(state): State<AppLayerApiState>,
-) -> Response {
+async fn list_session_display_h(State(state): State<AppLayerApiState>) -> Response {
     let r: Result<HashMap<String, SessionDisplay>, String> =
         state.user_config.list_session_display();
     into_response(r)
@@ -225,9 +223,7 @@ async fn get_project_display_h(
     into_response(state.user_config.get_project_display(&body.project_id))
 }
 
-async fn list_project_display_h(
-    State(state): State<AppLayerApiState>,
-) -> Response {
+async fn list_project_display_h(State(state): State<AppLayerApiState>) -> Response {
     let r: Result<HashMap<String, ProjectDisplay>, String> =
         state.user_config.list_project_display();
     into_response(r)
@@ -267,9 +263,7 @@ async fn get_project_worktree_h(
     into_response(state.user_config.get_project_worktree(&body.project_id))
 }
 
-async fn list_project_worktree_h(
-    State(state): State<AppLayerApiState>,
-) -> Response {
+async fn list_project_worktree_h(State(state): State<AppLayerApiState>) -> Response {
     let r: Result<HashMap<String, ProjectWorktree>, String> =
         state.user_config.list_project_worktree();
     into_response(r)

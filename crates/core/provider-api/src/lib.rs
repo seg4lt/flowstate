@@ -55,14 +55,14 @@ pub use helpers::{
     claude_bucket_label, claude_file_change_from_tool_call, first_non_empty_line,
     parse_options_from_value, session_cwd, write_json_line,
 };
+pub use mcp_config::{
+    McpConfigFile, McpServerConfig, flowstate_mcp_config_file, flowstate_mcp_entry,
+    write_mcp_config_file,
+};
 pub use messages::*;
 pub use orchestration::{
     PollOutcome, ProviderCatalogEntry, RuntimeCall, RuntimeCallDispatcher, RuntimeCallError,
     RuntimeCallOrigin, RuntimeCallResult, SessionCreator, SessionDigest, WorktreeSummary,
-};
-pub use mcp_config::{
-    McpConfigFile, McpServerConfig, flowstate_mcp_config_file, flowstate_mcp_entry,
-    write_mcp_config_file,
 };
 pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
 pub use probe::{ProbeCliOptions, probe_cli};

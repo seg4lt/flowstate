@@ -144,10 +144,7 @@ impl PartialOrd for HeapEntry {
 
 impl HeapEntry {
     fn from_row(row: ScheduledWakeupRow) -> Self {
-        let delta = row
-            .fire_at_unix
-            .saturating_sub(now_unix_secs())
-            .max(0) as u64;
+        let delta = row.fire_at_unix.saturating_sub(now_unix_secs()).max(0) as u64;
         Self {
             deadline: Instant::now() + Duration::from_secs(delta),
             wakeup_id: row.wakeup_id,
@@ -278,10 +275,7 @@ struct SchedulerInner {
     fire_handler: Arc<dyn WakeupFireHandler>,
 }
 
-async fn scheduler_loop(
-    inner: Arc<SchedulerInner>,
-    mut rx: mpsc::UnboundedReceiver<SchedulerCmd>,
-) {
+async fn scheduler_loop(inner: Arc<SchedulerInner>, mut rx: mpsc::UnboundedReceiver<SchedulerCmd>) {
     let mut cancelled_ids = std::collections::HashSet::<String>::new();
 
     loop {

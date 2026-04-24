@@ -37,7 +37,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use zenui_provider_api::{

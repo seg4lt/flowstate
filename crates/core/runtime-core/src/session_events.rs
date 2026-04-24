@@ -321,10 +321,7 @@ mod tests {
 
     #[test]
     fn session_id_of_matches_session_scoped_variants() {
-        assert_eq!(
-            session_id_of(&stub_delta("s1", "x")).as_deref(),
-            Some("s1")
-        );
+        assert_eq!(session_id_of(&stub_delta("s1", "x")).as_deref(), Some("s1"));
         let daemon = RuntimeEvent::DaemonShuttingDown {
             reason: "bye".into(),
         };
