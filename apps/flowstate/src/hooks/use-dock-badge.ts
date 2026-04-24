@@ -1,6 +1,7 @@
 import * as React from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useApp } from "@/stores/app-store";
+import { isPopoutWindow } from "@/lib/popout";
 
 /**
  * Sync the macOS Dock / Linux launcher / Windows taskbar icon badge
@@ -28,6 +29,14 @@ export function useDockBadge(): void {
   const done = state.doneSessionIds;
 
   React.useEffect(() => {
+    // Thread popouts share the same AppProvider (they hydrate from
+    // the same broadcast stream) and would otherwise race the main
+    // window to set the dock badge — whichever window's effect
+    // fired last would clobber the other's count. Since the dock
+    // icon is app-wide, delegating the badge exclusively to the
+    // main window is both correct and avoids the flicker.
+    if (isPopoutWindow()) return;
+
     const ids = new Set<string>();
     for (const id of awaiting) ids.add(id);
     for (const id of done) ids.add(id);

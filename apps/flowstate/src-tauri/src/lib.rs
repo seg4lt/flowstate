@@ -1842,6 +1842,86 @@ fn pty_kill(manager: State<'_, PtyManager>, id: PtyId) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Thread popout — spawn a second webview window pinned to a single
+// session, with an optional "always on top" flag
+// ─────────────────────────────────────────────────────────────────
+//
+// The popout window reuses the main app bundle: the frontend reads
+// `?popout=1` from the URL to render a stripped shell (no sidebar /
+// terminal dock) around the same `<ChatView sessionId=…>` the main
+// window uses. Because `connect` subscribes to a broadcast channel
+// (see `transport-tauri::commands::connect`), every popout gets its
+// own independent subscription and stays in sync with the main
+// window with zero extra plumbing.
+//
+// Labels are deterministic (`thread-<session_id>`) so a second click
+// on the same thread's "Pop out" button just re-focuses the existing
+// window instead of stacking duplicates. The capability file
+// (capabilities/default.json) widens its `windows` list with a
+// `thread-*` glob so the new window inherits the same IPC surface
+// the main window has.
+
+/// Build the deterministic window label for a session's popout.
+/// Extracted so the frontend (via `getCurrentWindow().label`) and
+/// the Rust side never disagree on the format.
+fn popout_window_label(session_id: &str) -> String {
+    format!("thread-{session_id}")
+}
+
+#[tauri::command]
+async fn popout_thread(
+    app: tauri::AppHandle,
+    session_id: String,
+    always_on_top: bool,
+) -> Result<(), String> {
+    let label = popout_window_label(&session_id);
+
+    // Already open? Flip the pin to match the caller's current
+    // preference (the user may have toggled it in the main header
+    // since the window was last focused), unminimize if needed,
+    // and bring it forward. Errors from set_always_on_top are
+    // swallowed — the window still exists and focusing it is the
+    // more important half of the contract.
+    if let Some(existing) = app.get_webview_window(&label) {
+        let _ = existing.set_always_on_top(always_on_top);
+        let _ = existing.unminimize();
+        let _ = existing.show();
+        return existing.set_focus().map_err(|e| e.to_string());
+    }
+
+    // `WebviewUrl::App` is resolved by Tauri relative to the
+    // frontend's base URL (the Vite dev server in `tauri dev`,
+    // the bundled `index.html` in release). The `?popout=1`
+    // query string is what the frontend keys off to render the
+    // stripped shell — see `isPopoutWindow` in `src/lib/popout.ts`.
+    let url = format!("/chat/{session_id}?popout=1");
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        &label,
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title("flowstate — thread")
+    .inner_size(480.0, 720.0)
+    .min_inner_size(360.0, 480.0)
+    .always_on_top(always_on_top)
+    .build()
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_window_always_on_top(
+    app: tauri::AppHandle,
+    label: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let win = app
+        .get_webview_window(&label)
+        .ok_or_else(|| format!("no window with label {label}"))?;
+    win.set_always_on_top(enabled).map_err(|e| e.to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────
 // user_config — flowstate-app-owned key/value store
 // ─────────────────────────────────────────────────────────────────
 //
@@ -2752,6 +2832,8 @@ pub fn run() {
             pty_pause,
             pty_resume,
             pty_kill,
+            popout_thread,
+            set_window_always_on_top,
             get_user_config,
             set_user_config,
             set_session_display,
