@@ -9,6 +9,7 @@ import {
 } from "@/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useApp } from "@/stores/app-store";
+import { rememberPickedModel, readPickedModel } from "@/lib/model-settings";
 import type { ProviderKind } from "@/lib/types";
 
 interface ModelSelectorProps {
@@ -67,23 +68,31 @@ export function ModelSelector({
   }
 
   // Label resolution fallback chain:
-  //   1. exact match on the session's stored model → its catalog label
-  //      (the usual case once the model is resolved)
-  //   2. the raw model id itself — e.g. when the SDK pinned a
-  //      date-stamped variant we haven't catalogued yet
-  //   3. the first entry in the provider's model list — populated from
-  //      the Claude SDK bridge's `q.supportedModels()`, whose first
-  //      entry IS the SDK's default, so a freshly spawned session
-  //      with `session.model === undefined` shows the real default
-  //      label (e.g. "Claude Opus 4.7") immediately instead of the
-  //      generic "Default" placeholder that used to linger until the
-  //      `model_resolved` event arrived after the first turn.
-  //   4. literal "Default" — only if the provider hasn't enumerated
+  //   1. exact match on the session's stored model → its catalog
+  //      label (the usual case when `session.model` is still the
+  //      user-picked alias).
+  //   2. the per-session picked alias we stashed when the user picked
+  //      from the dropdown (or when the session was spawned) → its
+  //      catalog label. This is what keeps the chip reading "Sonnet"
+  //      after `model_resolved` has replaced `session.model` with a
+  //      pinned id like `claude-sonnet-4-6-20251015`.
+  //   3. the raw model id itself — e.g. when the SDK pinned a
+  //      date-stamped variant we haven't catalogued and there's no
+  //      cached alias either.
+  //   4. the first entry in the provider's model list — populated
+  //      from the Claude SDK bridge's `q.supportedModels()`, whose
+  //      first entry IS the SDK's default. Covers the fresh-spawn
+  //      `session.model === undefined` window.
+  //   5. literal "Default" — only if the provider hasn't enumerated
   //      any models yet (the `models.length === 0` branch above has
   //      already short-circuited for that case, so this is belt-and-
   //      braces).
+  const pickedModel = readPickedModel(sessionId);
   const currentLabel =
     models.find((m) => m.value === currentModel)?.label ??
+    (pickedModel
+      ? models.find((m) => m.value === pickedModel)?.label
+      : undefined) ??
     currentModel ??
     models[0]?.label ??
     "Default";
@@ -91,6 +100,13 @@ export function ModelSelector({
 
   async function handleSelect(model: string) {
     setOpen(false);
+    // Stash the alias BEFORE sending so the capability lookups in
+    // chat-toolbar / chat-view's clamp effect see the pick on the
+    // very next render. The SDK will later emit `model_resolved` with
+    // a pinned id that replaces `session.model`, but by then our
+    // cached alias is already the source of truth for "which catalog
+    // entry does this session correspond to?".
+    rememberPickedModel(sessionId, model);
     await send({
       type: "update_session_model",
       session_id: sessionId,
@@ -133,7 +149,16 @@ export function ModelSelector({
           <CommandList>
             <CommandEmpty>No models match.</CommandEmpty>
             {models.map((model) => {
-              const isSelected = currentModel === model.value;
+              // Highlight the entry matching the user-picked alias
+              // when one is cached — after `model_resolved` replaces
+              // `session.model` with a pinned id, `currentModel`
+              // stops matching any catalog entry and the dropdown
+              // would lose its highlight without this. `pickedModel`
+              // falls back to `currentModel` so sessions that never
+              // went through the pick/spawn flow (e.g. imported
+              // history) still highlight correctly.
+              const isSelected =
+                model.value === (pickedModel ?? currentModel);
               // The string cmdk fuzzy-matches against. Join label +
               // value so searching for either works — the displayed
               // label is often pretty ("Claude Sonnet 4"), while

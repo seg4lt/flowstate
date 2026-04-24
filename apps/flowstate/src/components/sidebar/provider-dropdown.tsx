@@ -15,6 +15,7 @@ import {
 import { useApp } from "@/stores/app-store";
 import type { ProviderKind } from "@/lib/types";
 import { readDefaultModel } from "@/lib/defaults-settings";
+import { rememberPickedModel } from "@/lib/model-settings";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constants";
 import { SearchableModelSubMenu } from "./searchable-model-submenu";
@@ -117,6 +118,13 @@ export function ProviderDropdown({
       project_id: projectId,
     });
     if (res && res.type === "session_created") {
+      // Remember the alias we spawned with so the composer toolbar's
+      // capability lookups (effort / adaptive) survive the SDK
+      // replacing `session.model` with a pinned id on turn 1 — see
+      // the rationale in `lib/model-settings.ts`.
+      if (resolvedModel) {
+        rememberPickedModel(res.session.sessionId, resolvedModel);
+      }
       navigate({
         to: "/chat/$sessionId",
         params: { sessionId: res.session.sessionId },

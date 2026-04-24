@@ -1,11 +1,35 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
   clampEffortToModel,
   clampThinkingModeToModel,
   EFFORT_ORDER,
   MODEL_GATED_EFFORT_LEVELS,
+  readPickedModel,
+  rememberPickedModel,
 } from "./model-settings";
 import type { ProviderModel } from "./types";
+
+// Minimal in-memory sessionStorage shim so the tests run under
+// `--environment=node` (vitest's jsdom env fails to start on this
+// machine due to an unrelated ESM infra bug — see the commit
+// message).
+class MemoryStorage {
+  private store = new Map<string, string>();
+  getItem(key: string): string | null {
+    return this.store.has(key) ? (this.store.get(key) as string) : null;
+  }
+  setItem(key: string, value: string): void {
+    this.store.set(key, value);
+  }
+  removeItem(key: string): void {
+    this.store.delete(key);
+  }
+  clear(): void {
+    this.store.clear();
+  }
+}
+// @ts-expect-error — attaching to the global for the duration of the tests.
+globalThis.sessionStorage = new MemoryStorage();
 
 // Helper: build a minimal ProviderModel for testing.
 function model(overrides: Partial<ProviderModel> = {}): ProviderModel {
@@ -121,5 +145,34 @@ describe("clampThinkingModeToModel", () => {
     const noSupport = model({ supportsAdaptiveThinking: false });
     expect(clampThinkingModeToModel("always", supports)).toBe("always");
     expect(clampThinkingModeToModel("always", noSupport)).toBe("always");
+  });
+});
+
+describe("rememberPickedModel / readPickedModel", () => {
+  beforeEach(() => {
+    // Reset between tests so state from one case doesn't leak.
+    (globalThis.sessionStorage as unknown as MemoryStorage).clear();
+  });
+
+  it("round-trips a picked alias per session id", () => {
+    rememberPickedModel("sess-1", "sonnet");
+    expect(readPickedModel("sess-1")).toBe("sonnet");
+  });
+
+  it("returns undefined for a session that never had a model remembered", () => {
+    expect(readPickedModel("sess-never")).toBeUndefined();
+  });
+
+  it("keeps per-session entries independent", () => {
+    rememberPickedModel("sess-1", "sonnet");
+    rememberPickedModel("sess-2", "default");
+    expect(readPickedModel("sess-1")).toBe("sonnet");
+    expect(readPickedModel("sess-2")).toBe("default");
+  });
+
+  it("overwrites when the user picks a different alias on the same session", () => {
+    rememberPickedModel("sess-1", "sonnet");
+    rememberPickedModel("sess-1", "haiku");
+    expect(readPickedModel("sess-1")).toBe("haiku");
   });
 });

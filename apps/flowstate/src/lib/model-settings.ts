@@ -1,5 +1,35 @@
 // Centralised normalisation for composer settings (effort,
-// thinking-mode) against the active model's capabilities.
+// thinking-mode) against the active model's capabilities, plus a
+// per-session cache of the dropdown-alias the user actually picked.
+//
+// ─── Why the picked-alias cache exists ────────────────────────────
+//
+// The Claude Agent SDK's `q.supportedModels()` returns *aliases* as
+// model `value`s — `"default"`, `"sonnet"`, `"sonnet[1m]"`, `"haiku"`.
+// Each alias carries its own `supportedEffortLevels` /
+// `supportsAdaptiveThinking` flags. The user picks an alias from the
+// toolbar dropdown, and we send that alias to the SDK as the model.
+//
+// On the first turn the SDK emits a `model_resolved` event with the
+// *pinned* id it actually ran on — e.g. `"claude-opus-4-7-20250514"`
+// for `"default"`, `"claude-sonnet-4-6-20251015"` for `"sonnet"`.
+// runtime-core persists this pinned id onto `session.summary.model`
+// so subsequent UI reads "what actually ran this turn".
+//
+// Problem: the pinned id has no textual relationship to the alias
+// (especially `"default"` → `claude-opus-4-7-*`). So a catalog
+// lookup against the post-`model_resolved` `session.model` returns
+// `undefined`, and every capability-gated control (effort selector,
+// Adaptive pill, clamp-on-model-change effect) sees empty flags and
+// silently misbehaves.
+//
+// Fix: stash the alias the user picked (or that the session spawned
+// with) in sessionStorage, keyed by sessionId. Capability-consuming
+// sites resolve via `pickedModel ?? session.model`, so the right
+// dropdown entry is found even after the pinned id has replaced the
+// alias on `session.summary.model`. `session.summary.model` remains
+// the source of truth for "what ran" — it's what agent-message
+// headers, cost attribution, and usage dashboards read.
 //
 // The Claude Agent SDK populates `ProviderModel.supportedEffortLevels`
 // and `ProviderModel.supportsAdaptiveThinking` per-model — but nothing
@@ -125,4 +155,51 @@ export function clampThinkingModeToModel(
     return "always";
   }
   return mode;
+}
+
+// ─── Picked-alias cache (per sessionId) ────────────────────────────
+// Stored in sessionStorage, not the app store, because the right
+// lifetime is "one browser tab" — same as `effort`, `thinkingMode`,
+// and `permissionMode`. Lost on reload, which is fine: on reload the
+// session will re-run through `model_resolved` on its next turn and
+// the alias is gone anyway; we fall back to `session.model` and
+// display degrades gracefully (entry = undefined). For the in-tab
+// session where users actually interact with these controls, the
+// cache lives exactly as long as it's useful.
+
+const PICKED_MODEL_STORAGE_PREFIX = "flowstate:pickedModel:";
+
+function pickedModelKey(sessionId: string): string {
+  return `${PICKED_MODEL_STORAGE_PREFIX}${sessionId}`;
+}
+
+/**
+ * Record the dropdown-alias the user picked (or that the session
+ * spawned with) so later capability lookups can find the matching
+ * catalog entry even after `model_resolved` has replaced
+ * `session.model` with a pinned id.
+ *
+ * Silent on storage failures — sessionStorage can throw in private-
+ * browsing mode and we don't want to take the toolbar down for an
+ * edge-case persistence blip.
+ */
+export function rememberPickedModel(sessionId: string, model: string): void {
+  try {
+    sessionStorage.setItem(pickedModelKey(sessionId), model);
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+/**
+ * Read the previously-remembered alias for a session, or `undefined`
+ * if we've never seen the user pick / spawn with a model (fresh tab
+ * on an existing session) or if storage access failed.
+ */
+export function readPickedModel(sessionId: string): string | undefined {
+  try {
+    return sessionStorage.getItem(pickedModelKey(sessionId)) ?? undefined;
+  } catch {
+    return undefined;
+  }
 }

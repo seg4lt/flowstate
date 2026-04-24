@@ -7,6 +7,7 @@ import { useApp } from "@/stores/app-store";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
 import { resolveModelDisplay } from "@/lib/model-lookup";
+import { readPickedModel } from "@/lib/model-settings";
 import type {
   ProviderKind,
   ReasoningEffort,
@@ -47,8 +48,20 @@ export function ChatToolbar({
   // SDK's `ModelInfo.supportedEffortLevels`; it's empty when the
   // provider hasn't enumerated levels, which the selector treats as
   // "show flowstate's base set".
+  //
+  // We try the user-picked alias first (`readPickedModel`), then
+  // fall back to `currentModel`. The SDK's `supportedModels()`
+  // returns aliases like `"default"`/`"sonnet"`, and on turn 1 the
+  // SDK's `model_resolved` event replaces `session.model` with an
+  // unrelated pinned id like `"claude-opus-4-7-20250514"` that has
+  // no catalog entry — so without the picked-alias preference the
+  // lookup would return `undefined`, collapsing
+  // `supportedEffortLevels` to `[]` and disabling Adaptive on every
+  // model after the first turn. The full rationale for the cache
+  // lives in `lib/model-settings.ts`.
+  const pickedModel = readPickedModel(sessionId);
   const modelEntry = resolveModelDisplay(
-    currentModel,
+    pickedModel ?? currentModel,
     provider,
     state.providers,
   ).entry;

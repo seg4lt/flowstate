@@ -18,6 +18,7 @@ import { useApp } from "@/stores/app-store";
 import type { ProviderKind } from "@/lib/types";
 import type { GitWorktree } from "@/lib/api";
 import { readDefaultModel } from "@/lib/defaults-settings";
+import { rememberPickedModel } from "@/lib/model-settings";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useDefaultProvider } from "@/hooks/use-default-provider";
 import {
@@ -226,6 +227,12 @@ function WorktreeDropdownInner({
           project_id: wtProjectId,
         });
         if (res?.type === "session_created") {
+          // Remember the spawn alias so capability lookups in the
+          // toolbar survive the SDK's `model_resolved` overwrite —
+          // see `lib/model-settings.ts`.
+          if (model) {
+            rememberPickedModel(res.session.sessionId, model);
+          }
           navigate({
             to: "/chat/$sessionId",
             params: { sessionId: res.session.sessionId },
@@ -269,6 +276,9 @@ function WorktreeDropdownInner({
       project_id: projectId,
     });
     if (res && res.type === "session_created") {
+      if (resolvedModel) {
+        rememberPickedModel(res.session.sessionId, resolvedModel);
+      }
       navigate({
         to: "/chat/$sessionId",
         params: { sessionId: res.session.sessionId },

@@ -38,6 +38,7 @@ import {
 import {
   clampEffortToModel,
   clampThinkingModeToModel,
+  readPickedModel,
 } from "@/lib/model-settings";
 import { resolveModelDisplay } from "@/lib/model-lookup";
 import {
@@ -945,22 +946,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // switches to a model that doesn't support them. Covers all three
   // ways the model field can change:
   //   1. user picks a new model via `ModelSelector`,
-  //   2. the Claude SDK emits `model_resolved` on turn 1 (which can
-  //      replace an alias with a pinned date-stamped id whose
-  //      capability flags may differ), and
+  //   2. the Claude SDK emits `model_resolved` on turn 1 (which
+  //      replaces `session.model` with a pinned id that has no
+  //      catalog entry — so we prefer the cached picked-alias for
+  //      the capability lookup, see `lib/model-settings.ts`), and
   //   3. session hydration from sessionStorage after an app restart —
   //      the stored effort/mode may outlive a later model change.
   //
-  // Skipped when the catalog hasn't loaded the session's model yet
-  // (`resolveModelDisplay(...).entry === undefined`): we'd rather
-  // leave the user's stored preference alone than flip it prematurely
-  // on a bootstrap that's about to resolve the entry anyway. The
-  // effect re-runs when `state.providers` updates, so the clamp
-  // eventually fires once the catalog lands.
+  // Skipped when we can't find a catalog entry at all (neither the
+  // picked alias nor `session.model` match). That happens briefly
+  // during bootstrap before `state.providers` lands, or on imported
+  // sessions whose alias we never cached. In both cases we prefer
+  // the user's stored preference over a premature flip — the effect
+  // re-runs when `state.providers` updates, so the clamp eventually
+  // fires once the catalog is available.
   React.useEffect(() => {
     if (!session?.model) return;
+    const pickedModel = readPickedModel(sessionId);
     const { entry } = resolveModelDisplay(
-      session.model,
+      pickedModel ?? session.model,
       session.provider,
       state.providers,
     );
@@ -970,6 +974,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     const nextMode = clampThinkingModeToModel(thinkingMode, entry);
     if (nextMode !== thinkingMode) setThinkingMode(nextMode);
   }, [
+    sessionId,
     session?.model,
     session?.provider,
     state.providers,
