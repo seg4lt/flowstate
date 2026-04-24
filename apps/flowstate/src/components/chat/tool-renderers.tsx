@@ -1,8 +1,10 @@
 import * as React from "react";
 import { structuredPatch, formatPatch, FILE_HEADERS_ONLY } from "diff";
 import { PatchDiff } from "@pierre/diffs/react";
+import { Maximize2, X } from "lucide-react";
 import { CodeBlock as ShikiCodeBlock } from "./messages/code-block";
 import { MarkdownContent } from "./messages/markdown-content";
+import { Button } from "@/components/ui/button";
 import { extractToolOutputText } from "@/lib/parse-tool-output";
 
 // Per-tool args renderers. Looked up by tool name. The default falls
@@ -525,6 +527,23 @@ function CollapsibleMarkdown({ label, body }: { label: string; body: string }) {
 // ---------------------------------------------------------------------------
 export function ToolOutputContent({ output }: { output: string }) {
   const { text, isMarkdown } = extractToolOutputText(output);
+  const [expanded, setExpanded] = React.useState(false);
+
+  // ESC closes the expanded overlay. We register the listener only while
+  // the overlay is open so it doesn't compete with other ESC handlers
+  // (e.g. closing menus) on the page when collapsed.
+  React.useEffect(() => {
+    if (!expanded) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setExpanded(false);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
+
   if (!isMarkdown) {
     return (
       <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-muted/60 p-2 text-[11px] text-muted-foreground">
@@ -532,9 +551,65 @@ export function ToolOutputContent({ output }: { output: string }) {
       </pre>
     );
   }
+
   return (
-    <div className="max-h-40 overflow-auto rounded bg-muted/60 p-2 text-xs text-muted-foreground [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_pre]:text-[10px]">
-      <MarkdownContent content={text} />
+    <>
+      <div className="relative">
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={() => setExpanded(true)}
+          aria-label="Expand output"
+          title="Expand"
+          className="absolute top-1 right-1 z-10 bg-background/80 text-muted-foreground hover:text-foreground"
+        >
+          <Maximize2 className="h-3 w-3" />
+        </Button>
+        <div className="max-h-40 overflow-auto rounded bg-muted/60 p-2 text-xs text-muted-foreground [&_h1]:text-sm [&_h2]:text-xs [&_h3]:text-xs [&_pre]:text-[10px]">
+          <MarkdownContent content={text} />
+        </div>
+      </div>
+      {expanded && <ExpandedOutputOverlay text={text} onClose={() => setExpanded(false)} />}
+    </>
+  );
+}
+
+// Low-key floating panel — opaque, no backdrop dim/blur. Sits above the
+// page on a high z-index, but doesn't block the rest of the UI visually.
+// Close via ESC (handled in ToolOutputContent) or the X button.
+function ExpandedOutputOverlay({
+  text,
+  onClose,
+}: {
+  text: string;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      role="dialog"
+      aria-modal="false"
+      aria-label="Expanded tool output"
+      className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center p-6"
+    >
+      <div className="pointer-events-auto flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl ring-1 ring-foreground/10">
+        <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            Output
+          </span>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            onClick={onClose}
+            aria-label="Close"
+            title="Close"
+          >
+            <X className="h-3 w-3" />
+          </Button>
+        </div>
+        <div className="overflow-auto p-4 text-sm [&_pre]:text-xs">
+          <MarkdownContent content={text} />
+        </div>
+      </div>
     </div>
   );
 }
