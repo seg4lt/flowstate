@@ -1248,6 +1248,12 @@ const CodeViewBody = React.memo(function CodeViewBody({
         sessionId={sessionId}
         surface="code"
         pathAttr="data-code-path"
+        // The Virtualizer below is our scroll container — it needs a
+        // bounded height ancestor or `overflow-auto` has nothing to
+        // clip against. Without this `h-full`, the overlay wrapper
+        // collapses to content height and long files silently overflow
+        // the pane with no scrollbar.
+        className="h-full"
       >
         <Virtualizer className="h-full overflow-auto">
           <PierreFile

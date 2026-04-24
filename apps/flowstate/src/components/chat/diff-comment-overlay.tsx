@@ -47,6 +47,7 @@ export function DiffCommentOverlay({
   sessionId,
   surface,
   pathAttr,
+  className,
   children,
 }: {
   sessionId: string | null;
@@ -56,6 +57,12 @@ export function DiffCommentOverlay({
    *  `data-search-path` in the multibuffer, `data-code-path` in the
    *  open-file code viewer tab. */
   pathAttr: "data-diff-path" | "data-search-path" | "data-code-path";
+  /** Extra classes for the wrapper div. Callers that host a scroll
+   *  container inside us (the open-file code viewer's Virtualizer)
+   *  need to pass `h-full` — without it our wrapper collapses to
+   *  content height and the child's `h-full overflow-auto` has
+   *  nothing bounded to scroll against. */
+  className?: string;
   children: React.ReactNode;
 }) {
   const containerRef = React.useRef<HTMLDivElement>(null);
@@ -226,6 +233,7 @@ export function DiffCommentOverlay({
   if (!enabled) {
     return (
       <div
+        className={className}
         data-comment-overlay-status="disabled"
         data-comment-overlay-surface={surface}
       >
@@ -237,7 +245,7 @@ export function DiffCommentOverlay({
   return (
     <div
       ref={containerRef}
-      className="relative"
+      className={cn("relative", className)}
       data-comment-overlay-status="enabled"
       data-comment-overlay-surface={surface}
     >
