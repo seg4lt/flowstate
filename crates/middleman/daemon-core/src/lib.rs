@@ -330,6 +330,13 @@ pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -
         ReadyFile::for_project(&config.project_root).context("resolve daemon ready file")?;
     let shutdown_grace = config.shutdown_grace;
 
+    // Hand-off clone of the adapter vector for the shutdown sweep.
+    // `graceful_shutdown` needs the same `Arc<dyn ProviderAdapter>`s
+    // that were handed to `RuntimeCore` so it can call
+    // `adapter.shutdown()` on each. Cloning a `Vec<Arc<_>>` is cheap —
+    // one refcount bump per adapter.
+    let shutdown_adapters = config.adapters.clone();
+
     let result: Result<()> = {
         let lifecycle_inner = lifecycle.clone();
         let runtime_inner = runtime_core.clone();
@@ -403,7 +410,13 @@ pub fn run_blocking(config: DaemonConfig, transports: Vec<Box<dyn Transport>>) -
                 }
             }
 
-            graceful_shutdown(runtime_inner, lifecycle_inner, shutdown_grace).await?;
+            graceful_shutdown(
+                runtime_inner,
+                lifecycle_inner,
+                &shutdown_adapters,
+                shutdown_grace,
+            )
+            .await?;
 
             // Drain transports in reverse order of start.
             for h in handles.into_iter().rev() {

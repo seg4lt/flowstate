@@ -890,6 +890,22 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             mcp_servers,
         })
     }
+
+    /// Daemon-shutdown hook: kill every cached Copilot SDK bridge
+    /// child. Mirrors `invalidate_session` but sweeps the whole cache
+    /// in one pass so `graceful_shutdown` reaps the bridges without
+    /// relying on Drop timing.
+    async fn shutdown(&self) {
+        for (session_id, cached) in self.sessions.drain_all().await {
+            let mut process = cached.inner().lock().await;
+            if let Err(e) = process.child.start_kill() {
+                debug!(
+                    %session_id,
+                    "github-copilot shutdown: start_kill failed (child likely already exited): {e}"
+                );
+            }
+        }
+    }
 }
 
 impl GitHubCopilotAdapter {

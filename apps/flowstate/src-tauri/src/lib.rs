@@ -5,6 +5,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// Shutdown-gate atomics for the two-phase Tauri exit flow. Every
+/// close path (red traffic light, Cmd+Q, SIGTERM, SIGINT) funnels
+/// through `RunEvent::ExitRequested`; the gate checks these two
+/// atomics to decide whether to allow the process to exit or to
+/// prevent exit and let the daemon task keep running.
+///
+/// - `SHUTDOWN_STARTED` guards one-shot install of the watchdog
+///   thread (prevents multiple watchdogs if the user clicks close
+///   several times).
+/// - `SHUTDOWN_COMPLETE` is flipped by the daemon task at the very
+///   end of its `async move` block, after `graceful_shutdown` has
+///   swept every adapter and handle/core/config have been dropped.
+///   The next `ExitRequested` observes `true` and allows the actual
+///   process termination.
+///
+/// See the big block comment above the `on_window_event` handler at
+/// the bottom of `run()` for the full sequence diagram.
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
+
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::Emitter;
@@ -2072,6 +2092,37 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
+            // Install a default app menu on macOS.
+            //
+            // Why: Tauri v2 does NOT apply a default menu automatically.
+            // Without any menu, NSApplication has no menu item bound to
+            // `terminate:`, so Cmd+Q is a no-op — the user observes
+            // "flowstate doesn't quit on Cmd+Q". `Menu::default` builds
+            // the standard Apple-style menu (App > About / Quit, Edit,
+            // Window, View, Help) which wires Cmd+Q back into the
+            // normal NSApp terminate path. From there Tauri emits
+            // `RunEvent::ExitRequested`, which the builder's `run`
+            // closure below turns into a graceful daemon shutdown.
+            //
+            // Non-macOS platforms keep no explicit menu (Linux/Windows
+            // Tauri apps have no menubar by default and the
+            // close-button already terminates the process — see the
+            // `WindowEvent::CloseRequested` arm below).
+            #[cfg(target_os = "macos")]
+            {
+                match tauri::menu::Menu::default(&app.handle().clone()) {
+                    Ok(menu) => {
+                        if let Err(e) = app.handle().set_menu(menu) {
+                            tracing::warn!(
+                                %e,
+                                "failed to install default app menu; Cmd+Q will be inoperative"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(%e, "failed to build default app menu"),
+                }
+            }
+
             // Orphan scan — first thing in setup, BEFORE we bind the
             // loopback HTTP port. If a previous flowstate was SIGKILL'd
             // (routine during `tauri dev` reload), its `opencode serve`
@@ -2170,6 +2221,15 @@ pub fn run() {
             // ProvisionEvent can be forwarded to the webview via
             // `emit("provision", …)`.
             let provision_app_handle = app.handle().clone();
+
+            // Clone for the daemon task's end-of-scope exit trigger.
+            // After `graceful_shutdown` + explicit drops complete, the
+            // daemon task sets `SHUTDOWN_COMPLETE` and calls
+            // `app_handle_for_daemon.exit(0)`. That re-enters the
+            // `RunEvent::ExitRequested` gate in `.run(|_,_| …)` below
+            // which now observes `SHUTDOWN_COMPLETE == true` and lets
+            // Tauri tear the event loop down cleanly.
+            let app_handle_for_daemon = app.handle().clone();
 
             // Run the daemon on Tauri's existing tokio runtime so the
             // process has exactly one thread pool. The previous shape
@@ -2440,11 +2500,34 @@ pub fn run() {
                 let _ = graceful_shutdown(
                     core.runtime_core.clone(),
                     core.lifecycle.clone(),
+                    &config.adapters,
                     config.shutdown_grace,
                 )
                 .await;
 
+                // `handle.shutdown()` consumes the handle; it's
+                // already gone by the time we reach the explicit-drop
+                // block below, so no `drop(handle)` is needed.
                 handle.shutdown().await;
+
+                // Explicit drops to force any residual Arc chains
+                // (RuntimeCore.adapters, transport managed state) to
+                // collapse BEFORE we signal done. Belt-and-braces with
+                // the per-adapter kill that `graceful_shutdown` now
+                // performs; one of the two reliably terminates each
+                // subprocess but both together rule out any "Drop
+                // never fired" edge case.
+                drop(_loopback);
+                drop(core);
+                drop(config);
+
+                // Tell the Tauri exit gate (RunEvent::ExitRequested in
+                // `.run(...)` below) that shutdown has fully drained.
+                // Then request exit — this re-enters the gate with
+                // `SHUTDOWN_COMPLETE == true`, so Tauri tears the
+                // event loop down and the process terminates cleanly.
+                SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
+                app_handle_for_daemon.exit(0);
             });
 
             // Don't block setup waiting for the daemon to come up.
@@ -2628,15 +2711,128 @@ pub fn run() {
             get_app_data_dir,
         ])
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                if let Some(pty) = window.try_state::<PtyManager>() {
-                    pty.kill_all();
+            match event {
+                // User clicked the red traffic light (or frontend-initiated
+                // `getCurrentWindow().close()`). On macOS the NSApp keeps
+                // the process alive after the last window closes — so
+                // without an explicit `exit(0)` here flowstate's dock icon
+                // stays lit and the daemon keeps running with no UI to
+                // drive it, which is exactly the "does not get killed"
+                // symptom users hit. Force the process down: fire the
+                // graceful-shutdown path (so `opencode serve` +
+                // `flowstate mcp-server` children get SIGTERM before the
+                // event loop tears down) then call `exit(0)`, which
+                // dispatches `RunEvent::ExitRequested` into the run
+                // closure below.
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    if let Some(pty) = window.try_state::<PtyManager>() {
+                        pty.kill_all();
+                    }
+                    if let Some(state) = window.try_state::<AppLifecycle>() {
+                        state.lifecycle.request_shutdown();
+                    }
+                    window.app_handle().exit(0);
                 }
-                if let Some(state) = window.try_state::<AppLifecycle>() {
-                    state.lifecycle.request_shutdown();
+                // Still wire the Destroyed path as a belt-and-braces
+                // fallback — any code path that destroys a window
+                // without going through CloseRequested (plugin teardown,
+                // OS-driven close) still trips the daemon shutdown.
+                tauri::WindowEvent::Destroyed => {
+                    if let Some(pty) = window.try_state::<PtyManager>() {
+                        pty.kill_all();
+                    }
+                    if let Some(state) = window.try_state::<AppLifecycle>() {
+                        state.lifecycle.request_shutdown();
+                    }
                 }
+                _ => {}
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Two-phase exit gate. The full sequence for a red-traffic
+            // light / Cmd+Q / SIGTERM close is:
+            //
+            //   1. User close → `request_shutdown()` + `exit(0)`.
+            //   2. Tauri fires `RunEvent::ExitRequested` here with
+            //      `SHUTDOWN_COMPLETE == false`. We call
+            //      `api.prevent_exit()` so Tauri keeps the event loop
+            //      running. The daemon task keeps getting CPU time.
+            //   3. Daemon task's `wait_for_shutdown()` returns (it was
+            //      tipped by step 1). It runs `graceful_shutdown`,
+            //      which invokes `adapter.shutdown()` on every
+            //      provider — opencode sends killpg(SIGTERM) to its
+            //      process group (reaping `flowstate mcp-server`
+            //      grandchildren along the way), the per-session CLI
+            //      adapters sweep their cached children with
+            //      `start_kill`.
+            //   4. Daemon task explicitly drops `handle`, `_loopback`,
+            //      `core`, `config`, then sets
+            //      `SHUTDOWN_COMPLETE = true` and calls `exit(0)`.
+            //   5. Tauri fires `RunEvent::ExitRequested` a second
+            //      time. This branch now observes
+            //      `SHUTDOWN_COMPLETE == true` and returns without
+            //      calling `prevent_exit()`, so Tauri proceeds to
+            //      `RunEvent::Exit` and the process terminates.
+            //
+            // A 10 s watchdog thread installed on the first entry
+            // force-exits the process if the daemon task wedges (e.g.
+            // an adapter.shutdown that somehow exceeds its outer
+            // timeout). Residual orphans in that pathological case
+            // are still reaped by the startup orphan scan on next
+            // launch (see `orphan_scan::reap_orphaned_subprocesses`).
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
+                    // Daemon task finished and re-entered exit(0).
+                    // Don't prevent — let Tauri take the process down.
+                    return;
+                }
+
+                // First (or still in-progress) entry. Keep the event
+                // loop alive so the daemon task can run its async
+                // teardown to completion.
+                api.prevent_exit();
+
+                // Idempotent kicks — CloseRequested / the signal
+                // handler have almost certainly already done these,
+                // but for Cmd+Q on macOS the window handler didn't
+                // fire, so this is the only place the request gets
+                // raised before the daemon task notices.
+                if let Some(state) = app_handle.try_state::<AppLifecycle>() {
+                    state.lifecycle.request_shutdown();
+                }
+                if let Some(pty) = app_handle.try_state::<PtyManager>() {
+                    pty.kill_all();
+                }
+
+                // Install the shutdown watchdog exactly once. Runs on
+                // a std::thread (not a Tauri-owned task) so it's
+                // unaffected by whatever the tokio runtime is doing.
+                if !SHUTDOWN_STARTED.swap(true, Ordering::SeqCst) {
+                    let app_handle_for_watchdog = app_handle.clone();
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("flowstate-shutdown-watchdog".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_secs(10));
+                            if !SHUTDOWN_COMPLETE.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    "shutdown watchdog elapsed (>10s); forcing exit — \
+                                     any surviving subprocesses will be reaped by \
+                                     the startup orphan scan on next launch"
+                                );
+                                SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
+                                app_handle_for_watchdog.exit(0);
+                            }
+                        })
+                    {
+                        tracing::warn!(
+                            %e,
+                            "failed to spawn shutdown watchdog; a wedged daemon task \
+                             will block the UI until the user force-quits"
+                        );
+                    }
+                }
+            }
+        });
 }

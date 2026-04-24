@@ -1280,6 +1280,44 @@ impl ProviderAdapter for OpenCodeAdapter {
             }
         }
     }
+
+    /// Tear down the shared `opencode serve` process during daemon
+    /// shutdown. Called by `graceful_shutdown` (see
+    /// `crates/middleman/daemon-core/src/shutdown.rs`). Swaps the slot
+    /// to `Stopped` up-front so any concurrent `ensure_server` caller
+    /// observes a dead slot and doesn't race us spawning a replacement
+    /// mid-shutdown, then awaits the async `OpenCodeServer::shutdown`
+    /// which sends `killpg(SIGTERM)`, waits up to 3s for the process
+    /// group to exit, and escalates to SIGKILL if needed.
+    ///
+    /// Idempotent: a second call finds `Stopped`/`Starting` and
+    /// returns immediately.
+    async fn shutdown(&self) {
+        let server = {
+            let mut slot = self.server_slot.lock().await;
+            match std::mem::replace(&mut *slot, ServerSlot::Stopped) {
+                ServerSlot::Running(running) => Some(running.server),
+                ServerSlot::Draining(server) => Some(server),
+                ServerSlot::Starting | ServerSlot::Stopped => None,
+            }
+        };
+        // Wake any blocked `ensure_server` so it can observe the
+        // `Stopped` slot and bail rather than wait forever for a
+        // spawn that is never going to land.
+        self.server_ready.notify_waiters();
+
+        if let Some(server) = server {
+            // Fail any in-flight SSE subscribers cleanly — matches
+            // what `IdleWatcher::run` does before killing the server,
+            // so a daemon-wide shutdown racing against a live turn
+            // doesn't hang its completion oneshot forever.
+            self.event_router
+                .fail_all_in_flight("opencode server shutting down with daemon")
+                .await;
+            // SIGTERM → wait 3s → SIGKILL escalation.
+            server.shutdown().await;
+        }
+    }
 }
 
 #[cfg(test)]

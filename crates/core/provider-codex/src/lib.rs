@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, warn};
 use zenui_provider_api::{
     OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProbeCliOptions,
     ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState, ProviderStatus,
@@ -539,6 +539,28 @@ impl ProviderAdapter for CodexAdapter {
             "Codex interrupt requested for session `{}`.",
             session.summary.session_id
         ))
+    }
+
+    /// Daemon-shutdown hook: kill every per-session `codex` CLI child
+    /// and abort its stderr pump. Mirrors `invalidate_session` but
+    /// sweeps the whole map in one pass — the existing Drop on
+    /// `CodexSessionProcess` does the same thing, but explicit here
+    /// keeps us independent of Arc-refcount timing.
+    async fn shutdown(&self) {
+        let drained: Vec<(String, Arc<Mutex<CodexSessionProcess>>)> = {
+            let mut map = self.sessions.lock().await;
+            map.drain().collect()
+        };
+        for (session_id, process) in drained {
+            let mut proc = process.lock().await;
+            proc.stderr_task.abort();
+            if let Err(e) = proc.child.start_kill() {
+                debug!(
+                    %session_id,
+                    "codex shutdown: start_kill failed (child likely already exited): {e}"
+                );
+            }
+        }
     }
 }
 

@@ -1168,6 +1168,27 @@ impl ProviderAdapter for ClaudeCliAdapter {
             mcp_servers: mcp_out,
         })
     }
+
+    /// Daemon-shutdown hook: kill every per-session `claude` CLI
+    /// child. Matches `end_session`'s kill path (start_kill + drop the
+    /// init-cache entry) but sweeps the whole map in one pass.
+    async fn shutdown(&self) {
+        let drained: Vec<(String, Arc<Mutex<ClaudeCliProcess>>)> = {
+            let mut map = self.active_processes.lock().await;
+            map.drain().collect()
+        };
+        for (session_id, process) in drained {
+            let mut proc = process.lock().await;
+            if let Err(e) = proc.child.start_kill() {
+                debug!(
+                    %session_id,
+                    "claude-cli shutdown: start_kill failed (child likely already exited): {e}"
+                );
+            }
+        }
+        // Drop cached init snapshots — nothing will replay them.
+        self.init_cache.lock().await.clear();
+    }
 }
 
 /// Map a `CommandKind` variant to a short tag used in synthesised ids.

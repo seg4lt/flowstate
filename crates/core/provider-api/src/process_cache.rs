@@ -160,6 +160,23 @@ impl<T: Send + Sync + 'static> ProcessCache<T> {
         self.map.lock().await.remove(session_id)
     }
 
+    /// Remove every entry and return them. Used by the owning
+    /// adapter's `ProviderAdapter::shutdown` during daemon teardown to
+    /// kill every cached child in one sweep — the adapter then locks
+    /// each returned entry's inner process and calls `start_kill`
+    /// (matching what the watchdog's `kill` callback does on per-entry
+    /// expiry).
+    ///
+    /// This is *not* the same as `ensure_watchdog`'s per-tick cull: it
+    /// ignores `in_flight` and `last_activity` because a daemon
+    /// shutdown is authoritative — nothing new will run against these
+    /// children, so holding them open for an active turn would just
+    /// leak the subprocess past the daemon's exit.
+    pub async fn drain_all(&self) -> Vec<(String, CachedProcess<T>)> {
+        let mut map = self.map.lock().await;
+        map.drain().collect()
+    }
+
     /// Spawn the idle-kill watchdog exactly once.
     ///
     /// The watchdog ticks every `watchdog_interval_secs`, scans the

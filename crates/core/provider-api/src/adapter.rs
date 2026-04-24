@@ -279,4 +279,36 @@ pub trait ProviderAdapter: Send + Sync {
     async fn acquire_shared_bridge_lease(&self) -> Option<SharedBridgeGuard> {
         None
     }
+
+    /// Stop all owned subprocesses and background tasks. Called
+    /// exactly once by [`graceful_shutdown`] when the daemon is
+    /// terminating.
+    ///
+    /// The daemon's shutdown path previously relied on `Drop` chains
+    /// firing at end-of-scope to clean up child processes (e.g.
+    /// `OpenCodeServer::Drop` sending `killpg(SIGTERM)`). That path
+    /// is racy in two ways:
+    ///
+    /// 1. Any lingering `Arc` (in transport managed state, background
+    ///    tasks, etc.) keeps the adapter alive past scope end, so
+    ///    `Drop` never fires.
+    /// 2. Rust `Drop` is synchronous — async teardown work (awaiting
+    ///    `child.wait()` with a timeout, escalating SIGTERM → SIGKILL)
+    ///    cannot run from there.
+    ///
+    /// `shutdown` sidesteps both by being async and explicit. The
+    /// caller in `daemon-core/src/shutdown.rs` iterates adapters and
+    /// awaits this method with a per-adapter timeout.
+    ///
+    /// **Contract for implementors:**
+    /// - Best-effort. Log failures; never propagate errors — one
+    ///   wedged adapter must not block shutdown of its siblings.
+    /// - Bounded. Internal awaits must have timeouts; the caller also
+    ///   wraps this whole call in an outer `tokio::time::timeout`.
+    /// - Idempotent. Calling twice is legal and must be a no-op the
+    ///   second time.
+    ///
+    /// Default is a no-op — adapters that own no persistent state can
+    /// skip overriding.
+    async fn shutdown(&self) {}
 }

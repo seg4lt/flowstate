@@ -1424,6 +1424,29 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             mcp_servers,
         })
     }
+
+    /// Daemon-shutdown hook: kill every cached bridge child and clear
+    /// the ancillary maps. Mirrors `invalidate_session` but sweeps the
+    /// whole cache in one pass so `graceful_shutdown` can reap the
+    /// Node SDK bridges without depending on Drop timing (see the
+    /// module-level note on the trait method).
+    async fn shutdown(&self) {
+        // Drop the parallel-write maps first so any in-flight control
+        // RPC sees its stdin/pending-rpcs gone and its oneshot dropped
+        // the moment the child is killed below.
+        self.session_stdins.lock().await.clear();
+        self.session_pending_rpcs.lock().await.clear();
+
+        for (session_id, cached) in self.sessions.drain_all().await {
+            let mut process = cached.inner().lock().await;
+            if let Err(e) = process.child.start_kill() {
+                debug!(
+                    %session_id,
+                    "claude-sdk shutdown: start_kill failed (child likely already exited): {e}"
+                );
+            }
+        }
+    }
 }
 
 impl ClaudeSdkAdapter {

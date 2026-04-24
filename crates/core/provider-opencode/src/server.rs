@@ -229,10 +229,14 @@ impl OpenCodeServer {
     ///   3. If the child is still alive past the timeout, escalate
     ///      via tokio's `start_kill` (maps to SIGKILL on Unix).
     ///
-    /// Phase A: this method exists but is never called — `Drop` is
-    /// still the only teardown path. Wired in so Phase B's idle
-    /// watcher can adopt it without another refactor.
-    #[allow(dead_code)] // Phase B makes this live
+    /// Live in Phase B: the idle watcher
+    /// (`crates/core/provider-opencode/src/lib.rs` `IdleWatcher`) and
+    /// the daemon-wide graceful shutdown path
+    /// (`OpenCodeAdapter::shutdown` →
+    /// `daemon-core/src/shutdown.rs::graceful_shutdown`) both call
+    /// this. The sync `Drop` impl below remains as a belt-and-braces
+    /// fallback for paths that bypass graceful shutdown entirely
+    /// (hard aborts, SIGKILL).
     pub async fn shutdown(&self) {
         #[cfg(unix)]
         if let Some(pgid) = self.child_pgid {

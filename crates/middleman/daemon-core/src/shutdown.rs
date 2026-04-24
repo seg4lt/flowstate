@@ -2,10 +2,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use zenui_provider_api::RuntimeEvent;
+use zenui_provider_api::{ProviderAdapter, RuntimeEvent};
 use zenui_runtime_core::RuntimeCore;
 
 use crate::lifecycle::DaemonLifecycle;
+
+/// Outer per-adapter timeout applied around each
+/// `ProviderAdapter::shutdown` call. Individual implementations are
+/// expected to be bounded internally (e.g. opencode's SIGTERM → 3s
+/// wait → SIGKILL escalation tops out around 5s), but we wrap the
+/// call in a timeout anyway so one wedged adapter can't block
+/// shutdown of its siblings.
+const ADAPTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Graceful daemon shutdown. Called by `run_blocking` when the shutdown
 /// signal fires (idle timeout, SIGTERM, or explicit /api/shutdown POST).
@@ -15,12 +23,19 @@ use crate::lifecycle::DaemonLifecycle;
 ///    banner and stop issuing new commands.
 /// 2. Ask the runtime to interrupt all in-flight turns, waiting up to
 ///    `grace` for the providers to settle.
-/// 3. Return. The caller (`run_blocking`) then drops the local server
-///    listener and, finally, the tokio runtime — reaping remaining
-///    subprocess children.
+/// 3. Explicitly call `ProviderAdapter::shutdown` on each adapter with
+///    a bounded per-adapter timeout. This replaces the previous
+///    implicit reliance on `Drop` firing at end-of-scope to tear down
+///    subprocesses — that path is racy (lingering `Arc`s past scope
+///    end, async teardown work can't run from `Drop`) and was the
+///    root cause of orphaned `opencode serve` + per-session CLI
+///    children after a host-process close.
+/// 4. Return. The caller (`run_blocking` / the Tauri shell's daemon
+///    task) then drops the local server listener and tokio runtime.
 pub async fn graceful_shutdown(
     runtime: Arc<RuntimeCore>,
     _lifecycle: Arc<DaemonLifecycle>,
+    adapters: &[Arc<dyn ProviderAdapter>],
     grace: Duration,
 ) -> Result<()> {
     runtime.publish(RuntimeEvent::DaemonShuttingDown {
@@ -32,7 +47,30 @@ pub async fn graceful_shutdown(
         grace_ms = grace.as_millis() as u64,
         "graceful shutdown swept in-flight turns"
     );
+
+    shutdown_adapters(adapters).await;
     Ok(())
+}
+
+/// Shared adapter-sweep implementation used by both shutdown paths.
+/// Kept private (only the two `pub async fn`s below invoke it) so the
+/// per-adapter timeout and logging stay in one place.
+async fn shutdown_adapters(adapters: &[Arc<dyn ProviderAdapter>]) {
+    for adapter in adapters {
+        let kind = adapter.kind();
+        match tokio::time::timeout(ADAPTER_SHUTDOWN_TIMEOUT, adapter.shutdown()).await {
+            Ok(()) => {
+                tracing::info!(?kind, "adapter shutdown complete");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    ?kind,
+                    timeout_ms = ADAPTER_SHUTDOWN_TIMEOUT.as_millis() as u64,
+                    "adapter shutdown timed out; proceeding — any surviving children will be reaped by the startup orphan scan on next launch"
+                );
+            }
+        }
+    }
 }
 
 /// Wait for in-flight turns to finish naturally, then tear down.
@@ -58,6 +96,7 @@ pub async fn graceful_shutdown(
 pub async fn drain_shutdown(
     runtime: Arc<RuntimeCore>,
     lifecycle: Arc<DaemonLifecycle>,
+    adapters: &[Arc<dyn ProviderAdapter>],
     max_wait: Duration,
     interrupt_grace: Duration,
 ) -> Result<()> {
@@ -70,7 +109,6 @@ pub async fn drain_shutdown(
             max_wait_ms = max_wait.as_millis() as u64,
             "drain shutdown: all in-flight turns completed naturally"
         );
-        Ok(())
     } else {
         // Timeout elapsed; some turns are still running. Escalate to
         // interrupt with the caller's configured grace so we don't
@@ -87,6 +125,11 @@ pub async fn drain_shutdown(
             interrupted,
             "drain shutdown: interrupt phase completed"
         );
-        Ok(())
     }
+    // Always sweep adapters after the turns settle (either naturally
+    // or via interrupt). Matches the explicit-kill contract in
+    // `graceful_shutdown` above — no path through drain_shutdown
+    // should leave a provider subprocess running.
+    shutdown_adapters(adapters).await;
+    Ok(())
 }

@@ -1185,6 +1185,23 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             mcp_servers,
         })
     }
+
+    /// Daemon-shutdown hook: kill every cached Copilot CLI child.
+    /// Mirrors `end_session`'s `start_kill` path but sweeps the whole
+    /// cache in one pass. The CLI's per-process `run_dispatcher` task
+    /// exits naturally when stdout closes on child kill, so no
+    /// separate abort handle is needed.
+    async fn shutdown(&self) {
+        for (session_id, cached) in self.active_processes.drain_all().await {
+            let mut proc = cached.inner().lock().await;
+            if let Err(e) = proc.child.start_kill() {
+                debug!(
+                    %session_id,
+                    "github-copilot-cli shutdown: start_kill failed (child likely already exited): {e}"
+                );
+            }
+        }
+    }
 }
 
 impl GitHubCopilotCliAdapter {
