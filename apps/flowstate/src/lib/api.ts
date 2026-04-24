@@ -496,6 +496,14 @@ export function clearRuntimeCache(): Promise<number> {
   return invoke<number>("clear_runtime_cache");
 }
 
+// Push the active "max tokens per task" value into the Claude SDK
+// adapter. Affects the NEXT session spawn — existing sessions keep
+// their original value (the SDK bakes taskBudget in at Query open
+// time). Pass `null` to clear and let the SDK default kick in.
+export function setClaudeMaxTokens(value: number | null): Promise<void> {
+  return invoke<void>("set_claude_max_tokens", { value });
+}
+
 // Re-run a single runtime-provisioning phase ("node" | "claude-sdk"
 // | "copilot-sdk"). Used by the Settings page Retry buttons.
 // Resolves on success; rejects with the error string from Rust on

@@ -22,6 +22,7 @@ import {
   getCacheDir,
   getLogDir,
   retryProvisionPhase,
+  setClaudeMaxTokens,
 } from "@/lib/api";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -55,6 +56,11 @@ import {
   writeDefaultProvider,
   readStrictPlanMode,
   writeStrictPlanMode,
+  readDefaultMaxTokens,
+  writeDefaultMaxTokens,
+  MAX_TOKENS_DEFAULT,
+  MAX_TOKENS_MIN,
+  MAX_TOKENS_MAX,
   DEFAULT_PROVIDER,
 } from "@/lib/defaults-settings";
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
@@ -340,6 +346,107 @@ function StrictPlanModeRow() {
         checked={enabled}
         onCheckedChange={handleChange}
         aria-label="Strict plan mode"
+      />
+    </div>
+  );
+}
+
+// "Max tokens per task" — surfaces the Claude SDK's `taskBudget`
+// option (the closest equivalent the Agent SDK exposes to the
+// Messages-API `max_tokens`). The model sees a running countdown of
+// the budget and self-paces. Bumping this gives Opus 4.7 more
+// headroom — the new tokenizer uses ~1.0–1.35× the tokens of 4.6
+// for the same English text, so a value sized for 4.6 will hit the
+// ceiling earlier on 4.7. Default 64k matches Anthropic's
+// recommended starting point.
+//
+// Affects newly-spawned sessions only — the SDK bakes taskBudget in
+// at Query open time. The row's helper text says so explicitly.
+function MaxTokensRow() {
+  // null while the sqlite read is in flight; flips to a number once
+  // resolved. Empty string in the input would otherwise lose the
+  // "loading" affordance.
+  const [value, setValue] = React.useState<number | null>(null);
+  const [saving, setSaving] = React.useState(false);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readDefaultMaxTokens()
+      .then((stored) => {
+        if (!cancelled) setValue(stored ?? MAX_TOKENS_DEFAULT);
+      })
+      .catch(() => {
+        if (!cancelled) setValue(MAX_TOKENS_DEFAULT);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const commit = React.useCallback(async (next: number) => {
+    const clamped = Math.max(
+      MAX_TOKENS_MIN,
+      Math.min(MAX_TOKENS_MAX, Math.round(next)),
+    );
+    setValue(clamped);
+    setSaving(true);
+    try {
+      await writeDefaultMaxTokens(clamped);
+      // Push to the Rust adapter so the change picks up on the next
+      // session spawn — no app restart required. We do this AFTER the
+      // sqlite write so a refresh sees the same value the daemon is
+      // about to use.
+      await setClaudeMaxTokens(clamped);
+    } catch (err) {
+      toast({
+        description: `Couldn't save: ${(err as Error).message ?? String(err)}`,
+        duration: 4000,
+      });
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+
+  return (
+    <div className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Max tokens per task</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Advisory token budget the model self-paces against across an
+          entire agentic loop (thinking + tool calls + output). Bump this
+          for long-horizon coding work or to give Opus 4.7&apos;s new
+          tokenizer more headroom.
+        </div>
+        <div className="mt-1 text-[11px] text-muted-foreground">
+          Range {MAX_TOKENS_MIN.toLocaleString()}–
+          {MAX_TOKENS_MAX.toLocaleString()} · default{" "}
+          {MAX_TOKENS_DEFAULT.toLocaleString()} · applies to new sessions
+          only.
+        </div>
+      </div>
+      <input
+        type="number"
+        min={MAX_TOKENS_MIN}
+        max={MAX_TOKENS_MAX}
+        step={1000}
+        value={value ?? ""}
+        disabled={value === null || saving}
+        onChange={(e) => {
+          const parsed = Number.parseInt(e.target.value, 10);
+          if (Number.isFinite(parsed)) {
+            // Update the local input optimistically so the user sees
+            // their typing; commit (with clamp + persist) runs on
+            // blur to avoid hammering sqlite + the Tauri command
+            // mid-typing.
+            setValue(parsed);
+          }
+        }}
+        onBlur={(e) => {
+          const parsed = Number.parseInt(e.target.value, 10);
+          if (Number.isFinite(parsed)) void commit(parsed);
+        }}
+        className="h-8 w-24 rounded-md border border-input bg-background px-2 text-sm disabled:opacity-50"
+        aria-label="Max tokens per task"
       />
     </div>
   );
@@ -1278,6 +1385,7 @@ export function SettingsView() {
             <DefaultPermissionModeRow />
             <StrictPlanModeRow />
             <DefaultModelRow />
+            <MaxTokensRow />
           </SettingsGroup>
           <SettingsGroup
             title="Providers"

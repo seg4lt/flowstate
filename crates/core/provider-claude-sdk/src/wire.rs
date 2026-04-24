@@ -89,6 +89,20 @@ pub(crate) enum BridgeRequest {
         /// zenui restart or bridge crash recovers the conversation.
         #[serde(skip_serializing_if = "Option::is_none")]
         resume_session_id: Option<String>,
+        /// Per-task token budget surfaced to the SDK as `taskBudget`
+        /// (which underneath maps to the `task-budgets-2026-03-13`
+        /// beta + Anthropic's `output_config.task_budget`). Advisory:
+        /// the model sees a countdown and self-paces. Distinct from
+        /// the Messages-API `max_tokens` hard cap, which the Agent
+        /// SDK doesn't expose — `taskBudget` is the closest equivalent
+        /// surfaced by the SDK and is the right knob for the user's
+        /// "give Opus 4.7 more headroom" request.
+        ///
+        /// Sourced from `provider_claude_sdk::config::current_max_tokens`
+        /// at session-create time, populated by the Tauri shell from
+        /// `user_config["defaults.max_tokens"]`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_tokens: Option<u64>,
     },
     #[serde(rename = "send_prompt")]
     SendPrompt {

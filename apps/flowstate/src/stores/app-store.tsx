@@ -9,6 +9,7 @@ import {
   listProjectWorktree,
   listSessionDisplay,
   sendMessage,
+  setClaudeMaxTokens,
   setProjectDisplay,
   setProjectWorktree,
   setSessionDisplay,
@@ -35,7 +36,11 @@ import type {
   SessionSummary,
   UserInputQuestion,
 } from "@/lib/types";
-import { ALL_PROVIDER_KINDS } from "@/lib/defaults-settings";
+import {
+  ALL_PROVIDER_KINDS,
+  readDefaultMaxTokens,
+  MAX_TOKENS_DEFAULT,
+} from "@/lib/defaults-settings";
 
 /** Single permission prompt awaiting the user's answer. */
 export interface PendingPermission {
@@ -1118,6 +1123,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
       if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Seed the Claude SDK adapter's process-wide "max tokens per task"
+  // slot from user_config on app boot. Fires once; the Settings page
+  // calls `setClaudeMaxTokens` directly when the user saves a new
+  // value, so live updates don't need to round-trip through here.
+  //
+  // We always push a value (the configured one or the hardcoded
+  // default) rather than letting the slot stay empty, so the bridge
+  // gets a `taskBudget` on every session — important since the doc
+  // explicitly recommends raising headroom for Opus 4.7.
+  React.useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const stored = await readDefaultMaxTokens();
+      if (cancelled) return;
+      try {
+        await setClaudeMaxTokens(stored ?? MAX_TOKENS_DEFAULT);
+      } catch (err) {
+        console.warn("[app-store] seed claude max_tokens failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
