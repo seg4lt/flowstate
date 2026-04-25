@@ -322,6 +322,19 @@ function buildEditorTheme(theme: "light" | "dark"): Extension {
     colors["editorLineNumber.foreground"] ??
     (theme === "dark" ? "#6b7280" : "#9ca3af");
 
+  // Vim mode badge palette. The `.cm-vim-panel` text content is
+  // `--NORMAL--`, `--INSERT--`, or `--VISUAL--` — we don't have a
+  // mode-specific class to colour against, so we just make the
+  // whole panel bold/prominent regardless of mode. The fat-cursor
+  // colour is what really differentiates modes at-a-glance:
+  // block in NORMAL, line in INSERT, the plugin handles the shape;
+  // we just pick a colour with enough contrast on either theme.
+  const fatCursorBg = theme === "dark" ? "#7dd3fc" : "#0284c7";
+  const fatCursorFg = theme === "dark" ? "#0b0b0c" : "#ffffff";
+  const panelBg = theme === "dark" ? "#1f1f23" : "#f4f4f5";
+  const panelBorder = theme === "dark" ? "#2e2e35" : "#d4d4d8";
+  const panelAccent = theme === "dark" ? "#7dd3fc" : "#0369a1";
+
   return EditorView.theme(
     {
       "&": {
@@ -351,6 +364,62 @@ function buildEditorTheme(theme: "light" | "dark"): Extension {
         opacity: "0.6",
       },
       ".cm-foldGutter .cm-gutterElement:hover": { opacity: "1" },
+
+      // ── Vim panel (bottom status bar) ──
+      // The plugin renders `<div class="cm-vim-panel"><span>--MODE--</span>
+      // <span flex:1></span><span>{partial command}</span></div>`.
+      // We override the default ~13px monospace strip with a more
+      // prominent bar so the mode is impossible to miss. The first
+      // child span is the mode badge — bold + accent colour. The
+      // last child span is the partial command (e.g., `2dd` while
+      // the user is mid-keystroke); kept dimmer so it doesn't
+      // compete visually.
+      ".cm-vim-panel": {
+        padding: "4px 10px",
+        fontFamily:
+          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+        fontSize: "11px",
+        minHeight: "1.8em",
+        backgroundColor: panelBg,
+        borderTop: `1px solid ${panelBorder}`,
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+      },
+      ".cm-vim-panel > span:first-child": {
+        fontWeight: "700",
+        letterSpacing: "0.04em",
+        color: panelAccent,
+        cursor: "pointer",
+      },
+      ".cm-vim-panel > span:last-child": {
+        opacity: "0.7",
+      },
+      ".cm-vim-panel input": {
+        border: "none",
+        outline: "none",
+        backgroundColor: "transparent",
+        color: fg,
+        flex: "1",
+        fontFamily: "inherit",
+        fontSize: "inherit",
+      },
+
+      // ── Vim block cursor (NORMAL / VISUAL mode) ──
+      // The plugin's default green block (`#77ee77`) clashes with
+      // every theme. Override with theme-tuned colours so the block
+      // cursor is obvious without being garish, and so characters
+      // sitting under the block stay legible.
+      ".cm-fat-cursor": {
+        backgroundColor: fatCursorBg + " !important",
+        color: fatCursorFg + " !important",
+        border: "none !important",
+      },
+      "&:not(.cm-focused) .cm-fat-cursor": {
+        backgroundColor: "transparent !important",
+        outline: `1px solid ${fatCursorBg}`,
+        color: "inherit !important",
+      },
     },
     { dark: theme === "dark" },
   );
@@ -536,7 +605,10 @@ export function CodeEditor({
     const extensions: Extension[] = [
       // vim() must be first so its keymap takes precedence in NORMAL
       // mode. Compartment lets us flip vim on/off in place.
-      vimCompartmentRef.current.of(vimEnabled ? vim() : []),
+      // `status: true` mounts the `--NORMAL--` / `--INSERT--` /
+      // `--VISUAL--` panel at the bottom; we style it prominently
+      // in the editor theme below so the mode is easy to read.
+      vimCompartmentRef.current.of(vimEnabled ? vim({ status: true }) : []),
       lineNumbers(),
       foldGutter(),
       codeFolding(),
@@ -642,7 +714,9 @@ export function CodeEditor({
       }
     }
     view.dispatch({
-      effects: vimCompartmentRef.current.reconfigure(vimEnabled ? vim() : []),
+      effects: vimCompartmentRef.current.reconfigure(
+        vimEnabled ? vim({ status: true }) : [],
+      ),
     });
   }, [vimEnabled]);
 
