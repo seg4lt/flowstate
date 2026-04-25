@@ -1374,7 +1374,21 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             .fetch_capabilities(session.cwd.clone(), session.summary.model.clone())
             .await;
         let (sdk_commands, sdk_agents, sdk_mcp) = match capabilities {
-            Ok(c) => c,
+            Ok(c) => {
+                // INFO so the success-but-empty case is visible at the
+                // default log filter. We've shipped two regressions where
+                // `q.supportedCommands()` returned `[]` (init handshake not
+                // populating the field) and the user saw an empty `/`
+                // popup with zero log signal at WARN. Cheap to print once
+                // per session start.
+                info!(
+                    sdk_commands = c.0.len(),
+                    sdk_agents = c.1.len(),
+                    sdk_mcp = c.2.len(),
+                    "claude-sdk session_command_catalog: bridge returned"
+                );
+                c
+            }
             Err(err) => {
                 warn!("session_command_catalog: falling back to disk-only ({err})");
                 (Vec::new(), Vec::new(), Vec::new())

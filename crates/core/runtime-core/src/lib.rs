@@ -1167,7 +1167,15 @@ impl RuntimeCore {
 
             match result {
                 Ok(catalog) => {
-                    tracing::debug!(
+                    // INFO (not debug) so we can tell at a glance whether the
+                    // adapter actually returned built-ins / agents. When this
+                    // logs `commands=2 agents=0 mcp_servers=0` we know the
+                    // disk-only fallback fired silently or the SDK init
+                    // handshake came back empty — both have shipped as
+                    // user-visible regressions where the slash popup shows
+                    // only core commands. Cheap signal, fires once per
+                    // session start.
+                    tracing::info!(
                         %session_id,
                         provider = ?session.summary.provider,
                         commands = catalog.commands.len(),
