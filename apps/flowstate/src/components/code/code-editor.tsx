@@ -13,10 +13,16 @@ import {
   EditorView,
   ViewPlugin,
   type ViewUpdate,
+  crosshairCursor,
   drawSelection,
+  dropCursor,
   highlightActiveLine,
+  highlightActiveLineGutter,
+  highlightSpecialChars,
   keymap,
   lineNumbers,
+  rectangularSelection,
+  scrollPastEnd,
 } from "@codemirror/view";
 import {
   bracketMatching,
@@ -24,6 +30,7 @@ import {
   foldGutter,
   foldKeymap,
   indentOnInput,
+  indentUnit,
 } from "@codemirror/language";
 import {
   copyLineDown,
@@ -147,6 +154,99 @@ function hasOverlongLine(text: string): boolean {
     }
   }
   return text.length - lineStart > MAX_HIGHLIGHTABLE_LINE_LEN;
+}
+
+// ─── indent detection ────────────────────────────────────────────
+//
+// Inspect leading whitespace to figure out how the file is
+// indented. The result drives:
+//   * `EditorState.tabSize`  — display width of `\t` in the gutter
+//   * `indentUnit`           — the string `Tab` / `indentMore`
+//                              inserts at the cursor
+//
+// Algorithm: walk up to 5 000 lines, count tab-indented vs space-
+// indented lines, and (for spaces) collect the unique indent
+// lengths. The GCD of those lengths is mathematically the indent
+// unit — every level is a multiple of it. Snap to {2, 4, 8} to
+// reject 1-space and other off-by-one outliers caused by stray
+// alignment spaces. Falls back to 2-space for files with no
+// usable signal (empty, single-line, all-flush-left).
+
+interface DetectedIndent {
+  /** String inserted on Tab / indentMore. `"\t"` or `" ".repeat(n)`. */
+  unit: string;
+  /** Tab display width and visual indent step. */
+  size: number;
+}
+
+const DEFAULT_INDENT: DetectedIndent = { unit: "  ", size: 2 };
+
+function gcd(a: number, b: number): number {
+  while (b !== 0) {
+    const t = b;
+    b = a % b;
+    a = t;
+  }
+  return a;
+}
+
+function detectIndent(text: string): DetectedIndent {
+  // Sample size cap — reading the whole file is fine but 5 k lines
+  // is enough signal even for monorepo-sized files, and bounds the
+  // worst-case scan time on multi-megabyte buffers.
+  const SAMPLE_LINES = 5_000;
+  let tabLines = 0;
+  let spaceLines = 0;
+  // Set, not Map — we only care which indent lengths exist, the
+  // GCD doesn't need counts.
+  const spaceLengths = new Set<number>();
+
+  let lineStart = 0;
+  let scannedLines = 0;
+  for (let i = 0; i <= text.length; i++) {
+    const isEnd = i === text.length || text.charCodeAt(i) === 10;
+    if (!isEnd) continue;
+    if (i > lineStart) {
+      const c = text.charCodeAt(lineStart);
+      if (c === 9 /* \t */) {
+        tabLines++;
+      } else if (c === 32 /* space */) {
+        let n = 0;
+        while (lineStart + n < i && text.charCodeAt(lineStart + n) === 32) {
+          n++;
+        }
+        // Skip lines that are all whitespace (no leading-indent
+        // signal — they'd inject odd lengths into the GCD).
+        if (lineStart + n < i) {
+          spaceLengths.add(n);
+          spaceLines++;
+        }
+      }
+    }
+    lineStart = i + 1;
+    scannedLines++;
+    if (scannedLines >= SAMPLE_LINES) break;
+  }
+
+  if (tabLines === 0 && spaceLines === 0) return DEFAULT_INDENT;
+  if (tabLines >= spaceLines) {
+    // Tab-indented. 4 is the universal display default; we don't
+    // try to infer a tab "size" from content — that's a vibes
+    // setting per repo, not something the file content encodes.
+    return { unit: "\t", size: 4 };
+  }
+
+  let g = 0;
+  for (const len of spaceLengths) {
+    g = g === 0 ? len : gcd(g, len);
+  }
+  // Snap to the realistic indent sizes. A GCD of 1, 3, 5, 6, 7
+  // almost always means a stray alignment space crept in — fall
+  // back rather than insert weird amounts of whitespace on Tab.
+  if (g === 2 || g === 4 || g === 8) {
+    return { unit: " ".repeat(g), size: g };
+  }
+  return DEFAULT_INDENT;
 }
 
 // ─── shiki decoration extension ──────────────────────────────────
@@ -522,6 +622,16 @@ export function CodeEditor({
     [path],
   );
 
+  // Indent detection runs once per file open. Like `overlong`, this
+  // is keyed only on `path` — once we've decided "this file is
+  // 4-space indented", we don't keep re-detecting as the user
+  // types. Switching tabs (different `path`) re-detects.
+  const indent = React.useMemo<DetectedIndent>(
+    () => detectIndent(initialContent),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [path],
+  );
+
   // Keep the latest onSave/onDirtyChange callbacks accessible to
   // the (stable) view extensions through a ref, so the React
   // closure doesn't go stale across re-renders.
@@ -603,6 +713,22 @@ export function CodeEditor({
     });
 
     const extensions: Extension[] = [
+      // Required opt-in for any multi-range selection. Without
+      // this facet, CM6 silently collapses every operation that
+      // produces more than one selection range to a single one —
+      // breaking Cmd+D / Cmd+Shift+L (multi-cursor by word match),
+      // Alt-click / Cmd-click (add cursor at click), Alt-drag
+      // (rectangular selection), and Vim's `Ctrl+V` visual block
+      // mode. Single-range visual modes (`v`, `V`) work without
+      // it, but block mode does not.
+      EditorState.allowMultipleSelections.of(true),
+      // Indent detected from the file's own leading whitespace.
+      // `tabSize` controls how wide a literal `\t` glyph renders;
+      // `indentUnit` controls what Tab / `indentMore` inserts at
+      // the cursor. Detection is one-shot per file open — the
+      // editor doesn't try to track schema drift mid-session.
+      EditorState.tabSize.of(indent.size),
+      indentUnit.of(indent.unit),
       // vim() must be first so its keymap takes precedence in NORMAL
       // mode. Compartment lets us flip vim on/off in place.
       // `status: true` mounts the `--NORMAL--` / `--INSERT--` /
@@ -610,11 +736,25 @@ export function CodeEditor({
       // in the editor theme below so the mode is easy to read.
       vimCompartmentRef.current.of(vimEnabled ? vim({ status: true }) : []),
       lineNumbers(),
+      highlightActiveLineGutter(),
       foldGutter(),
       codeFolding(),
       highlightActiveLine(),
       highlightSelectionMatches(),
+      // Visualises invisible characters (zero-width, control
+      // chars, BOM, replacement chars). Useful when files have
+      // funky pasted whitespace or invisible Unicode.
+      highlightSpecialChars(),
       drawSelection(),
+      // Drop cursor renders a caret at the drop point while text
+      // is being dragged inside the editor — without this, dragging
+      // a selection has no visual indication of where it'll land.
+      dropCursor(),
+      // Alt-drag for rectangular (column) selection. Pairs with
+      // crosshairCursor below for the visual hint that the mode
+      // is active. Both rely on `allowMultipleSelections` above.
+      rectangularSelection(),
+      crosshairCursor(),
       bracketMatching(),
       closeBrackets(),
       indentOnInput(),
@@ -629,6 +769,10 @@ export function CodeEditor({
         ...buildExtraKeymap(onSaveRef),
       ]),
       search({ top: true }),
+      // Adds bottom padding so the last line of the file can
+      // scroll up to the top of the viewport — matches the
+      // "scroll past EOF" behaviour every modern editor has.
+      scrollPastEnd(),
       blurAutoSave,
       updateListener,
       readOnlyCompartmentRef.current.of(
