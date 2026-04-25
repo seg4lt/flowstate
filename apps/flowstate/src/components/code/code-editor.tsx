@@ -255,6 +255,7 @@ function shikiPlugin(cfg: ShikiPluginConfig): Extension {
         const run = () => {
           this.pending = null;
           if (this.destroyed) return;
+          if (!view.dom.isConnected) return;
           const text = view.state.doc.toString();
           const deco = buildDecorations(
             cfg.highlighter,
@@ -265,7 +266,16 @@ function shikiPlugin(cfg: ShikiPluginConfig): Extension {
           view.dispatch({ effects: shikiTokensEffect.of(deco) });
         };
         if (immediate) {
-          run();
+          // Even "immediate" has to yield. CM6 silently drops any
+          // `view.dispatch` call made from inside a ViewPlugin
+          // constructor or update(), and our constructor runs as
+          // part of the compartment reconfigure that mounts this
+          // plugin — so calling `run` synchronously here would
+          // post the tokens effect into the void and the field
+          // would stay empty (no highlighting). queueMicrotask
+          // defers to the very next microtask, after the current
+          // update cycle completes, with effectively zero delay.
+          queueMicrotask(run);
           return;
         }
         // ~60-100ms delay — long enough for a typing burst to settle,
