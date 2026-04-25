@@ -110,6 +110,7 @@ export interface Shortcut {
 export const TOGGLE_DIFF_EVENT = "flowstate:toggle-diff";
 export const TOGGLE_CONTEXT_EVENT = "flowstate:toggle-context";
 export const OPEN_EDITOR_PICKER_EVENT = "flowstate:open-editor-picker";
+export const LAUNCH_DEFAULT_EDITOR_EVENT = "flowstate:launch-default-editor";
 export const OPEN_MODEL_PICKER_EVENT = "flowstate:open-model-picker";
 export const OPEN_EFFORT_PICKER_EVENT = "flowstate:open-effort-picker";
 export const ADD_PROJECT_EVENT = "flowstate:add-project";
@@ -191,6 +192,20 @@ export const SHORTCUTS: Shortcut[] = [
         ctx.notify?.(`Pin toggle failed: ${String(err)}`);
       });
     },
+  },
+  {
+    id: "launch-default-editor",
+    label: "Open in default editor",
+    defaultBinding: "mod+o",
+    group: "View",
+    // Fires even when the chat composer (or any other text input) is
+    // focused — see useGlobalShortcuts. Without this the browser's
+    // built-in "Open File…" dialog would hijack ⌘O whenever an input
+    // had focus, since the dispatcher only calls preventDefault for
+    // shortcuts it actually runs.
+    fireInTextInputs: true,
+    run: () =>
+      window.dispatchEvent(new CustomEvent(LAUNCH_DEFAULT_EDITOR_EVENT)),
   },
   {
     id: "open-editor-picker",

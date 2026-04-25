@@ -32,7 +32,10 @@ import {
   readPopoutPinPref,
   setPopoutPinned,
 } from "@/lib/popout";
-import { OPEN_EDITOR_PICKER_EVENT } from "@/lib/keyboard-shortcuts";
+import {
+  LAUNCH_DEFAULT_EDITOR_EVENT,
+  OPEN_EDITOR_PICKER_EVENT,
+} from "@/lib/keyboard-shortcuts";
 
 interface HeaderActionsProps {
   sessionId: string;
@@ -241,26 +244,16 @@ export function HeaderActions({
     [launchEditor],
   );
 
-  // Cmd/Ctrl+O — open the project in the current default editor.
-  // Skips when the user is typing in an input/textarea so it
-  // doesn't fight any in-textbox shortcut. Falls back to a toast
-  // when no default has been picked yet.
+  // ⌘O — open the project in the current default editor.
+  // The keystroke itself is owned by the global shortcut registry
+  // (`launch-default-editor`, see lib/keyboard/registry.tsx) which
+  // dispatches LAUNCH_DEFAULT_EDITOR_EVENT here. The registry has
+  // `fireInTextInputs: true` so this works even while the chat
+  // composer is focused — without that flag the browser's built-in
+  // "Open File…" dialog would hijack ⌘O. Falls back to a toast when
+  // no default has been picked yet.
   React.useEffect(() => {
-    function isInTextInput(target: EventTarget | null): boolean {
-      if (!(target instanceof HTMLElement)) return false;
-      const tag = target.tagName;
-      return (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        target.isContentEditable === true
-      );
-    }
-    function onKeyDown(e: KeyboardEvent) {
-      const mod = e.metaKey || e.ctrlKey;
-      if (!mod || e.shiftKey || e.altKey) return;
-      if (e.key.toLowerCase() !== "o") return;
-      if (isInTextInput(e.target)) return;
-      e.preventDefault();
+    function onLaunch() {
       if (!defaultEditor) {
         toast({
           description:
@@ -271,8 +264,9 @@ export function HeaderActions({
       }
       void launchEditor(defaultEditor);
     }
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener(LAUNCH_DEFAULT_EDITOR_EVENT, onLaunch);
+    return () =>
+      window.removeEventListener(LAUNCH_DEFAULT_EDITOR_EVENT, onLaunch);
   }, [defaultEditor, launchEditor]);
 
   return (
