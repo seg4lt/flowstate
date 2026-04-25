@@ -520,6 +520,119 @@ function buildEditorTheme(theme: "light" | "dark"): Extension {
         outline: `1px solid ${fatCursorBg}`,
         color: "inherit !important",
       },
+
+      // ── Search / replace panel ──
+      // CM6 ships the search panel with raw browser defaults
+      // (Helvetica, square buttons, native checkboxes). Re-skin
+      // to match the rest of the editor: monospace 11 px, padded
+      // flex row, theme-tuned inputs and buttons, accent-coloured
+      // focus ring, and a less garish search-match highlight than
+      // the default flat yellow / cyan.
+      ".cm-panels": {
+        backgroundColor: panelBg,
+        color: fg,
+      },
+      ".cm-panels-top": {
+        borderBottom: `1px solid ${panelBorder}`,
+      },
+      ".cm-panel.cm-search": {
+        padding: "8px 36px 8px 10px",
+        display: "flex",
+        alignItems: "center",
+        gap: "6px",
+        flexWrap: "wrap",
+        fontFamily:
+          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+        fontSize: "11px",
+        position: "relative",
+      },
+      ".cm-panel.cm-search input": {
+        margin: "0",
+        padding: "4px 8px",
+        border: `1px solid ${panelBorder}`,
+        borderRadius: "4px",
+        backgroundColor: bg,
+        color: fg,
+        fontFamily: "inherit",
+        fontSize: "11px",
+        outline: "none",
+        minWidth: "200px",
+      },
+      ".cm-panel.cm-search input:focus": {
+        borderColor: panelAccent,
+        boxShadow: `0 0 0 1px ${panelAccent}`,
+      },
+      ".cm-panel.cm-search input[type=checkbox]": {
+        minWidth: "auto",
+        margin: "0 4px 0 0",
+        accentColor: panelAccent,
+        cursor: "pointer",
+      },
+      ".cm-panel.cm-search button": {
+        margin: "0",
+        padding: "4px 10px",
+        border: `1px solid ${panelBorder}`,
+        borderRadius: "4px",
+        backgroundColor: bg,
+        color: fg,
+        fontFamily: "inherit",
+        fontSize: "11px",
+        cursor: "pointer",
+        transition: "background-color 80ms, border-color 80ms",
+      },
+      ".cm-panel.cm-search button:hover": {
+        backgroundColor: lineHighlightBg,
+        borderColor: panelAccent,
+      },
+      ".cm-panel.cm-search label": {
+        display: "inline-flex",
+        alignItems: "center",
+        margin: "0",
+        fontSize: "11px",
+        color: gutterFg,
+        cursor: "pointer",
+        whiteSpace: "nowrap",
+      },
+      ".cm-panel.cm-search br": { display: "none" },
+      ".cm-panel.cm-search [name=close]": {
+        position: "absolute",
+        top: "6px",
+        right: "8px",
+        background: "transparent",
+        border: "none",
+        color: gutterFg,
+        cursor: "pointer",
+        fontSize: "16px",
+        lineHeight: "1",
+        padding: "4px 6px",
+        borderRadius: "4px",
+        minWidth: "auto",
+      },
+      ".cm-panel.cm-search [name=close]:hover": {
+        color: fg,
+        backgroundColor: lineHighlightBg,
+      },
+
+      // Search-match highlights. Defaults are flat yellow (light)
+      // and cyan (dark), both of which are unreadable on top of
+      // Shiki tokens. Amber/orange give clear contrast in either
+      // theme without competing with the selection's blue.
+      ".cm-searchMatch": {
+        backgroundColor:
+          theme === "dark" ? "rgba(250, 204, 21, 0.22)" : "rgba(250, 204, 21, 0.4)",
+        outline:
+          theme === "dark"
+            ? "1px solid rgba(250, 204, 21, 0.55)"
+            : "1px solid rgba(202, 138, 4, 0.55)",
+      },
+      ".cm-searchMatch-selected": {
+        backgroundColor:
+          theme === "dark" ? "rgba(251, 146, 60, 0.45)" : "rgba(251, 146, 60, 0.55)",
+        outline:
+          theme === "dark"
+            ? "1px solid rgba(251, 146, 60, 1)"
+            : "1px solid rgba(194, 65, 12, 1)",
+      },
     },
     { dark: theme === "dark" },
   );
