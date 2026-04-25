@@ -779,6 +779,20 @@ export function readProjectFile(path: string, file: string): Promise<string> {
   return invoke<string>("read_project_file", { path, file });
 }
 
+// Write UTF-8 `contents` to `path / file`. Rejects on:
+//   * file outside the project root (parent-canonicalisation escape)
+//   * I/O error from std::fs::write
+// Used by the /code editor's save flow (Cmd+S, Vim :w, auto-save
+// on focus-out). The frontend guards file size at 10 MiB before
+// invoking — no size cap on the Rust side.
+export function writeProjectFile(
+  path: string,
+  file: string,
+  contents: string,
+): Promise<void> {
+  return invoke<void>("write_project_file", { path, file, contents });
+}
+
 export interface BlockLine {
   // 1-based line number, matching ripgrep / editor convention.
   line: number;

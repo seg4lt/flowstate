@@ -159,9 +159,18 @@ export function TabBar({
                 }
               >
                 <span className="truncate font-mono">{basename}</span>
+                {/*
+                  Dirty / close affordance — when the tab has
+                  unsaved edits, render a `•` dot at rest and
+                  swap to the `X` close button on hover. In the
+                  steady state with auto-save-on-blur this dot
+                  flashes briefly between keystroke and save
+                  completion; it sticks around longer only when
+                  a save fails.
+                */}
                 <span
                   role="button"
-                  aria-label={`Close ${basename}`}
+                  aria-label={tab.dirty ? `Close ${basename} (unsaved)` : `Close ${basename}`}
                   tabIndex={-1}
                   onClick={(e) => {
                     e.stopPropagation();
@@ -170,11 +179,21 @@ export function TabBar({
                   onMouseDown={(e) => e.stopPropagation()}
                   className={
                     "ml-auto flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-sm " +
-                    "text-muted-foreground/70 opacity-0 transition-opacity hover:bg-muted hover:text-foreground group-hover:opacity-100 " +
-                    (isActive ? "opacity-60" : "")
+                    "transition-opacity hover:bg-muted hover:text-foreground " +
+                    (tab.dirty
+                      ? "text-foreground opacity-100"
+                      : "text-muted-foreground/70 opacity-0 group-hover:opacity-100 " +
+                        (isActive ? "opacity-60" : ""))
                   }
                 >
-                  <X className="h-3 w-3" />
+                  {tab.dirty ? (
+                    <span aria-hidden="true" className="block h-1.5 w-1.5 rounded-full bg-current group-hover:hidden" />
+                  ) : null}
+                  <X
+                    className={
+                      "h-3 w-3 " + (tab.dirty ? "hidden group-hover:block" : "")
+                    }
+                  />
                 </span>
                 {isActive && (
                   <span

@@ -1,8 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { File as PierreFile } from "@pierre/diffs/react";
-import { Virtualizer } from "@pierre/diffs/react";
 import {
   ArrowLeft,
   CaseSensitive,
@@ -15,17 +13,28 @@ import {
 } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { useApp } from "@/stores/app-store";
 import {
   defaultContentSearchOptions,
   readProjectFile,
   searchFileContents,
+  writeProjectFile,
   type ContentBlock,
   type ContentSearchOptions,
 } from "@/lib/api";
 import { projectFilesQueryOptions } from "@/lib/queries";
 import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
 import { useTheme } from "@/hooks/use-theme";
+import { useEditorPrefs } from "@/hooks/use-editor-prefs";
+import { toast } from "@/hooks/use-toast";
 import { hashContent } from "@/lib/content-hash";
 import { FileTree } from "./file-tree";
 import { Multibuffer } from "./multibuffer";
@@ -38,6 +47,21 @@ import {
   type Pane as PaneState,
 } from "./use-editor-tabs";
 import { useEnsurePierrePoolActive } from "@/lib/pierre-pool-controller";
+
+// CM6 editor module is dynamic-imported so the editor chunk
+// (CodeMirror + vim + Shiki integration, ~180 KB gz) only lands
+// in the bundle on first file open. The `Suspense` fallback in
+// `CodeViewBody` covers the brief load gap.
+const LazyCodeEditor = React.lazy(() => import("./code-editor"));
+
+// Frontend-side max size for inline editing. The Rust read API
+// caps at 4 MiB (CODE_VIEW_MAX_FILE_BYTES) so files above that
+// never reach us, but if a future loader bypasses the Rust cap
+// we still don't want to mount CM6 on a multi-megabyte buffer
+// (the rope can take it; the keystroke path stays smooth) but
+// the initial paint cost on huge files is wasteful — better to
+// surface a banner and let the user pick another tool.
+const MAX_EDITABLE_BYTES = 10 * 1024 * 1024;
 
 // Read-only editor view: file tree + Cmd+P / content search picker
 // + single-file viewer. Layout:
@@ -260,6 +284,21 @@ export function CodeView(props: CodeViewProps) {
   // though a tab is active. Any subsequent tab activation or file
   // open clears the override.
   const [multibufferOverride, setMultibufferOverride] = React.useState(false);
+
+  // Editor preferences (vim mode, soft-wrap). Backed by localStorage
+  // and shared across panes via a module-singleton store, so toggling
+  // vim flips both panes' editors at once.
+  const { vimEnabled, setVimEnabled, softWrap } = useEditorPrefs();
+
+  // Confirm-close-with-unsaved-changes dialog state. This only
+  // appears in the rare case where auto-save-on-blur has FAILED
+  // (e.g., file became read-only on disk), leaving the tab dirty.
+  // In the happy path, focus-out auto-saves, the dirty bit clears
+  // before the close click lands, and this dialog never shows.
+  const [confirmClose, setConfirmClose] = React.useState<{
+    path: string;
+    pane: PaneIndex;
+  } | null>(null);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -524,6 +563,71 @@ export function CodeView(props: CodeViewProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectPath, activePathsKey]);
 
+  // ─── editor save / dirty wiring ──────────────────────────────────
+  //
+  // `handleSaveFile` is invoked by CodeEditor on Cmd+S, Vim `:w`,
+  // and the focus-out auto-save path. Throws on failure so the
+  // editor's own error wrapper surfaces a toast and leaves the
+  // dirty bit set — the Close-with-unsaved dialog can then offer
+  // the user the choice to discard.
+  //
+  // `handleDirtyChange` flips the tab's dirty flag in the layout
+  // reducer. The reducer dedupes redundant transitions, so this
+  // is a cheap dispatch on every keystroke that crosses the
+  // saved/unsaved boundary.
+  const handleSaveFile = React.useCallback(
+    async (path: string, pane: PaneIndex, contents: string): Promise<void> => {
+      if (!projectPath) {
+        throw new Error("no project");
+      }
+      try {
+        await writeProjectFile(projectPath, path, contents);
+      } catch (err) {
+        toast({
+          title: "Save failed",
+          description: String(err),
+          duration: 5000,
+        });
+        throw err;
+      }
+      // Re-baseline the file cache so reopening this tab uses the
+      // new content (no re-fetch, no flash of stale text). Bump the
+      // cacheKey via hashContent so any future @pierre/diffs LRU
+      // (still used for diffs) re-keys cleanly.
+      fileCacheRef.current.set(path, {
+        path,
+        contents,
+        cacheKey: `${path}::${hashContent(contents)}`,
+      });
+      tabs.setTabDirty(path, pane, false);
+      setCacheVersion((v) => v + 1);
+    },
+    [projectPath, tabs],
+  );
+
+  const handleDirtyChange = React.useCallback(
+    (path: string, pane: PaneIndex, dirty: boolean) => {
+      tabs.setTabDirty(path, pane, dirty);
+    },
+    [tabs],
+  );
+
+  // Wrap close-tab to gate on dirty state. In the steady state this
+  // dialog never appears — auto-save-on-blur clears `dirty` before
+  // the close click lands. It's only here for the save-failure
+  // case where the dirty bit is stuck.
+  const handleCloseTab = React.useCallback(
+    (path: string, pane: PaneIndex) => {
+      const target = layout.panes[pane]?.tabs.find((t) => t.path === path);
+      if (target?.dirty) {
+        setConfirmClose({ path, pane });
+        return;
+      }
+      tabs.closeTab(path, pane);
+    },
+    [layout, tabs],
+  );
+
   // Cmd/Ctrl+P focuses the picker in `files` mode; Cmd/Ctrl+Shift+F
   // focuses it in `content` mode; Cmd/Ctrl+B toggles the file tree
   // collapse. Mirrors VS Code muscle memory across all three.
@@ -683,6 +787,23 @@ export function CodeView(props: CodeViewProps) {
               </span>
             </>
           )}
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Button
+            variant={vimEnabled ? "secondary" : "ghost"}
+            size="xs"
+            onClick={() => setVimEnabled(!vimEnabled)}
+            title={
+              vimEnabled
+                ? "Vim mode is ON — click to disable"
+                : "Vim mode is OFF — click to enable"
+            }
+            aria-pressed={vimEnabled}
+          >
+            <span className="font-mono text-[10px] uppercase tracking-wide">
+              vim {vimEnabled ? "on" : "off"}
+            </span>
+          </Button>
         </div>
       </header>
 
@@ -879,7 +1000,7 @@ export function CodeView(props: CodeViewProps) {
                       tabs.activateTab(p, 0);
                       setMultibufferOverride(false);
                     }}
-                    onClose={(p) => tabs.closeTab(p, 0)}
+                    onClose={(p) => handleCloseTab(p, 0)}
                     onFocus={() => tabs.focusPane(0)}
                     onSplitHorizontal={() => tabs.splitPane("horizontal")}
                     onSplitVertical={() => tabs.splitPane("vertical")}
@@ -887,6 +1008,10 @@ export function CodeView(props: CodeViewProps) {
                       if (fromPane !== 0) tabs.moveTab(fromPane, 0, path);
                     }}
                     sessionId={sessionId ?? null}
+                    vimEnabled={vimEnabled}
+                    softWrap={softWrap}
+                    onSaveFile={handleSaveFile}
+                    onDirtyChangeFile={handleDirtyChange}
                   />
                 }
                 second={
@@ -905,12 +1030,16 @@ export function CodeView(props: CodeViewProps) {
                         tabs.activateTab(p, 1);
                         setMultibufferOverride(false);
                       }}
-                      onClose={(p) => tabs.closeTab(p, 1)}
+                      onClose={(p) => handleCloseTab(p, 1)}
                       onFocus={() => tabs.focusPane(1)}
                       onDropTab={(fromPane, path) => {
                         if (fromPane !== 1) tabs.moveTab(fromPane, 1, path);
                       }}
                       sessionId={sessionId ?? null}
+                      vimEnabled={vimEnabled}
+                      softWrap={softWrap}
+                      onSaveFile={handleSaveFile}
+                      onDirtyChangeFile={handleDirtyChange}
                     />
                   ) : undefined
                 }
@@ -919,6 +1048,39 @@ export function CodeView(props: CodeViewProps) {
           </div>
         </div>
       </div>
+      <Dialog
+        open={confirmClose !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmClose(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Unsaved changes</DialogTitle>
+            <DialogDescription>
+              {confirmClose
+                ? `${confirmClose.path} has unsaved changes that failed to auto-save. Close without saving?`
+                : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmClose(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                if (confirmClose) {
+                  tabs.closeTab(confirmClose.path, confirmClose.pane);
+                }
+                setConfirmClose(null);
+              }}
+            >
+              Close without saving
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -1179,6 +1341,15 @@ interface TabPaneViewProps {
   /** Forwarded to DiffCommentOverlay so hover "+" works on the open
    *  file viewer. Null disables the overlay (passthrough). */
   sessionId: string | null;
+  /** Editor preferences forwarded into the CodeMirror instance. */
+  vimEnabled: boolean;
+  softWrap: boolean;
+  /** Save handler — bubbles all the way up to CodeView's
+   *  `handleSaveFile` which writes the file via Tauri and updates
+   *  the file cache + tab dirty bit. */
+  onSaveFile: (path: string, pane: PaneIndex, contents: string) => Promise<void>;
+  /** Dirty-bit handler — bubbles up to `tabs.setTabDirty`. */
+  onDirtyChangeFile: (path: string, pane: PaneIndex, dirty: boolean) => void;
 }
 
 function TabPaneView({
@@ -1198,6 +1369,10 @@ function TabPaneView({
   onSplitVertical,
   onDropTab,
   sessionId,
+  vimEnabled,
+  softWrap,
+  onSaveFile,
+  onDirtyChangeFile,
 }: TabPaneViewProps) {
   const activePath = pane.activePath;
   const loadedFile =
@@ -1207,6 +1382,20 @@ function TabPaneView({
   const loading =
     activePath !== null && loadingPathsRef.current?.has(activePath) === true;
   const error = activePath !== null ? (fileErrors.get(activePath) ?? null) : null;
+
+  // Bind the save / dirty callbacks to this pane's index so the
+  // editor can stay generic (it doesn't know which pane it lives in).
+  const handleSave = React.useCallback(
+    (contents: string) => onSaveFile(activePath ?? "", paneIndex, contents),
+    [onSaveFile, activePath, paneIndex],
+  );
+  const handleDirty = React.useCallback(
+    (dirty: boolean) => {
+      if (activePath !== null) onDirtyChangeFile(activePath, paneIndex, dirty);
+    },
+    [onDirtyChangeFile, activePath, paneIndex],
+  );
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <TabBar
@@ -1234,6 +1423,10 @@ function TabPaneView({
           filesError={filesError}
           hasProject={hasProject}
           sessionId={sessionId}
+          vimEnabled={vimEnabled}
+          softWrap={softWrap}
+          onSave={handleSave}
+          onDirtyChange={handleDirty}
         />
       </div>
     </div>
@@ -1250,6 +1443,10 @@ interface CodeViewBodyProps {
   /** Forwarded to DiffCommentOverlay — hover "+" only works when we
    *  have a chat session to attach comments to. */
   sessionId: string | null;
+  vimEnabled: boolean;
+  softWrap: boolean;
+  onSave: (contents: string) => Promise<void>;
+  onDirtyChange: (dirty: boolean) => void;
 }
 
 const CodeViewBody = React.memo(function CodeViewBody({
@@ -1260,6 +1457,10 @@ const CodeViewBody = React.memo(function CodeViewBody({
   filesError,
   hasProject,
   sessionId,
+  vimEnabled,
+  softWrap,
+  onSave,
+  onDirtyChange,
 }: CodeViewBodyProps) {
   const { resolvedTheme } = useTheme();
   if (!hasProject) {
@@ -1305,41 +1506,54 @@ const CodeViewBody = React.memo(function CodeViewBody({
       </div>
     );
   }
-  // Wrap the viewer with the comment overlay so hovering a line
-  // surfaces the gutter "+" just like on the diff panel and the
-  // search multibuffer. `data-code-path` is what
-  // DiffCommentOverlay walks up to find the file path — it sits on
-  // the outermost wrapper so the shadow-DOM ancestor walk always
-  // reaches it regardless of pierre's internal layout.
+  // Files larger than the editable cap get a static banner instead
+  // of CM6. The 4 MiB Rust read cap is the binding constraint today,
+  // but this protects against future code paths that might surface
+  // larger buffers.
+  if (loadedFile.contents.length > MAX_EDITABLE_BYTES) {
+    return (
+      <div className="flex h-full items-center justify-center px-4 text-center text-xs text-muted-foreground">
+        File is too large to edit inline (
+        {Math.round(loadedFile.contents.length / 1024 / 1024)} MB).
+        <br />
+        Open it in an external editor.
+      </div>
+    );
+  }
+
+  // Wrap the editor with DiffCommentOverlay + `data-code-path` to
+  // keep parity with the multibuffer / diff panels. NOTE for v1.1:
+  // the overlay's "+" line-hover walks @pierre/diffs' shadow-DOM
+  // `data-line` attributes — CM6 doesn't emit those, so the "+"
+  // never appears over this editor. Documented regression; the
+  // wrapper stays so the data-code-path attribute is in place for
+  // a future CM6-aware overlay (`view.posAtCoords` + `lineBlockAt`).
   return (
     <div className="h-full" data-code-path={loadedFile.path}>
       <DiffCommentOverlay
         sessionId={sessionId}
         surface="code"
         pathAttr="data-code-path"
-        // The Virtualizer below is our scroll container — it needs a
-        // bounded height ancestor or `overflow-auto` has nothing to
-        // clip against. Without this `h-full`, the overlay wrapper
-        // collapses to content height and long files silently overflow
-        // the pane with no scrollbar.
         className="h-full"
       >
-        <Virtualizer className="h-full overflow-auto">
-          <PierreFile
+        <React.Suspense
+          fallback={
+            <div className="flex h-full items-center justify-center text-[11px] text-muted-foreground">
+              Loading editor…
+            </div>
+          }
+        >
+          <LazyCodeEditor
             key={loadedFile.path}
-            file={{
-              name: loadedFile.path,
-              contents: loadedFile.contents,
-              cacheKey: loadedFile.cacheKey,
-            }}
-            options={{
-              theme: { dark: "pierre-dark", light: "pierre-light" },
-              themeType: resolvedTheme,
-              overflow: "scroll",
-              tokenizeMaxLineLength: 5_000,
-            }}
+            path={loadedFile.path}
+            initialContent={loadedFile.contents}
+            theme={resolvedTheme}
+            vimEnabled={vimEnabled}
+            softWrap={softWrap}
+            onSave={onSave}
+            onDirtyChange={onDirtyChange}
           />
-        </Virtualizer>
+        </React.Suspense>
       </DiffCommentOverlay>
     </div>
   );
