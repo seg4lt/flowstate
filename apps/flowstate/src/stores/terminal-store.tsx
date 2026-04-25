@@ -246,21 +246,43 @@ function terminalReducer(
       return { ...state, projects };
     }
     case "prune_projects": {
+      // Fast path: every existing key is either NO_PROJECT_KEY or in
+      // `keep`, so nothing would be dropped. Returning `state` here is
+      // critical for the snapshot path — TerminalDock re-fires this
+      // dispatch on every snapshot, and if we returned a new state
+      // object whenever the keep set merely *re-equals* the current
+      // membership we'd notify every consumer for no reason.
+      let allKept = true;
+      for (const key of state.projects.keys()) {
+        if (key !== NO_PROJECT_KEY && !action.keep.has(key)) {
+          allKept = false;
+          break;
+        }
+      }
+      if (allKept) return state;
       const projects = new Map<string, ProjectTerminalState>();
       for (const [key, val] of state.projects) {
         if (key === NO_PROJECT_KEY || action.keep.has(key)) {
           projects.set(key, val);
         }
       }
-      if (projects.size === state.projects.size) return state;
       return { ...state, projects };
     }
     case "prune_sessions": {
+      // Same logic as prune_projects: bail on a no-op so we don't
+      // churn TerminalProvider's context value on every snapshot.
+      let allKept = true;
+      for (const sid of state.dockOpenBySession.keys()) {
+        if (!action.keep.has(sid)) {
+          allKept = false;
+          break;
+        }
+      }
+      if (allKept) return state;
       const dockOpenBySession = new Map<string, boolean>();
       for (const [sid, open] of state.dockOpenBySession) {
         if (action.keep.has(sid)) dockOpenBySession.set(sid, open);
       }
-      if (dockOpenBySession.size === state.dockOpenBySession.size) return state;
       return { ...state, dockOpenBySession };
     }
     default:

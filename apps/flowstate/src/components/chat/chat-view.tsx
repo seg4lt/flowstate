@@ -12,25 +12,22 @@ import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
   AttachmentRef,
-  ContentBlock,
   PermissionDecision,
   PermissionMode,
   ReasoningEffort,
-  RuntimeEvent,
   ThinkingMode,
   TurnRecord,
   UserInputAnswer,
   UserInputQuestion,
 } from "@/lib/types";
-import { connectStream, sendMessage } from "@/lib/api";
+import { sendMessage } from "@/lib/api";
+import { useSessionStreamSubscription } from "@/hooks/useSessionStreamSubscription";
 import {
   gitBranchQueryOptions,
   gitRootQueryOptions,
   loadFullSession,
   pathExistsQueryOptions,
-  sessionQueryKey,
   sessionQueryOptions,
-  type SessionPage,
 } from "@/lib/queries";
 import { useStreamedGitDiffSummary } from "@/lib/git-diff-stream";
 import { cycleMode, MODE_LABELS } from "@/lib/mode-cycling";
@@ -126,300 +123,6 @@ interface QuestionRequest {
   questions: UserInputQuestion[];
 }
 
-// Stream-order block accumulators. Adjacent text deltas coalesce into
-// the trailing text block; a non-text block (e.g. a tool call) closes
-// the run so the next text delta opens a new block. Always returns a
-// new array so React.memo / reference equality picks up the change.
-function appendTextDelta(
-  blocks: ContentBlock[] | undefined,
-  delta: string,
-): ContentBlock[] {
-  const list = blocks ?? [];
-  const last = list[list.length - 1];
-  if (last && last.kind === "text") {
-    return [...list.slice(0, -1), { kind: "text", text: last.text + delta }];
-  }
-  return [...list, { kind: "text", text: delta }];
-}
-
-function appendReasoningDelta(
-  blocks: ContentBlock[] | undefined,
-  delta: string,
-): ContentBlock[] {
-  const list = blocks ?? [];
-  const last = list[list.length - 1];
-  if (last && last.kind === "reasoning") {
-    return [
-      ...list.slice(0, -1),
-      { kind: "reasoning", text: last.text + delta },
-    ];
-  }
-  return [...list, { kind: "reasoning", text: delta }];
-}
-
-// Merge-or-append for compaction blocks. Runtime-core already pairs
-// up `compact_boundary` + `compact_summary` into one block, but the
-// frontend receives incremental updates as either event arrives. If
-// the last block is a Compact whose payload is compatible (same
-// trigger, no newer-than-stream regressions) we fold the fresh
-// fields in; otherwise we append a new block. Two compactions in
-// one turn (rare, but possible on very long turns) show as two
-// separate blocks.
-function applyCompactUpdate(
-  blocks: ContentBlock[] | undefined,
-  update: {
-    trigger: "auto" | "manual";
-    preTokens?: number;
-    postTokens?: number;
-    durationMs?: number;
-    summary?: string;
-  },
-): ContentBlock[] {
-  const list = blocks ?? [];
-  const last = list[list.length - 1];
-  if (last && last.kind === "compact") {
-    const merged: ContentBlock = {
-      kind: "compact",
-      trigger: update.trigger,
-      preTokens: update.preTokens ?? last.preTokens,
-      postTokens: update.postTokens ?? last.postTokens,
-      durationMs: update.durationMs ?? last.durationMs,
-      summary: update.summary ?? last.summary,
-    };
-    return [...list.slice(0, -1), merged];
-  }
-  return [
-    ...list,
-    {
-      kind: "compact",
-      trigger: update.trigger,
-      preTokens: update.preTokens,
-      postTokens: update.postTokens,
-      durationMs: update.durationMs,
-      summary: update.summary,
-    },
-  ];
-}
-
-// Apply a single runtime event to a turns array and return the
-// next-state turns. Used by the stream handler to update the
-// query cache entry for the event's session — because this is a
-// pure function over `prev`, we can run it inside a
-// `queryClient.setQueryData` updater and route every event
-// directly to the right session's cache entry without any
-// cross-session state leakage. Returns the same array reference
-// when the event doesn't apply to any known turn, so the
-// updater can bail out and avoid a wasted re-render.
-function applyEventToTurns(
-  prev: TurnRecord[],
-  event: RuntimeEvent,
-): TurnRecord[] {
-  switch (event.type) {
-    case "turn_started":
-    case "turn_completed": {
-      const exists = prev.some((t) => t.turnId === event.turn.turnId);
-      if (exists) {
-        return prev.map((t) =>
-          t.turnId === event.turn.turnId ? event.turn : t,
-        );
-      }
-      return [...prev, event.turn];
-    }
-    case "content_delta":
-      return prev.map((t) =>
-        t.turnId === event.turn_id
-          ? {
-              ...t,
-              output: event.accumulated_output,
-              blocks: appendTextDelta(t.blocks, event.delta),
-            }
-          : t,
-      );
-    case "reasoning_delta":
-      return prev.map((t) =>
-        t.turnId === event.turn_id
-          ? {
-              ...t,
-              reasoning: (t.reasoning ?? "") + event.delta,
-              blocks: appendReasoningDelta(t.blocks, event.delta),
-            }
-          : t,
-      );
-    case "compact_updated":
-      return prev.map((t) =>
-        t.turnId === event.turn_id
-          ? {
-              ...t,
-              blocks: applyCompactUpdate(t.blocks, {
-                trigger: event.trigger,
-                preTokens: event.pre_tokens,
-                postTokens: event.post_tokens,
-                durationMs: event.duration_ms,
-                summary: event.summary,
-              }),
-            }
-          : t,
-      );
-    case "memory_recalled":
-      return prev.map((t) =>
-        t.turnId === event.turn_id
-          ? {
-              ...t,
-              blocks: [
-                ...(t.blocks ?? []),
-                {
-                  kind: "memory_recall",
-                  mode: event.mode,
-                  memories: event.memories,
-                },
-              ],
-            }
-          : t,
-      );
-    case "tool_call_started":
-      return prev.map((t) =>
-        t.turnId === event.turn_id
-          ? {
-              ...t,
-              toolCalls: [
-                ...(t.toolCalls ?? []),
-                {
-                  callId: event.call_id,
-                  name: event.name,
-                  args: event.args,
-                  status: "pending" as const,
-                  parentCallId: event.parent_call_id,
-                },
-              ],
-              blocks: [
-                ...(t.blocks ?? []),
-                { kind: "tool_call", callId: event.call_id },
-              ],
-            }
-          : t,
-      );
-    case "tool_call_completed":
-      return prev.map((t) => {
-        if (t.turnId !== event.turn_id || !t.toolCalls) return t;
-        return {
-          ...t,
-          toolCalls: t.toolCalls.map((tc) =>
-            tc.callId === event.call_id
-              ? {
-                  ...tc,
-                  output: event.output,
-                  error: event.error,
-                  status: event.error
-                    ? ("failed" as const)
-                    : ("completed" as const),
-                }
-              : tc,
-          ),
-        };
-      });
-    // Per-tool heartbeat from a provider that opted into
-    // ProviderFeatures.toolProgress (Claude SDK today). We just
-    // stamp lastProgressAt on the matching tool call; the
-    // tool-call card watches that field against wall time and
-    // shows a "no progress · Ns" pip when it goes stale, while
-    // the stuck banner stays out of the way for tools that are
-    // still ticking. Unknown call_ids are silently ignored —
-    // usually means the heartbeat raced ahead of
-    // tool_call_started by a frame.
-    case "tool_progress":
-      return prev.map((t) => {
-        if (t.turnId !== event.turn_id || !t.toolCalls) return t;
-        return {
-          ...t,
-          toolCalls: t.toolCalls.map((tc) =>
-            tc.callId === event.call_id
-              ? { ...tc, lastProgressAt: event.occurred_at }
-              : tc,
-          ),
-        };
-      });
-    // Subagent lifecycle. Previously these only landed via the
-    // whole-turn refetch triggered by turn_completed, so the
-    // subagent box stayed empty during long-running dispatches.
-    // Handling them here lets the UI stream the subagent's state
-    // (including its per-agent model, once observed) live.
-    case "subagent_started":
-      return prev.map((t) =>
-        t.turnId === event.turn_id
-          ? {
-              ...t,
-              subagents: [
-                ...(t.subagents ?? []),
-                {
-                  agentId: event.agent_id,
-                  parentCallId: event.parent_call_id,
-                  agentType: event.agent_type,
-                  prompt: event.prompt,
-                  model: event.model,
-                  events: [],
-                  status: "running" as const,
-                },
-              ],
-            }
-          : t,
-      );
-    case "subagent_event":
-      return prev.map((t) => {
-        if (t.turnId !== event.turn_id || !t.subagents) return t;
-        return {
-          ...t,
-          subagents: t.subagents.map((s) =>
-            s.agentId === event.agent_id
-              ? { ...s, events: [...s.events, event.event] }
-              : s,
-          ),
-        };
-      });
-    case "subagent_completed":
-      return prev.map((t) => {
-        if (t.turnId !== event.turn_id || !t.subagents) return t;
-        return {
-          ...t,
-          subagents: t.subagents.map((s) =>
-            s.agentId === event.agent_id
-              ? {
-                  ...s,
-                  output: event.output,
-                  error: event.error,
-                  status: event.error
-                    ? ("failed" as const)
-                    : ("completed" as const),
-                }
-              : s,
-          ),
-        };
-      });
-    case "subagent_model_observed":
-      return prev.map((t) => {
-        if (t.turnId !== event.turn_id || !t.subagents) return t;
-        return {
-          ...t,
-          subagents: t.subagents.map((s) =>
-            s.agentId === event.agent_id ? { ...s, model: event.model } : s,
-          ),
-        };
-      });
-    // Incremental usage snapshots land on the in-flight turn so the
-    // ContextDisplay popover updates as each API call in the turn's
-    // tool loop completes. Without this, `turn.usage` only gets set
-    // on `turn_completed` — on an 11-minute turn that means 11
-    // minutes of a frozen numerator. See provider-claude-sdk bridge
-    // which now emits `turn_usage` per assistant message carrying
-    // the LATEST call's input/cache (not the aggregated sum that
-    // inflated the display past the window).
-    case "turn_usage_updated":
-      return prev.map((t) =>
-        t.turnId === event.turn_id ? { ...t, usage: event.usage } : t,
-      );
-    default:
-      return prev;
-  }
-}
 
 // Vertical drag handle between the chat column and the diff pane.
 // Mirrors the sidebar DragHandle pattern in router.tsx but measures
@@ -1390,188 +1093,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
   }, [sessionId, activateDiffSubscription, refreshDiffs]);
 
-  // Single stream listener for the lifetime of ChatView. It
-  // *never* reads sessionId from a closure — turn updates go into
-  // the query cache entry identified by `event.session_id`, and
-  // per-view side effects (pending input, permission prompts)
-  // check against the `sessionIdRef` so only events for the
-  // currently-visible thread touch transient UI state. That's
-  // what makes cross-session isolation structural: a thread-A
-  // content_delta that lands after the user has clicked over to
-  // thread B writes into cache[A], updates exactly nothing on
-  // screen, and silently waits for the user to come back to A.
-  React.useEffect(() => {
-    let active = true;
-
-    connectStream((message) => {
-      if (!active) return;
-
-      if (message.type === "session_loaded") {
-        // Replace the cache entry for the target session outright —
-        // this is the lag-recovery path, where the daemon is telling
-        // us "here is the authoritative state of session X right now".
-        const detail = message.session;
-        const targetId = detail.summary.sessionId;
-        const totalTurns = detail.summary.turnCount ?? detail.turns.length;
-        queryClient.setQueryData<SessionPage>(sessionQueryKey(targetId), {
-          detail,
-          loadedTurns: detail.turns.length,
-          totalTurns,
-          hasMoreOlder: detail.turns.length < totalTurns,
-        });
-        if (targetId === sessionIdRef.current) {
-          setPendingInput(null);
-          setLastEventAt(Date.now());
-          setStuckSince(null);
-          // Activate and refresh the diff subscription so the badge
-          // reflects the current working-tree state after reconnection.
-          activateDiffSubscription();
-          refreshDiffs();
-        }
-        return;
-      }
-
-      if (message.type !== "event") return;
-      const event = message.event;
-      if (!("session_id" in event)) return;
-      const eventSessionId = event.session_id;
-
-      // Route turn mutations to the event's session cache. Events
-      // whose session isn't in the cache (the user has never
-      // visited) silently no-op — when the user eventually opens
-      // that thread, useQuery fetches fresh data from the daemon.
-      queryClient.setQueryData<SessionPage>(
-        sessionQueryKey(eventSessionId),
-        (prev) => {
-          if (!prev) return prev;
-          const nextTurns = applyEventToTurns(prev.detail.turns, event);
-          if (nextTurns === prev.detail.turns) return prev;
-          const total = Math.max(prev.totalTurns, nextTurns.length);
-          return {
-            ...prev,
-            detail: { ...prev.detail, turns: nextTurns },
-            loadedTurns: nextTurns.length,
-            totalTurns: total,
-            hasMoreOlder: nextTurns.length < total,
-          };
-        },
-      );
-
-      // Per-view UI state only moves for events on the currently-
-      // visible session. Everything below here is "reset pending
-      // chrome" / "scroll-to-bottom hints" / "router navigation" —
-      // all current-view concerns.
-      if (eventSessionId !== sessionIdRef.current) return;
-
-      setLastEventAt(Date.now());
-      setStuckSince(null);
-
-      switch (event.type) {
-        case "turn_started":
-          // Clear the optimistic pending row now that the real turn
-          // has been appended to the cache. The store handles
-          // pendingPermissions/pendingQuestion clearing globally
-          // (turn_completed / session_interrupted reducer paths).
-          setPendingInput(null);
-          setTurnPhase(undefined);
-          setRetryState(null);
-          // Clear any stale suggestion from the previous turn —
-          // the new turn will emit its own `prompt_suggested`
-          // if the SDK has a prediction.
-          setPromptSuggestion(null);
-          break;
-
-        case "turn_completed":
-          setPendingInput(null);
-          setTurnPhase(undefined);
-          setRetryState(null);
-          // Every completed turn activates the diff subscription
-          // (idempotent after the first call) and restarts it so
-          // the badge reflects what this turn left on disk. The
-          // git work runs entirely on the Rust side via Tauri IPC
-          // — non-blocking for the UI.
-          activateDiffSubscription();
-          refreshDiffs();
-          break;
-
-        case "content_delta":
-          // First token of the turn clears any in-flight retry
-          // banner — if the provider was retrying and the model
-          // started responding, the retry succeeded. Always
-          // dispatch: React short-circuits a same-value set, so
-          // we don't need to gate on the current retryState.
-          setRetryState(null);
-          break;
-
-        case "turn_status_changed":
-          setTurnPhase(event.phase);
-          break;
-
-        case "turn_retrying":
-          setRetryState({
-            turnId: event.turn_id,
-            attempt: event.attempt,
-            maxRetries: event.max_retries,
-            retryDelayMs: event.retry_delay_ms,
-            errorStatus: event.error_status,
-            error: event.error,
-            startedAt: Date.now(),
-          });
-          break;
-
-        case "prompt_suggested":
-          // Latest prediction wins — the SDK may emit several over
-          // the life of a turn and we only show the freshest.
-          setPromptSuggestion(event.suggestion);
-          break;
-
-        case "tool_call_completed": {
-          // Detect auto-approved EnterPlanMode completing successfully.
-          // When it goes through the permission prompt, PlanEnterPrompt
-          // already sets the mode via modeOverride. This catches the
-          // bypass/allow-always case where no permission_requested fires.
-          if (!event.error) {
-            const cached = queryClient.getQueryData<SessionPage>(
-              sessionQueryKey(sessionIdRef.current),
-            );
-            if (cached) {
-              const turn = cached.detail.turns.find(
-                (t) => t.turnId === event.turn_id,
-              );
-              const tc = turn?.toolCalls?.find(
-                (c) => c.callId === event.call_id,
-              );
-              if (tc?.name === "EnterPlanMode" && !tc.parentCallId) {
-                setPermissionMode("plan");
-                toast({
-                  description: "Agent switched to Plan mode",
-                  duration: 3000,
-                });
-              }
-            }
-          }
-          break;
-        }
-
-        // permission_requested / user_question_asked are handled in
-        // the global store reducer (app-store.tsx). chat-view reads
-        // pendingPermissions / pendingQuestion from the store, so a
-        // prompt that arrives while the user is on a different
-        // thread now lives in the store until they switch over.
-
-        case "session_deleted":
-        case "session_archived":
-          // Active thread deleted / archived from elsewhere — bail
-          // out so the user isn't staring at a title with no data.
-          navigate({ to: "/" });
-          break;
-      }
-    });
-
-    return () => {
-      active = false;
-    };
-  }, [queryClient, navigate, refreshDiffs, activateDiffSubscription]);
+  // Per-view stream subscription. Routes through the store's single
+  // `connectStream` channel via `addServerMessageListener` — there is
+  // exactly one Tauri channel open for the whole app, regardless of
+  // how many ChatView instances mount. The hook owns all the
+  // routing/dispatch logic that used to live inline here; chat-view
+  // just hands it the local state setters and refs.
+  useSessionStreamSubscription({
+    sessionId,
+    sessionIdRef,
+    setPendingInput,
+    setLastEventAt,
+    setStuckSince,
+    setTurnPhase,
+    setRetryState,
+    setPromptSuggestion,
+    setPermissionMode,
+    activateDiffSubscription,
+    refreshDiffs,
+  });
 
   // --- Draft persistence callbacks ---
   const handleDraftChange = React.useCallback(
