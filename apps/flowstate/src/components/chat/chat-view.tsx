@@ -4,7 +4,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 import { isPopoutWindow } from "@/lib/popout";
-import { TOGGLE_DIFF_EVENT } from "@/lib/keyboard-shortcuts";
+import {
+  TOGGLE_CONTEXT_EVENT,
+  TOGGLE_DIFF_EVENT,
+} from "@/lib/keyboard-shortcuts";
 import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
@@ -1884,6 +1887,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       return next;
     });
   }, []);
+
+  // Bridge for the global ⌘⇧K shortcut: same indirection as
+  // TOGGLE_DIFF_EVENT above so the open/closed state stays owned by
+  // this component (which already does the diff↔context mutual
+  // exclusion). The active ChatView is the listener; popouts host
+  // their own ChatView so the popout's ⌘⇧K toggles its own panel.
+  React.useEffect(() => {
+    window.addEventListener(TOGGLE_CONTEXT_EVENT, handleToggleContext);
+    return () =>
+      window.removeEventListener(TOGGLE_CONTEXT_EVENT, handleToggleContext);
+  }, [handleToggleContext]);
 
   // Is there at least one tool call on the running turn still waiting
   // for its completion event? That's the precondition for the

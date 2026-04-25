@@ -14,6 +14,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  isPopoutWindow,
+  popoutThread,
+  readPopoutPinPref,
+  setPopoutPinned,
+} from "@/lib/popout";
 import type { SessionSummary } from "@/lib/types";
 
 // ─── shortcut registry ─────────────────────────────────────────────
@@ -48,6 +54,16 @@ export interface ShortcutCtx {
   projectSessions: SessionSummary[];
   /** Open the cheatsheet modal. */
   openShortcutsHelp: () => void;
+  /** Open the project picker (then provider dropdown) used by ⌘⇧N.
+   *  Owned by `AppShell` so the dialog renders alongside the help
+   *  dialog and the picker can fire start_session with the active
+   *  React hooks in scope (useApp / useNavigate). */
+  openProjectPicker: () => void;
+  /** Start a thread on the active session's project using the user's
+   *  saved default provider/model. Async because it round-trips
+   *  `start_session` and navigates on the response. Used by ⌘N.
+   *  Toasts when there's no active session to anchor on. */
+  startThreadOnCurrentProject: () => Promise<void>;
   /** Optional UI-feedback hook (toast in production, no-op in tests). */
   notify?: (message: string) => void;
 }
@@ -77,6 +93,16 @@ export interface Shortcut {
    *  required this for *every* registered shortcut, but the flag is
    *  here so future additions can opt out without forking the hook. */
   fireInTextInputs: boolean;
+  /** When true, the shortcut only fires inside a popout window. Used
+   *  for the always-on-top pin toggle which has no meaning in the
+   *  main window (the pin button itself is hidden there). When true
+   *  the entry is also hidden from the main-window cheatsheet so
+   *  users don't see a binding that does nothing for them. */
+  popoutOnly?: boolean;
+  /** Inverse of `popoutOnly`: when true, the shortcut only fires in
+   *  the main window. Pop-out (⌘T) uses this so a second press from
+   *  inside a popout doesn't try to re-pop the same thread. */
+  mainWindowOnly?: boolean;
   /** Pure predicate over the raw event. Returning true means "this
    *  shortcut owns this keydown" — the handler then preventDefaults
    *  and calls `run`. */
@@ -87,6 +113,30 @@ export interface Shortcut {
 /** Custom event the diff toggle dispatches. Listened to by chat-view.tsx.
  *  Module-level constant so both sides import the same string. */
 export const TOGGLE_DIFF_EVENT = "flowstate:toggle-diff";
+/** Same pattern as TOGGLE_DIFF_EVENT — fired by the ⌘⇧K shortcut and
+ *  consumed by the active ChatView to call its `handleToggleContext`
+ *  (which already handles mutual exclusion with the diff panel). */
+export const TOGGLE_CONTEXT_EVENT = "flowstate:toggle-context";
+/** Fired by ⌘⇧O. HeaderActions controls its editor DropdownMenu
+ *  state and listens for this to flip `open` to true; arrow keys +
+ *  Enter then walk the items via Radix's built-in nav. */
+export const OPEN_EDITOR_PICKER_EVENT = "flowstate:open-editor-picker";
+/** Fired by ⌘⇧M. The chat-toolbar's ModelSelector listens and pops
+ *  its Popover; cmdk handles arrow + Enter / search-as-you-type. The
+ *  selector is only mounted when there's an active chat session, so
+ *  the event is a no-op everywhere else (no extra route guard needed
+ *  at the dispatch site). */
+export const OPEN_MODEL_PICKER_EVENT = "flowstate:open-model-picker";
+/** Fired by ⌘⇧E. EffortSelector (also chat-toolbar-scoped) listens
+ *  and pops its DropdownMenu. Same "only fires when mounted"
+ *  guarantee as the model picker. */
+export const OPEN_EFFORT_PICKER_EVENT = "flowstate:open-effort-picker";
+/** Fired by ⌘⌥N. AppSidebar listens and pops the OS folder-picker
+ *  via `handleAddFolder` (then `createProject(path, basename)`). The
+ *  sidebar is always mounted in the main window so we don't need a
+ *  route guard at the dispatch site — the listener is the only
+ *  gate. */
+export const ADD_PROJECT_EVENT = "flowstate:add-project";
 
 function hasMod(e: KeyboardEvent): boolean {
   return e.metaKey || e.ctrlKey;
@@ -196,6 +246,153 @@ export const SHORTCUTS: Shortcut[] = [
     },
   },
   {
+    id: "toggle-context",
+    label: "Toggle agent context panel",
+    keys: ["⌘", "⇧", "K"],
+    group: "View",
+    fireInTextInputs: true,
+    match: (e) =>
+      hasMod(e) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "k",
+    run: () => {
+      // Fire-and-forget: chat-view.tsx subscribes to this event and
+      // calls its `handleToggleContext` (which already closes the
+      // diff panel on open via the existing mutual-exclusion logic).
+      window.dispatchEvent(new CustomEvent(TOGGLE_CONTEXT_EVENT));
+    },
+  },
+  {
+    id: "popout-thread",
+    label: "Pop out current thread",
+    keys: ["⌘", "T"],
+    group: "View",
+    fireInTextInputs: true,
+    // `mainWindowOnly` covers the "fired from inside a popout" case;
+    // we still defensively guard with `isPopoutWindow()` so a stale
+    // import couldn't sneak through. The `popoutThread` Rust command
+    // is idempotent on label collision (re-focuses the existing
+    // window), so this is also safe to spam from the main window.
+    mainWindowOnly: true,
+    match: (e) =>
+      hasMod(e) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "t",
+    run: (ctx) => {
+      if (isPopoutWindow()) return;
+      if (!ctx.activeSessionId) {
+        ctx.notify?.("Open a thread first to pop it out");
+        return;
+      }
+      void popoutThread(ctx.activeSessionId).catch((err) => {
+        ctx.notify?.(`Pop-out failed: ${String(err)}`);
+      });
+    },
+  },
+  {
+    id: "popout-pin-toggle",
+    label: "Toggle always-on-top",
+    keys: ["⌘", "⇧", "T"],
+    group: "View",
+    fireInTextInputs: true,
+    // Popout-only — the pin button doesn't exist in the main window
+    // and the underlying Tauri call would target the main window's
+    // flag instead, which would be confusing.
+    popoutOnly: true,
+    match: (e) =>
+      hasMod(e) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "t",
+    run: (ctx) => {
+      const next = !readPopoutPinPref();
+      void setPopoutPinned(next).catch((err) => {
+        ctx.notify?.(`Pin toggle failed: ${String(err)}`);
+      });
+    },
+  },
+  {
+    id: "open-editor-picker",
+    label: "Open editor picker",
+    keys: ["⌘", "⇧", "O"],
+    group: "View",
+    fireInTextInputs: true,
+    match: (e) =>
+      hasMod(e) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "o",
+    run: () => {
+      // HeaderActions owns the editor DropdownMenu's open state and
+      // listens for this event. Same indirection as the diff/context
+      // toggles so the menu state stays co-located with its other
+      // editor logic.
+      window.dispatchEvent(new CustomEvent(OPEN_EDITOR_PICKER_EVENT));
+    },
+  },
+  {
+    id: "open-model-picker",
+    label: "Open model picker",
+    keys: ["⌘", "⇧", "M"],
+    group: "View",
+    fireInTextInputs: true,
+    match: (e) =>
+      hasMod(e) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "m",
+    run: () => {
+      // ModelSelector (chat-toolbar) listens and opens its Popover.
+      // No-op when no chat is mounted (no listener) — by design.
+      window.dispatchEvent(new CustomEvent(OPEN_MODEL_PICKER_EVENT));
+    },
+  },
+  {
+    id: "open-effort-picker",
+    label: "Open effort picker",
+    keys: ["⌘", "⇧", "E"],
+    group: "View",
+    fireInTextInputs: true,
+    match: (e) =>
+      hasMod(e) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "e",
+    run: () => {
+      // EffortSelector (chat-toolbar) listens and opens its
+      // DropdownMenu. Radix handles arrow / Enter inside.
+      window.dispatchEvent(new CustomEvent(OPEN_EFFORT_PICKER_EVENT));
+    },
+  },
+  {
+    id: "new-thread-current-project",
+    label: "New thread (current project)",
+    keys: ["⌘", "N"],
+    group: "Navigation",
+    fireInTextInputs: true,
+    match: (e) =>
+      hasMod(e) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n",
+    run: (ctx) => {
+      void ctx.startThreadOnCurrentProject();
+    },
+  },
+  {
+    id: "new-thread-pick-project",
+    label: "New thread (pick project)",
+    keys: ["⌘", "⇧", "N"],
+    group: "Navigation",
+    fireInTextInputs: true,
+    match: (e) =>
+      hasMod(e) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "n",
+    run: (ctx) => ctx.openProjectPicker(),
+  },
+  {
+    id: "add-project",
+    label: "Add project (pick folder)",
+    keys: ["⌘", "⌥", "N"],
+    group: "Navigation",
+    fireInTextInputs: true,
+    // Cmd+Option+N. macOS sometimes routes Option+letter to the
+    // dead-key composer, but Cmd suppresses that path so `e.key`
+    // arrives as plain "n" with both metaKey and altKey set. We
+    // match `e.key.toLowerCase() === "n"` like every other letter
+    // shortcut here; if a layout ever delivers "˜" instead, the
+    // key chain still reaches us via `event.code === "KeyN"` —
+    // accept both for safety.
+    match: (e) =>
+      hasMod(e) &&
+      !e.shiftKey &&
+      e.altKey &&
+      (e.key.toLowerCase() === "n" || e.code === "KeyN"),
+    run: () => {
+      window.dispatchEvent(new CustomEvent(ADD_PROJECT_EVENT));
+    },
+  },
+  {
     id: "show-shortcuts",
     label: "Show keyboard shortcuts",
     keys: ["⌘", "⇧", "?"],
@@ -226,11 +423,19 @@ export function ShortcutsDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  // Pre-group once per render. The list is static, so this is cheap.
+  // Pre-group once per render. The list is static AND the
+  // popout/main-window split is a per-window constant
+  // (`isPopoutWindow()` is cached after first call), so the empty
+  // dep array is correct here.
   const groups = React.useMemo(() => {
+    const inPopout = isPopoutWindow();
     const order: ShortcutGroup[] = ["Navigation", "View", "Help"];
     const byGroup = new Map<ShortcutGroup, Shortcut[]>();
     for (const s of SHORTCUTS) {
+      // Hide bindings that won't fire in this window. Showing a row
+      // for a key that does nothing teaches users nothing.
+      if (s.popoutOnly && !inPopout) continue;
+      if (s.mainWindowOnly && inPopout) continue;
       const list = byGroup.get(s.group) ?? [];
       list.push(s);
       byGroup.set(s.group, list);

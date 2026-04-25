@@ -36,6 +36,13 @@ interface ProviderDropdownProps {
    *  thread itself. Useful when the caller needs to run extra setup
    *  (e.g. worktree provisioning) before starting the session. */
   onSelect?: (provider: ProviderKind, model?: string) => void;
+  /** Optional controlled-open props. Omitting both keeps the original
+   *  uncontrolled behavior (Radix tracks open state internally), so
+   *  every existing call site stays unchanged. The ⌘⇧N project picker
+   *  passes both so it can pop the menu open programmatically once a
+   *  project is selected. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
 export function ProviderDropdown({
@@ -43,6 +50,8 @@ export function ProviderDropdown({
   projectPath,
   trigger,
   onSelect,
+  open,
+  onOpenChange,
 }: ProviderDropdownProps) {
   const { state, send } = useApp();
   const { isProviderEnabled } = useProviderEnabled();
@@ -133,7 +142,7 @@ export function ProviderDropdown({
   }
 
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={onOpenChange}>
       <DropdownMenuTrigger asChild>
         {trigger ?? (
           <button

@@ -2,11 +2,14 @@ import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useApp } from "@/stores/app-store";
 import { toast } from "@/hooks/use-toast";
+import { useDefaultProvider } from "@/hooks/use-default-provider";
+import { readDefaultModel } from "@/lib/defaults-settings";
+import { isPopoutWindow } from "@/lib/popout";
 import {
   SHORTCUTS,
   type ShortcutCtx,
 } from "@/lib/keyboard-shortcuts";
-import type { SessionSummary } from "@/lib/types";
+import type { ProviderKind, SessionSummary } from "@/lib/types";
 
 // Single global keydown listener that walks the SHORTCUTS registry
 // and runs the first matching entry. Mounted exactly once in
@@ -23,10 +26,31 @@ import type { SessionSummary } from "@/lib/types";
 // defaults like ⌘P (print), ⌘[ / ⌘] (history nav), ⌘⇧F (fullscreen).
 export function useGlobalShortcuts(params: {
   openShortcutsHelp: () => void;
+  /** Open the project picker dialog used by ⌘⇧N. Owned by AppShell so
+   *  the picker can render alongside the cheatsheet dialog and reuse
+   *  the same provider hooks the sidebar already uses. */
+  openProjectPicker: () => void;
+  /**
+   * Which shell mounted the hook. "main" runs every non-`popoutOnly`
+   * binding (the default — this is what AppShell uses). "popout"
+   * restricts dispatch to `popoutOnly: true` entries only, so the
+   * popout window can still respond to ⌘⇧T (always-on-top) without
+   * also firing ⌘N / ⌘P / ⌘⇧? — those depend on UI mounted only in
+   * the main window's AppShell (project picker dialog, help dialog,
+   * sidebar-driven nav) and would silently no-op or feel broken.
+   */
+  mode?: "main" | "popout";
 }): void {
-  const { openShortcutsHelp } = params;
-  const { state } = useApp();
+  const { openShortcutsHelp, openProjectPicker, mode = "main" } = params;
+  const { state, send } = useApp();
   const navigate = useNavigate();
+  // The default-provider preference is async (SQLite-backed). Reading
+  // it inside the listener directly would either need to be async on
+  // the keypress path (breaks preventDefault flow) or block on a
+  // ref. Pre-resolve at the hook layer and stash so the handler is a
+  // synchronous read.
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
 
   // Build the per-press context lazily inside the listener so the
   // event always sees the freshest state — if we closed over `state`
@@ -36,8 +60,21 @@ export function useGlobalShortcuts(params: {
   React.useEffect(() => {
     stateRef.current = state;
   }, [state]);
+  const sendRef = React.useRef(send);
+  React.useEffect(() => {
+    sendRef.current = send;
+  }, [send]);
+  const defaultProviderRef = React.useRef(defaultProvider);
+  React.useEffect(() => {
+    defaultProviderRef.current = defaultProvider;
+  }, [defaultProvider]);
+  const defaultProviderLoadedRef = React.useRef(defaultProviderLoaded);
+  React.useEffect(() => {
+    defaultProviderLoadedRef.current = defaultProviderLoaded;
+  }, [defaultProviderLoaded]);
 
   React.useEffect(() => {
+    const inPopout = isPopoutWindow();
     function onKeyDown(e: KeyboardEvent) {
       // First match wins. The registry is small (single-digit
       // entries) so a linear scan per keydown is fine — no need for
@@ -48,16 +85,39 @@ export function useGlobalShortcuts(params: {
         if (!shortcut.fireInTextInputs && isInTextInput(e.target)) {
           return;
         }
+        // Mode filter. The popout shell mounts this hook in "popout"
+        // mode and only runs `popoutOnly` bindings — every other
+        // shortcut depends on UI mounted in the main AppShell
+        // (project picker, help dialog, etc.) or has semantics that
+        // don't transfer (⌘N would create a thread the popout can't
+        // navigate to). The main shell uses default "main" and skips
+        // popout-only entries so a popout pin keystroke can't
+        // accidentally fire there.
+        if (mode === "popout" && !shortcut.popoutOnly) continue;
+        if (mode === "main" && shortcut.popoutOnly) continue;
+        // Window-scope safety net. `mainWindowOnly` is redundant with
+        // the mode check above when mode="popout" but stays for
+        // belt-and-braces in case someone calls the hook in main mode
+        // from inside a popout (e.g. a future shared shell).
+        if (shortcut.mainWindowOnly && inPopout) continue;
 
         e.preventDefault();
-        const ctx = buildCtx(stateRef.current, navigate, openShortcutsHelp);
+        const ctx = buildCtx({
+          state: stateRef.current,
+          navigate,
+          openShortcutsHelp,
+          openProjectPicker,
+          sendMsg: sendRef.current,
+          defaultProvider: defaultProviderRef.current,
+          defaultProviderLoaded: defaultProviderLoadedRef.current,
+        });
         shortcut.run(ctx);
         return;
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navigate, openShortcutsHelp]);
+  }, [navigate, openShortcutsHelp, openProjectPicker]);
 }
 
 function isInTextInput(target: EventTarget | null): boolean {
@@ -137,18 +197,51 @@ function getAllSessionsInSidebarOrder(
   return flat;
 }
 
-function buildCtx(
+/** Resolve the active session's "effective" project id — the parent
+ *  of a worktree row, or the project itself. Mirrors the rollup the
+ *  sidebar uses so ⌘N feels like "new thread in the row I'm reading
+ *  the sidebar from". */
+function effectiveActiveProjectId(
   state: ReturnType<typeof useApp>["state"],
-  navigate: ReturnType<typeof useNavigate>,
-  openShortcutsHelp: () => void,
-): ShortcutCtx {
+): string | null {
+  const activeId = state.activeSessionId;
+  const active = activeId ? state.sessions.get(activeId) : undefined;
+  if (!active?.projectId) return null;
+  return (
+    state.projectWorktrees.get(active.projectId)?.parentProjectId ??
+    active.projectId
+  );
+}
+
+interface BuildCtxArgs {
+  state: ReturnType<typeof useApp>["state"];
+  navigate: ReturnType<typeof useNavigate>;
+  openShortcutsHelp: () => void;
+  openProjectPicker: () => void;
+  sendMsg: ReturnType<typeof useApp>["send"];
+  defaultProvider: ProviderKind;
+  defaultProviderLoaded: boolean;
+}
+
+function buildCtx(args: BuildCtxArgs): ShortcutCtx {
+  const {
+    state,
+    navigate,
+    openShortcutsHelp,
+    openProjectPicker,
+    sendMsg,
+    defaultProvider,
+    defaultProviderLoaded,
+  } = args;
+  const notify = (message: string) => {
+    toast({ description: message, duration: 2000 });
+  };
   return {
     activeSessionId: state.activeSessionId,
     projectSessions: getAllSessionsInSidebarOrder(state),
     openShortcutsHelp,
-    notify: (message) => {
-      toast({ description: message, duration: 2000 });
-    },
+    openProjectPicker,
+    notify,
     // The registry's NavigateArg is structurally a subset of TanStack's
     // `NavigateOptions`, but TanStack's type is a deeply-generic union
     // over the route tree that won't accept a literal-typed arg
@@ -158,5 +251,42 @@ function buildCtx(
     // is sound at runtime.
     navigate: (opts) =>
       navigate(opts as unknown as Parameters<typeof navigate>[0]),
+    startThreadOnCurrentProject: async () => {
+      // Resolve "current project" the same way the sidebar groups
+      // threads — walking through worktree links so a popout from a
+      // worktree thread still lands the new thread on the parent
+      // project (which is what the user sees as the active row).
+      const projectId = effectiveActiveProjectId(state);
+      if (!projectId) {
+        notify("Open a thread first to start one in its project");
+        return;
+      }
+      if (!defaultProviderLoaded) {
+        // Keep the UX honest — falling through to the constant
+        // DEFAULT_PROVIDER would silently disregard a saved choice
+        // that just hadn't loaded yet. Same guard the sidebar's
+        // worktree-new-thread dropdown uses for the same reason.
+        notify("Default provider still loading… try again in a moment");
+        return;
+      }
+      try {
+        const model = await readDefaultModel(defaultProvider);
+        const res = await sendMsg({
+          type: "start_session",
+          provider: defaultProvider,
+          model: model ?? undefined,
+          project_id: projectId,
+        });
+        if (res?.type === "session_created") {
+          navigate({
+            to: "/chat/$sessionId",
+            params: { sessionId: res.session.sessionId },
+          } as unknown as Parameters<typeof navigate>[0]);
+        }
+      } catch (err) {
+        notify(`Failed to start thread: ${String(err)}`);
+      }
+    },
   };
 }
+

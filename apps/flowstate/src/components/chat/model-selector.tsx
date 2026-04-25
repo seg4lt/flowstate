@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronDown, Check, Loader2 } from "lucide-react";
 import {
   Command,
@@ -10,6 +10,7 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useApp } from "@/stores/app-store";
 import { rememberPickedModel, readPickedModel } from "@/lib/model-settings";
+import { OPEN_MODEL_PICKER_EVENT } from "@/lib/keyboard-shortcuts";
 import type { ProviderKind } from "@/lib/types";
 
 interface ModelSelectorProps {
@@ -31,6 +32,18 @@ export function ModelSelector({
 }: ModelSelectorProps) {
   const { state, send } = useApp();
   const [open, setOpen] = useState(false);
+  // ⌘⇧M bridge: the global registry dispatches an event rather than
+  // calling into this component directly so the popover state stays
+  // local. Same indirection pattern the diff/context/editor toggles
+  // use. The selector is only mounted when there's an active chat,
+  // so the event is naturally a no-op on every other route.
+  useEffect(() => {
+    function onOpen() {
+      setOpen(true);
+    }
+    window.addEventListener(OPEN_MODEL_PICKER_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_MODEL_PICKER_EVENT, onOpen);
+  }, []);
   const providerStatus = state.providers.find((p) => p.kind === provider);
   const models = providerStatus?.models ?? [];
 
