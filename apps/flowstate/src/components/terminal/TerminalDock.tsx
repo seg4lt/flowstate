@@ -148,29 +148,26 @@ export function TerminalDock() {
   const dockOpen = selectDockOpen(state, sessionId);
 
   // Prune terminals for projects that no longer exist in app state
-  // (user deleted the folder) OR whose last active session was
-  // archived / deleted. Keeps NO_PROJECT_KEY alive. Also prunes
-  // per-session dock-open entries so we don't leak booleans for
-  // sessions the user has deleted or archived.
+  // (user deleted the folder). Keeps NO_PROJECT_KEY alive. Previously
+  // this effect also pruned a project whose last *active* session had
+  // been archived/deleted — derived from `appState.sessions` membership
+  // — but that was unsafe for two reasons:
+  //
+  //  1. Snapshots from the daemon are not transactionally complete:
+  //     on reconnect / focus return the snapshot can briefly omit a
+  //     session that's still very much alive, and pruning the project
+  //     in that window kills every open PTY in the dock.
+  //  2. Archived sessions can still own a useful workspace — the user
+  //     might pop the dock and run a `git log` on the worktree without
+  //     wanting their terminals nuked just because the chat thread
+  //     was archived.
+  //
+  // Trust `appState.projects` membership as the sole authority for
+  // "this project still exists." Per-session dock-open entries are
+  // pruned against the current sessions set so we don't accumulate
+  // stale booleans across hard deletes.
   React.useEffect(() => {
-    const existingProjects = new Set(appState.projects.map((p) => p.projectId));
-
-    // Collect projects that still have at least one active (non-archived) session.
-    const activeProjectIds = new Set<string>();
-    for (const session of appState.sessions.values()) {
-      if (session.projectId) {
-        activeProjectIds.add(session.projectId);
-      }
-    }
-
-    // Keep only projects that exist AND have active sessions.
-    const keep = new Set<string>();
-    for (const pid of existingProjects) {
-      if (activeProjectIds.has(pid)) {
-        keep.add(pid);
-      }
-    }
-
+    const keep = new Set(appState.projects.map((p) => p.projectId));
     dispatch({ type: "prune_projects", keep });
     dispatch({
       type: "prune_sessions",

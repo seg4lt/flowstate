@@ -24,6 +24,11 @@ export interface Tab {
   /** Monotonic counter from openedAt; higher = more recently touched.
    *  Used as the LRU key when we need to evict past MAX_TABS_PER_PANE. */
   lastAccessedAt: number;
+  /** True while the editor's buffer differs from disk. Cleared on
+   *  successful save (Cmd+S, Vim `:w`, or auto-save on focus-out).
+   *  Drives the unsaved-dot in the tab bar and the close-confirm
+   *  dialog. NOT persisted — always starts false on app reload. */
+  dirty?: boolean;
 }
 
 export interface Pane {
@@ -165,6 +170,7 @@ type Action =
   | { type: "cycleTab"; pane: PaneIndex; delta: 1 | -1 }
   | { type: "focusTabAtIndex"; pane: PaneIndex; index: number }
   | { type: "setSplitRatio"; ratio: number }
+  | { type: "markTabDirty"; pane: PaneIndex; path: string; dirty: boolean }
   | { type: "reset"; next: EditorLayout };
 
 let stampSeq = 0;
@@ -379,6 +385,25 @@ function reducer(layout: EditorLayout, action: Action): EditorLayout {
       const clamped = Math.max(0.15, Math.min(0.85, action.ratio));
       return { ...layout, splitRatio: clamped };
     }
+    case "markTabDirty": {
+      const idx =
+        action.pane < layout.panes.length ? action.pane : 0;
+      const pane = layout.panes[idx]!;
+      const tab = pane.tabs.find((t) => t.path === action.path);
+      // Skip if no such tab or the dirty bit is already what we want
+      // — keeps the layout reference stable and avoids a needless
+      // localStorage persist tick.
+      if (!tab) return layout;
+      const current = tab.dirty === true;
+      if (current === action.dirty) return layout;
+      const nextPane: Pane = {
+        ...pane,
+        tabs: pane.tabs.map((t) =>
+          t.path === action.path ? { ...t, dirty: action.dirty } : t,
+        ),
+      };
+      return setPane(layout, idx as PaneIndex, nextPane);
+    }
     case "reset": {
       return action.next;
     }
@@ -399,6 +424,9 @@ export interface EditorTabsApi {
   focusTabAtIndex: (index: number) => void;
   closeActiveTab: () => void;
   setSplitRatio: (ratio: number) => void;
+  /** Set the dirty bit on the matching tab. No-op if the tab doesn't
+   *  exist or the bit is already in the requested state. */
+  setTabDirty: (path: string, pane: PaneIndex, dirty: boolean) => void;
 }
 
 /**
@@ -509,6 +537,8 @@ export function useEditorTabs(
         }
       },
       setSplitRatio: (ratio) => dispatch({ type: "setSplitRatio", ratio }),
+      setTabDirty: (path, pane, dirty) =>
+        dispatch({ type: "markTabDirty", pane, path, dirty }),
     };
   }, [layout]);
 

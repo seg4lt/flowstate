@@ -1276,6 +1276,40 @@ fn read_project_file(path: String, file: String) -> Result<String, String> {
     std::fs::read_to_string(&abs_canon).map_err(|e| format!("read: {e}"))
 }
 
+/// Write UTF-8 `contents` to a project file at `path / file`. Used
+/// by the /code editor view's save flow (Cmd+S, Vim `:w`, and
+/// auto-save on focus-out).
+///
+/// Path-escape defense: we canonicalise the **parent directory** —
+/// not the target file — because `canonicalize` fails on paths that
+/// don't exist yet, and a save can target a freshly-renamed file
+/// or a brand-new file the user just typed into. Canonicalising the
+/// parent then re-joining the basename is the standard workaround
+/// and still rejects `..` traversal (the canonical parent must lie
+/// inside the canonical project root).
+///
+/// No size cap on write — the frontend guards at 10 MiB before
+/// invoking this. The 4 MiB read cap (`CODE_VIEW_MAX_FILE_BYTES`)
+/// is a read-side concern and doesn't apply here.
+#[tauri::command]
+fn write_project_file(path: String, file: String, contents: String) -> Result<(), String> {
+    let project_path = Path::new(&path);
+    let abs = project_path.join(&file);
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let parent = abs.parent().ok_or("no parent directory")?;
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| format!("parent path: {e}"))?;
+    let basename = abs.file_name().ok_or("no filename")?;
+    let final_path = parent_canon.join(basename);
+    if !final_path.starts_with(&project_canon) {
+        return Err("file is outside the project root".into());
+    }
+    std::fs::write(&final_path, contents.as_bytes()).map_err(|e| format!("write: {e}"))
+}
+
 /// A single entry returned by `list_directory`. `is_ignored` is true
 /// when the entry would be excluded by `.gitignore` / `.git/info/exclude`
 /// / the global gitignore — the frontend still receives the entry, but
@@ -3077,6 +3111,7 @@ pub fn run() {
             list_project_files,
             list_directory,
             read_project_file,
+            write_project_file,
             search_file_contents,
             open_in_editor,
             pty_open,

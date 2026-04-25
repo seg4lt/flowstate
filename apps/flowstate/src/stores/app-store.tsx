@@ -438,6 +438,35 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
+// Field-by-field equality for the wire types that arrive in
+// `snapshot` messages. Both shapes are flat records of primitives, so
+// a hand-rolled compare avoids pulling in a deep-equal dep and keeps
+// the snapshot reducer's hot path allocation-free in the common
+// "nothing actually changed" case.
+function sessionSummariesEqual(a: SessionSummary, b: SessionSummary): boolean {
+  return (
+    a === b ||
+    (a.sessionId === b.sessionId &&
+      a.provider === b.provider &&
+      a.status === b.status &&
+      a.createdAt === b.createdAt &&
+      a.updatedAt === b.updatedAt &&
+      a.turnCount === b.turnCount &&
+      a.model === b.model &&
+      a.projectId === b.projectId)
+  );
+}
+
+function projectRecordsEqual(a: ProjectRecord, b: ProjectRecord): boolean {
+  return (
+    a === b ||
+    (a.projectId === b.projectId &&
+      a.path === b.path &&
+      a.createdAt === b.createdAt &&
+      a.updatedAt === b.updatedAt)
+  );
+}
+
 function handleServerMessage(
   state: AppState,
   message: ServerMessage,
@@ -459,15 +488,69 @@ function handleServerMessage(
     }
 
     case "snapshot": {
-      const sessions = new Map<string, SessionSummary>();
-      for (const detail of message.snapshot.sessions) {
-        sessions.set(detail.summary.sessionId, detail.summary);
+      // Reference-stable snapshot handling. The daemon re-sends the
+      // full snapshot on reconnect / focus return / certain server-side
+      // state nudges; in the common case the contents are identical to
+      // what we already hold but JSON.parse hands us fresh objects with
+      // new identities. Replacing `state.sessions` / `state.projects`
+      // unconditionally would fan a render storm through every
+      // `useApp()` consumer (and re-fire TerminalDock's prune effect,
+      // which can in turn destroy live PTYs if the snapshot transiently
+      // omits a session whose project tabs are open). Reuse the prior
+      // values whenever the new payload is equivalent so React bails
+      // out of the downstream re-renders entirely.
+      const incomingSessions = message.snapshot.sessions;
+      let sessions = state.sessions;
+      let sessionsChanged = sessions.size !== incomingSessions.length;
+      if (!sessionsChanged) {
+        for (const detail of incomingSessions) {
+          const prev = sessions.get(detail.summary.sessionId);
+          if (!prev || !sessionSummariesEqual(prev, detail.summary)) {
+            sessionsChanged = true;
+            break;
+          }
+        }
       }
-      return {
-        ...state,
-        sessions,
-        projects: message.snapshot.projects,
-      };
+      if (sessionsChanged) {
+        sessions = new Map<string, SessionSummary>();
+        for (const detail of incomingSessions) {
+          // Preserve the prior reference if content is identical so
+          // downstream `===` checks (e.g. queryClient cache lookups
+          // keyed on summary identity) don't see spurious churn.
+          const prev = state.sessions.get(detail.summary.sessionId);
+          sessions.set(
+            detail.summary.sessionId,
+            prev && sessionSummariesEqual(prev, detail.summary)
+              ? prev
+              : detail.summary,
+          );
+        }
+      }
+
+      const incomingProjects = message.snapshot.projects;
+      let projects = state.projects;
+      let projectsChanged = projects.length !== incomingProjects.length;
+      if (!projectsChanged) {
+        for (let i = 0; i < incomingProjects.length; i++) {
+          const prev = projects[i];
+          const next = incomingProjects[i];
+          if (!prev || !projectRecordsEqual(prev, next)) {
+            projectsChanged = true;
+            break;
+          }
+        }
+      }
+      if (projectsChanged) {
+        projects = incomingProjects.map((next) => {
+          const prev = state.projects.find(
+            (p) => p.projectId === next.projectId,
+          );
+          return prev && projectRecordsEqual(prev, next) ? prev : next;
+        });
+      }
+
+      if (!sessionsChanged && !projectsChanged) return state;
+      return { ...state, sessions, projects };
     }
 
     case "session_created": {
