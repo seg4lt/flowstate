@@ -223,7 +223,7 @@ function hasOverlongLine(text: string): boolean {
 // alignment spaces. Falls back to 2-space for files with no
 // usable signal (empty, single-line, all-flush-left).
 
-interface DetectedIndent {
+export interface DetectedIndent {
   /** String inserted on Tab / indentMore. `"\t"` or `" ".repeat(n)`. */
   unit: string;
   /** Tab display width and visual indent step. */
