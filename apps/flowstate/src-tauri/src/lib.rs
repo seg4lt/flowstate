@@ -25,6 +25,16 @@ use std::time::Duration;
 static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
 
+/// Label of the primary application window declared in
+/// `tauri.conf.json`. Popout windows use deterministic labels of the
+/// form `thread-<session_id>` (see `popout_window_label`). The
+/// `on_window_event` handler and the macOS dock-reopen path both
+/// compare against this constant to apply main-window-only policy
+/// (hide-on-close, daemon shutdown, dock-icon resurrection) without
+/// mistakenly applying it to popouts — which must be free to close
+/// and have their WKWebView subprocesses reaped normally.
+const MAIN_WINDOW_LABEL: &str = "main";
+
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::Emitter;
@@ -2447,7 +2457,8 @@ pub fn run() {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    let Some(window) = shortcut_handle.get_webview_window("main") else {
+                    let Some(window) = shortcut_handle.get_webview_window(MAIN_WINDOW_LABEL)
+                    else {
                         return;
                     };
                     match window.is_focused() {
@@ -3103,6 +3114,18 @@ pub fn run() {
             retry_provision_phase,
         ])
         .on_window_event(|window, event| {
+            // The handler is registered globally and fires for *every*
+            // window — main + every `thread-<id>` popout. Main-window
+            // policy (hide-on-close, daemon shutdown) must be gated
+            // behind this label check; otherwise closing a popout
+            // either leaks its WKWebView subprocess (macOS hide-and-
+            // never-destroy) or quits the entire app (Linux/Windows
+            // exit(0) path). Popouts get the default Tauri close
+            // behaviour, which destroys the window and reaps the
+            // webview process — the connect broadcast loop in
+            // `transport-tauri` self-cleans when its channel send
+            // fails on teardown.
+            let is_main = window.label() == MAIN_WINDOW_LABEL;
             match event {
                 // Red traffic light (or frontend-initiated
                 // `getCurrentWindow().close()`).
@@ -3121,13 +3144,42 @@ pub fn run() {
                 // a hidden window around would just orphan the
                 // process. Fall through to the original shutdown path
                 // there.
+                //
+                // Single macOS arm with branch on label. Popouts need
+                // `window.destroy()` explicitly: Tauri/Tao's default
+                // close path on macOS only orders the window out, it
+                // does NOT release the NSWindow / WKWebView. Without
+                // an explicit destroy, the WKWebView (visible as a
+                // `tauri://localhost` row in Activity Monitor) stays
+                // alive indefinitely, holding 100s of MB per popout
+                // and keeping its Rust-side `connect` broadcast
+                // subscription open.
                 #[cfg(target_os = "macos")]
                 tauri::WindowEvent::CloseRequested { api, .. } => {
-                    api.prevent_close();
-                    let _ = window.hide();
+                    if is_main {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    } else {
+                        // Stop Tauri/Tao's default close path (which on
+                        // macOS only orders the NSWindow out and leaves
+                        // the WKWebView alive) before destroying — the
+                        // two paths can race otherwise.
+                        api.prevent_close();
+                        tracing::info!(
+                            label = %window.label(),
+                            "popout close requested; destroying window"
+                        );
+                        if let Err(e) = window.destroy() {
+                            tracing::warn!(
+                                label = %window.label(),
+                                error = %e,
+                                "popout window.destroy() failed"
+                            );
+                        }
+                    }
                 }
                 #[cfg(not(target_os = "macos"))]
-                tauri::WindowEvent::CloseRequested { .. } => {
+                tauri::WindowEvent::CloseRequested { .. } if is_main => {
                     if let Some(pty) = window.try_state::<PtyManager>() {
                         pty.kill_all();
                     }
@@ -3137,10 +3189,14 @@ pub fn run() {
                     window.app_handle().exit(0);
                 }
                 // Still wire the Destroyed path as a belt-and-braces
-                // fallback — any code path that destroys a window
-                // without going through CloseRequested (plugin teardown,
-                // OS-driven close) still trips the daemon shutdown.
-                tauri::WindowEvent::Destroyed => {
+                // fallback — any code path that destroys the main
+                // window without going through CloseRequested (plugin
+                // teardown, OS-driven close) still trips the daemon
+                // shutdown. For popouts this is a no-op: PtyManager
+                // and AppLifecycle are global state, so calling them
+                // here would tear down terminals and the daemon that
+                // belong to the main window.
+                tauri::WindowEvent::Destroyed if is_main => {
                     if let Some(pty) = window.try_state::<PtyManager>() {
                         pty.kill_all();
                     }
@@ -3148,28 +3204,34 @@ pub fn run() {
                         state.lifecycle.request_shutdown();
                     }
                 }
+                tauri::WindowEvent::Destroyed => {
+                    tracing::info!(label = %window.label(), "popout window destroyed");
+                }
                 _ => {}
             }
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // macOS dock-icon click. When all windows are hidden (which
-            // is what the `CloseRequested` arm above does on macOS)
-            // clicking the dock icon should restore the main window —
+            // macOS dock-icon click. When the main window is hidden
+            // (which is what the `CloseRequested` arm above does on
+            // macOS) clicking the dock icon should restore it —
             // otherwise there's no way back in short of Cmd+Tab +
-            // Cmd+N-style tricks. `has_visible_windows` is false after
-            // our hide, so iterate every window and show+focus it.
+            // Cmd+N-style tricks. Only the main window is targeted:
+            // popouts that are still open are visible already, and
+            // popouts that the user closed must NOT be resurrected
+            // (they don't even exist anymore now that popout close
+            // actually destroys the window).
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {
                 has_visible_windows, ..
             } = &event
             {
                 if !*has_visible_windows {
-                    for (_, window) in app_handle.webview_windows() {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
+                    if let Some(main) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
+                        let _ = main.show();
+                        let _ = main.unminimize();
+                        let _ = main.set_focus();
                     }
                 }
             }
