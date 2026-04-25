@@ -104,6 +104,57 @@ function ensureVimWriteRegistered(): void {
   });
 }
 
+// Mirror vim yank / delete / change to the OS clipboard. The plugin
+// only writes to `navigator.clipboard` when the user explicitly
+// names the `+` register (`"+y`, `"+d`); plain `y`, `dd`, `cw`
+// stay inside vim's own registers. That matches stock vim, but
+// most people running vim in a GUI editor expect `set clipboard=
+// unnamed` semantics — yank in here, paste with Cmd+V over there.
+//
+// We patch `RegisterController.pushText` once at module load. Every
+// operation that targets the unnamed register (no explicit `"x`
+// prefix) for yank / delete / change additionally fires
+// `navigator.clipboard.writeText`. Failures are swallowed: the
+// vim register is still updated, the user just won't get the OS
+// clipboard sync (e.g., insecure context, permission denied).
+let clipboardSyncRegistered = false;
+function ensureClipboardSyncRegistered(): void {
+  if (clipboardSyncRegistered) return;
+  clipboardSyncRegistered = true;
+  if (typeof navigator === "undefined" || !navigator.clipboard) return;
+  // The Vim runtime API isn't strictly typed for the controller's
+  // `pushText` method — pull it through `unknown` so TS doesn't
+  // complain about the mutation while preserving runtime safety.
+  const ctrl = (
+    Vim as unknown as { getRegisterController?: () => unknown }
+  ).getRegisterController?.();
+  if (!ctrl) return;
+  type PushText = (
+    registerName: string | null | undefined,
+    operator: string,
+    text: string,
+    linewise?: boolean,
+    blockwise?: boolean,
+  ) => void;
+  const c = ctrl as { pushText?: PushText };
+  const original = c.pushText;
+  if (typeof original !== "function") return;
+  c.pushText = function (registerName, operator, text, linewise, blockwise) {
+    original.call(this, registerName, operator, text, linewise, blockwise);
+    if (
+      text &&
+      !registerName &&
+      (operator === "yank" || operator === "delete" || operator === "change")
+    ) {
+      // Fire and forget — the clipboard call is async but we
+      // don't gate the vim register write on it.
+      void navigator.clipboard.writeText(text).catch(() => {
+        /* silent — vim register is still updated */
+      });
+    }
+  };
+}
+
 // ─── language resolution ─────────────────────────────────────────
 
 // Map a file extension (without the dot) to a Shiki language name.
@@ -911,6 +962,7 @@ export function CodeEditor({
     viewRef.current = view;
     saveHandlers.set(view, () => onSaveRef.current());
     ensureVimWriteRegistered();
+    ensureClipboardSyncRegistered();
 
     // Resolve the highlighter + grammar asynchronously. Once ready,
     // reconfigure the theme compartment to include the Shiki plugin
