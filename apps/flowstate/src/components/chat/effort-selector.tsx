@@ -1,3 +1,4 @@
+import * as React from "react";
 import { Check, ChevronDown } from "lucide-react";
 import {
   DropdownMenu,
@@ -6,6 +7,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { OPEN_EFFORT_PICKER_EVENT } from "@/lib/keyboard-shortcuts";
 import type { ReasoningEffort } from "@/lib/types";
 
 // Full set of effort levels flowstate knows about, in the order the
@@ -74,8 +76,22 @@ export function EffortSelector({
     EFFORT_OPTIONS.find((o) => o.value === value)?.label ??
     "High";
 
+  // Controlled open state so the global ⌘⇧E shortcut can pop the
+  // menu programmatically. Mouse path stays identical — Radix's
+  // controlled mode toggles via onOpenChange when the trigger is
+  // clicked. Once open, Radix handles arrow + Enter on the
+  // DropdownMenuItem rows out of the box.
+  const [open, setOpen] = React.useState(false);
+  React.useEffect(() => {
+    function onOpen() {
+      setOpen(true);
+    }
+    window.addEventListener(OPEN_EFFORT_PICKER_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_EFFORT_PICKER_EVENT, onOpen);
+  }, []);
+
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <button
           type="button"

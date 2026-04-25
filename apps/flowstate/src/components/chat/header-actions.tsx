@@ -28,9 +28,11 @@ import { selectDockOpen, useTerminal } from "@/stores/terminal-store";
 import {
   isPopoutWindow,
   popoutThread,
+  POPOUT_PIN_CHANGED_EVENT,
   readPopoutPinPref,
   setPopoutPinned,
 } from "@/lib/popout";
+import { OPEN_EDITOR_PICKER_EVENT } from "@/lib/keyboard-shortcuts";
 
 interface HeaderActionsProps {
   sessionId: string;
@@ -141,6 +143,41 @@ export function HeaderActions({
       });
     }
   }, [pinned]);
+  // Keep the local `pinned` state in sync when the global ⌘⇧T
+  // shortcut flips the preference out from under us. setPopoutPinned
+  // dispatches POPOUT_PIN_CHANGED_EVENT after the localStorage write
+  // so the header button visually flips at the same instant the OS
+  // applies the always-on-top change.
+  React.useEffect(() => {
+    function onPinChanged(e: Event) {
+      const detail = (e as CustomEvent<{ enabled: boolean }>).detail;
+      if (detail && typeof detail.enabled === "boolean") {
+        setPinned(detail.enabled);
+      } else {
+        // Defensive — re-read the source of truth if the event
+        // somehow arrived without a payload.
+        setPinned(readPopoutPinPref());
+      }
+    }
+    window.addEventListener(POPOUT_PIN_CHANGED_EVENT, onPinChanged);
+    return () =>
+      window.removeEventListener(POPOUT_PIN_CHANGED_EVENT, onPinChanged);
+  }, []);
+
+  // Controlled editor DropdownMenu state. The mouse path opens it via
+  // the trigger button (Radix's default behavior); the ⌘⇧O global
+  // shortcut opens it by dispatching OPEN_EDITOR_PICKER_EVENT below.
+  // Once open, Radix handles arrow-key navigation between
+  // DropdownMenuItems out of the box; Enter activates.
+  const [editorMenuOpen, setEditorMenuOpen] = React.useState(false);
+  React.useEffect(() => {
+    function onOpenPicker() {
+      setEditorMenuOpen(true);
+    }
+    window.addEventListener(OPEN_EDITOR_PICKER_EVENT, onOpenPicker);
+    return () =>
+      window.removeEventListener(OPEN_EDITOR_PICKER_EVENT, onOpenPicker);
+  }, []);
   // Hover-driven prefetch for the /code view's file list. Wired to
   // both onMouseEnter and onFocus on the Search button so mouse and
   // keyboard users get the same head-start: by the time the click
@@ -336,7 +373,7 @@ export function HeaderActions({
       >
         <Search className="h-3 w-3" />
       </Button>
-      <DropdownMenu>
+      <DropdownMenu open={editorMenuOpen} onOpenChange={setEditorMenuOpen}>
         <DropdownMenuTrigger asChild>
           {/* Native <button> (not the shadcn Button) — matches the
               working DropdownMenu pattern in model-selector.tsx /
@@ -347,8 +384,8 @@ export function HeaderActions({
             type="button"
             title={
               defaultEditor
-                ? `Open project in ${defaultEditor.label}  (Cmd/Ctrl+O)`
-                : "Pick an editor to open the project in"
+                ? `Open project in ${defaultEditor.label}  (Cmd/Ctrl+O · ⇧ for picker)`
+                : "Pick an editor to open the project in (Cmd/Ctrl+Shift+O)"
             }
             className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
           >

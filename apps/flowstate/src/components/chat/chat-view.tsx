@@ -4,6 +4,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 import { isPopoutWindow } from "@/lib/popout";
+import {
+  TOGGLE_CONTEXT_EVENT,
+  TOGGLE_DIFF_EVENT,
+} from "@/lib/keyboard-shortcuts";
 import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
@@ -856,6 +860,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     },
     [sessionId],
   );
+
   /** When set, a lightbox is open on top of everything for a persisted
    * attachment. The bytes are fetched lazily via attachmentQueryOptions
    * the first time it opens. */
@@ -934,6 +939,44 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
     return CONTEXT_DEFAULT_WIDTH;
   });
+
+  // Single toggle handler for the diff pane, shared by the header
+  // button and the global ⌘⇧D shortcut. Encapsulates everything that
+  // happens on "open": activating the streamed-diff subscription,
+  // forcing a refresh tick so the panel reflects on-disk changes,
+  // and closing the mutually-exclusive context pane. On "close" it
+  // also drops fullscreen so a re-open isn't surprising.
+  const toggleDiff = React.useCallback(() => {
+    setDiffOpen((v) => {
+      if (!v) {
+        activateDiffSubscription();
+        refreshDiffs({ force: true });
+        setContextOpen(false);
+        setContextFullscreen(false);
+      } else {
+        setDiffFullscreen(false);
+      }
+      return !v;
+    });
+  }, [
+    setDiffOpen,
+    activateDiffSubscription,
+    refreshDiffs,
+    setContextOpen,
+    setContextFullscreen,
+    setDiffFullscreen,
+  ]);
+
+  // Bridge for the global ⌘⇧D shortcut: useGlobalShortcuts dispatches
+  // a window-level CustomEvent rather than calling into this component
+  // directly, so the diff state stays owned here without lifting it
+  // into a context. Whichever ChatView is currently mounted (one per
+  // active /chat/$sessionId route) is the one that responds, so the
+  // shortcut naturally targets the open thread.
+  React.useEffect(() => {
+    window.addEventListener(TOGGLE_DIFF_EVENT, toggleDiff);
+    return () => window.removeEventListener(TOGGLE_DIFF_EVENT, toggleDiff);
+  }, [toggleDiff]);
 
   // Look up the active session first, then fall back to the archived
   // list so the chat view can render read-only history for an archived
@@ -1845,6 +1888,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     });
   }, []);
 
+  // Bridge for the global ⌘⇧K shortcut: same indirection as
+  // TOGGLE_DIFF_EVENT above so the open/closed state stays owned by
+  // this component (which already does the diff↔context mutual
+  // exclusion). The active ChatView is the listener; popouts host
+  // their own ChatView so the popout's ⌘⇧K toggles its own panel.
+  React.useEffect(() => {
+    window.addEventListener(TOGGLE_CONTEXT_EVENT, handleToggleContext);
+    return () =>
+      window.removeEventListener(TOGGLE_CONTEXT_EVENT, handleToggleContext);
+  }, [handleToggleContext]);
+
   // Is there at least one tool call on the running turn still waiting
   // for its completion event? That's the precondition for the
   // stuck-watchdog: we don't care about ordinary model thinking
@@ -1997,30 +2051,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             contextOpen={contextOpen}
             todoProgress={todoProgress}
             onToggleContext={handleToggleContext}
-            onToggleDiff={() => {
-              setDiffOpen((v) => {
-                if (!v) {
-                  // First interaction with the diff button of any
-                  // kind activates the subscription. `refreshDiffs`
-                  // then bumps the tick so the newly-opened panel
-                  // picks up any on-disk changes made outside the
-                  // agent — but unlike the old path this does NOT
-                  // blank out the badge, because the streamed hook
-                  // keeps the previous diffs committed until the
-                  // new subscription's Phase 1 lands.
-                  activateDiffSubscription();
-                  refreshDiffs({ force: true });
-                  // Mutual exclusion with the agent-context pane:
-                  // opening diff closes context and drops its
-                  // fullscreen so the split-right slot is clean.
-                  setContextOpen(false);
-                  setContextFullscreen(false);
-                } else {
-                  setDiffFullscreen(false);
-                }
-                return !v;
-              });
-            }}
+            // First interaction with the diff button of any kind
+            // activates the streamed-diff subscription and bumps the
+            // refresh tick (does not blank the badge — the streamed
+            // hook keeps the previous diffs committed until the new
+            // subscription's Phase 1 lands). Opening also closes the
+            // mutually-exclusive agent-context pane and drops its
+            // fullscreen so the split-right slot is clean. Closing
+            // drops diff fullscreen for the same reason. All of that
+            // lives in `toggleDiff` so the global ⌘⇧D shortcut runs
+            // the exact same path.
+            onToggleDiff={toggleDiff}
             // Hover arms the subscription (exactly once, via the
             // React setState bail-out). No tick bump, no refetch —
             // the subscription fires as soon as it's activated and

@@ -30,6 +30,9 @@ import { UpdateBanner } from "@/components/update-banner";
 import { ProvisioningSplash } from "@/components/provisioning-splash";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isPopoutWindow } from "@/lib/popout";
+import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
+import { ShortcutsDialog } from "@/lib/keyboard-shortcuts";
+import { ProjectProviderPicker } from "@/components/project/project-provider-picker";
 
 const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -234,6 +237,18 @@ function useZoomShortcuts() {
 // into the TanStack Router error boundary.
 function PopoutShell() {
   useZoomShortcuts();
+  // Run the global shortcuts hook in "popout" mode so the only entry
+  // that fires here is the always-on-top toggle (⌘⇧T). Everything
+  // else in SHORTCUTS depends on UI mounted in the main AppShell
+  // (project picker, help dialog) or has semantics that don't transfer
+  // to a single-thread popout (⌘N spawning a thread the user can't
+  // see, ⌘[/⌘] cycling threads inside a window pinned to one). The
+  // help / picker callbacks are no-ops here for the same reason.
+  useGlobalShortcuts({
+    openShortcutsHelp: noopOpen,
+    openProjectPicker: noopOpen,
+    mode: "popout",
+  });
   return (
     <TooltipProvider>
       <SidebarProvider>
@@ -246,9 +261,37 @@ function PopoutShell() {
   );
 }
 
+// Module-level no-op so PopoutShell's useGlobalShortcuts call gets a
+// stable callback identity each render — useGlobalShortcuts depends
+// on the callback for its effect deps and a fresh function per
+// render would needlessly re-bind the keydown listener.
+function noopOpen(): void {
+  /* PopoutShell never opens these dialogs — they aren't mounted here. */
+}
+
 function AppShell() {
   useTerminalShortcut();
   useZoomShortcuts();
+  // Global shortcuts (⌘⇧D toggle diff, ⌘⇧K toggle context, ⌘[/⌘]
+  // thread nav, ⌘P / ⌘⇧F file/content search, ⌘T pop-out, ⌘O / ⌘⇧O
+  // editor open/picker, ⌘N / ⌘⇧N new thread, ⌘⇧? help). Registered
+  // here so they're alive on every route in the main window.
+  // PopoutShell intentionally doesn't mount this — popouts host a
+  // single thread and don't need cross-thread navigation, and ⌘P /
+  // ⌘⇧F there would jump out of the popout into the main window's
+  // /code route.
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = React.useState(false);
+  const [projectPickerOpen, setProjectPickerOpen] = React.useState(false);
+  useGlobalShortcuts({
+    openShortcutsHelp: React.useCallback(
+      () => setShortcutsHelpOpen(true),
+      [],
+    ),
+    openProjectPicker: React.useCallback(
+      () => setProjectPickerOpen(true),
+      [],
+    ),
+  });
   const [width, setWidth] = React.useState<number>(() => {
     const saved = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
     if (!saved) return SIDEBAR_DEFAULT_WIDTH;
@@ -297,6 +340,14 @@ function AppShell() {
         sessions) is already hydrated when the splash unmounts.
       */}
       <ProvisioningSplash />
+      <ShortcutsDialog
+        open={shortcutsHelpOpen}
+        onOpenChange={setShortcutsHelpOpen}
+      />
+      <ProjectProviderPicker
+        open={projectPickerOpen}
+        onOpenChange={setProjectPickerOpen}
+      />
     </TooltipProvider>
   );
 }
@@ -357,9 +408,26 @@ const chatRoute = createRoute({
 const codeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/code/$sessionId",
+  // `mode` is the initial picker tab: "files" for file-name search,
+  // "content" for ripgrep content search. Set by the global ⌘P / ⌘⇧F
+  // shortcuts in keyboard-shortcuts.tsx so the user lands in the
+  // right mode without an extra click. Optional and validated through
+  // a string allowlist so unknown values silently fall back to the
+  // route's default (files mode).
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { mode?: "files" | "content" } => ({
+    mode:
+      search.mode === "content"
+        ? "content"
+        : search.mode === "files"
+          ? "files"
+          : undefined,
+  }),
   component: function CodePage() {
     const { sessionId } = useParams({ from: "/code/$sessionId" });
-    return <CodeView sessionId={sessionId} />;
+    const { mode } = codeRoute.useSearch();
+    return <CodeView sessionId={sessionId} initialSearchMode={mode} />;
   },
 });
 

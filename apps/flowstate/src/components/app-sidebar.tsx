@@ -70,6 +70,7 @@ import {
   SidebarDragSuppressionProvider,
   useSidebarDragSuppressed,
 } from "@/components/sidebar/drag-suppression";
+import { ADD_PROJECT_EVENT } from "@/lib/keyboard-shortcuts";
 import type { SessionSummary } from "@/lib/types";
 
 /**
@@ -355,6 +356,23 @@ function AppSidebarBody() {
     const name = path.split("/").pop() ?? path;
     await createProject(path, name);
   }
+
+  // Bridge for the global ⌘⌥N shortcut. Same indirection as the
+  // diff/context/editor toggles — the registry dispatches a window
+  // CustomEvent and AppSidebar (already mounted in every main-window
+  // route) handles the OS folder-picker + createProject call so the
+  // dispatch site stays decoupled from Tauri APIs.
+  React.useEffect(() => {
+    function onAddProject() {
+      void handleAddFolder();
+    }
+    window.addEventListener(ADD_PROJECT_EVENT, onAddProject);
+    return () => window.removeEventListener(ADD_PROJECT_EVENT, onAddProject);
+    // handleAddFolder closes over `createProject` and `open` (Tauri
+    // dialog import) — both stable across renders, so the empty dep
+    // array is correct and saves a per-render listener rebind.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function handleRemoveProject(projectId: string) {
     await send({ type: "delete_project", project_id: projectId });

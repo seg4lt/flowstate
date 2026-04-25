@@ -18,6 +18,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const PIN_STORAGE_KEY = "flowstate:popout-pin";
 
+/** Fired by `setPopoutPinned` so any component holding a derived
+ *  copy of `readPopoutPinPref()` (HeaderActions's `pinned` state, in
+ *  particular) can resync after the keyboard shortcut flips the
+ *  preference. Without this, the header's pin button would lag
+ *  behind reality until the popout was reopened. */
+export const POPOUT_PIN_CHANGED_EVENT = "flowstate:popout-pin-changed";
+
 /** True when the current webview was opened as a thread popout.
  *  The Rust `popout_thread` command appends `?popout=1` to the
  *  URL it hands to `WebviewWindowBuilder`, so the flag is visible
@@ -74,9 +81,19 @@ export function popoutThread(sessionId: string): Promise<void> {
 /** Toggle `alwaysOnTop` on the current popout window. Caller is
  *  expected to have checked `isPopoutWindow()` — calling this
  *  from the main window is still safe (the Rust side just flips
- *  the main window's flag), but the UI shouldn't expose it. */
+ *  the main window's flag), but the UI shouldn't expose it.
+ *
+ *  Dispatches `POPOUT_PIN_CHANGED_EVENT` after the localStorage
+ *  write so any UI mirroring `readPopoutPinPref()` (header pin
+ *  button, primarily) can resync immediately when the keyboard
+ *  shortcut flips the pref out from under React state. */
 export async function setPopoutPinned(enabled: boolean): Promise<void> {
   writePopoutPinPref(enabled);
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent(POPOUT_PIN_CHANGED_EVENT, { detail: { enabled } }),
+    );
+  }
   const label = getCurrentWindow().label;
   await invoke<void>("set_window_always_on_top", { label, enabled });
 }
