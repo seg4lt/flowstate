@@ -30,6 +30,8 @@ import { UpdateBanner } from "@/components/update-banner";
 import { ProvisioningSplash } from "@/components/provisioning-splash";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isPopoutWindow } from "@/lib/popout";
+import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
+import { ShortcutsDialog } from "@/lib/keyboard-shortcuts";
 
 const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -249,6 +251,19 @@ function PopoutShell() {
 function AppShell() {
   useTerminalShortcut();
   useZoomShortcuts();
+  // Global shortcuts (⌘⇧D toggle diff, ⌘[/⌘] thread nav, ⌘P / ⌘⇧F
+  // file/content search, ⌘⇧? help). Registered here so they're alive
+  // on every route in the main window. PopoutShell intentionally
+  // doesn't mount this — popouts host a single thread and don't need
+  // cross-thread navigation, and ⌘P / ⌘⇧F there would jump out of
+  // the popout into the main window's /code route.
+  const [shortcutsHelpOpen, setShortcutsHelpOpen] = React.useState(false);
+  useGlobalShortcuts({
+    openShortcutsHelp: React.useCallback(
+      () => setShortcutsHelpOpen(true),
+      [],
+    ),
+  });
   const [width, setWidth] = React.useState<number>(() => {
     const saved = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
     if (!saved) return SIDEBAR_DEFAULT_WIDTH;
@@ -297,6 +312,10 @@ function AppShell() {
         sessions) is already hydrated when the splash unmounts.
       */}
       <ProvisioningSplash />
+      <ShortcutsDialog
+        open={shortcutsHelpOpen}
+        onOpenChange={setShortcutsHelpOpen}
+      />
     </TooltipProvider>
   );
 }
@@ -357,9 +376,26 @@ const chatRoute = createRoute({
 const codeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/code/$sessionId",
+  // `mode` is the initial picker tab: "files" for file-name search,
+  // "content" for ripgrep content search. Set by the global ⌘P / ⌘⇧F
+  // shortcuts in keyboard-shortcuts.tsx so the user lands in the
+  // right mode without an extra click. Optional and validated through
+  // a string allowlist so unknown values silently fall back to the
+  // route's default (files mode).
+  validateSearch: (
+    search: Record<string, unknown>,
+  ): { mode?: "files" | "content" } => ({
+    mode:
+      search.mode === "content"
+        ? "content"
+        : search.mode === "files"
+          ? "files"
+          : undefined,
+  }),
   component: function CodePage() {
     const { sessionId } = useParams({ from: "/code/$sessionId" });
-    return <CodeView sessionId={sessionId} />;
+    const { mode } = codeRoute.useSearch();
+    return <CodeView sessionId={sessionId} initialSearchMode={mode} />;
   },
 });
 

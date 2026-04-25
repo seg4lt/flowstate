@@ -118,6 +118,15 @@ type SearchMode = "files" | "content";
 interface CodeViewProps {
   sessionId?: string;
   projectPath?: string;
+  /** Optional initial picker mode, sourced from the `mode` search
+   *  param on /code/$sessionId. The global ⌘P / ⌘⇧F shortcuts set
+   *  this so the user lands directly in the right tab; defaults to
+   *  "files" when absent. Subsequent changes to the search param
+   *  (e.g. ⌘⇧F while already on /code) re-seed the mode via the
+   *  effect below — without re-syncing, a second press of ⌘⇧F from
+   *  inside CodeView would be a no-op because the route was already
+   *  active. */
+  initialSearchMode?: SearchMode;
 }
 
 export function CodeView(props: CodeViewProps) {
@@ -199,7 +208,14 @@ export function CodeView(props: CodeViewProps) {
   const filesError = filesQuery.error ? String(filesQuery.error) : null;
 
   // ─── search state ────────────────────────────────────────────
-  const [searchMode, setSearchMode] = React.useState<SearchMode>("files");
+  // Seed from the route's `mode` search param so deep links / the
+  // global ⌘P, ⌘⇧F shortcuts land in the right tab. Falls back to
+  // "files" — the same default the view had before route-driven mode
+  // existed. The re-sync effect that handles in-place search-param
+  // changes lives below `inputRef` so it can focus the input.
+  const [searchMode, setSearchMode] = React.useState<SearchMode>(
+    props.initialSearchMode ?? "files",
+  );
   const [query, setQuery] = React.useState("");
   const [highlightedIndex, setHighlightedIndex] = React.useState(0);
   const [contentBlocks, setContentBlocks] = React.useState<ContentBlock[]>([]);
@@ -246,6 +262,59 @@ export function CodeView(props: CodeViewProps) {
   const [multibufferOverride, setMultibufferOverride] = React.useState(false);
 
   const inputRef = React.useRef<HTMLInputElement>(null);
+
+  // Re-sync search mode when the route's `mode` search param changes
+  // while this view is already mounted. Pressing ⌘⇧F from /code/$id
+  // (already on the route) pushes a new search-param value but
+  // doesn't remount this component, so without this effect the second
+  // press would be a silent no-op. Focus + select the input on every
+  // change so the keypress feels like the in-view shortcut path
+  // (Cmd+P / Cmd+Shift+F handlers below).
+  React.useEffect(() => {
+    if (!props.initialSearchMode) return;
+    setSearchMode(props.initialSearchMode);
+    queueMicrotask(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    });
+  }, [props.initialSearchMode]);
+
+  // Esc → leave the code view. If the user came from a chat thread,
+  // route back to it; otherwise fall through to browser history. Skip
+  // when focus is in the search input — handleInputKeyDown owns Esc
+  // there (clear query first, blur, etc.) and we don't want this
+  // global handler to swallow that. Same isInTextInput rule as the
+  // tab-bar shortcuts below so typing Esc into any other text field
+  // (mention popup, future inline rename, etc.) keeps working.
+  React.useEffect(() => {
+    function isInTextInputEl(target: EventTarget | null): boolean {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        target.isContentEditable === true
+      );
+    }
+    function onEsc(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (isInTextInputEl(e.target)) return;
+      e.preventDefault();
+      if (sessionId) {
+        navigate({
+          to: "/chat/$sessionId",
+          params: { sessionId },
+        });
+      } else {
+        // No session context (e.g. /browse?path=…) — fall back to
+        // browser history. Matches the header "Back" button's
+        // behavior (see Back button onClick above).
+        window.history.back();
+      }
+    }
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [navigate, sessionId]);
 
   // Reset search + file-content caches when the project changes.
   // The tab/pane layout is owned by `useEditorTabs` and re-hydrates
