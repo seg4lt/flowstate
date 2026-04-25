@@ -58,6 +58,7 @@ import {
   DEFAULT_PROVIDER,
 } from "@/lib/defaults-settings";
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
+import { ShortcutsDialog } from "@/lib/keyboard";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useCheckpointSettings } from "@/hooks/useCheckpointSettings";
@@ -499,6 +500,33 @@ function DefaultModelRow() {
         </div>
       )}
     </div>
+  );
+}
+
+function KeyboardShortcutsRow() {
+  // Local state — the cheatsheet dialog is self-contained and works
+  // wherever it's mounted. No need to plumb open/close into AppShell
+  // (it has its own ⌘⇧? bridge); this row just exposes a mouse path.
+  // The future per-shortcut editor lands here, replacing the button
+  // with a `<ShortcutsList />` table reading the same registry.
+  const [open, setOpen] = React.useState(false);
+  return (
+    <>
+      <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">All keyboard shortcuts</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">
+            Browse every shortcut available in Flowstate. Custom rebinding
+            is coming soon — for now, the bindings shipped with the app
+            are the active set.
+          </div>
+        </div>
+        <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
+          Show all shortcuts
+        </Button>
+      </div>
+      <ShortcutsDialog open={open} onOpenChange={setOpen} />
+    </>
   );
 }
 
@@ -1268,6 +1296,12 @@ export function SettingsView() {
           >
             <ThemeRow />
             <ContextDisplayRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Keyboard shortcuts"
+            description="See every action you can trigger from the keyboard. Press ⌘⇧? from anywhere to pull up the same list as a quick overlay."
+          >
+            <KeyboardShortcutsRow />
           </SettingsGroup>
           <SettingsGroup
             title="Defaults"

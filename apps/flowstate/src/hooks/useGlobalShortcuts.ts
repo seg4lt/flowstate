@@ -7,8 +7,14 @@ import { readDefaultModel } from "@/lib/defaults-settings";
 import { isPopoutWindow } from "@/lib/popout";
 import {
   SHORTCUTS,
+  detectConflicts,
+  effectiveBinding,
+  getOverrideStore,
+  matchChord,
+  parseDsl,
+  type Shortcut,
   type ShortcutCtx,
-} from "@/lib/keyboard-shortcuts";
+} from "@/lib/keyboard";
 import type { ProviderKind, SessionSummary } from "@/lib/types";
 
 // Single global keydown listener that walks the SHORTCUTS registry
@@ -73,14 +79,63 @@ export function useGlobalShortcuts(params: {
     defaultProviderLoadedRef.current = defaultProviderLoaded;
   }, [defaultProviderLoaded]);
 
+  // Active bindings — DSL strings resolved through the override store.
+  // Recomputed when overrides change so a rebinding is live without a
+  // page reload. The parsed chord is cached alongside so the keydown
+  // path is a cheap field compare per entry.
+  const overrides = React.useMemo(() => getOverrideStore(), []);
+  const [overrideTick, setOverrideTick] = React.useState(0);
+  React.useEffect(() => {
+    return overrides.subscribe(() => setOverrideTick((t) => t + 1));
+  }, [overrides]);
+
+  type ResolvedShortcut = {
+    shortcut: Shortcut;
+    chord: ReturnType<typeof parseDsl>;
+  };
+  const resolved = React.useMemo<ResolvedShortcut[]>(() => {
+    const out: ResolvedShortcut[] = [];
+    for (const s of SHORTCUTS) {
+      const dsl = effectiveBinding(s, overrides);
+      if (dsl === null) continue; // user explicitly unbound this row
+      try {
+        out.push({ shortcut: s, chord: parseDsl(dsl) });
+      } catch (err) {
+        // Bad override silently dropped (the cheatsheet renders the
+        // raw DSL chip so the user sees what's broken). Logging here
+        // helps when debugging from a console.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `keyboard: failed to parse binding for "${s.id}" ("${dsl}"): ${String(err)}`,
+        );
+      }
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overrides, overrideTick]);
+
+  // Conflict detection — runs whenever the resolved set changes.
+  // Logs to console so the dev catches collisions early; the future
+  // rebinding UI will surface them inline next to each row.
+  React.useEffect(() => {
+    const inPopout = isPopoutWindow();
+    const conflicts = detectConflicts(SHORTCUTS, overrides, inPopout);
+    if (conflicts.length === 0) return;
+    for (const c of conflicts) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `keyboard: conflict — multiple bindings match "${c.binding}": ${c.ids.join(", ")}`,
+      );
+    }
+  }, [overrides, overrideTick]);
+
   React.useEffect(() => {
     const inPopout = isPopoutWindow();
     function onKeyDown(e: KeyboardEvent) {
-      // First match wins. The registry is small (single-digit
-      // entries) so a linear scan per keydown is fine — no need for
-      // a key-indexed map.
-      for (const shortcut of SHORTCUTS) {
-        if (!shortcut.match(e)) continue;
+      // First match wins. The registry is small so a linear scan per
+      // keydown is fine — no need for a key-indexed map.
+      for (const { shortcut, chord } of resolved) {
+        if (!matchChord(chord, e)) continue;
 
         if (!shortcut.fireInTextInputs && isInTextInput(e.target)) {
           return;
@@ -117,7 +172,7 @@ export function useGlobalShortcuts(params: {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [navigate, openShortcutsHelp, openProjectPicker]);
+  }, [navigate, openShortcutsHelp, openProjectPicker, mode, resolved]);
 }
 
 function isInTextInput(target: EventTarget | null): boolean {
