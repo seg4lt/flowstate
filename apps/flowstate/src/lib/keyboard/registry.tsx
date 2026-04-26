@@ -114,6 +114,12 @@ export const LAUNCH_DEFAULT_EDITOR_EVENT = "flowstate:launch-default-editor";
 export const OPEN_MODEL_PICKER_EVENT = "flowstate:open-model-picker";
 export const OPEN_EFFORT_PICKER_EVENT = "flowstate:open-effort-picker";
 export const ADD_PROJECT_EVENT = "flowstate:add-project";
+// Dispatched by toolbar pickers (model / effort) when they close so the
+// chat composer can reclaim focus. Without this, Radix's default
+// `onCloseAutoFocus` returns focus to the trigger button, leaving the
+// user reaching for the mouse after a ⌘⇧M / ⌘⇧E + Enter selection.
+// The chat-input component listens and refocuses its textarea.
+export const FOCUS_CHAT_INPUT_EVENT = "flowstate:focus-chat-input";
 
 function cycleThread(ctx: ShortcutCtx, direction: 1 | -1): void {
   const list = ctx.projectSessions;

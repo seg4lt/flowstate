@@ -30,6 +30,7 @@ import { InFluxAttachmentChip } from "./attachment-chip";
 import { FileMentionChip } from "./file-mention-chip";
 import { ImageLightbox, type LightboxSource } from "./image-lightbox";
 import { CommentChip } from "./comment-chip";
+import { FOCUS_CHAT_INPUT_EVENT } from "@/lib/keyboard";
 import {
   clearComments,
   removeComment,
@@ -281,13 +282,41 @@ export function ChatInput({
     if (disabled || providerDisabled || archived) return;
     const el = textareaRef.current;
     if (!el) return;
-    el.focus();
+    // Avoid re-focusing while the user is already typing in this textarea.
+    // `disabled` flips false when the session query resolves — if that
+    // happens mid-keystroke, calling el.focus() resets the browser caret
+    // and the next characters land at the wrong offset. Only steal focus
+    // when something else currently has it (or nothing does).
+    if (document.activeElement !== el) {
+      el.focus();
+    }
     // When restoring a saved draft the textarea starts at rows=1;
     // auto-size it so the full draft is visible on mount.
     if (el.value.length > 0) {
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     }
+  }, [disabled, providerDisabled, archived]);
+
+  // Bridge for the model / effort selectors (and any future toolbar
+  // picker) to hand focus back to the composer when they close. Radix
+  // Popover / DropdownMenu return focus to the trigger button by
+  // default — fine for mouse users, but a regression for the keyboard
+  // path: ⌘⇧M / ⌘⇧E + arrows + Enter would otherwise leave focus on
+  // the toolbar chip, forcing a mouse trip back to the textarea before
+  // typing can resume. The pickers `preventDefault()` on
+  // `onCloseAutoFocus` and dispatch this event so the composer (the
+  // only component holding `textareaRef`) does the focus call itself.
+  React.useEffect(() => {
+    function onFocusRequest() {
+      const el = textareaRef.current;
+      if (!el) return;
+      if (disabled || providerDisabled || archived) return;
+      el.focus();
+    }
+    window.addEventListener(FOCUS_CHAT_INPUT_EVENT, onFocusRequest);
+    return () =>
+      window.removeEventListener(FOCUS_CHAT_INPUT_EVENT, onFocusRequest);
   }, [disabled, providerDisabled, archived]);
 
   // Auto-focus the inline edit textarea when entering edit mode.

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, Check, Loader2 } from "lucide-react";
+import { Command as CmdkPrimitive } from "cmdk";
 import {
   Command,
   CommandEmpty,
@@ -10,7 +11,10 @@ import {
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useApp } from "@/stores/app-store";
 import { rememberPickedModel, readPickedModel } from "@/lib/model-settings";
-import { OPEN_MODEL_PICKER_EVENT } from "@/lib/keyboard-shortcuts";
+import {
+  FOCUS_CHAT_INPUT_EVENT,
+  OPEN_MODEL_PICKER_EVENT,
+} from "@/lib/keyboard-shortcuts";
 import type { ProviderKind } from "@/lib/types";
 
 interface ModelSelectorProps {
@@ -145,6 +149,17 @@ export function ModelSelector({
       <PopoverContent
         align="start"
         className={showSearch ? "w-80 p-0" : "min-w-56 p-0"}
+        // Radix's default returns focus to the PopoverTrigger (the
+        // toolbar chip) on close. For a keyboard-driven flow that's a
+        // regression — the user opened the picker via ⌘⇧M from the
+        // composer and expects to keep typing after picking. Block the
+        // default and ask the composer to refocus instead. Mouse users
+        // are unaffected: they were never holding focus on the chip,
+        // and the textarea getting focus afterwards is harmless.
+        onCloseAutoFocus={(e) => {
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent(FOCUS_CHAT_INPUT_EVENT));
+        }}
       >
         <Command
           // Match on both the label the user sees and the underlying
@@ -158,7 +173,21 @@ export function ModelSelector({
         >
           {showSearch ? (
             <CommandInput placeholder="Search models…" autoFocus />
-          ) : null}
+          ) : (
+            // cmdk routes arrow-key navigation through Command.Input's
+            // onKeyDown handler — without a mounted, focused input the
+            // list can't be keyboard-navigated (Popover doesn't manage
+            // menu focus the way Radix DropdownMenu does). For small
+            // lists where the visible search box would be visual noise,
+            // mount the cmdk primitive directly with `sr-only` so it's
+            // focusable but invisible. `autoFocus` makes ⌘⇧M land here
+            // immediately, restoring up/down/enter navigation.
+            <CmdkPrimitive.Input
+              autoFocus
+              aria-label="Filter models"
+              className="sr-only"
+            />
+          )}
           <CommandList>
             <CommandEmpty>No models match.</CommandEmpty>
             {models.map((model) => {

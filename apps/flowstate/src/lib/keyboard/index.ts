@@ -13,6 +13,7 @@ export {
   OPEN_MODEL_PICKER_EVENT,
   OPEN_EFFORT_PICKER_EVENT,
   ADD_PROJECT_EVENT,
+  FOCUS_CHAT_INPUT_EVENT,
   effectiveBinding,
   detectConflicts,
 } from "./registry";

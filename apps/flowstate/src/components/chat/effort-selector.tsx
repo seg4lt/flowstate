@@ -7,7 +7,10 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { OPEN_EFFORT_PICKER_EVENT } from "@/lib/keyboard-shortcuts";
+import {
+  FOCUS_CHAT_INPUT_EVENT,
+  OPEN_EFFORT_PICKER_EVENT,
+} from "@/lib/keyboard-shortcuts";
 import type { ReasoningEffort } from "@/lib/types";
 
 // Full set of effort levels flowstate knows about, in the order the
@@ -101,7 +104,19 @@ export function EffortSelector({
           <ChevronDown className="h-3 w-3 text-muted-foreground" />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" className="min-w-36">
+      <DropdownMenuContent
+        align="start"
+        className="min-w-36"
+        // Radix returns focus to the DropdownMenuTrigger by default.
+        // For ⌘⇧E + arrows + Enter that strands focus on the toolbar
+        // chip, forcing a mouse trip back to the composer. Block it
+        // and tell the chat-input to refocus its textarea so the
+        // keyboard flow stays end-to-end keyboard-only.
+        onCloseAutoFocus={(e) => {
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent(FOCUS_CHAT_INPUT_EVENT));
+        }}
+      >
         <DropdownMenuLabel>Effort</DropdownMenuLabel>
         {visibleOptions.map((option) => (
           <DropdownMenuItem
