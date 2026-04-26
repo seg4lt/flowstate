@@ -172,6 +172,19 @@ export function MessageList({
   // are actually in the list; without the length check the first
   // render after a click would try to scroll an empty virtuoso
   // and the call silently no-ops.
+  //
+  // The ref is stamped with `sessionId` BEFORE the rAF (not inside
+  // its callback). Stamping after meant any unrelated re-render
+  // landing in the same frame — `welcome` / `hydrate_display`
+  // arriving mid-boot, an `useApp()` context value change, the
+  // session-detail query resolving — would re-fire this effect, the
+  // cleanup would `cancelAnimationFrame` the in-flight scroll, the
+  // next pass would re-schedule it, and a long enough cancel/
+  // reschedule chain meant the scroll never actually landed and
+  // the user was stranded with the "Jump to latest" pill visible.
+  // Marking up front bails subsequent re-runs at the ref check;
+  // the rAF still runs against the live Virtuoso and the cleanup
+  // only matters when the session itself changes between frames.
   const scrolledForSessionRef = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (displayItems.length === 0) return;
@@ -181,7 +194,9 @@ export function MessageList({
     // items that just arrived. Without the frame the scrollToIndex
     // call fires before layout and gets dropped.
     const raf = requestAnimationFrame(() => {
-      virtuosoRef.current?.scrollToIndex({
+      const v = virtuosoRef.current;
+      if (!v) return;
+      v.scrollToIndex({
         index: "LAST",
         align: "end",
         behavior: "auto",

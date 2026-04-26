@@ -376,11 +376,44 @@ function appReducer(state: AppState, action: AppAction): AppState {
       };
     }
     case "hydrate_display": {
+      // Reference-stable hydrate. The current usage site fires this
+      // exactly once at AppProvider mount (so the no-op short-circuit
+      // never trips today), but the action is well-suited to a future
+      // re-hydration path — and on every re-fire the unconditional
+      // Map swap would re-render every `useApp()` consumer (sidebar,
+      // chat header, etc.) even when content is identical to what we
+      // already hold. Compare maps before swapping; bail completely
+      // if nothing changed, otherwise reuse prior value identities
+      // for entries whose contents match so React's `===` shortcuts
+      // for downstream memoised consumers still kick in. Mirrors the
+      // pattern used by `welcome` and `snapshot` for `state.sessions`.
+      const sessionDisplay = mergeMapStable(
+        state.sessionDisplay,
+        action.sessionDisplay,
+        sessionDisplaysEqual,
+      );
+      const projectDisplay = mergeMapStable(
+        state.projectDisplay,
+        action.projectDisplay,
+        projectDisplaysEqual,
+      );
+      const projectWorktrees = mergeMapStable(
+        state.projectWorktrees,
+        action.projectWorktrees,
+        projectWorktreesEqual,
+      );
+      if (
+        sessionDisplay === state.sessionDisplay &&
+        projectDisplay === state.projectDisplay &&
+        projectWorktrees === state.projectWorktrees
+      ) {
+        return state;
+      }
       return {
         ...state,
-        sessionDisplay: action.sessionDisplay,
-        projectDisplay: action.projectDisplay,
-        projectWorktrees: action.projectWorktrees,
+        sessionDisplay,
+        projectDisplay,
+        projectWorktrees,
       };
     }
     case "set_session_display": {
@@ -467,21 +500,139 @@ function projectRecordsEqual(a: ProjectRecord, b: ProjectRecord): boolean {
   );
 }
 
+// Display-map equality predicates. Used by the `hydrate_display`
+// reducer to skip swapping Maps when the incoming hydration is
+// content-equivalent to what we already hold (e.g. a future
+// re-hydration path that races a no-op refresh). All three shapes
+// are flat primitive records — same hand-rolled approach as
+// `sessionSummariesEqual` / `projectRecordsEqual`.
+function sessionDisplaysEqual(a: SessionDisplay, b: SessionDisplay): boolean {
+  return (
+    a === b ||
+    (a.title === b.title && a.lastTurnPreview === b.lastTurnPreview)
+  );
+}
+
+function projectDisplaysEqual(a: ProjectDisplay, b: ProjectDisplay): boolean {
+  return a === b || (a.name === b.name && a.sortOrder === b.sortOrder);
+}
+
+function projectWorktreesEqual(
+  a: ProjectWorktree,
+  b: ProjectWorktree,
+): boolean {
+  return (
+    a === b ||
+    (a.projectId === b.projectId &&
+      a.parentProjectId === b.parentProjectId &&
+      a.branch === b.branch)
+  );
+}
+
+/** Reuse `prev`'s reference whenever `next` is content-equivalent;
+ *  otherwise build a new Map that preserves prior value identities
+ *  for entries whose contents match. Mirrors the welcome/snapshot
+ *  reducers' Map-merge pattern so consumers downstream of every
+ *  display map see stable `===` references and bail out of cheap
+ *  React.memo / useMemo dep checks. */
+function mergeMapStable<V>(
+  prev: Map<string, V>,
+  next: Map<string, V>,
+  eq: (a: V, b: V) => boolean,
+): Map<string, V> {
+  if (prev === next) return prev;
+  let changed = prev.size !== next.size;
+  if (!changed) {
+    for (const [k, v] of next) {
+      const p = prev.get(k);
+      if (p === undefined || !eq(p, v)) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (!changed) return prev;
+  const merged = new Map<string, V>();
+  for (const [k, v] of next) {
+    const p = prev.get(k);
+    merged.set(k, p !== undefined && eq(p, v) ? p : v);
+  }
+  return merged;
+}
+
 function handleServerMessage(
   state: AppState,
   message: ServerMessage,
 ): AppState {
   switch (message.type) {
     case "welcome": {
-      const sessions = new Map<string, SessionSummary>();
-      for (const detail of message.bootstrap.snapshot.sessions) {
-        sessions.set(detail.summary.sessionId, detail.summary);
+      // Reference-stable rebuild — same shape as the `snapshot` case
+      // below. A second `welcome` only happens on a fresh `connect`
+      // invocation (StrictMode double-mount in dev, a future explicit
+      // reconnect path, or a remounted popout sharing the AppProvider
+      // tree). When the second payload's sessions/projects match what
+      // we already hold, reuse the prior `Map` and per-summary
+      // identities so the unconditional `new Map(...)` rebuild
+      // doesn't fan a render storm through every `useApp()` consumer
+      // (Virtuoso scroll loss, ChatInput disabled-flip cursor jumps,
+      // TerminalDock prune storms). On the FIRST welcome `state.sessions`
+      // is empty so the size check forces a rebuild — no behavior
+      // change for the common boot path. The route `<Outlet />` in
+      // router.tsx is gated on `state.ready` so route components
+      // mount once, here, instead of mounting empty and re-rendering
+      // through this update.
+      const incomingSessions = message.bootstrap.snapshot.sessions;
+      let sessions = state.sessions;
+      let sessionsChanged = sessions.size !== incomingSessions.length;
+      if (!sessionsChanged) {
+        for (const detail of incomingSessions) {
+          const prev = sessions.get(detail.summary.sessionId);
+          if (!prev || !sessionSummariesEqual(prev, detail.summary)) {
+            sessionsChanged = true;
+            break;
+          }
+        }
       }
+      if (sessionsChanged) {
+        sessions = new Map<string, SessionSummary>();
+        for (const detail of incomingSessions) {
+          const prev = state.sessions.get(detail.summary.sessionId);
+          sessions.set(
+            detail.summary.sessionId,
+            prev && sessionSummariesEqual(prev, detail.summary)
+              ? prev
+              : detail.summary,
+          );
+        }
+      }
+
+      const incomingProjects = message.bootstrap.snapshot.projects;
+      let projects = state.projects;
+      let projectsChanged = projects.length !== incomingProjects.length;
+      if (!projectsChanged) {
+        for (let i = 0; i < incomingProjects.length; i++) {
+          const prev = projects[i];
+          const next = incomingProjects[i];
+          if (!prev || !projectRecordsEqual(prev, next)) {
+            projectsChanged = true;
+            break;
+          }
+        }
+      }
+      if (projectsChanged) {
+        projects = incomingProjects.map((next) => {
+          const prev = state.projects.find(
+            (p) => p.projectId === next.projectId,
+          );
+          return prev && projectRecordsEqual(prev, next) ? prev : next;
+        });
+      }
+
       return {
         ...state,
         providers: message.bootstrap.providers,
         sessions,
-        projects: message.bootstrap.snapshot.projects,
+        projects,
         checkpointSettings: message.bootstrap.checkpointSettings,
         ready: true,
       };

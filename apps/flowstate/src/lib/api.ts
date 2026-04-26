@@ -474,12 +474,66 @@ export function listDirectory(
 //
 // `getUserConfig` returns null when the key has never been set;
 // callers should treat that as "use the default."
+
+// Module-level read-through cache for `get_user_config`. The keys
+// addressed here (`defaults.model.<provider>`, `defaults.provider`,
+// `provider.enabled.<provider>`, `defaults.effort`, etc.) are
+// written from a single place per key (Settings UI / explicit user
+// action) and read from many places, so a JS-side cache is safe
+// and dramatically reduces IPC pressure during boot.
+//
+// Why this matters: during a fresh launch, `provider-dropdown.tsx`
+// and `worktree-new-thread-dropdown.tsx` each run an effect with a
+// `[state.providers]` dep that calls `readDefaultModel(p.kind)` for
+// every ready provider. As providers transition to `ready` one by
+// one (one `state.providers` identity change per transition), the
+// effect re-fires; multiplied across multiple sidebar instances and
+// 4–5 providers, a real recording from a user's machine showed
+// **70 get_user_config IPC calls in ~50 ms** — the same key
+// (`defaults.model.claude`) fetched 14 times. That storm queues on
+// Tauri's IPC thread, blocks the JS event loop while responses
+// arrive, and downstream produced a 53 ms `message` handler, a
+// 50 ms `message` handler, an 82 ms `scroll` handler, and a 307-
+// paint storm in a single 100 ms window — the visible "refresh
+// blip" + scroll/cursor displacement the user reported.
+//
+// The cache stores Promises (not resolved values) so concurrent
+// callers all await the same in-flight invoke instead of racing
+// new ones. `setUserConfig` writes through so subsequent reads
+// see the new value without an extra IPC round-trip; the rejection
+// path drops the entry so a transient failure doesn't poison the
+// cache forever.
+const userConfigCache = new Map<string, Promise<string | null>>();
+
 export function getUserConfig(key: string): Promise<string | null> {
-  return invoke<string | null>("get_user_config", { key });
+  const cached = userConfigCache.get(key);
+  if (cached !== undefined) return cached;
+  const pending = invoke<string | null>("get_user_config", { key });
+  userConfigCache.set(key, pending);
+  pending.catch(() => {
+    // Drop the failed promise so the next caller can retry rather
+    // than re-await a rejected handle for the rest of the session.
+    if (userConfigCache.get(key) === pending) {
+      userConfigCache.delete(key);
+    }
+  });
+  return pending;
 }
 
-export function setUserConfig(key: string, value: string): Promise<void> {
-  return invoke<void>("set_user_config", { key, value });
+export async function setUserConfig(key: string, value: string): Promise<void> {
+  await invoke<void>("set_user_config", { key, value });
+  // Write-through: prime the cache with the just-written value so
+  // any reader that lands after this point gets the fresh answer
+  // without an extra round-trip. We resolve a fresh promise rather
+  // than reusing a possibly-still-pending older one.
+  userConfigCache.set(key, Promise.resolve(value));
+}
+
+/** Clear all cached user-config reads. Exposed for tests and as an
+ *  escape hatch if a future migration writes config out-of-band; not
+ *  used by app code today. */
+export function clearUserConfigCache(): void {
+  userConfigCache.clear();
 }
 
 // Per-session and per-project display metadata: titles, names,
@@ -499,11 +553,41 @@ export interface ProjectDisplay {
   sortOrder: number | null;
 }
 
-export function setSessionDisplay(
+// Read-through caches for the three "list_*" display endpoints.
+// Each endpoint returns 5–25 KB of JSON and lives on the boot
+// critical path — `app-store.tsx`'s mount effect fires
+// `Promise.all([listSessionDisplay, listProjectDisplay,
+// listProjectWorktree])` while `connectStream` is also in flight.
+// In a real user recording the three calls returned 22.8 / 5.0 /
+// 10.7 KB respectively in ~12 ms parallel; that's fine *once* but
+// `usage-top-sessions-table.tsx` re-fires `listSessionDisplay()`
+// on every visit to /usage, and any future feature that needs the
+// same map again pays a fresh IPC + 22 KB reparse. The cache makes
+// repeat reads free and dedupes concurrent callers (multiple
+// components mounting in the same render frame all await one
+// in-flight invoke). Single-shot mutators (`setSessionDisplay`
+// etc.) write through, batch reorderings invalidate the relevant
+// cache so the next read sees the persisted truth.
+let sessionDisplayCache: Promise<Record<string, SessionDisplay>> | null = null;
+let projectDisplayCache: Promise<Record<string, ProjectDisplay>> | null = null;
+let projectWorktreeCache: Promise<Record<string, ProjectWorktree>> | null = null;
+
+export async function setSessionDisplay(
   sessionId: string,
   display: SessionDisplay,
 ): Promise<void> {
-  return invoke<void>("set_session_display", { sessionId, display });
+  await invoke<void>("set_session_display", { sessionId, display });
+  // Patch the cached map so subsequent listSessionDisplay() reads
+  // see this write without an extra IPC. Falling back to a full
+  // invalidate keeps semantics correct even if the cache is empty.
+  if (sessionDisplayCache) {
+    sessionDisplayCache = sessionDisplayCache
+      .then((rec) => ({ ...rec, [sessionId]: display }))
+      .catch(() => {
+        sessionDisplayCache = null;
+        return {} as Record<string, SessionDisplay>;
+      });
+  }
 }
 
 export function getSessionDisplay(
@@ -513,18 +597,45 @@ export function getSessionDisplay(
 }
 
 export function listSessionDisplay(): Promise<Record<string, SessionDisplay>> {
-  return invoke<Record<string, SessionDisplay>>("list_session_display");
+  if (sessionDisplayCache !== null) return sessionDisplayCache;
+  const pending = invoke<Record<string, SessionDisplay>>("list_session_display");
+  sessionDisplayCache = pending;
+  pending.catch(() => {
+    if (sessionDisplayCache === pending) sessionDisplayCache = null;
+  });
+  return pending;
 }
 
-export function deleteSessionDisplay(sessionId: string): Promise<void> {
-  return invoke<void>("delete_session_display", { sessionId });
+export async function deleteSessionDisplay(sessionId: string): Promise<void> {
+  await invoke<void>("delete_session_display", { sessionId });
+  if (sessionDisplayCache) {
+    sessionDisplayCache = sessionDisplayCache
+      .then((rec) => {
+        // Avoid in-place mutation — other awaiters may still hold
+        // the same Record reference.
+        const { [sessionId]: _omit, ...rest } = rec;
+        return rest;
+      })
+      .catch(() => {
+        sessionDisplayCache = null;
+        return {} as Record<string, SessionDisplay>;
+      });
+  }
 }
 
-export function setProjectDisplay(
+export async function setProjectDisplay(
   projectId: string,
   display: ProjectDisplay,
 ): Promise<void> {
-  return invoke<void>("set_project_display", { projectId, display });
+  await invoke<void>("set_project_display", { projectId, display });
+  if (projectDisplayCache) {
+    projectDisplayCache = projectDisplayCache
+      .then((rec) => ({ ...rec, [projectId]: display }))
+      .catch(() => {
+        projectDisplayCache = null;
+        return {} as Record<string, ProjectDisplay>;
+      });
+  }
 }
 
 export function getProjectDisplay(
@@ -534,11 +645,28 @@ export function getProjectDisplay(
 }
 
 export function listProjectDisplay(): Promise<Record<string, ProjectDisplay>> {
-  return invoke<Record<string, ProjectDisplay>>("list_project_display");
+  if (projectDisplayCache !== null) return projectDisplayCache;
+  const pending = invoke<Record<string, ProjectDisplay>>("list_project_display");
+  projectDisplayCache = pending;
+  pending.catch(() => {
+    if (projectDisplayCache === pending) projectDisplayCache = null;
+  });
+  return pending;
 }
 
-export function deleteProjectDisplay(projectId: string): Promise<void> {
-  return invoke<void>("delete_project_display", { projectId });
+export async function deleteProjectDisplay(projectId: string): Promise<void> {
+  await invoke<void>("delete_project_display", { projectId });
+  if (projectDisplayCache) {
+    projectDisplayCache = projectDisplayCache
+      .then((rec) => {
+        const { [projectId]: _omit, ...rest } = rec;
+        return rest;
+      })
+      .catch(() => {
+        projectDisplayCache = null;
+        return {} as Record<string, ProjectDisplay>;
+      });
+  }
 }
 
 // Parent/child worktree links. Each worktree has its own SDK
@@ -553,16 +681,25 @@ export interface ProjectWorktree {
   branch: string | null;
 }
 
-export function setProjectWorktree(
+export async function setProjectWorktree(
   projectId: string,
   parentProjectId: string,
   branch: string | null,
 ): Promise<void> {
-  return invoke<void>("set_project_worktree", {
+  await invoke<void>("set_project_worktree", {
     projectId,
     parentProjectId,
     branch,
   });
+  if (projectWorktreeCache) {
+    const record: ProjectWorktree = { projectId, parentProjectId, branch };
+    projectWorktreeCache = projectWorktreeCache
+      .then((rec) => ({ ...rec, [projectId]: record }))
+      .catch(() => {
+        projectWorktreeCache = null;
+        return {} as Record<string, ProjectWorktree>;
+      });
+  }
 }
 
 export function getProjectWorktree(
@@ -572,11 +709,36 @@ export function getProjectWorktree(
 }
 
 export function listProjectWorktree(): Promise<Record<string, ProjectWorktree>> {
-  return invoke<Record<string, ProjectWorktree>>("list_project_worktree");
+  if (projectWorktreeCache !== null) return projectWorktreeCache;
+  const pending = invoke<Record<string, ProjectWorktree>>("list_project_worktree");
+  projectWorktreeCache = pending;
+  pending.catch(() => {
+    if (projectWorktreeCache === pending) projectWorktreeCache = null;
+  });
+  return pending;
 }
 
-export function deleteProjectWorktree(projectId: string): Promise<void> {
-  return invoke<void>("delete_project_worktree", { projectId });
+export async function deleteProjectWorktree(projectId: string): Promise<void> {
+  await invoke<void>("delete_project_worktree", { projectId });
+  if (projectWorktreeCache) {
+    projectWorktreeCache = projectWorktreeCache
+      .then((rec) => {
+        const { [projectId]: _omit, ...rest } = rec;
+        return rest;
+      })
+      .catch(() => {
+        projectWorktreeCache = null;
+        return {} as Record<string, ProjectWorktree>;
+      });
+  }
+}
+
+/** Drop all cached display lists. Exposed for tests / migrations;
+ *  not used by app code today. */
+export function clearDisplayCaches(): void {
+  sessionDisplayCache = null;
+  projectDisplayCache = null;
+  projectWorktreeCache = null;
 }
 
 // Resolved cross-platform app data dir for Flowstate — the same

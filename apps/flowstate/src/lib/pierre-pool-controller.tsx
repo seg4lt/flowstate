@@ -172,30 +172,51 @@ export function PierrePoolProvider({
   // Cleanup on unmount of the provider itself.
   React.useEffect(() => cancelIdleKillTimer, [cancelIdleKillTimer]);
 
+  // CRITICAL: keep the tree shape under PierrePoolControllerContext.Provider
+  // stable across `active` and `targetPoolSize` changes. Two earlier patterns
+  // both unmounted the entire app subtree (RouterProvider → AppLayout →
+  // AppProvider → routes → message list / composer / Virtuoso state), which
+  // is what produced the user-visible "blink" 10–30 s after launch:
+  //
+  //   1. `{active ? <WorkerPoolContextProvider>{children}</…> : children}`
+  //      — when the idle-kill timer fired, React's reconciler saw the
+  //      child of this Context.Provider change type from
+  //      `WorkerPoolContextProvider` to the children's root element type,
+  //      diffed them as different components, unmounted the whole subtree,
+  //      and mounted a fresh one. AppProvider's `useEffect(_, [])` re-ran,
+  //      `connect` fired again, `welcome` re-arrived, every `useApp()`
+  //      consumer re-rendered. `IDLE_KILL_MS = 30_000` precisely matches
+  //      the 10–30 s timing reported in user traces.
+  //   2. `<WorkerPoolContextProvider key={targetPoolSize}>` — every
+  //      scale-up bumped the key, forcing a remount of the provider AND
+  //      its children for the same reason.
+  //
+  // The fix: always render `WorkerPoolContextProvider` and never give it
+  // a key driven by state. `poolOptions` is still memoized on
+  // `targetPoolSize` so any worker-pool-library that supports prop-driven
+  // resize gets the new size; if it doesn't, we accept that scale-up only
+  // takes effect on the next provider mount (e.g. app reload). The
+  // `active`/`requestKill` machinery is left in place so telemetry +
+  // future "really do kill workers" work can hook in without resurrecting
+  // the unmount cascade — `active` is intentionally unused in the JSX
+  // below.
+  void active; // see comment above — keep state for diagnostics, do not gate
   return (
     <PierrePoolControllerContext.Provider value={ctxValue}>
-      {active ? (
-        <WorkerPoolContextProvider
-          key={targetPoolSize}
-          poolOptions={poolOptions}
-          highlighterOptions={highlighterOptions}
-        >
-          <PoolStatsWatcher
-            mountCountRef={mountCountRef}
-            idleKillTimerRef={idleKillTimerRef}
-            targetPoolSize={targetPoolSize}
-            maxPoolSize={effectiveMaxPoolSize}
-            onScaleUp={requestScaleUp}
-            onKill={requestKill}
-          />
-          {children}
-        </WorkerPoolContextProvider>
-      ) : (
-        // Render children without the provider. useWorkerPool() will
-        // return undefined until a consumer calls bumpMount(), which
-        // flips active back to true and remounts the provider.
-        children
-      )}
+      <WorkerPoolContextProvider
+        poolOptions={poolOptions}
+        highlighterOptions={highlighterOptions}
+      >
+        <PoolStatsWatcher
+          mountCountRef={mountCountRef}
+          idleKillTimerRef={idleKillTimerRef}
+          targetPoolSize={targetPoolSize}
+          maxPoolSize={effectiveMaxPoolSize}
+          onScaleUp={requestScaleUp}
+          onKill={requestKill}
+        />
+        {children}
+      </WorkerPoolContextProvider>
     </PierrePoolControllerContext.Provider>
   );
 }

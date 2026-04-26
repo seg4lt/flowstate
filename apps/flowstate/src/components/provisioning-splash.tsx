@@ -84,18 +84,32 @@ export function ProvisioningSplash() {
     };
   }, []);
 
-  // Hide the splash completely for the first ~300 ms — warm-cache
-  // launches go from mount → ready in well under that, and flashing
-  // a splash screen on every boot is worse UX than showing nothing
-  // for the first frame or two.
+  // 300 ms grace before showing the spinner+text content. The
+  // BACKGROUND layer below renders immediately (from frame 1) so
+  // the empty-state sidebar / outlet underneath is never visible
+  // to the user during the welcome handshake; only the foreground
+  // copy is gated by this timer so warm-cache launches don't flash
+  // a spinner that disappears in the same breath.
+  //
+  // Previous behavior was to return null for the first 300 ms,
+  // which left the sidebar's initial `state.sessions = empty Map`
+  // / `state.projects = []` render visible and produced the
+  // "projects/sessions briefly gone, then come back" blink the
+  // user reported. Routes (chat-view, code-view, …) are gated on
+  // `state.ready` in router.tsx so they don't have the same hole;
+  // this closes it for everything else mounted under AppShell.
   React.useEffect(() => {
-    if (state.ready) return; // already ready → nothing to show
+    if (state.ready) return;
     const t = window.setTimeout(() => setShowAfter(true), 300);
     return () => window.clearTimeout(t);
   }, [state.ready]);
 
   if (state.ready) return null;
-  if (!showAfter && !error) return null;
+
+  // Foreground content visibility: spinner + copy only after the
+  // grace period (or immediately on error so the user sees the
+  // failure surface without delay).
+  const showForeground = showAfter || !!error;
 
   return (
     <div
@@ -104,10 +118,14 @@ export function ProvisioningSplash() {
       // z-[9999] so we sit above the sidebar, dock, update banner,
       // and any floating toaster that might render underneath. bg
       // matches `tauri.conf.json`'s window background (#252525) so
-      // there's no visible seam while the splash paints.
+      // there's no visible seam while the splash paints — and so
+      // the warm-launch case (ready before the 300 ms grace) shows
+      // a uniform color flash instead of the empty sidebar that
+      // used to leak through the previous `return null`.
       className="fixed inset-0 z-[9999] flex items-center justify-center bg-[#252525] text-white"
       data-testid="provisioning-splash"
     >
+      {showForeground && (
       <div className="flex max-w-md flex-col items-center gap-5 px-6 text-center">
         <div className="text-2xl font-semibold tracking-tight">flowstate</div>
         <div className="flex items-center gap-3">
@@ -142,6 +160,7 @@ export function ProvisioningSplash() {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 }

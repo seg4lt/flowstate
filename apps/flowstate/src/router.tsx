@@ -21,6 +21,7 @@ import { ProviderEnabledProvider } from "@/hooks/use-provider-enabled";
 import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
 import { TerminalDock } from "@/components/terminal/TerminalDock";
 import { ChatView } from "@/components/chat/chat-view";
+import { RoutePromptOverlay } from "@/components/chat/route-prompt-overlay";
 import { CodeView } from "@/components/code/code-view";
 import { ProjectHomeView } from "@/components/project/project-home-view";
 import { SettingsView } from "@/components/settings/settings-view";
@@ -175,6 +176,13 @@ function useZoomShortcuts() {
     );
     const initial = Number.isFinite(saved) ? clampZoom(saved) : ZOOM_DEFAULT;
     zoomRef.current = initial;
+    // The WKWebView default is 1.0. Calling setZoom(1.0) still triggers a
+    // full document reflow — and because Tauri's IPC queue is blocked behind
+    // provision_runtimes / connectStream backoff on cold launch, that reflow
+    // can land 5–15 s after first paint, disrupting whatever the user is
+    // doing (cursor jumps, Virtuoso scroll loss, sidebar/title flicker).
+    // Skip the IPC entirely when there's nothing to restore.
+    if (initial === ZOOM_DEFAULT) return;
     getCurrentWebviewWindow()
       .setZoom(initial)
       .catch(() => {});
@@ -249,11 +257,29 @@ function PopoutShell() {
     openProjectPicker: noopOpen,
     mode: "popout",
   });
+  // Same `state.ready` gate as AppShell — keep the popout's Outlet
+  // unmounted until `welcome` lands so ChatView doesn't mount with
+  // an empty `state.sessions` (popouts open at /chat/<id>?popout=1
+  // and would otherwise render the same boot-race "no session"
+  // shell that AppShell does). Popouts don't host ProvisioningSplash,
+  // so render a small placeholder while we wait — boot is bounded
+  // by `connectStream`'s retry budget either way.
+  const { state } = useApp();
   return (
     <TooltipProvider>
       <SidebarProvider>
         <div className="h-svh w-svw">
-          <Outlet />
+          {state.ready ? (
+            <Outlet />
+          ) : (
+            <div
+              role="status"
+              aria-live="polite"
+              className="flex h-full items-center justify-center text-xs text-muted-foreground"
+            >
+              Loading…
+            </div>
+          )}
         </div>
       </SidebarProvider>
       <Toaster />
@@ -272,14 +298,23 @@ function noopOpen(): void {
 function AppShell() {
   useTerminalShortcut();
   useZoomShortcuts();
-  // Global shortcuts (⌘⇧D toggle diff, ⌘⇧K toggle context, ⌘[/⌘]
-  // thread nav, ⌘P / ⌘⇧F file/content search, ⌘T pop-out, ⌘O / ⌘⇧O
-  // editor open/picker, ⌘N / ⌘⇧N new thread, ⌘⇧? help). Registered
-  // here so they're alive on every route in the main window.
-  // PopoutShell intentionally doesn't mount this — popouts host a
-  // single thread and don't need cross-thread navigation, and ⌘P /
-  // ⌘⇧F there would jump out of the popout into the main window's
-  // /code route.
+  // Gate the route `<Outlet />` on `state.ready` so route components
+  // (ChatView, CodeView, ProjectHomeView, …) don't mount with an
+  // empty `state.sessions` / `state.projects` before the daemon's
+  // `welcome` message lands. Without this gate, ChatView mounted with
+  // a sessionId from the persisted URL but `state.sessions.get(id)`
+  // returned undefined, so the chat shell rendered as a "no session"
+  // view; then `welcome` arrived, state populated, and the entire
+  // route subtree re-rendered through the populated path. The user-
+  // visible result was a refresh blip ("all projects/sessions gone,
+  // current thread goes to new thread, fixes itself"), Virtuoso
+  // losing its scroll position (the rAF in MessageList's scroll-to-
+  // latest effect got canceled mid-storm), and the composer cursor
+  // jumping as `disabled` flipped during the re-render cascade. The
+  // `<ProvisioningSplash />` overlay below still covers the screen
+  // while we wait, so this just defers route mount to the moment we
+  // actually have data to render.
+  const { state } = useApp();
   const [shortcutsHelpOpen, setShortcutsHelpOpen] = React.useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = React.useState(false);
   useGlobalShortcuts({
@@ -327,8 +362,28 @@ function AppShell() {
             anchor is what the TerminalDock positions itself against
             (absolute bottom). */}
         <SidebarInset className="relative min-w-0 overflow-hidden">
-          <Outlet />
-          <TerminalDock />
+          {/* `state.ready` flips true the moment the daemon's `welcome`
+              message lands and `state.sessions` / `state.projects` are
+              populated. Holding the route mount until then is what
+              eliminates the boot-time "empty → populated" re-render
+              storm; ProvisioningSplash covers the gap visually. The
+              `RoutePromptOverlay` and `TerminalDock` consume per-
+              session state too, so they sit inside the same gate. */}
+          {state.ready ? (
+            <>
+              <Outlet />
+              {/* Route-independent surface for the per-session
+                  permission and clarifying-question prompts. Yields
+                  to ChatView's inline rendering on /chat/$sessionId;
+                  on every other route that carries a sessionId param
+                  (notably /code/$sessionId) it surfaces the same
+                  prompt at the bottom of the viewport so the daemon's
+                  pause for input isn't invisible while the user is in
+                  the code view. */}
+              <RoutePromptOverlay />
+              <TerminalDock />
+            </>
+          ) : null}
         </SidebarInset>
       </SidebarProvider>
       <Toaster />
