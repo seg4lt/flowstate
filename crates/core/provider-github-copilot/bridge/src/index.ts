@@ -120,10 +120,17 @@ interface UserInputResponse {
 // asks the host (via permission/user-input handler), drained when an
 // `answer_*` message arrives on stdin.
 const pendingUserInputs = new Map<string, (resp: UserInputResponse) => void>();
-const pendingPermissions = new Map<
-  string,
-  (result: PermissionRequestResult) => void
->();
+// Permission resolvers carry the original `PermissionRequest` alongside
+// the resolver because SDK v0.3.0's `'approve-for-session'` /
+// `'approve-for-location'` decisions require an `approval` object whose
+// shape depends on the request's `kind` (read/write/mcp/etc.). Without
+// the request stashed, we can't construct the matching approval at
+// answer time.
+interface PendingPermission {
+  resolve: (result: PermissionRequestResult) => void;
+  request: PermissionRequest;
+}
+const pendingPermissions = new Map<string, PendingPermission>();
 
 /** Write a stream event JSON line to stdout. */
 function writeStream(payload: Record<string, unknown>): void {
@@ -147,10 +154,68 @@ function drainPendingOnAbort(): void {
     resolver({ answer: '[aborted]', wasFreeform: true });
   }
   pendingUserInputs.clear();
-  for (const [, resolver] of pendingPermissions) {
-    resolver({ kind: 'denied-interactively-by-user' });
+  for (const [, entry] of pendingPermissions) {
+    // SDK v0.3.0 renamed `'denied-interactively-by-user'` → `'reject'`
+    // and added `'user-not-available'` for cases where there's no UI
+    // to ask. The drain path fires on interrupt / send_prompt error,
+    // i.e. the user explicitly aborted — `'reject'` matches that
+    // intent.
+    entry.resolve({ kind: 'reject' });
   }
   pendingPermissions.clear();
+}
+
+/**
+ * Build the `approval` payload required by `approve-for-session` /
+ * `approve-for-location` from the originating `PermissionRequest`.
+ * Returns `null` for request kinds that have no matching session-scoped
+ * approval shape (`url`, `hook`, partially-known `custom-tool`); the
+ * caller falls back to a single-shot `approve-once` so the user's
+ * "Allow Always" intent still approves *this* call instead of being
+ * denied because we couldn't construct a session-scope.
+ *
+ * The simple kinds (`read`, `write`, `memory`) round-trip 1:1 to their
+ * approval shape. `mcp` requires server/tool identifiers which the
+ * `PermissionRequest` carries on a `mcpRequest` extension when
+ * dispatched by the SDK. `shell` would map to a `commands` approval
+ * but we don't yet have a way to extract the command identifier from
+ * the request — falls back to one-shot until that's plumbed.
+ */
+function buildSessionApproval(
+  req: PermissionRequest,
+): unknown | null {
+  switch (req.kind) {
+    case 'read':
+      return { kind: 'read' };
+    case 'write':
+      return { kind: 'write' };
+    case 'memory':
+      return { kind: 'memory' };
+    case 'mcp': {
+      // The MCP variant of PermissionRequest carries serverName /
+      // toolName on the structural request object. Fall back to
+      // one-shot if either is missing — the SDK rejects an
+      // incomplete approval payload.
+      const r = req as PermissionRequest & {
+        serverName?: string;
+        toolName?: string | null;
+      };
+      if (typeof r.serverName !== 'string') return null;
+      return {
+        kind: 'mcp',
+        serverName: r.serverName,
+        toolName: typeof r.toolName === 'string' ? r.toolName : null,
+      };
+    }
+    // shell needs a command identifier we don't have; url / hook /
+    // custom-tool have no read-across to a session-scope shape.
+    case 'shell':
+    case 'url':
+    case 'hook':
+    case 'custom-tool':
+    default:
+      return null;
+  }
 }
 
 /** Best-effort markdown bullet/numbered-list parser for plan content. */
@@ -183,15 +248,21 @@ class CopilotBridge {
   private decidePermissionLocally(
     req: PermissionRequest,
   ): PermissionRequestResult | null {
+    // SDK v0.3.0 renamed `'approved'` → `'approve-once'` (single
+    // call) and added the scoped variants `'approve-for-session'` /
+    // `'approve-for-location'`. Auto-decisions here all use
+    // `'approve-once'` — the local policy doesn't carry "always
+    // allow" semantics, those flow through `answer_permission` from
+    // the user's interactive choice.
     const mode = this.currentPermissionMode;
     if (mode === 'bypass') {
-      return { kind: 'approved' };
+      return { kind: 'approve-once' };
     }
     if (mode === 'accept_edits' || mode === 'plan') {
       // Auto-approve read/write file ops; route shell/mcp/url/custom-tool
       // through the user.
       if (req.kind === 'read' || req.kind === 'write') {
-        return { kind: 'approved' };
+        return { kind: 'approve-once' };
       }
       return null;
     }
@@ -257,10 +328,21 @@ class CopilotBridge {
 
     const selectedModel = model ?? 'gpt-4o';
 
+    // HANDLER SIGNATURE: pre-0.2.1 SDKs invoked these handlers with two
+    // positional args `(request, invocation)`; 0.2.1+ collapsed both
+    // into a single context bag (mirroring the change `onElicitationRequest`
+    // got in the same release). 0.3.0 keeps the single-context shape.
+    //
+    // We accept both forms by checking for a `request` property on the
+    // incoming arg. This makes the bridge resilient to future minor
+    // signature tweaks without forcing a hard pin to one specific SDK
+    // shape — and matches the JS-runtime reality that "extra positional
+    // args are ignored" when the SDK passes only one.
     const permissionHandler = async (
-      req: PermissionRequest,
-      _invocation: { sessionId: string },
+      arg: PermissionRequest | { request: PermissionRequest; sessionId?: string },
     ): Promise<PermissionRequestResult> => {
+      const req: PermissionRequest =
+        (arg as { request?: PermissionRequest }).request ?? (arg as PermissionRequest);
       const local = this.decidePermissionLocally(req);
       if (local !== null) {
         return local;
@@ -275,14 +357,20 @@ class CopilotBridge {
         suggested: 'allow',
       });
       return await new Promise<PermissionRequestResult>((resolve) => {
-        pendingPermissions.set(requestId, resolve);
+        // Stash the request alongside the resolver so an
+        // `allow_always` answer can construct the matching
+        // `approve-for-session` approval payload — see
+        // `buildSessionApproval` and the `answer_permission`
+        // handler.
+        pendingPermissions.set(requestId, { resolve, request: req });
       });
     };
 
     const userInputHandler = async (
-      req: UserInputRequest,
-      _invocation: { sessionId: string },
+      arg: UserInputRequest | { request: UserInputRequest; sessionId?: string },
     ): Promise<UserInputResponse> => {
+      const req: UserInputRequest =
+        (arg as { request?: UserInputRequest }).request ?? (arg as UserInputRequest);
       const requestId = randomUUID();
       writeStream({
         event: 'user_question',
@@ -345,8 +433,14 @@ class CopilotBridge {
       if (flowstatePid) {
         flowstateEnv.FLOWSTATE_PID = flowstatePid;
       }
+      // SDK v0.3.0 renamed `MCPLocalServerConfig` → `MCPStdioServerConfig`
+      // and (per the rename) the runtime tag `type: 'local'` →
+      // `type: 'stdio'`. The shape is otherwise identical
+      // (command/args/env). Older SDKs will reject this tag with an
+      // unknown-server-type error — we're committed to >= 0.3.0 (see
+      // package.json).
       mcpServers.flowstate = {
-        type: 'local',
+        type: 'stdio',
         command: flowstateExePath,
         args: [
           'mcp-server',
@@ -467,6 +561,7 @@ class CopilotBridge {
       | 'high'
       | 'xhigh'
       | 'max',
+    images: Array<{ media_type: string; data_base64: string }> = [],
   ): Promise<string> {
     if (!this.session) {
       throw new Error('No active session');
@@ -694,6 +789,25 @@ class CopilotBridge {
       if (reasoningEffort !== undefined) {
         sendPayload.reasoning_effort = reasoningEffort;
       }
+      // Multimodal: convert each image into a Copilot SDK
+      // `BlobAttachment` (inline base64 binary, no disk write
+      // needed) and add to the prompt payload. Available since
+      // SDK v0.2.0. Older SDKs that don't recognise the
+      // `attachments` field would silently drop it; we're committed
+      // to >= 0.3.0 (see package.json).
+      //
+      // The runtime widens the channel to any media type — Copilot's
+      // server-side may reject non-image MIMEs, but passing the
+      // bytes through keeps the bridge honest with what the user
+      // attached and surfaces the provider error rather than
+      // dropping silently.
+      if (images.length > 0) {
+        sendPayload.attachments = images.map((img) => ({
+          kind: 'blob' as const,
+          mimeType: img.media_type,
+          data: img.data_base64,
+        }));
+      }
       const response = await this.session.sendAndWait(sendPayload as { prompt: string }, 120_000);
       const content: string =
         response?.data?.content ?? '[No response from Copilot]';
@@ -918,9 +1032,21 @@ async function main(): Promise<void> {
               | 'xhigh'
               | 'max'
               | undefined;
+            // Multimodal attachments forwarded by the Rust adapter.
+            // Each entry becomes a `BlobAttachment` on the SDK
+            // payload — see sendPrompt for the conversion. Empty /
+            // missing → no attachments, single-prompt path.
+            const images = (msg.images as
+              | Array<{ media_type: string; data_base64: string }>
+              | undefined) ?? [];
             promptInFlight = (async () => {
               try {
-                const output = await bridge.sendPrompt(prompt, permissionMode, effort);
+                const output = await bridge.sendPrompt(
+                  prompt,
+                  permissionMode,
+                  effort,
+                  images,
+                );
                 process.stdout.write(
                   JSON.stringify({ type: 'response', output }) + '\n',
                 );
@@ -974,18 +1100,70 @@ async function main(): Promise<void> {
           }
 
           case 'answer_permission': {
+            // Scoped permission approvals (SDK v0.3.0+):
+            //   * 'allow'        → `{ kind: 'approve-once' }` — this
+            //                      single tool call only.
+            //   * 'allow_always' → `{ kind: 'approve-for-session' }` —
+            //                      the SDK auto-approves subsequent
+            //                      matching requests for the rest of
+            //                      this session, no further prompts.
+            //                      Maps onto flowstate's "Always allow"
+            //                      affordance without needing a
+            //                      separate persistent allowlist.
+            //   * 'deny'         → `{ kind: 'reject' }`
+            //   * 'deny_always'  → same rejection; the SDK doesn't
+            //                      expose a session-scoped denial
+            //                      kind, so a future-proof persistent
+            //                      block would have to live in
+            //                      flowstate's own policy layer.
+            //
+            // `approve-for-location` (path-scoped approval) exists in
+            // the SDK but flowstate's permission card has no path
+            // affordance today, so we don't emit it. Add a separate
+            // decision wire value if/when the UI grows that surface.
+            //
+            // The 0.3.0 enum also adds `'user-not-available'` (no UI
+            // present) and `'no-result'` (skip without yes/no); both
+            // are server/automation-side concerns flowstate doesn't
+            // produce from the interactive permission card.
             const reqId = msg.request_id as string;
             const decision = msg.decision as string;
-            const resolver = pendingPermissions.get(reqId);
-            if (resolver) {
+            const entry = pendingPermissions.get(reqId);
+            if (entry) {
               pendingPermissions.delete(reqId);
-              const approved =
-                decision === 'allow' || decision === 'allow_always';
-              resolver(
-                approved
-                  ? { kind: 'approved' }
-                  : { kind: 'denied-interactively-by-user' },
-              );
+              // Build per-branch — the SDK's PermissionRequestResult
+              // is a discriminated union, so a stored union-typed
+              // `kind` doesn't narrow at the call site.
+              let result: PermissionRequestResult;
+              if (decision === 'allow') {
+                result = { kind: 'approve-once' };
+              } else if (decision === 'allow_always') {
+                // Try to construct a session-scoped approval from
+                // the original request shape; fall back to a
+                // single-shot approve-once when the request kind
+                // has no matching session-scope (url, hook, shell
+                // without a command id, etc.). Falling back is
+                // strictly better than denying — the user clicked
+                // "Allow Always", they at minimum want this call
+                // through.
+                const approval = buildSessionApproval(entry.request);
+                if (approval) {
+                  // The runtime accepts any of the approval
+                  // discriminated-union shapes; cast through
+                  // `unknown` so the loose `unknown` from the
+                  // builder satisfies the strict union here.
+                  result = {
+                    kind: 'approve-for-session',
+                    approval,
+                  } as unknown as PermissionRequestResult;
+                } else {
+                  result = { kind: 'approve-once' };
+                }
+              } else {
+                // deny / deny_always / unknown
+                result = { kind: 'reject' };
+              }
+              entry.resolve(result);
             }
             break;
           }

@@ -89,6 +89,17 @@ pub(crate) enum BridgeRequest {
         /// zenui restart or bridge crash recovers the conversation.
         #[serde(skip_serializing_if = "Option::is_none")]
         resume_session_id: Option<String>,
+        /// Forwarded to the Claude Agent SDK as `Options.title`. When
+        /// supplied, the SDK uses it as the session title and skips
+        /// its own auto-title generation pass — saving one extra
+        /// non-essential request to the model on the first turn.
+        /// Available since `@anthropic-ai/claude-agent-sdk` v0.2.113.
+        /// We pass the flowstate session id today so the title in
+        /// Claude's session log matches our session id; future
+        /// versions can replace this with a richer human label
+        /// (e.g. last_turn_preview) once that surface exists.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
     },
     #[serde(rename = "send_prompt")]
     SendPrompt {
@@ -205,6 +216,23 @@ pub(crate) enum BridgeRequest {
     /// on the bridge side.
     #[serde(rename = "load_tool_catalog")]
     LoadToolCatalog { tools: Vec<ToolCatalogEntry> },
+    /// Append a user message to the live SDK Query *without*
+    /// triggering an assistant turn. The bridge pushes the message
+    /// onto its `inputQueue` with `shouldQuery: false`, which
+    /// causes the SDK to persist the message into the conversation
+    /// transcript but skip the post-message turn boundary — no
+    /// assistant response, no tools, no billing.
+    ///
+    /// Useful for slipping system reminders / background context
+    /// / queued user input into the transcript without paying for
+    /// a turn. No-op if no Query is active on the bridge — the
+    /// Rust caller is expected to have triggered at least one
+    /// `send_prompt` (or `list_capabilities`) first.
+    ///
+    /// Available since `@anthropic-ai/claude-agent-sdk` v0.2.110
+    /// (`shouldQuery` field on `SDKUserMessage`).
+    #[serde(rename = "append_user_message")]
+    AppendUserMessage { text: String },
 }
 
 #[derive(Debug, Deserialize)]

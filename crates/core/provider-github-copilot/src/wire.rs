@@ -21,6 +21,20 @@ pub(crate) enum UserInputOutcome {
 
 /// Bridge process wrapper for GitHub Copilot SDK
 
+/// One image attachment forwarded into the Copilot bridge's
+/// `send_prompt`. Mirrors the Claude SDK adapter's
+/// `BridgeImageAttachment` so the Rust side can pass attachments
+/// through `UserInput::images` uniformly. The bridge converts each
+/// entry into a Copilot SDK `BlobAttachment` (mimeType + base64
+/// data) and threads them into `session.sendAndWait`. Available on
+/// the SDK since v0.2.0.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CopilotBridgeImage {
+    pub(crate) media_type: String,
+    pub(crate) data_base64: String,
+}
+
 /// the Copilot SDK's `SessionSkillsListResult.skills[]` entry.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +113,15 @@ pub(crate) enum BridgeRequest {
         permission_mode: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
+        /// Multimodal image attachments. Forwarded to the bridge,
+        /// which converts each entry to a `BlobAttachment` and
+        /// includes them in the `sendAndWait` payload. Empty by
+        /// default — the bridge skips the attachments field
+        /// entirely when this is `Vec::new()`, preserving the
+        /// pre-0.3.0 single-prompt path. Available on the
+        /// `@github/copilot-sdk` `BlobAttachment` API since v0.2.0.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<CopilotBridgeImage>,
     },
     #[serde(rename = "answer_permission")]
     AnswerPermission {

@@ -32,7 +32,8 @@ use crate::process::{
 };
 use crate::wire::{
     BridgeCopilotAgent, BridgeCopilotMcp, BridgeRequest, BridgeResponse, BridgeSkill,
-    UserInputOutcome, parse_decision, permission_decision_to_str, permission_mode_to_str,
+    CopilotBridgeImage, UserInputOutcome, parse_decision, permission_decision_to_str,
+    permission_mode_to_str,
 };
 
 #[derive(Clone)]
@@ -232,6 +233,7 @@ impl GitHubCopilotAdapter {
         prompt: String,
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
+        images: Vec<CopilotBridgeImage>,
         events: &TurnEventSink,
     ) -> Result<String, String> {
         write_request(
@@ -240,6 +242,7 @@ impl GitHubCopilotAdapter {
                 prompt,
                 permission_mode: permission_mode_to_str(permission_mode).to_string(),
                 reasoning_effort: reasoning_effort.map(|e| e.as_str().to_string()),
+                images,
             },
         )
         .await?;
@@ -691,16 +694,11 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         events: TurnEventSink,
     ) -> Result<ProviderTurnOutput, String> {
         info!(
-            "Executing turn with GitHub Copilot (mode={:?}, effort={:?})",
-            permission_mode, reasoning_effort
+            "Executing turn with GitHub Copilot (mode={:?}, effort={:?}, images={})",
+            permission_mode,
+            reasoning_effort,
+            input.images.len(),
         );
-        if !input.images.is_empty() {
-            tracing::warn!(
-                provider = ?ProviderKind::GitHubCopilot,
-                count = input.images.len(),
-                "github copilot SDK adapter dropping image attachments; not implemented"
-            );
-        }
 
         let cached = self.ensure_session_process(session).await?;
         // Held for the entire turn. Drops after `process` is released,
@@ -713,12 +711,28 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             // we can return it as native_thread_id even on first turn.
             // ensure_session_process populates it during CreateSession.
             let bridge_session_id = process.bridge_session_id.clone();
+            // Map the runtime's `UserInput::images` (the same shape
+            // we hand to the Claude SDK adapter) into the
+            // bridge-side `CopilotBridgeImage` wire type. The bridge
+            // wraps each entry in a `BlobAttachment` and includes
+            // them in `session.sendAndWait`. Empty stays empty —
+            // serde skips the field entirely when no images are
+            // attached, preserving the pre-0.3.0 single-prompt path.
+            let bridge_images: Vec<CopilotBridgeImage> = input
+                .images
+                .iter()
+                .map(|img| CopilotBridgeImage {
+                    media_type: img.media_type.clone(),
+                    data_base64: img.data_base64.clone(),
+                })
+                .collect();
             let output = self
                 .bridge_request_streaming(
                     &mut process,
                     input.text.clone(),
                     permission_mode,
                     reasoning_effort,
+                    bridge_images,
                     &events,
                 )
                 .await?;

@@ -390,6 +390,12 @@ impl ClaudeSdkAdapter {
                 .to_string(),
             model: session.summary.model.clone(),
             resume_session_id,
+            // Pass the flowstate session id as the SDK title. This
+            // both names the SDK session in Claude's own logs and
+            // skips the SDK's auto-title generation request on first
+            // turn (one fewer non-essential model call). Available
+            // since SDK v0.2.113.
+            title: Some(session.summary.session_id.clone()),
         };
         write_request(&bridge.stdin, &request).await?;
 
@@ -1186,6 +1192,28 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             },
         )
         .await?;
+        Ok(())
+    }
+
+    async fn append_user_message(
+        &self,
+        session: &SessionDetail,
+        text: String,
+    ) -> Result<(), String> {
+        // Forward the text to the live bridge as an
+        // `append_user_message`. Bridge pushes onto its `inputQueue`
+        // with `shouldQuery: false`, so the SDK persists the message
+        // into the transcript but skips the post-message turn — no
+        // assistant response, no tools, no billing.
+        //
+        // Same stdin-grab pattern as `update_permission_mode`: avoids
+        // deadlocking against the outer process Mutex held by an
+        // in-flight `run_turn`. No-op (Ok) if no bridge exists yet —
+        // there's no transcript to append to. SDK v0.2.110+.
+        let Some(stdin) = self.session_stdin(&session.summary.session_id).await else {
+            return Ok(());
+        };
+        write_request(&stdin, &BridgeRequest::AppendUserMessage { text }).await?;
         Ok(())
     }
 

@@ -702,8 +702,24 @@ class ClaudeBridge {
    * `ProviderModel.contextWindow`.
    */
   private lastContextWindow: number | null = null;
+  /**
+   * Optional session title forwarded to the Claude Agent SDK via the
+   * `title` option on `query()`. When set, the SDK uses this as the
+   * session's title and skips its own auto-title generation pass —
+   * which would otherwise fire an extra non-essential request to
+   * the model on the first turn. Sourced from
+   * `BridgeRequest::CreateSession.title` (Rust supplies the
+   * flowstate session id today; future versions may pass a richer
+   * label). Available since SDK v0.2.113.
+   */
+  private title?: string;
 
-  createSession(cwd: string, model?: string, resumeSessionId?: string): string {
+  createSession(
+    cwd: string,
+    model?: string,
+    resumeSessionId?: string,
+    title?: string,
+  ): string {
     this.cwd = cwd;
     this.model = model;
     // Hydrate the SDK resume id from persisted state when zenui restarts or
@@ -711,6 +727,9 @@ class ClaudeBridge {
     // send_prompt picks this up and replays the prior conversation.
     if (resumeSessionId) {
       this.resumeSessionId = resumeSessionId;
+    }
+    if (title) {
+      this.title = title;
     }
     const sessionId = `claude-sdk-${randomUUID()}`;
     return sessionId;
@@ -1011,6 +1030,14 @@ class ClaudeBridge {
       'Agent',
     ];
 
+    // ENV SEMANTICS: as of `@anthropic-ai/claude-agent-sdk` v0.2.113
+    // `Options.env` *replaces* `process.env` (it used to overlay).
+    // Anyone who later wires a custom `env` here MUST spread
+    // `process.env` first — `env: { ...process.env, MY_VAR: 'x' }` —
+    // otherwise the spawned Claude CLI loses PATH, HOME, and any
+    // other inherited variable and crashes on startup. The bridge
+    // intentionally omits the option entirely so the SDK's
+    // inherit-from-parent default applies.
     const options: Options = {
       cwd: this.cwd,
       permissionMode: initialPermissionMode,
@@ -1089,10 +1116,33 @@ class ClaudeBridge {
       ...(this.resumeSessionId ? { resume: this.resumeSessionId } : {}),
       ...(thinkingConfig ? { thinking: thinkingConfig } : {}),
       ...(effortLevel ? { effort: effortLevel } : {}),
+      // Skip the SDK's auto-title generation pass (extra
+      // non-essential request to the model on first turn) when the
+      // host has supplied a session title. Available since SDK
+      // v0.2.113.
+      ...(this.title ? { title: this.title } : {}),
       ...(RESOLVED_LOCAL_CLAUDE_PATH
         ? { pathToClaudeCodeExecutable: RESOLVED_LOCAL_CLAUDE_PATH }
         : {}),
     };
+
+    // Stream sub-agent text deltas (Task/Agent tool calls) back to
+    // the parent in real time. Without this we'd only see sub-agent
+    // output on the aggregate boundary at the end of the sub-call.
+    // The `assistant` message handler already routes
+    // parent_tool_use_id-bearing messages into per-agent buckets
+    // (see `agentUsage` map), so lighting this option up surfaces
+    // those same messages incrementally instead of in a final lump.
+    //
+    // Field exists on the SDK's internal `SDKControlInitializeRequest`
+    // and is forwarded to the spawned Claude Code process at session
+    // init, but as of v0.2.119 the public `Options` type doesn't yet
+    // expose it. The SDK accepts unknown extra fields on Options and
+    // passes them through, so we set it here via a one-line type
+    // widen and revisit when the type is exposed publicly. Listed in
+    // the v0.2.119 changelog. Safe to remove the cast once the public
+    // type catches up.
+    (options as Options & { forwardSubagentText?: boolean }).forwardSubagentText = true;
 
     const inputQueue = new PushableAsyncIterable<SDKUserMessage>();
     this.inputQueue = inputQueue;
@@ -1166,6 +1216,53 @@ class ClaudeBridge {
     // state — without this the bypass short-circuit would still
     // read the stale turn-start mode for the rest of the turn.
     this.livePermissionMode = mode;
+  }
+
+  /**
+   * Append a user message to the active SDK Query *without*
+   * triggering an assistant turn. Pushed onto the input queue with
+   * `shouldQuery: false`, which causes the SDK to:
+   *   1. Persist the message into the conversation transcript so
+   *      it's part of the resumed history on subsequent turns.
+   *   2. Skip the post-message turn boundary — no assistant
+   *      response is generated, no tools fire, no usage is billed.
+   *   3. Skip auto-title generation and the `UserPromptSubmit`
+   *      hook (the SDK fixed this hook leak in v0.2.110).
+   *
+   * Useful for slipping system reminders, background context, or
+   * "queue this user input while a turn is running" patterns into
+   * the transcript without paying for a turn.
+   *
+   * No-op if no Query is active. Safe to call between turns —
+   * unlike `sendPrompt`, this does NOT lazy-open a Query because
+   * an append on a never-opened session has no resume target. The
+   * Rust caller is expected to have triggered at least one
+   * `send_prompt` first (or `list_capabilities` to seed the SDK
+   * session id).
+   *
+   * Available since SDK v0.2.110 (`shouldQuery` field on
+   * `SDKUserMessage`); fix for the hook-leak landed in the same
+   * release.
+   */
+  appendUserMessage(text: string): void {
+    if (!this.inputQueue) {
+      console.error(
+        '[claude-bridge] appendUserMessage: no active input queue (no live Query); message dropped',
+      );
+      return;
+    }
+    const userMessage: SDKUserMessage = {
+      type: 'user' as const,
+      message: {
+        role: 'user' as const,
+        content: text,
+      },
+      parent_tool_use_id: null,
+      session_id: '',
+      // The whole point of this method: append-only, no turn fired.
+      shouldQuery: false,
+    };
+    this.inputQueue.push(userMessage);
   }
 
   /**
@@ -2399,8 +2496,12 @@ async function main(): Promise<void> {
         const cwd = (msg.cwd as string) ?? process.cwd();
         const model = msg.model as string | undefined;
         const resumeSessionId = msg.resume_session_id as string | undefined;
+        // Optional session title — when present, the SDK uses it as
+        // the session's name and skips its own auto-title generation
+        // pass. See `Options.title` (SDK v0.2.113+).
+        const title = msg.title as string | undefined;
         try {
-          const sessionId = bridge.createSession(cwd, model, resumeSessionId);
+          const sessionId = bridge.createSession(cwd, model, resumeSessionId, title);
           writeJson({ type: 'session_created', session_id: sessionId });
         } catch (err) {
           writeJson({
@@ -2451,6 +2552,20 @@ async function main(): Promise<void> {
             promptInFlight = null;
           }
         })();
+        break;
+      }
+
+      case 'append_user_message': {
+        // Push a user message onto the live SDK input queue with
+        // `shouldQuery: false` so it's added to the transcript
+        // without firing an assistant turn. Used for slipping
+        // background context, system reminders, or queueing
+        // additional user input while a turn is running. SDK
+        // v0.2.110+.
+        const text = msg.text as string | undefined;
+        if (typeof text === 'string' && text.length > 0) {
+          bridge.appendUserMessage(text);
+        }
         break;
       }
 

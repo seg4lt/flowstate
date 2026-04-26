@@ -176,6 +176,35 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Append a user message to the session's transcript *without*
+    /// triggering an assistant turn — append-only persistence into
+    /// the conversation history.
+    ///
+    /// Useful for slipping system reminders, background context, or
+    /// queueing additional user input while a turn is running. The
+    /// message becomes part of the resumed transcript on the next
+    /// real turn but generates no model output, no tool calls, and
+    /// no usage on its own.
+    ///
+    /// Currently implemented by the Claude SDK adapter via the
+    /// `shouldQuery: false` field on `SDKUserMessage` (added in
+    /// `@anthropic-ai/claude-agent-sdk` v0.2.110). Other adapters
+    /// inherit the no-op default, which silently drops the message —
+    /// the runtime should gate calls on the kind of provider when a
+    /// fallback is unsuitable.
+    ///
+    /// No-op (Ok) when no live provider session exists yet — the
+    /// caller is expected to have triggered at least one
+    /// `execute_turn` first; otherwise there's no transcript to
+    /// append to.
+    async fn append_user_message(
+        &self,
+        _session: &SessionDetail,
+        _text: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Return a per-category breakdown of what's currently filling
     /// the session's context window. Powers the "Context breakdown"
     /// popover on the session's token counter.
