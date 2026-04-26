@@ -13,6 +13,7 @@ fn main() {
     // rebuild loop.
     println!("cargo:rerun-if-changed=bridge/src/index.ts");
     println!("cargo:rerun-if-changed=bridge/package.json");
+    println!("cargo:rerun-if-changed=bridge/package-lock.json");
     println!("cargo:rerun-if-changed=bridge/bun.lock");
     println!("cargo:rerun-if-changed=bridge/tsconfig.json");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EMBED");
@@ -26,6 +27,12 @@ fn main() {
         fs::create_dir_all(out_dir.join("bridge-assets")).ok();
         return;
     }
+
+    // Fail-fast guard — see provider-github-copilot/build.rs for the
+    // full rationale. `npm ci` at runtime refuses to install when
+    // package.json and package-lock.json disagree on dep versions, so
+    // we catch drift at build time before it ships.
+    validate_lockfile_consistency(&bridge_dir, "Claude SDK");
 
     // --- bun install (only needed when embed=ON so `node_modules/` gets
     //     staged; skip entirely in download mode — npm hydrates at
@@ -227,4 +234,87 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run the SAME `npm ci` flags that the runtime uses
+/// (`bridge_runtime.rs::hydrate_node_modules`), but with `--dry-run`
+/// so no `node_modules/` materializes. npm's first pre-flight stage
+/// is exactly the lockfile/package.json sync check; if it fails here,
+/// it would fail on every end-user's machine on first launch.
+///
+/// Mirrors the validation in `provider-github-copilot/build.rs` —
+/// keep in sync. Both bridges ship `package-lock.json` to end-user
+/// machines and rely on `npm ci` to hydrate `node_modules` on first
+/// launch, so a silent lockfile drift bricks the provider for everyone.
+///
+/// Best-effort: if either file is missing, or `npm` is not on PATH
+/// (rare — the bridge build also requires `bun`, so devs reaching this
+/// step have a JS toolchain installed), the check skips with a
+/// warning rather than failing the build.
+fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
+    let pkg_path = bridge_dir.join("package.json");
+    let lock_path = bridge_dir.join("package-lock.json");
+    if !pkg_path.exists() || !lock_path.exists() {
+        return;
+    }
+
+    let output = Command::new("npm")
+        .args([
+            "ci",
+            "--omit=dev",
+            "--legacy-peer-deps",
+            "--no-audit",
+            "--no-fund",
+            "--dry-run",
+        ])
+        .current_dir(bridge_dir)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            println!(
+                "cargo:warning={provider} bridge: skipping lockfile-consistency check ({e}); \
+                install npm to enable build-time validation"
+            );
+            return;
+        }
+    };
+
+    if output.status.success() {
+        return;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    println!(
+        "cargo:warning=========================================================="
+    );
+    println!(
+        "cargo:warning={provider} bridge: package-lock.json is OUT OF SYNC with package.json"
+    );
+    println!("cargo:warning=`npm ci --dry-run` rejected the lockfile.");
+    for line in stderr.lines().chain(stdout.lines()) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        println!("cargo:warning=  {line}");
+    }
+    println!(
+        "cargo:warning=Fix: cd {} && npm install --package-lock-only --legacy-peer-deps",
+        bridge_dir.display()
+    );
+    println!(
+        "cargo:warning=(Then commit the regenerated package-lock.json. \
+        `npm ci` on end-user machines refuses to install when these drift, \
+        bricking first launch of the {provider} provider.)"
+    );
+    println!(
+        "cargo:warning=========================================================="
+    );
+    panic!(
+        "{provider} bridge package-lock.json drift detected by `npm ci --dry-run`; \
+         see cargo warnings above for the fix"
+    );
 }
