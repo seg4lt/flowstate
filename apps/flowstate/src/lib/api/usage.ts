@@ -12,6 +12,8 @@ export type UsageRange =
   | "last7_days"
   | "last30_days"
   | "last90_days"
+  | "last120_days"
+  | "last180_days"
   | "all_time";
 
 export type UsageGroupBy = "by_provider" | "by_model";

@@ -50,6 +50,8 @@ pub enum UsageRange {
     Last7Days,
     Last30Days,
     Last90Days,
+    Last120Days,
+    Last180Days,
     AllTime,
 }
 
@@ -63,6 +65,8 @@ impl UsageRange {
             UsageRange::Last7Days => (now - Duration::days(6)).format("%Y-%m-%d").to_string(),
             UsageRange::Last30Days => (now - Duration::days(29)).format("%Y-%m-%d").to_string(),
             UsageRange::Last90Days => (now - Duration::days(89)).format("%Y-%m-%d").to_string(),
+            UsageRange::Last120Days => (now - Duration::days(119)).format("%Y-%m-%d").to_string(),
+            UsageRange::Last180Days => (now - Duration::days(179)).format("%Y-%m-%d").to_string(),
             UsageRange::AllTime => "0000-01-01".to_string(),
         };
         (start, end)

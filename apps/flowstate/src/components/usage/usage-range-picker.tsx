@@ -7,6 +7,8 @@ const RANGE_LABELS: { value: UsageRange; label: string }[] = [
   { value: "last7_days", label: "7d" },
   { value: "last30_days", label: "30d" },
   { value: "last90_days", label: "90d" },
+  { value: "last120_days", label: "120d" },
+  { value: "last180_days", label: "180d" },
   { value: "all_time", label: "All time" },
 ];
 
@@ -17,6 +19,8 @@ function isUsageRange(value: unknown): value is UsageRange {
     value === "last7_days" ||
     value === "last30_days" ||
     value === "last90_days" ||
+    value === "last120_days" ||
+    value === "last180_days" ||
     value === "all_time"
   );
 }

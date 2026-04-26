@@ -140,10 +140,18 @@ export function UsageTokensChart({
     // every token kind for that model on that day so the bar
     // height represents total token volume — same scale as the
     // by-kind view.
+    //
+    // We only surface models that were actually used at least once
+    // in the selected timeframe — otherwise the legend grows
+    // unbounded as new models appear in the catalog (or as old
+    // ones get retired but linger in `data.series`). A model with
+    // zero tokens across every bucket contributes nothing to the
+    // chart anyway, so dropping its key keeps the legend honest.
     const labels: Record<string, string> = {};
     const byDay: Record<string, Record<string, number>> = {};
+    const usedKeys: string[] = [];
     for (const s of data.series) {
-      labels[s.key] = s.label;
+      let seriesTotal = 0;
       for (const p of s.points) {
         const total =
           p.totals.inputTokens +
@@ -151,8 +159,13 @@ export function UsageTokensChart({
           p.totals.cacheReadTokens +
           p.totals.cacheWriteTokens;
         if (total === 0) continue;
+        seriesTotal += total;
         if (!byDay[p.bucketStart]) byDay[p.bucketStart] = {};
         byDay[p.bucketStart][s.key] = total;
+      }
+      if (seriesTotal > 0) {
+        labels[s.key] = s.label;
+        usedKeys.push(s.key);
       }
     }
     const rows = data.points.map((p) => ({
@@ -161,7 +174,7 @@ export function UsageTokensChart({
     }));
     return {
       byModelRows: rows,
-      modelKeys: data.series.map((s) => s.key),
+      modelKeys: usedKeys,
       modelLabelByKey: labels,
     };
   }, [data]);
