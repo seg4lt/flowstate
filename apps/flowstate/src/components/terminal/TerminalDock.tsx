@@ -166,14 +166,36 @@ export function TerminalDock() {
   // "this project still exists." Per-session dock-open entries are
   // pruned against the current sessions set so we don't accumulate
   // stale booleans across hard deletes.
+  //
+  // Guards against transient daemon snapshots:
+  //
+  //  * `appState.ready` gate — during the bootstrap window before the
+  //    welcome message arrives, `appState.projects` is empty even
+  //    though projects exist. Pruning here would nuke every restored
+  //    tab on app start.
+  //  * empty-keep belt-and-braces — if the keep set is empty AND we
+  //    have at least one project still in the terminal store, treat
+  //    that as a partial / churning snapshot and skip the dispatch.
+  //    A genuine "all projects deleted" event is rare and the next
+  //    user interaction reconciles it; the false-positive case
+  //    (reconnect dropping the projects list) is the bug we're
+  //    fixing.
   React.useEffect(() => {
+    if (!appState.ready) return;
     const keep = new Set(appState.projects.map((p) => p.projectId));
+    if (keep.size === 0 && state.projects.size > 0) return;
     dispatch({ type: "prune_projects", keep });
     dispatch({
       type: "prune_sessions",
       keep: new Set(appState.sessions.keys()),
     });
-  }, [appState.projects, appState.sessions, dispatch]);
+  }, [
+    appState.ready,
+    appState.projects,
+    appState.sessions,
+    state.projects,
+    dispatch,
+  ]);
 
   const projectState = state.projects.get(projectKey);
 

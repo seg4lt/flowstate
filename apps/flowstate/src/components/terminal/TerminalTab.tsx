@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { UnicodeGraphemesAddon } from "@xterm/addon-unicode-graphemes";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   killPty,
   openPty,
@@ -88,7 +89,23 @@ export function TerminalTab({
     const fit = new FitAddon();
     fitRef.current = fit;
     term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
+    // xterm's default WebLinksAddon handler calls
+    // `window.open(url, "_blank")`, which Tauri's WKWebView silently
+    // drops — links appear underlined but clicking does nothing.
+    // Route through `openUrl` from `@tauri-apps/plugin-opener` (the
+    // same path `markdown-content.tsx` uses) so a click on a URL in
+    // shell output opens the system browser. Falls back to
+    // `window.open` outside Tauri so the addon still works in a
+    // plain-browser dev/test build.
+    term.loadAddon(
+      new WebLinksAddon((_event, url) => {
+        if ("__TAURI_INTERNALS__" in window) {
+          void openUrl(url);
+        } else {
+          window.open(url, "_blank", "noopener,noreferrer");
+        }
+      }),
+    );
     try {
       term.loadAddon(new UnicodeGraphemesAddon());
     } catch {
@@ -183,6 +200,17 @@ export function TerminalTab({
             if (pending > HIGH_WATERMARK && ptyIdRef.current != null) {
               pausePty(ptyIdRef.current).catch(() => {});
             }
+          },
+          // The Rust reader thread sends a single `Exit` event when
+          // the shell process dies — clean `exit`, signal, or kill
+          // from another thread. Bubble that up to the dock so the
+          // tab auto-closes. The `disposed` guard skips this when
+          // React has already torn the component down (e.g. the
+          // user clicked the X button, which calls killPty → EOF →
+          // Exit, but the unmount cleanup has already run).
+          onExit: () => {
+            if (disposed) return;
+            onExitRef.current();
           },
         });
         if (disposed) {

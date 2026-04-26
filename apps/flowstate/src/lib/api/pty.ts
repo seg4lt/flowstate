@@ -2,29 +2,45 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 // Integrated terminal — PTY control plane. Frontend pairs this
 // with @xterm/xterm on the render side. `openPty` creates a shell
-// child and returns a numeric id; the provided onData channel
-// delivers the shell's raw byte output (as a number array today;
-// upgradeable to ArrayBuffer when we care). All the other helpers
-// take that id as the first arg.
+// child and returns a numeric id; the provided onEvent channel
+// multiplexes raw byte output and the lifecycle exit notification
+// in source order. All the other helpers take that id as the first
+// arg.
 export type PtyId = number;
+
+/** Multiplexed channel payload for a live PTY session. Mirrors
+ *  `pty::PtyEvent` on the Rust side (serde-tagged with `kind`). */
+export type PtyEvent =
+  | { kind: "data"; bytes: number[] }
+  | { kind: "exit"; code: number | null };
 
 export interface OpenPtyOptions {
   cols: number;
   rows: number;
   cwd?: string;
   shell?: string;
+  /** Fires for every byte-chunk emitted by the shell. */
   onData: (bytes: number[]) => void;
+  /** Fires once when the shell process exits (clean `exit`, signal,
+   *  or external kill). The dock uses this to auto-close the tab. */
+  onExit: (code: number | null) => void;
 }
 
 export function openPty(opts: OpenPtyOptions): Promise<PtyId> {
-  const channel = new Channel<number[]>();
-  channel.onmessage = opts.onData;
+  const channel = new Channel<PtyEvent>();
+  channel.onmessage = (event) => {
+    if (event.kind === "data") {
+      opts.onData(event.bytes);
+    } else {
+      opts.onExit(event.code);
+    }
+  };
   return invoke<PtyId>("pty_open", {
     cols: opts.cols,
     rows: opts.rows,
     cwd: opts.cwd ?? null,
     shell: opts.shell ?? null,
-    onData: channel,
+    onEvent: channel,
   });
 }
 

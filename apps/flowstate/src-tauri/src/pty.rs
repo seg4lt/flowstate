@@ -25,9 +25,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use serde::Serialize;
 use tauri::ipc::Channel;
 
 pub type PtyId = u64;
+
+/// Events streamed from a PTY session to the frontend over a single
+/// per-session `Channel<PtyEvent>`. Multiplexing data and lifecycle
+/// on the same channel preserves ordering — a final burst of output
+/// followed by EOF arrives in source order — and avoids the second
+/// IPC pipe a parallel exit channel would require.
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PtyEvent {
+    /// Raw bytes from the master end of the pty.
+    Data { bytes: Vec<u8> },
+    /// The reader hit EOF or a read error — the child shell is gone.
+    /// `code` is `None` because we deliberately do NOT block in
+    /// `wait()` from the reader thread (would race with `kill_all` on
+    /// the child mutex). Frontend treats this as "tab should close".
+    Exit { code: Option<i32> },
+}
 
 struct PtySession {
     writer: Mutex<Box<dyn Write + Send>>,
@@ -61,7 +79,7 @@ impl PtyManager {
         rows: u16,
         cwd: Option<String>,
         shell: Option<String>,
-        on_data: Channel<Vec<u8>>,
+        on_event: Channel<PtyEvent>,
     ) -> Result<PtyId, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -126,7 +144,7 @@ impl PtyManager {
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
             .spawn(move || {
-                reader_loop(reader, on_data, paused_for_thread);
+                reader_loop(reader, on_event, paused_for_thread);
             })
             .map_err(|e| format!("spawn reader thread: {e}"))?;
 
@@ -228,10 +246,16 @@ fn which_in_path(binary: &str) -> bool {
 
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
-    channel: Channel<Vec<u8>>,
+    channel: Channel<PtyEvent>,
     paused: Arc<AtomicBool>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
+    // Track whether we exited via EOF (child died on its own — user
+    // typed `exit`, or signal) versus a frontend-side channel drop
+    // (terminal was disposed or webview reloaded). Only the former
+    // should fire an `Exit` event; in the latter the frontend can't
+    // hear us anyway.
+    let mut child_gone = false;
     loop {
         // Lightweight busy-sleep while paused. The pty buffer will
         // fill and SIGSTOP-equivalent-block the child on its own
@@ -242,19 +266,37 @@ fn reader_loop(
         }
 
         match reader.read(&mut buf) {
-            Ok(0) => break, // child exited, slave fd closed
+            Ok(0) => {
+                // Slave fd closed — the child exited (clean `exit`,
+                // signal, or kill from another thread). Notify the
+                // frontend so it can auto-close the tab.
+                child_gone = true;
+                break;
+            }
             Ok(n) => {
                 let chunk = buf[..n].to_vec();
-                if channel.send(chunk).is_err() {
+                if channel.send(PtyEvent::Data { bytes: chunk }).is_err() {
                     // Frontend dropped the channel — terminal was
                     // disposed or the webview reloaded. Stop reading.
                     break;
                 }
             }
             Err(e) => {
+                // EIO on the master after the slave closes is normal
+                // on some platforms — treat it as "child gone" so the
+                // tab still auto-closes on `exit`. Other errors get
+                // logged for diagnosis but reach the same outcome.
                 tracing::warn!("pty reader error: {e}");
+                child_gone = true;
                 break;
             }
         }
+    }
+    if child_gone {
+        // Best-effort. We deliberately do NOT block in `wait()` to
+        // harvest the exit status — the child mutex may be contended
+        // by `kill_all` during shutdown, and the frontend doesn't use
+        // the code today. Send `None` and call it done.
+        let _ = channel.send(PtyEvent::Exit { code: None });
     }
 }

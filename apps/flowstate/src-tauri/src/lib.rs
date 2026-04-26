@@ -50,7 +50,7 @@ use zenui_daemon_core::{
 use zenui_runtime_core::ConnectionObserver;
 
 mod pty;
-use pty::{PtyId, PtyManager};
+use pty::{PtyEvent, PtyId, PtyManager};
 
 mod shell_env;
 
@@ -1853,9 +1853,9 @@ fn pty_open(
     rows: u16,
     cwd: Option<String>,
     shell: Option<String>,
-    on_data: Channel<Vec<u8>>,
+    on_event: Channel<PtyEvent>,
 ) -> Result<PtyId, String> {
-    manager.open(cols, rows, cwd, shell, on_data)
+    manager.open(cols, rows, cwd, shell, on_event)
 }
 
 #[tauri::command]
