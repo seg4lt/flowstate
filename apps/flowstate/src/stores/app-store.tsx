@@ -163,6 +163,21 @@ interface AppState {
    *  ServerMessage); flips to `"failed"` if the retry budget is
    *  exhausted (~5 minutes of failed connect attempts). */
   daemonConnectStatus: "connecting" | "connected" | "failed";
+  /** True once the daemon's `welcome` bootstrap has landed in state.
+   *  Internal — consumers should read `ready` instead. */
+  welcomeReceived: boolean;
+  /** True once `listSessionDisplay` / `listProjectDisplay` /
+   *  `listProjectWorktree` have all returned (or failed and committed
+   *  empty maps). Internal — consumers should read `ready` instead.
+   *
+   *  Both flags exist because welcome and display-hydration arrive on
+   *  independent channels: welcome carries the projects list (SDK side),
+   *  hydrate_display carries the names + worktree-parent links (app
+   *  side). If welcome arrives first and the splash drops, the sidebar
+   *  paints unnamed top-level projects ("Untitled project") for every
+   *  worktree until hydrate_display lands — that flash is what `ready`
+   *  exists to suppress. */
+  displayHydrated: boolean;
   ready: boolean;
 }
 
@@ -402,10 +417,16 @@ function appReducer(state: AppState, action: AppAction): AppState {
         action.projectWorktrees,
         projectWorktreesEqual,
       );
+      // Even when the maps are reference-identical we still need to
+      // flip `displayHydrated` on the FIRST hydrate, otherwise a cold
+      // boot whose stored display tables are empty would never satisfy
+      // the `ready` gate and the splash would hang forever.
+      const alreadyFlagged = state.displayHydrated;
       if (
         sessionDisplay === state.sessionDisplay &&
         projectDisplay === state.projectDisplay &&
-        projectWorktrees === state.projectWorktrees
+        projectWorktrees === state.projectWorktrees &&
+        alreadyFlagged
       ) {
         return state;
       }
@@ -414,6 +435,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
         sessionDisplay,
         projectDisplay,
         projectWorktrees,
+        displayHydrated: true,
+        // Pair with the welcome handler — both must have landed for
+        // the sidebar to render with full data on first paint.
+        ready: state.welcomeReceived,
       };
     }
     case "set_session_display": {
@@ -634,7 +659,13 @@ function handleServerMessage(
         sessions,
         projects,
         checkpointSettings: message.bootstrap.checkpointSettings,
-        ready: true,
+        welcomeReceived: true,
+        // `ready` only flips true once display metadata is also in.
+        // Without this gate the sidebar would paint every project as
+        // "Untitled project" (and worktree children as un-rolled-up
+        // top-level entries) for the few hundred ms between welcome
+        // and hydrate_display.
+        ready: state.displayHydrated,
       };
     }
 
@@ -1181,6 +1212,8 @@ const initialState: AppState = {
   isWindowFocused: true,
   provisionFailures: [],
   daemonConnectStatus: "connecting",
+  welcomeReceived: false,
+  displayHydrated: false,
   ready: false,
 };
 
@@ -1524,6 +1557,17 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       })
       .catch((err) => {
         console.error("failed to hydrate display metadata", err);
+        // Still dispatch with empty maps so `displayHydrated` flips
+        // and `ready` can become true. Otherwise the splash hangs
+        // forever on a SQLite outage — better to show the sidebar
+        // with placeholder labels than to brick the app.
+        if (!active) return;
+        dispatchRef.current({
+          type: "hydrate_display",
+          sessionDisplay: new Map(),
+          projectDisplay: new Map(),
+          projectWorktrees: new Map(),
+        });
       });
 
     return () => {
