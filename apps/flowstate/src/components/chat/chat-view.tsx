@@ -35,7 +35,6 @@ import { toneForMode } from "@/lib/mode-tone";
 import {
   readDefaultEffort,
   readDefaultPermissionMode,
-  readStrictPlanMode,
 } from "@/lib/defaults-settings";
 import {
   clampEffortToModel,
@@ -48,7 +47,6 @@ import {
   resolveCommand,
   type SlashCommandContext,
 } from "@/lib/slash-commands";
-import { PLAN_MODE_MUTATING_TOOLS } from "@/lib/tool-policy";
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
@@ -418,26 +416,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     };
   }, [permissionStorageKey, sessionQuery.data]);
 
-  // Strict Plan Mode preference — opt-in frontend policy that auto-
-  // denies any mutating-tool permission request while the session is
-  // in plan mode (see `PLAN_MODE_MUTATING_TOOLS` + the enforcement
-  // useEffect below). We refresh on window focus so flipping the
-  // toggle in Settings takes effect without a reload.
-  const [strictPlanMode, setStrictPlanMode] = React.useState(false);
-  React.useEffect(() => {
-    let cancelled = false;
-    const refresh = () => {
-      readStrictPlanMode().then((saved) => {
-        if (!cancelled) setStrictPlanMode(saved);
-      });
-    };
-    refresh();
-    window.addEventListener("focus", refresh);
-    return () => {
-      cancelled = true;
-      window.removeEventListener("focus", refresh);
-    };
-  }, []);
+  // (Strict Plan Mode auto-deny lives in <RoutePromptOverlay /> so it
+  // fires regardless of which route the user is on — otherwise a
+  // mutating-tool request that arrived while the user was browsing
+  // /code would sit undenied until they navigated back to /chat. The
+  // overlay reads the same `readStrictPlanMode` setting and looks at
+  // the session's `permissionModeBySession` entry that this view's
+  // `setPermissionMode` wrapper keeps up to date.)
 
   // (Effort / permissionMode are persisted to sessionStorage +
   // dispatched to the app-store inside their wrapped setters above —
@@ -1329,46 +1314,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     }
   }
 
-  // Strict Plan Mode enforcement. When enabled AND the session is in
-  // plan mode, any pending permission request for a mutating tool
-  // (Bash / Write / Edit / NotebookEdit) is auto-denied before the
-  // PermissionPrompt UI has a chance to render. This prevents an
-  // accidental Allow click from exiting plan mode mid-investigation.
-  //
-  // Provider-agnostic: operates on the queue any adapter feeds into
-  // `pendingPermissions`, so every provider gets the behaviour for
-  // free. The `autoDeniedRef` guards against double-answers during
-  // the dispatch → sendMessage round-trip (the queue head can still
-  // be the same request_id on the next render tick until the
-  // `consume_pending_permission` dispatch settles).
-  const autoDeniedRef = React.useRef<Set<string>>(new Set());
-  React.useEffect(() => {
-    if (!strictPlanMode) return;
-    if (permissionMode !== "plan") return;
-    const head = pendingPermissions[0];
-    if (!head) return;
-    if (!PLAN_MODE_MUTATING_TOOLS.has(head.toolName)) return;
-    if (autoDeniedRef.current.has(head.requestId)) return;
-    autoDeniedRef.current.add(head.requestId);
-    void handlePermissionDecision("deny");
-  }, [
-    strictPlanMode,
-    permissionMode,
-    pendingPermissions,
-    // handlePermissionDecision is defined in component scope and
-    // closes over dispatch/sessionId; not memoized, but stable
-    // across renders for our purposes (the autoDeniedRef guard
-    // prevents re-triggering anyway).
-  ]);
-
-  // Prune `autoDeniedRef` of request ids no longer in the queue so
-  // it can't grow unbounded over a long session.
-  React.useEffect(() => {
-    const live = new Set(pendingPermissions.map((p) => p.requestId));
-    for (const id of autoDeniedRef.current) {
-      if (!live.has(id)) autoDeniedRef.current.delete(id);
-    }
-  }, [pendingPermissions]);
+  // (Strict-plan-mode auto-deny moved to <RoutePromptOverlay />; see
+  // the comment near the deleted `strictPlanMode` state above.)
 
   async function handleQuestionSubmit(answers: UserInputAnswer[]) {
     if (!pendingQuestion) return;
@@ -1661,29 +1608,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
           {isRunning && retryState && <ApiRetryBanner state={retryState} />}
 
-          {pendingQuestion && (
-            <QuestionPrompt
-              questions={pendingQuestion.questions}
-              onSubmit={handleQuestionSubmit}
-              onCancel={handleQuestionCancel}
-            />
-          )}
-
-          {pendingPermissions.length > 0 && (
-            <PermissionPrompt
-              // Head-of-queue. The `key` forces React to remount the
-              // prompt so any local component state (e.g. the plan-exit
-              // mode picker's `pending` flag) resets between queued
-              // prompts and the user can't accidentally double-answer
-              // the next one with stale state.
-              key={pendingPermissions[0].requestId}
-              toolName={pendingPermissions[0].toolName}
-              input={pendingPermissions[0].input}
-              onDecision={handlePermissionDecision}
-              queueDepth={pendingPermissions.length}
-            />
-          )}
-
           {/* "Session may be stuck" warning — commented out for now.
               The watchdog still runs and sets `stuckSince`, but we don't
               surface the banner until we're confident about the
@@ -1712,46 +1636,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               />
             )}
           */}
-
-          {isArchived && (
-            <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
-              This thread is archived — read-only history. Archived
-              conversations can't receive new messages.
-            </div>
-          )}
-          {!isArchived && worktreeFolderMissing && (
-            <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
-              This worktree's folder no longer exists — read-only
-              history. Recreate the worktree to keep working on it.
-            </div>
-          )}
-          <ChatInput
-            // Remount the composer on every thread switch so its
-            // internal state (pendingSend queue flag, slash-command
-            // popup) resets cleanly. Draft text is now preserved
-            // via initialValue / onDraftChange so the user's
-            // in-progress message survives tab switches.
-            key={sessionId}
-            onSend={handleSend}
-            onInterrupt={handleInterrupt}
-            onSteer={handleSteer}
-            sessionStatus={session?.status}
-            disabled={loading}
-            providerDisabled={providerDisabled}
-            archived={isArchived || worktreeFolderMissing}
-            toolbar={toolbar}
-            commands={slashCommands}
-            provider={session?.provider}
-            initialValue={sessionDrafts.get(sessionId) ?? ""}
-            onDraftChange={handleDraftChange}
-            initialQueue={sessionQueues.get(sessionId)}
-            onQueueChange={handleQueueChange}
-            permissionMode={permissionMode}
-            promptSuggestion={promptSuggestion}
-            onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
-            projectPath={projectPath}
-            sessionId={sessionId}
-          />
         </div>
 
         {diffOpen && (
@@ -1825,6 +1709,75 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           </>
         )}
       </div>
+      {/* Per-session prompts + composer — pulled out of the chat
+          column so they stay visible regardless of which panel is
+          taking horizontal space (half-split diff / context) or
+          which one has gone fullscreen (chat column hidden). The
+          previous arrangement parented them inside the chat column,
+          which meant any layout state that hid or shrunk that column
+          could swallow the prompts and leave the daemon blocked
+          waiting for an answer the user couldn't see. /code routes
+          are handled by <RoutePromptOverlay /> in the root layout. */}
+      {pendingQuestion && (
+        <QuestionPrompt
+          questions={pendingQuestion.questions}
+          onSubmit={handleQuestionSubmit}
+          onCancel={handleQuestionCancel}
+        />
+      )}
+      {pendingPermissions.length > 0 && (
+        <PermissionPrompt
+          // Head-of-queue. The `key` forces React to remount the
+          // prompt so any local component state (e.g. the plan-exit
+          // mode picker's `pending` flag) resets between queued
+          // prompts and the user can't accidentally double-answer
+          // the next one with stale state.
+          key={pendingPermissions[0].requestId}
+          toolName={pendingPermissions[0].toolName}
+          input={pendingPermissions[0].input}
+          onDecision={handlePermissionDecision}
+          queueDepth={pendingPermissions.length}
+        />
+      )}
+      {isArchived && (
+        <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
+          This thread is archived — read-only history. Archived
+          conversations can't receive new messages.
+        </div>
+      )}
+      {!isArchived && worktreeFolderMissing && (
+        <div className="mx-4 mb-2 rounded border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-[11px] font-medium text-destructive">
+          This worktree's folder no longer exists — read-only
+          history. Recreate the worktree to keep working on it.
+        </div>
+      )}
+      <ChatInput
+        // Remount the composer on every thread switch so its
+        // internal state (pendingSend queue flag, slash-command
+        // popup) resets cleanly. Draft text is now preserved
+        // via initialValue / onDraftChange so the user's
+        // in-progress message survives tab switches.
+        key={sessionId}
+        onSend={handleSend}
+        onInterrupt={handleInterrupt}
+        onSteer={handleSteer}
+        sessionStatus={session?.status}
+        disabled={loading}
+        providerDisabled={providerDisabled}
+        archived={isArchived || worktreeFolderMissing}
+        toolbar={toolbar}
+        commands={slashCommands}
+        provider={session?.provider}
+        initialValue={sessionDrafts.get(sessionId) ?? ""}
+        onDraftChange={handleDraftChange}
+        initialQueue={sessionQueues.get(sessionId)}
+        onQueueChange={handleQueueChange}
+        permissionMode={permissionMode}
+        promptSuggestion={promptSuggestion}
+        onPromptSuggestionDismissed={() => setPromptSuggestion(null)}
+        projectPath={projectPath}
+        sessionId={sessionId}
+      />
       {persistedLightboxRef && (
         <ImageLightbox
           source={{ kind: "persisted", ref: persistedLightboxRef }}
