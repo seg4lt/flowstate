@@ -15,12 +15,16 @@ fn main() {
     println!("cargo:rerun-if-changed=bridge/package-lock.json");
     println!("cargo:rerun-if-changed=bridge/bun.lock");
     println!("cargo:rerun-if-changed=bridge/tsconfig.json");
+    // Embedded Node version is part of DEPS_FP (a node major bump can
+    // invalidate native modules in `node_modules/`), so re-run when
+    // it changes. Path is relative to this crate's manifest dir.
+    println!("cargo:rerun-if-changed=../embedded-node/src/lib.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EMBED");
 
     let embed = env::var("CARGO_FEATURE_EMBED").is_ok();
 
     if !bridge_dir.join("src/index.ts").exists() {
-        write_fingerprint(&out_dir, "0000000000000000");
+        write_fingerprints(&out_dir, "0000000000000000", "0000000000000000");
         fs::create_dir_all(out_dir.join("bridge-assets")).ok();
         return;
     }
@@ -91,7 +95,7 @@ fn main() {
     let bridge_src = PathBuf::from("bridge/dist/index.js");
     if !bridge_src.exists() {
         println!("cargo:warning=bridge/dist/index.js missing; Copilot bridge will not be embedded");
-        write_fingerprint(&out_dir, "0000000000000000");
+        write_fingerprints(&out_dir, "0000000000000000", "0000000000000000");
         return;
     }
 
@@ -121,58 +125,119 @@ fn main() {
         }
     }
 
-    let fingerprint = fingerprint_dir(&assets_dir);
-    write_fingerprint(&out_dir, &fingerprint);
+    // Two-axis fingerprinting: the runtime caches `node_modules/`
+    // under a directory named by DEPS_FP, and rewrites the small
+    // glue files (index.js + package.json) in place when GLUE_FP
+    // changes. This means a code-only edit to `bridge/src/index.ts`
+    // no longer triggers a fresh `npm ci` (and a ~100 MB download)
+    // on every end user's next launch.
+    //
+    // GLUE_FP: hash of bridge entry-point bytes + package.json bytes.
+    //   These two are tiny and rewritten in place if they change.
+    // DEPS_FP: hash of package-lock.json bytes + embedded Node version.
+    //   These determine `node_modules/` content; changing them is
+    //   the ONLY reason to re-hydrate.
+    let glue_fp = fingerprint_files(&[
+        &assets_dir.join("index.js"),
+        &assets_dir.join("package.json"),
+    ]);
+    let node_version = read_embedded_node_version();
+    let deps_fp = fingerprint_files_with_extra(
+        &[&assets_dir.join("package-lock.json")],
+        node_version.as_bytes(),
+    );
+    write_fingerprints(&out_dir, &glue_fp, &deps_fp);
 }
 
-fn write_fingerprint(out_dir: &Path, fingerprint: &str) {
-    let fingerprint_path = out_dir.join("bridge-assets-fingerprint.txt");
-    let existing = fs::read_to_string(&fingerprint_path).ok();
-    if existing.as_deref() != Some(fingerprint) {
-        fs::write(&fingerprint_path, fingerprint).expect("write bridge-assets-fingerprint.txt");
-    }
-    println!("cargo:rustc-env=BRIDGE_FINGERPRINT={fingerprint}");
-    println!("cargo:rerun-if-changed={}", fingerprint_path.display());
+/// Hash a fixed list of files by their content (FNV-1a over the file
+/// bytes, mixed with the basename so reordering files would still
+/// produce a different hash). Missing files contribute as empty so
+/// the build degrades gracefully when a stage was skipped.
+fn fingerprint_files(paths: &[&Path]) -> String {
+    fingerprint_files_with_extra(paths, &[])
 }
 
-fn fingerprint_dir(root: &Path) -> String {
-    let mut parts: Vec<(String, u64)> = Vec::new();
-    collect(root, root, &mut parts);
-    parts.sort();
-
+fn fingerprint_files_with_extra(paths: &[&Path], extra: &[u8]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for (name, size) in &parts {
+    for p in paths {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         for b in name.as_bytes() {
             hash ^= *b as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
-        for b in size.to_le_bytes() {
-            hash ^= b as u64;
+        // Mix a separator so name-vs-content boundaries don't smear
+        // (`abc` + `def` should not equal `ab` + `cdef`).
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+        let bytes = fs::read(p).unwrap_or_default();
+        for b in &bytes {
+            hash ^= *b as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
+        hash ^= 0xfe;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for b in extra {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
 }
 
-fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(root, &path, out);
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .expect("collected path is under root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            out.push((rel, size));
+/// Pull `pub const NODE_VERSION: &str = "<v>";` out of the
+/// embedded-node crate's lib.rs. Build-deps would let us depend on
+/// the crate cleanly, but that would force the embedded-node crate's
+/// own download-build to run as part of OUR build script — too
+/// expensive. Reading the source file is cheap and the constant
+/// shape is stable.
+fn read_embedded_node_version() -> String {
+    let lib_rs = "../embedded-node/src/lib.rs";
+    let src = match fs::read_to_string(lib_rs) {
+        Ok(s) => s,
+        Err(e) => {
+            println!(
+                "cargo:warning=failed to read {lib_rs} ({e}); DEPS_FP will not include node version"
+            );
+            return String::new();
         }
+    };
+    let needle = "pub const NODE_VERSION: &str = \"";
+    let start = match src.find(needle) {
+        Some(i) => i + needle.len(),
+        None => {
+            println!(
+                "cargo:warning=NODE_VERSION constant not found in {lib_rs}; DEPS_FP will not include node version"
+            );
+            return String::new();
+        }
+    };
+    let end = match src[start..].find('"') {
+        Some(i) => start + i,
+        None => return String::new(),
+    };
+    src[start..end].to_string()
+}
+
+fn write_fingerprints(out_dir: &Path, glue_fp: &str, deps_fp: &str) {
+    // The fingerprint files exist so rustc's dep-info tracks them —
+    // when a hash changes, the runtime crate's `include_str!` sees
+    // a different byte sequence and the `#[derive(Embed)]` proc-macro
+    // re-scans the staged tree.
+    let glue_path = out_dir.join("bridge-glue-fingerprint.txt");
+    let deps_path = out_dir.join("bridge-deps-fingerprint.txt");
+    if fs::read_to_string(&glue_path).ok().as_deref() != Some(glue_fp) {
+        fs::write(&glue_path, glue_fp).expect("write bridge-glue-fingerprint.txt");
     }
+    if fs::read_to_string(&deps_path).ok().as_deref() != Some(deps_fp) {
+        fs::write(&deps_path, deps_fp).expect("write bridge-deps-fingerprint.txt");
+    }
+    println!("cargo:rustc-env=BRIDGE_GLUE_FINGERPRINT={glue_fp}");
+    println!("cargo:rustc-env=BRIDGE_DEPS_FINGERPRINT={deps_fp}");
+    println!("cargo:rerun-if-changed={}", glue_path.display());
+    println!("cargo:rerun-if-changed={}", deps_path.display());
 }
 
 fn is_stamp_fresh(stamp: &Path, sources: &[&Path]) -> bool {

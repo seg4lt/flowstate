@@ -16,11 +16,31 @@ use rust_embed::Embed;
 #[folder = "$OUT_DIR/bridge-assets/"]
 struct BridgeAssets;
 
+// Load-bearing `include_str!`s: rustc tracks these in dep-info, so when
+// `build.rs` rewrites either fingerprint file (content hash of the
+// staged glue or deps changed) this module recompiles and the
+// `#[derive(Embed)]` proc-macro re-scans `$OUT_DIR/bridge-assets/`
+// with the fresh bytes.
 #[allow(dead_code)]
-const BRIDGE_ASSETS_FINGERPRINT_FILE: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/bridge-assets-fingerprint.txt"));
+const BRIDGE_GLUE_FINGERPRINT_FILE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/bridge-glue-fingerprint.txt"));
+#[allow(dead_code)]
+const BRIDGE_DEPS_FINGERPRINT_FILE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/bridge-deps-fingerprint.txt"));
 
-const BRIDGE_FINGERPRINT: &str = env!("BRIDGE_FINGERPRINT");
+/// Hash of the small glue files (`index.js`, `package.json`). Cheap to
+/// rewrite in place — used for the `.glue-fp` sentinel inside the cache
+/// dir so a code-only edit doesn't trigger a re-hydrate.
+const BRIDGE_GLUE_FINGERPRINT: &str = env!("BRIDGE_GLUE_FINGERPRINT");
+/// Hash of `package-lock.json` + the embedded Node version. Names the
+/// cache dir. The ONLY thing that changes here triggers a fresh
+/// `npm ci` (and hence a download) on first launch.
+const BRIDGE_DEPS_FINGERPRINT: &str = env!("BRIDGE_DEPS_FINGERPRINT");
+
+/// Sentinel filename inside the cache dir recording the GLUE_FP that
+/// was last written. Keeps the in-place rewrite check O(1) — no need
+/// to re-hash the embedded glue at runtime.
+const GLUE_SENTINEL: &str = ".glue-fp";
 
 #[derive(Debug, Clone)]
 pub struct BridgeRuntime {
@@ -40,22 +60,59 @@ pub fn ensure_extracted() -> Result<BridgeRuntime> {
 }
 
 fn provision_once() -> Result<BridgeRuntime> {
-    let cache_root = dirs::cache_dir()
+    let cache_parent = dirs::cache_dir()
         .context("failed to resolve per-user cache directory")?
-        .join("zenui")
-        .join(format!("copilot-bridge-{BRIDGE_FINGERPRINT}"));
+        .join("zenui");
+    let cache_root = cache_parent.join(format!("copilot-bridge-{BRIDGE_DEPS_FINGERPRINT}"));
     let script = cache_root.join("index.js");
     let node_modules = cache_root.join("node_modules");
+    let glue_sentinel = cache_root.join(GLUE_SENTINEL);
 
+    // Best-effort orphan sweep BEFORE we provision the current dir.
+    // Old `copilot-bridge-<prior-deps-fp>` siblings accumulate every
+    // time the lockfile or Node version moves; if we don't reap them
+    // the cache grows unbounded across releases (each ~100 MB+ of
+    // native binaries). Done first so a failure here doesn't strand
+    // the user's actual provisioning.
+    sweep_orphan_caches(&cache_parent);
+
+    // Hot path: deps-dir is already populated, glue is up to date.
+    // No filesystem work, no npm, no rust-embed walk.
     if script.exists() && node_modules.exists() {
+        let sentinel_matches = fs::read_to_string(&glue_sentinel)
+            .ok()
+            .map(|s| s.trim() == BRIDGE_GLUE_FINGERPRINT)
+            .unwrap_or(false);
+        if sentinel_matches {
+            return Ok(BridgeRuntime {
+                dir: cache_root,
+                script,
+            });
+        }
+
+        // Warm path: deps unchanged but the glue (index.js /
+        // package.json) was bumped. Rewrite ONLY those files in
+        // place — node_modules is reused as-is, no `npm ci`, no
+        // download.
+        tracing::info!(
+            deps_fp = BRIDGE_DEPS_FINGERPRINT,
+            glue_fp = BRIDGE_GLUE_FINGERPRINT,
+            cache = %cache_root.display(),
+            "Copilot bridge: refreshing glue in place (deps unchanged)"
+        );
+        rewrite_glue_in_place(&cache_root)
+            .with_context(|| format!("refresh glue in {}", cache_root.display()))?;
+        write_glue_sentinel(&cache_root)?;
         return Ok(BridgeRuntime {
             dir: cache_root,
             script,
         });
     }
 
+    // Cold path: deps dir doesn't exist or is half-provisioned.
     tracing::info!(
-        fingerprint = BRIDGE_FINGERPRINT,
+        deps_fp = BRIDGE_DEPS_FINGERPRINT,
+        glue_fp = BRIDGE_GLUE_FINGERPRINT,
         cache = %cache_root.display(),
         "provisioning Copilot bridge"
     );
@@ -98,10 +155,114 @@ fn provision_once() -> Result<BridgeRuntime> {
     #[cfg(unix)]
     chmod_vendored_binaries(&cache_root)?;
 
+    write_glue_sentinel(&cache_root)?;
+
     Ok(BridgeRuntime {
         dir: cache_root,
         script,
     })
+}
+
+/// Overwrite ONLY the glue files (`index.js`, `package.json`) inside
+/// an already-hydrated cache dir with their embedded versions. Other
+/// files (lockfile, node_modules, vendored binaries) are left
+/// untouched — they're determined by DEPS_FP, which by definition
+/// hasn't changed if we're on this code path.
+///
+/// Per-file atomic-rename: write to `<name>.tmp` first, then rename
+/// over the live file. A crash mid-rewrite leaves either the old
+/// glue or the new one — never a half-written file the runtime
+/// would try to parse and explode on.
+fn rewrite_glue_in_place(cache_root: &Path) -> Result<()> {
+    for name in ["index.js", "package.json"] {
+        let embedded = BridgeAssets::get(name).ok_or_else(|| {
+            anyhow!("embedded asset `{name}` missing — bridge build is broken")
+        })?;
+        let target = cache_root.join(name);
+        let tmp = cache_root.join(format!("{name}.tmp"));
+        if tmp.exists() {
+            fs::remove_file(&tmp).ok();
+        }
+        fs::write(&tmp, embedded.data.as_ref())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        fs::rename(&tmp, &target).with_context(|| {
+            format!("rename {} -> {}", tmp.display(), target.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Stamp the current GLUE_FP into the cache dir. The hot path reads
+/// this on next launch to decide whether the in-place rewrite is
+/// needed. Best-effort: the file is purely a cache hint, so a write
+/// failure shouldn't fail provisioning.
+fn write_glue_sentinel(cache_root: &Path) -> Result<()> {
+    let path = cache_root.join(GLUE_SENTINEL);
+    if let Err(e) = fs::write(&path, BRIDGE_GLUE_FINGERPRINT) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "failed to stamp Copilot bridge glue sentinel; \
+             next launch will rewrite glue unnecessarily but is otherwise correct"
+        );
+    }
+    Ok(())
+}
+
+/// Delete sibling `copilot-bridge-<other>/` directories whose deps
+/// fingerprint doesn't match the current build. Each old dir holds
+/// ~100 MB+ of native prebuilds (pty, conpty, keytar, ripgrep), so
+/// without this users accumulate dead bytes every release.
+///
+/// Best-effort: any errors are logged and swallowed. The current
+/// provisioning is what matters; cleanup is bonus.
+fn sweep_orphan_caches(cache_parent: &Path) {
+    let entries = match fs::read_dir(cache_parent) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let prefix = "copilot-bridge-";
+    let current_suffix = BRIDGE_DEPS_FINGERPRINT;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Only touch dirs we own. Match `copilot-bridge-<hex>` and the
+        // `.extracting` staging variant. Don't touch the
+        // `claude-sdk-bridge-*` siblings — that's the other crate's
+        // job.
+        let is_ours = name_str.starts_with(prefix);
+        if !is_ours {
+            continue;
+        }
+        // Skip the active dir.
+        if name_str == format!("{prefix}{current_suffix}") {
+            continue;
+        }
+        // Skip the `.extracting` staging path that belongs to the
+        // CURRENT provisioning attempt — provision_once cleans it
+        // explicitly. Old `.extracting` dirs from prior aborted runs
+        // ARE swept (they have a different deps_fp prefix).
+        let active_staging = format!("{prefix}{current_suffix}.extracting");
+        if name_str == active_staging {
+            continue;
+        }
+
+        let path = entry.path();
+        match fs::remove_dir_all(&path) {
+            Ok(_) => tracing::info!(
+                path = %path.display(),
+                "swept orphaned Copilot bridge cache"
+            ),
+            Err(e) => tracing::debug!(
+                path = %path.display(),
+                error = %e,
+                "failed to sweep Copilot bridge cache (likely in use; will retry next launch)"
+            ),
+        }
+    }
 }
 
 fn extract_embedded_assets(staging: &Path) -> Result<()> {

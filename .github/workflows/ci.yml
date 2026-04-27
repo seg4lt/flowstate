@@ -47,7 +47,7 @@ jobs:
       # shells out to `bun install` + `bun run build` to produce the
       # bridge/dist/index.js bundle that gets include_str!'d into the
       # Rust crate. Without bun the build fails before clippy even
-      # runs (bridge-assets-fingerprint.txt is missing).
+      # runs (bridge-{glue,deps}-fingerprint.txt is missing).
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
