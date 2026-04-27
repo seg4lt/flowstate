@@ -146,7 +146,7 @@ function defaultContentSearchUiOptions(): ContentSearchUiOptions {
   };
 }
 
-type SearchMode = "files" | "content";
+export type SearchMode = "files" | "content";
 
 interface CodeViewProps {
   sessionId?: string;
@@ -183,6 +183,14 @@ interface CodeViewProps {
    *  Same affordance as the diff/context panels — header button +
    *  Shift+Esc both flip this. */
   onToggleFullscreen?: () => void;
+  /** Embedded-only: a fresh-reference object request to switch the
+   *  search mode and focus the input. ChatView passes a new object
+   *  on every Cmd+P / Cmd+Shift+F press; the reference change is
+   *  what makes the effect re-fire even when the mode hasn't
+   *  changed. Mirrors the standalone route's `initialSearchMode`
+   *  re-sync, but driven by an explicit user-action signal instead
+   *  of URL search params. */
+  searchRequest?: { mode: SearchMode } | null;
 }
 
 export function CodeView(props: CodeViewProps) {
@@ -366,6 +374,20 @@ export function CodeView(props: CodeViewProps) {
       inputRef.current?.select();
     });
   }, [props.initialSearchMode]);
+
+  // Embedded-mode counterpart: re-sync mode + focus when the parent
+  // dispatches a fresh `searchRequest` object. Same semantics as
+  // the URL-driven effect above — Cmd+P and Cmd+Shift+F from the
+  // chat view route through here so each press lands the cursor in
+  // the input ready to type.
+  React.useEffect(() => {
+    if (!props.searchRequest) return;
+    setSearchMode(props.searchRequest.mode);
+    queueMicrotask(() => {
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    });
+  }, [props.searchRequest]);
 
   // Esc → leave the code view. If the user came from a chat thread,
   // route back to it; otherwise fall through to browser history. Skip

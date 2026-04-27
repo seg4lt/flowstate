@@ -8,8 +8,9 @@ import {
   TOGGLE_CONTEXT_EVENT,
   TOGGLE_DIFF_EVENT,
   TOGGLE_CODE_VIEW_EVENT,
+  OPEN_CODE_VIEW_EVENT,
 } from "@/lib/keyboard-shortcuts";
-import { CodeView } from "@/components/code/code-view";
+import { CodeView, type SearchMode } from "@/components/code/code-view";
 import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
@@ -644,6 +645,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     () => sessionCodeViewOpen.get(sessionId) ?? false,
   );
   const [codeViewFullscreen, setCodeViewFullscreen] = React.useState(false);
+  // Fresh-reference object passed down to CodeView's `searchRequest`
+  // prop. Each Cmd+P / Cmd+Shift+F press creates a new object so the
+  // effect on the other side fires even when the mode is unchanged
+  // (which is the common case — repeated Cmd+P should re-focus the
+  // input). Null between presses; never resets to null after first
+  // use (no need — CodeView's effect bails on null and the prop only
+  // matters at the moment of focus).
+  const [codeViewSearchRequest, setCodeViewSearchRequest] = React.useState<
+    { mode: SearchMode } | null
+  >(null);
   const setCodeViewOpen = React.useCallback<
     React.Dispatch<React.SetStateAction<boolean>>
   >(
@@ -738,6 +749,40 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return () =>
       window.removeEventListener(TOGGLE_CODE_VIEW_EVENT, toggleCodeView);
   }, [toggleCodeView]);
+
+  // Bridge for Cmd+P (files) / Cmd+Shift+F (content). The shortcuts
+  // dispatch OPEN_CODE_VIEW_EVENT with a `mode` detail. We force the
+  // panel open (mutually exclusive with diff/context) and push a
+  // fresh searchRequest object down to CodeView so it sets the mode
+  // and focuses the search input. The fresh-reference approach is
+  // what makes a second press of the same shortcut still re-focus.
+  React.useEffect(() => {
+    function onOpenCodeView(e: Event) {
+      const detail = (e as CustomEvent<{ mode?: SearchMode }>).detail;
+      const mode: SearchMode = detail?.mode ?? "files";
+      setCodeViewOpen(true);
+      setDiffOpen(false);
+      setDiffFullscreen(false);
+      setContextOpen(false);
+      setContextFullscreen(false);
+      // Always allocate a new object so the prop reference changes
+      // and CodeView's effect re-fires. `setCodeViewSearchRequest`
+      // is allowed to be called with the same value object only when
+      // the user genuinely hasn't pressed the shortcut again — but
+      // in practice the press IS the trigger, so always-new is
+      // correct and cheaper than equality checks.
+      setCodeViewSearchRequest({ mode });
+    }
+    window.addEventListener(OPEN_CODE_VIEW_EVENT, onOpenCodeView);
+    return () =>
+      window.removeEventListener(OPEN_CODE_VIEW_EVENT, onOpenCodeView);
+  }, [
+    setCodeViewOpen,
+    setDiffOpen,
+    setDiffFullscreen,
+    setContextOpen,
+    setContextFullscreen,
+  ]);
 
   // Shift+Esc — toggle fullscreen on whichever side panel is open.
   // Fires regardless of focus (chat composer, code editor, diff
@@ -1851,6 +1896,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 }}
                 isFullscreen={codeViewFullscreen}
                 onToggleFullscreen={() => setCodeViewFullscreen((v) => !v)}
+                searchRequest={codeViewSearchRequest}
               />
             </aside>
           </>
