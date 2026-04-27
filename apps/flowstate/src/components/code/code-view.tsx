@@ -5,11 +5,14 @@ import {
   ArrowLeft,
   CaseSensitive,
   FileText,
-  PanelLeft,
-  PanelLeftClose,
+  Maximize2,
+  Minimize2,
+  PanelRight,
+  PanelRightClose,
   Regex,
   Search,
   SlidersHorizontal,
+  X,
 } from "lucide-react";
 import { SidebarTrigger } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
@@ -22,6 +25,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useApp } from "@/stores/app-store";
+import { cn } from "@/lib/utils";
 import {
   defaultContentSearchOptions,
   readProjectFile,
@@ -152,11 +156,36 @@ interface CodeViewProps {
    *  inside CodeView would be a no-op because the route was already
    *  active. */
   initialSearchMode?: SearchMode;
+  /** When true, the view is mounted as a side panel inside ChatView
+   *  rather than as a full-screen route. In this mode:
+   *   * Use `h-full` so the host's flex container governs height
+   *     (the standalone route uses `h-svh`).
+   *   * Hide the SidebarTrigger + back-to-chat button — both are
+   *     redundant inside the chat view.
+   *   * Skip the plain-Esc → navigate-to-chat handler — the parent
+   *     ChatView owns the Esc key when the panel is embedded.
+   *   * Skip the Shift+Esc → internal-pane fullscreen handler —
+   *     ChatView's Shift+Esc takes precedence and fullscreens the
+   *     whole code panel relative to the chat column instead. */
+  embedded?: boolean;
+  /** Embedded-only: render a "close panel" button in the header.
+   *  Wired by ChatView to drop the panel from its layout. */
+  onClose?: () => void;
+  /** Embedded-only: current fullscreen state for the panel-level
+   *  fullscreen toggle. When true, the panel's max button shows the
+   *  "exit fullscreen" glyph. */
+  isFullscreen?: boolean;
+  /** Embedded-only: handler for the panel-level fullscreen toggle.
+   *  Same affordance as the diff/context panels — header button +
+   *  Shift+Esc both flip this. */
+  onToggleFullscreen?: () => void;
 }
 
 export function CodeView(props: CodeViewProps) {
   const { state } = useApp();
   const navigate = useNavigate();
+  const embedded = props.embedded === true;
+  const { onClose, isFullscreen, onToggleFullscreen } = props;
 
   // Participate in the Pierre worker-pool lifecycle: wake the pool
   // if it was killed during long idle, and keep it alive while this
@@ -286,6 +315,14 @@ export function CodeView(props: CodeViewProps) {
   // open clears the override.
   const [multibufferOverride, setMultibufferOverride] = React.useState(false);
 
+  // Transient fullscreen state for split layouts. When non-null, the
+  // indicated pane takes the whole viewer area; the other pane stays
+  // mounted (display:none) so its CodeMirror state survives the
+  // toggle. Toggled via Shift+Esc; reset automatically when the
+  // layout collapses to a single pane.
+  const [fullscreenedPane, setFullscreenedPane] =
+    React.useState<PaneIndex | null>(null);
+
   // Editor preferences (vim mode, soft-wrap, git mode). Backed by
   // localStorage and shared across panes via a module-singleton
   // store, so toggling any of these flips both panes' editors at
@@ -345,7 +382,45 @@ export function CodeView(props: CodeViewProps) {
     }
     function onEsc(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
+
+      // Shift+Esc — toggle fullscreen on the focused split pane.
+      // Fires regardless of focus (including from inside the editor
+      // contenteditable) since the fullscreen-toggle action is
+      // "global" within the code view. Only meaningful when there's
+      // a split open; outside that case the keystroke is ignored
+      // (lets the browser default through, which is nothing for
+      // Shift+Esc).
+      //
+      // SKIPPED in embedded mode: ChatView's outer Shift+Esc
+      // handler owns this keystroke when the code view is mounted
+      // as a panel — there it fullscreens the panel itself
+      // (relative to the chat column), which is the more useful
+      // affordance at that scope. Internal-split fullscreen would
+      // be a niche second-order feature and the two handlers can't
+      // both consume the same keystroke.
+      if (e.shiftKey) {
+        if (embedded) return;
+        if (layout.panes.length !== 2 || layout.split === null) return;
+        e.preventDefault();
+        setFullscreenedPane((cur) =>
+          cur === null ? layout.focusedPaneIndex : null,
+        );
+        return;
+      }
+
       if (isInTextInputEl(e.target)) return;
+      // Plain Esc inside fullscreen first exits fullscreen — gives
+      // the user a one-tap escape hatch back to the split before the
+      // second tap navigates back to chat. Mirrors VS Code's
+      // "exit zen mode" Esc behaviour.
+      if (fullscreenedPane !== null) {
+        e.preventDefault();
+        setFullscreenedPane(null);
+        return;
+      }
+      // In embedded mode, plain Esc is owned by ChatView (it closes
+      // the panel or pops a layer). Don't compete here.
+      if (embedded) return;
       e.preventDefault();
       if (sessionId) {
         navigate({
@@ -361,7 +436,26 @@ export function CodeView(props: CodeViewProps) {
     }
     window.addEventListener("keydown", onEsc);
     return () => window.removeEventListener("keydown", onEsc);
-  }, [navigate, sessionId]);
+  }, [
+    navigate,
+    sessionId,
+    layout.panes.length,
+    layout.split,
+    layout.focusedPaneIndex,
+    fullscreenedPane,
+    embedded,
+  ]);
+
+  // Reset fullscreen when the layout collapses to a single pane —
+  // e.g. the user closed the last tab in the non-fullscreened pane,
+  // or programmatically un-split. Without this the fullscreen flag
+  // would be a no-op held against a non-existent pane that any
+  // future re-split would awkwardly inherit.
+  React.useEffect(() => {
+    if (layout.panes.length !== 2 && fullscreenedPane !== null) {
+      setFullscreenedPane(null);
+    }
+  }, [layout.panes.length, fullscreenedPane]);
 
   // Reset search + file-content caches when the project changes.
   // The tab/pane layout is owned by `useEditorTabs` and re-hydrates
@@ -675,6 +769,19 @@ export function CodeView(props: CodeViewProps) {
         toggleTreeCollapsed();
         return;
       }
+      if (e.shiftKey && key === "b") {
+        // Cmd/Ctrl+Shift+B — same toggle as Cmd+B but fires
+        // unconditionally, including from inside the editor's
+        // contenteditable (where the bare Cmd+B is suppressed to
+        // preserve `bold` semantics in real text inputs). The
+        // listener only exists while CodeView is mounted, so this
+        // is a no-op when no editor / code view is open. The app
+        // sidebar's own Cmd+B handler explicitly excludes Shift, so
+        // there's no conflict between this and the sidebar toggle.
+        e.preventDefault();
+        toggleTreeCollapsed();
+        return;
+      }
       if (e.shiftKey && key === "g") {
         // Cmd/Ctrl+Shift+G — flip git mode (changed-files panel +
         // editor diff markers). Skip when typing in a real text
@@ -804,22 +911,29 @@ export function CodeView(props: CodeViewProps) {
   }, [projectPath]);
 
   return (
-    <div className="flex h-svh min-w-0 flex-col overflow-hidden">
+    <div
+      className={cn(
+        "flex min-w-0 flex-col overflow-hidden",
+        embedded ? "h-full" : "h-svh",
+      )}
+    >
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
-        <SidebarTrigger />
-        <Button
-          variant="ghost"
-          size="xs"
-          onClick={() =>
-            sessionId
-              ? navigate({ to: "/chat/$sessionId", params: { sessionId } })
-              : window.history.back()
-          }
-          title={sessionId ? "Back to chat" : "Back"}
-        >
-          <ArrowLeft className="h-3 w-3" />
-          {sessionId ? "Chat" : "Back"}
-        </Button>
+        {!embedded && <SidebarTrigger />}
+        {!embedded && (
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={() =>
+              sessionId
+                ? navigate({ to: "/chat/$sessionId", params: { sessionId } })
+                : window.history.back()
+            }
+            title={sessionId ? "Back to chat" : "Back"}
+          >
+            <ArrowLeft className="h-3 w-3" />
+            {sessionId ? "Chat" : "Back"}
+          </Button>
+        )}
         <div className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
           {projectLabel && (
             <span className="truncate font-medium text-foreground">
@@ -869,88 +983,46 @@ export function CodeView(props: CodeViewProps) {
               vim {vimEnabled ? "on" : "off"}
             </span>
           </Button>
+          {/* Embedded-only: panel-level fullscreen + close. Mirrors
+              the affordance the diff / context panels surface — the
+              fullscreen button shares state with the chat-view
+              Shift+Esc handler. */}
+          {embedded && onToggleFullscreen && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={onToggleFullscreen}
+              title={
+                isFullscreen
+                  ? "Exit fullscreen (Shift+Esc)"
+                  : "Fullscreen panel (Shift+Esc)"
+              }
+              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+              aria-pressed={isFullscreen}
+            >
+              {isFullscreen ? (
+                <Minimize2 className="h-3 w-3" />
+              ) : (
+                <Maximize2 className="h-3 w-3" />
+              )}
+            </Button>
+          )}
+          {embedded && onClose && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={onClose}
+              title="Close code view panel (Cmd/Ctrl+Alt+E)"
+              aria-label="Close code view panel"
+            >
+              <X className="h-3 w-3" />
+            </Button>
+          )}
         </div>
       </header>
 
       <div ref={splitContainerRef} className="flex min-h-0 min-w-0 flex-1">
-        {/* ── LEFT: file tree column (collapsed or expanded) ── */}
-        {treeCollapsed ? (
-          <aside
-            className="flex shrink-0 flex-col items-center border-r border-border bg-background py-1.5"
-            style={{ width: TREE_COLLAPSED_WIDTH }}
-            aria-label="File tree (collapsed)"
-          >
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onClick={toggleTreeCollapsed}
-              title="Show file tree (Cmd/Ctrl+B)"
-              aria-label="Show file tree"
-            >
-              <PanelLeft className="h-3 w-3" />
-            </Button>
-          </aside>
-        ) : (
-          <>
-            <aside
-              className="flex shrink-0 flex-col border-r border-border bg-background"
-              style={{ width: treeWidth }}
-            >
-              <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-[10px] uppercase tracking-wide text-muted-foreground">
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={toggleTreeCollapsed}
-                  title="Hide file tree (Cmd/Ctrl+B)"
-                  aria-label="Hide file tree"
-                >
-                  <PanelLeftClose className="h-3 w-3" />
-                </Button>
-                <span>{gitModeEnabled ? "Changed" : "Files"}</span>
-                {!gitModeEnabled && filesLoading && <span>· indexing…</span>}
-              </div>
-              <div className="min-h-0 flex-1 overflow-auto">
-                {filesError && !gitModeEnabled ? (
-                  <div className="px-3 py-3 text-[11px] text-destructive">
-                    {filesError}
-                  </div>
-                ) : !projectPath ? (
-                  <div className="px-3 py-3 text-[11px] text-muted-foreground">
-                    No project for this session.
-                  </div>
-                ) : gitModeEnabled ? (
-                  <ChangedFilesList
-                    projectPath={projectPath ?? null}
-                    selectedPath={focusedPane.activePath}
-                    onSelect={(p) => {
-                      tabs.openFile(p);
-                      setMultibufferOverride(false);
-                      setQuery("");
-                    }}
-                  />
-                ) : (
-                  <FileTree
-                    projectPath={projectPath ?? null}
-                    selectedPath={focusedPane.activePath}
-                    onSelect={(p) => {
-                      tabs.openFile(p);
-                      setMultibufferOverride(false);
-                      setQuery("");
-                    }}
-                  />
-                )}
-              </div>
-            </aside>
-
-            <TreeDragHandle
-              containerRef={splitContainerRef}
-              width={treeWidth}
-              onResize={setTreeWidth}
-            />
-          </>
-        )}
-
-        {/* ── RIGHT: search + viewer column ──────────────────── */}
+        {/* ── LEFT: search + viewer column ──────────────────── */}
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex shrink-0 items-center gap-2 border-b border-border px-2 py-1.5">
             <Search className="h-3 w-3 shrink-0 text-muted-foreground" />
@@ -1060,6 +1132,7 @@ export function CodeView(props: CodeViewProps) {
                 direction={layout.split}
                 ratio={layout.splitRatio}
                 onRatioChange={tabs.setSplitRatio}
+                fullscreenedPaneIndex={fullscreenedPane}
                 first={
                   <TabPaneView
                     paneIndex={0}
@@ -1126,6 +1199,86 @@ export function CodeView(props: CodeViewProps) {
             )}
           </div>
         </div>
+
+        {/* ── RIGHT: file tree column (collapsed or expanded) ── */}
+        {treeCollapsed ? (
+          <aside
+            className="flex shrink-0 flex-col items-center border-l border-border bg-background py-1.5"
+            style={{ width: TREE_COLLAPSED_WIDTH }}
+            aria-label="File tree (collapsed)"
+          >
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onClick={toggleTreeCollapsed}
+              title="Show file tree (Cmd/Ctrl+B)"
+              aria-label="Show file tree"
+            >
+              <PanelRight className="h-3 w-3" />
+            </Button>
+          </aside>
+        ) : (
+          <>
+            {/* Drag handle is on the LEFT edge of the tree (between
+                viewer and tree) so the user can grab the seam to
+                resize, mirroring the chat-view diff/context panel
+                handle position. */}
+            <TreeDragHandle
+              containerRef={splitContainerRef}
+              width={treeWidth}
+              onResize={setTreeWidth}
+            />
+            <aside
+              className="flex shrink-0 flex-col border-l border-border bg-background"
+              style={{ width: treeWidth }}
+            >
+              <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-[10px] uppercase tracking-wide text-muted-foreground">
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={toggleTreeCollapsed}
+                  title="Hide file tree (Cmd/Ctrl+B)"
+                  aria-label="Hide file tree"
+                >
+                  <PanelRightClose className="h-3 w-3" />
+                </Button>
+                <span>{gitModeEnabled ? "Changed" : "Files"}</span>
+                {!gitModeEnabled && filesLoading && <span>· indexing…</span>}
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto">
+                {filesError && !gitModeEnabled ? (
+                  <div className="px-3 py-3 text-[11px] text-destructive">
+                    {filesError}
+                  </div>
+                ) : !projectPath ? (
+                  <div className="px-3 py-3 text-[11px] text-muted-foreground">
+                    No project for this session.
+                  </div>
+                ) : gitModeEnabled ? (
+                  <ChangedFilesList
+                    projectPath={projectPath ?? null}
+                    selectedPath={focusedPane.activePath}
+                    onSelect={(p) => {
+                      tabs.openFile(p);
+                      setMultibufferOverride(false);
+                      setQuery("");
+                    }}
+                  />
+                ) : (
+                  <FileTree
+                    projectPath={projectPath ?? null}
+                    selectedPath={focusedPane.activePath}
+                    onSelect={(p) => {
+                      tabs.openFile(p);
+                      setMultibufferOverride(false);
+                      setQuery("");
+                    }}
+                  />
+                )}
+              </div>
+            </aside>
+          </>
+        )}
       </div>
       <Dialog
         open={confirmClose !== null}
@@ -1656,9 +1809,11 @@ const CodeViewBody = React.memo(function CodeViewBody({
 });
 
 // ──────────────────────────────────────────────────────────────
-// TreeDragHandle — mirrors PanelDragHandle in chat-view.tsx but
-// resizes from the LEFT edge instead of the right. Width grows as
-// you drag right; persisted to localStorage on mouse-up.
+// TreeDragHandle — mirrors PanelDragHandle in chat-view.tsx. The
+// tree sits on the RIGHT side of the code view; this handle lives
+// at its left edge (between the viewer and the tree). Width grows
+// as the user drags LEFT — measured from the container's right
+// edge. Persisted to localStorage on mouse-up.
 // ──────────────────────────────────────────────────────────────
 
 function TreeDragHandle({
@@ -1681,10 +1836,13 @@ function TreeDragHandle({
     function onMove(e: MouseEvent) {
       if (!draggingRef.current || !containerRef.current) return;
       const rect = containerRef.current.getBoundingClientRect();
-      // Width = mouse x relative to container's left edge, clamped.
+      // Width = container's right edge minus mouse x. Dragging
+      // leftward grows the tree (mouse moves further from right
+      // edge → larger delta → wider tree). Clamped to the same
+      // [MIN, MAX] window the keyboard collapse honors.
       const next = Math.max(
         TREE_MIN_WIDTH,
-        Math.min(TREE_MAX_WIDTH, Math.round(e.clientX - rect.left)),
+        Math.min(TREE_MAX_WIDTH, Math.round(rect.right - e.clientX)),
       );
       latestWidthRef.current = next;
       onResize(next);

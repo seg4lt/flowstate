@@ -24,6 +24,14 @@ export interface EditorPanesProps {
   onRatioChange: (ratio: number) => void;
   first: React.ReactNode;
   second?: React.ReactNode;
+  /** When set (and the layout is split), only the indicated pane is
+   *  visible; the other stays mounted but `display:none`. The split
+   *  handle is hidden while fullscreen is active. Keeping the hidden
+   *  pane in the React tree is deliberate — its CodeMirror instance
+   *  retains cursor, scroll, undo history, and Shiki decorations
+   *  across the toggle, so exiting fullscreen drops the user back
+   *  exactly where they were instead of remounting from scratch. */
+  fullscreenedPaneIndex?: 0 | 1 | null;
 }
 
 export function EditorPanes({
@@ -32,6 +40,7 @@ export function EditorPanes({
   onRatioChange,
   first,
   second,
+  fullscreenedPaneIndex = null,
 }: EditorPanesProps) {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
 
@@ -48,6 +57,25 @@ export function EditorPanes({
 
   const isHorizontal = direction === "horizontal";
   const firstBasis = `${ratio * 100}%`;
+  const fsActive = fullscreenedPaneIndex !== null;
+  const hideFirst = fullscreenedPaneIndex === 1;
+  const hideSecond = fullscreenedPaneIndex === 0;
+
+  // Sizing rules:
+  //   * No fullscreen → first uses ratio basis, handle is 1px,
+  //     second takes the remainder (flex 1 1 0).
+  //   * Fullscreen on pane N → that pane goes flex 1 1 0 (full),
+  //     the other gets `display: none`, handle is hidden.
+  const firstStyle: React.CSSProperties = hideFirst
+    ? { display: "none" }
+    : fsActive
+      ? { flex: "1 1 0" }
+      : isHorizontal
+        ? { flex: `0 0 ${firstBasis}`, width: firstBasis }
+        : { flex: `0 0 ${firstBasis}`, height: firstBasis };
+  const secondStyle: React.CSSProperties | undefined = hideSecond
+    ? { display: "none" }
+    : undefined;
 
   return (
     <div
@@ -59,24 +87,25 @@ export function EditorPanes({
     >
       <div
         className="flex min-h-0 min-w-0 flex-col overflow-hidden"
-        style={
-          isHorizontal
-            ? { flex: `0 0 ${firstBasis}`, width: firstBasis }
-            : { flex: `0 0 ${firstBasis}`, height: firstBasis }
-        }
+        style={firstStyle}
       >
         {first}
       </div>
-      <SplitResizeHandle
-        containerRef={containerRef}
-        direction={direction}
-        onRatioChange={onRatioChange}
-      />
+      {!fsActive && (
+        <SplitResizeHandle
+          containerRef={containerRef}
+          direction={direction}
+          onRatioChange={onRatioChange}
+        />
+      )}
       {/* Second pane takes whatever remains (flex: 1 1 0). This is
           what keeps the total at 100% even with the 1px handle in
           the middle — otherwise two 50% children + 1px handle
           would overflow the container by a pixel. */}
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+      <div
+        className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+        style={secondStyle}
+      >
         {second}
       </div>
     </div>
