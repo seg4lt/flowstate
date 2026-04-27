@@ -47,6 +47,11 @@ interface ChangedFilesListProps {
   projectPath: string | null;
   selectedPath: string | null;
   onSelect: (path: string) => void;
+  /** Bumping this restarts the underlying git diff subscription so
+   *  newly-staged / newly-changed files appear without toggling git
+   *  mode off and back on. Wired to the file-tree header's refresh
+   *  button. */
+  refreshTick?: number;
 }
 
 // ── tree model ──────────────────────────────────────────────────
@@ -196,13 +201,16 @@ export function ChangedFilesList({
   projectPath,
   selectedPath,
   onSelect,
+  refreshTick = 0,
 }: ChangedFilesListProps) {
-  // refreshTick=0 with enabled=true mirrors the diff panel's "open
-  // and stream" path. We don't currently expose a manual refresh —
-  // the user toggles git mode off/on to re-stream if they want.
+  // refreshTick is forwarded into the streaming hook: bumping it
+  // tears down the existing git subscription and starts a new one,
+  // picking up files added on disk since the panel was first opened.
+  // The hook keeps the previous list visible until phase 1 of the
+  // restart lands so the tree doesn't flash empty.
   const { diffs, status, error } = useStreamedGitDiffSummary(
     projectPath,
-    0,
+    refreshTick,
     /* enabled */ projectPath !== null,
   );
 

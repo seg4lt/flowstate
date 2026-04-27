@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
   CaseSensitive,
@@ -10,6 +10,7 @@ import {
   PanelRight,
   PanelRightClose,
   Regex,
+  RefreshCw,
   Search,
   SlidersHorizontal,
   X,
@@ -273,6 +274,14 @@ export function CodeView(props: CodeViewProps) {
   const filesLoading = filesQuery.isPending && !!projectPath;
   const filesError = filesQuery.error ? String(filesQuery.error) : null;
 
+  // Manual file-tree refresh state. The query client and tick are
+  // declared here next to filesQuery; the actual `refreshFileTree`
+  // callback is defined further down (after `gitModeEnabled` is in
+  // scope) so its mode-aware branch can read that flag without
+  // hitting a temporal-dead-zone error.
+  const queryClient = useQueryClient();
+  const [treeRefreshTick, setTreeRefreshTick] = React.useState(0);
+
   // ─── search state ────────────────────────────────────────────
   // Seed from the route's `mode` search param so deep links / the
   // global ⌘P, ⌘⇧F shortcuts land in the right tab. Falls back to
@@ -335,17 +344,62 @@ export function CodeView(props: CodeViewProps) {
   const [fullscreenedPane, setFullscreenedPane] =
     React.useState<PaneIndex | null>(null);
 
-  // Editor preferences (vim mode, soft-wrap, git mode). Backed by
-  // localStorage and shared across panes via a module-singleton
-  // store, so toggling any of these flips both panes' editors at
-  // once.
+  // Editor preferences. vim/soft-wrap are global (true preferences,
+  // backed by localStorage and shared across panes via a
+  // module-singleton store) so toggling either flips both panes at
+  // once. gitMode is per-session — keyed by `sessionId` in the
+  // transient store, lost on reload, mirroring how diff-panel-open
+  // is per-thread. When `sessionId` is undefined (the standalone
+  // /code/$id route with no chat parent), the toggle reads as
+  // `false` and writes are no-ops.
   const {
     vimEnabled,
     setVimEnabled,
     softWrap,
     gitModeEnabled,
     setGitModeEnabled,
-  } = useEditorPrefs();
+  } = useEditorPrefs(sessionId);
+
+  // Manual file-tree refresh, wired to the FILES/Changed header
+  // button. We hold the documented "no automatic refetches" contract
+  // on `projectFilesQueryOptions` and `directoryQueryOptions` — a
+  // click here is the explicit user signal those queries are gated
+  // on. Branches by mode:
+  //
+  //   * Files mode: invalidate the flat project-files list AND every
+  //     cached `directory` listing for this project so new files
+  //     created on disk show up in the tree, whether the user is
+  //     viewing the root or has subfolders expanded.
+  //   * Git mode: bump `treeRefreshTick`, forwarded into
+  //     ChangedFilesList → useStreamedGitDiffSummary's `refreshTick`
+  //     knob. Bumping it tears down the git subprocess and restarts
+  //     the status/numstat stream while keeping the previous list
+  //     visible until phase 1 lands (no flash to empty).
+  const refreshFileTree = React.useCallback(() => {
+    if (gitModeEnabled) {
+      setTreeRefreshTick((t) => t + 1);
+      return;
+    }
+    if (!projectPath) return;
+    void queryClient.invalidateQueries({
+      queryKey: ["code", "project-files", projectPath],
+    });
+    void queryClient.invalidateQueries({
+      // Predicate form so every cached subdirectory listing for this
+      // project (any subPath) gets invalidated in one call. Cached
+      // shape is `["code", "directory", projectPath, subPath]` —
+      // matching on the first three positions catches all of them.
+      predicate: (q) => {
+        const k = q.queryKey;
+        return (
+          Array.isArray(k) &&
+          k[0] === "code" &&
+          k[1] === "directory" &&
+          k[2] === projectPath
+        );
+      },
+    });
+  }, [gitModeEnabled, projectPath, queryClient]);
 
   // Confirm-close-with-unsaved-changes dialog state. This only
   // appears in the rare case where auto-save-on-blur has FAILED
@@ -1278,6 +1332,30 @@ export function CodeView(props: CodeViewProps) {
                 </Button>
                 <span>{gitModeEnabled ? "Changed" : "Files"}</span>
                 {!gitModeEnabled && filesLoading && <span>· indexing…</span>}
+                <span className="ml-auto" />
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={refreshFileTree}
+                  disabled={!projectPath || filesLoading}
+                  title={
+                    gitModeEnabled
+                      ? "Refresh changed-files list"
+                      : "Refresh file tree"
+                  }
+                  aria-label="Refresh file tree"
+                >
+                  <RefreshCw
+                    className={cn(
+                      "h-3 w-3",
+                      // Spin while the flat-list cold fetch is in
+                      // flight. Git-mode restarts complete on the
+                      // order of frames so a one-off spin would
+                      // flicker; we leave it static there.
+                      !gitModeEnabled && filesLoading && "animate-spin",
+                    )}
+                  />
+                </Button>
               </div>
               <div className="min-h-0 flex-1 overflow-auto">
                 {filesError && !gitModeEnabled ? (
@@ -1292,6 +1370,7 @@ export function CodeView(props: CodeViewProps) {
                   <ChangedFilesList
                     projectPath={projectPath ?? null}
                     selectedPath={focusedPane.activePath}
+                    refreshTick={treeRefreshTick}
                     onSelect={(p) => {
                       tabs.openFile(p);
                       setMultibufferOverride(false);

@@ -72,6 +72,7 @@ import {
 import { DiffPanel, type DiffStyle } from "./diff-panel";
 import { ImageLightbox } from "./image-lightbox";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
+import { sessionTransient } from "@/stores/session-transient-store";
 
 // Per-session draft text. Module-level so it survives ChatView
 // re-renders and ChatInput remounts (keyed by sessionId). Cleared
@@ -83,16 +84,20 @@ const sessionDrafts = new Map<string, string>();
 // preserves queued messages when the user switches threads mid-turn.
 const sessionQueues = new Map<string, QueuedMessage[]>();
 
-// Per-session diff / context panel open flags. Module-level so they
-// survive thread switches (ChatView does NOT remount on sessionId
-// change — sessionId is a prop, not a key). Lost on reload, which is
-// intentional: "did I leave the diff open" is transient UI state, not
-// a persisted preference. Width / style live in localStorage below
-// because those ARE preferences. Fullscreen is deliberately NOT
+// Per-session diff / context / code-view panel open flags. Module-level
+// so they survive thread switches (ChatView does NOT remount on
+// sessionId change — sessionId is a prop, not a key). Lost on reload,
+// which is intentional: "did I leave the diff open" is transient UI
+// state, not a persisted preference. Width / style live in localStorage
+// below because those ARE preferences. Fullscreen is deliberately NOT
 // per-thread (plain useState) — it's a momentary intent.
+//
+// Diff and Context still use these module-local maps for now; only the
+// code-view flag has been promoted to the typed `sessionTransient`
+// store next to the editor's per-session git-mode flag. Migrating
+// diff/context is the obvious next step but isn't this change's scope.
 const sessionDiffOpen = new Map<string, boolean>();
 const sessionContextOpen = new Map<string, boolean>();
-const sessionCodeViewOpen = new Map<string, boolean>();
 
 // Trip the watchdog after this many seconds of silence while a tool
 // call is pending. Picked to be well past a normal tool round-trip
@@ -642,7 +647,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // it — momentary intent), and a localStorage-backed width.
   // Mutually exclusive with diff/context inside the toggle handler.
   const [codeViewOpen, setCodeViewOpenState] = React.useState<boolean>(
-    () => sessionCodeViewOpen.get(sessionId) ?? false,
+    () => sessionTransient.getCodeViewOpen(sessionId),
   );
   const [codeViewFullscreen, setCodeViewFullscreen] = React.useState(false);
   // Fresh-reference object passed down to CodeView's `searchRequest`
@@ -664,8 +669,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           typeof value === "function"
             ? (value as (p: boolean) => boolean)(prev)
             : value;
-        if (next) sessionCodeViewOpen.set(sessionId, true);
-        else sessionCodeViewOpen.delete(sessionId);
+        sessionTransient.setCodeViewOpen(sessionId, next);
         return next;
       });
     },
@@ -1209,6 +1213,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     const nextDiffOpen = sessionDiffOpen.get(sessionId) ?? false;
     setDiffOpenState(nextDiffOpen);
     setContextOpenState(sessionContextOpen.get(sessionId) ?? false);
+    // Code-view panel: same per-thread restore the diff/context flags
+    // get above. Without this, opening the code view on thread A and
+    // switching to thread B would leave B mounted with A's panel
+    // visible, since ChatView doesn't remount on sessionId changes.
+    setCodeViewOpenState(sessionTransient.getCodeViewOpen(sessionId));
+    setCodeViewFullscreen(false);
     setDiffFullscreen(false);
     setContextFullscreen(false);
     // Diff subscription lifecycle on thread switch. Previous

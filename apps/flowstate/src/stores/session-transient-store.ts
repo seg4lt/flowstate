@@ -30,15 +30,29 @@ const sessionDrafts = new Map<string, string>();
 // preserves queued messages when the user switches threads mid-turn.
 const sessionQueues = new Map<string, QueuedMessage[]>();
 
-// Per-session diff / context panel open flags. Module-level so they
-// survive thread switches (ChatView does NOT remount on sessionId
-// change — sessionId is a prop, not a key). Lost on reload, which is
-// intentional: "did I leave the diff open" is transient UI state, not
-// a persisted preference. Width / style live in localStorage in the
-// panel hosts because those ARE preferences. Fullscreen is
-// deliberately NOT per-thread — it's a momentary intent.
+// Per-session diff / context / code-view panel open flags, plus the
+// per-session git-mode toggle inside the code view. Module-level so
+// they survive thread switches (ChatView does NOT remount on
+// sessionId change — sessionId is a prop, not a key). Lost on reload,
+// which is intentional: "did I leave the diff open" / "was git mode
+// on for this thread" is transient UI state, not a persisted
+// preference. Width / style live in localStorage in the panel hosts
+// because those ARE preferences. Fullscreen is deliberately NOT
+// per-thread — it's a momentary intent.
 const sessionDiffOpen = new Map<string, boolean>();
 const sessionContextOpen = new Map<string, boolean>();
+const sessionCodeViewOpen = new Map<string, boolean>();
+const sessionGitMode = new Map<string, boolean>();
+
+// Subscribers for sessionGitMode. The editor-prefs hook reads this
+// map through `useSyncExternalStore`, so flips made from one mounted
+// view (e.g. the code-view header toggle) propagate to anything else
+// rendering the same thread's git-mode in the same render pass. The
+// other Maps don't need this because their consumers always own the
+// authoritative React state and write through to the map (one-way),
+// whereas git-mode wants the map to be the source of truth so the
+// hook can stay shaped like the existing vim/wrap singleton.
+const gitModeSubscribers = new Set<() => void>();
 
 export const sessionTransient = {
   getDraft: (sessionId: string): string =>
@@ -73,5 +87,32 @@ export const sessionTransient = {
   setContextOpen: (sessionId: string, open: boolean): void => {
     if (open) sessionContextOpen.set(sessionId, true);
     else sessionContextOpen.delete(sessionId);
+  },
+
+  getCodeViewOpen: (sessionId: string): boolean =>
+    sessionCodeViewOpen.get(sessionId) ?? false,
+  setCodeViewOpen: (sessionId: string, open: boolean): void => {
+    if (open) sessionCodeViewOpen.set(sessionId, true);
+    else sessionCodeViewOpen.delete(sessionId);
+  },
+
+  getGitMode: (sessionId: string | null | undefined): boolean => {
+    if (!sessionId) return false;
+    return sessionGitMode.get(sessionId) ?? false;
+  },
+  setGitMode: (
+    sessionId: string | null | undefined,
+    enabled: boolean,
+  ): void => {
+    if (!sessionId) return;
+    if (enabled) sessionGitMode.set(sessionId, true);
+    else sessionGitMode.delete(sessionId);
+    for (const fn of gitModeSubscribers) fn();
+  },
+  subscribeGitMode: (notify: () => void): (() => void) => {
+    gitModeSubscribers.add(notify);
+    return () => {
+      gitModeSubscribers.delete(notify);
+    };
   },
 };
