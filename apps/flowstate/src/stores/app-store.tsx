@@ -1541,34 +1541,90 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     // in `user_config.sqlite` (app-owned), not in the SDK's daemon
     // database. The daemon only knows session/project ids + runtime
     // state; anything a user sees as a label is merged in here.
-    Promise.all([
-      listSessionDisplay(),
-      listProjectDisplay(),
-      listProjectWorktree(),
-    ])
-      .then(([sessionRecord, projectRecord, worktreeRecord]) => {
+    //
+    // The list_* commands route through the daemon's HTTP loopback
+    // (see `daemon_client.rs`), which throws
+    //   "daemon base URL not yet available; loopback transport may
+    //    still be starting"
+    // until the Rust shell finishes spawning the loopback server.
+    // On a cold launch that happens AFTER React mounts, so the very
+    // first call usually fails. The previous catch path here
+    // dispatched empty maps in that case, which permanently flipped
+    // `displayHydrated = true` with NO names, NO worktree links —
+    // the sidebar then painted every project as "Untitled project"
+    // and every worktree as a top-level orphan until the user
+    // refreshed the webview (Cmd+R), which remounted AppProvider
+    // long after the loopback had come up. Retry with capped backoff
+    // until the loopback is reachable; only fall back to empty maps
+    // if the budget is fully exhausted (true SQLite outage / daemon
+    // never came up).
+    (async () => {
+      const isTransientLoopbackError = (err: unknown): boolean => {
+        const msg = typeof err === "string" ? err : (err as Error)?.message ?? "";
+        return (
+          msg.includes("base URL not yet available") ||
+          msg.includes("loopback") ||
+          msg.includes("Failed to fetch") ||
+          msg.includes("ECONNREFUSED")
+        );
+      };
+      // 12 attempts × ~250 ms-1.5 s = up to ~12 s of retries. The
+      // splash sits behind this gate, so we want to be patient
+      // enough for a slow first-launch loopback boot but still
+      // surface a SQLite-real outage in finite time.
+      const maxAttempts = 12;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (!active) return;
-        dispatchRef.current({
-          type: "hydrate_display",
-          sessionDisplay: new Map(Object.entries(sessionRecord)),
-          projectDisplay: new Map(Object.entries(projectRecord)),
-          projectWorktrees: new Map(Object.entries(worktreeRecord)),
-        });
-      })
-      .catch((err) => {
-        console.error("failed to hydrate display metadata", err);
-        // Still dispatch with empty maps so `displayHydrated` flips
-        // and `ready` can become true. Otherwise the splash hangs
-        // forever on a SQLite outage — better to show the sidebar
-        // with placeholder labels than to brick the app.
-        if (!active) return;
-        dispatchRef.current({
-          type: "hydrate_display",
-          sessionDisplay: new Map(),
-          projectDisplay: new Map(),
-          projectWorktrees: new Map(),
-        });
+        try {
+          const [sessionRecord, projectRecord, worktreeRecord] = await Promise.all([
+            listSessionDisplay(),
+            listProjectDisplay(),
+            listProjectWorktree(),
+          ]);
+          if (!active) return;
+          dispatchRef.current({
+            type: "hydrate_display",
+            sessionDisplay: new Map(Object.entries(sessionRecord)),
+            projectDisplay: new Map(Object.entries(projectRecord)),
+            projectWorktrees: new Map(Object.entries(worktreeRecord)),
+          });
+          return;
+        } catch (err) {
+          lastErr = err;
+          // Real DB error (corruption / permission denied) — no
+          // amount of retrying will help. Bail to the empty-map
+          // fallback below so the splash drops and the user can
+          // at least navigate.
+          if (!isTransientLoopbackError(err)) {
+            console.error(
+              "failed to hydrate display metadata (non-transient)",
+              err,
+            );
+            break;
+          }
+          // Linear-ish backoff with a 1.5 s ceiling. The loopback
+          // typically comes up within a couple of attempts.
+          const delay = Math.min(250 + attempt * 150, 1500);
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+
+      if (!active) return;
+      console.error(
+        "display metadata never hydrated; falling back to empty maps",
+        lastErr,
+      );
+      // Last-resort dispatch so `displayHydrated` flips and the
+      // splash drops. The sidebar will paint with placeholder
+      // labels — better than a forever-spinning splash.
+      dispatchRef.current({
+        type: "hydrate_display",
+        sessionDisplay: new Map(),
+        projectDisplay: new Map(),
+        projectWorktrees: new Map(),
       });
+    })();
 
     return () => {
       active = false;
