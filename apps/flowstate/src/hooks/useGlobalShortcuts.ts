@@ -294,9 +294,20 @@ function buildCtx(args: BuildCtxArgs): ShortcutCtx {
   return {
     activeSessionId: state.activeSessionId,
     projectSessions: getAllSessionsInSidebarOrder(state),
+    archivedSessions: state.archivedSessions,
     openShortcutsHelp,
     openProjectPicker,
     notify,
+    archiveSession: (sessionId: string) => {
+      void sendMsg({ type: "archive_session", session_id: sessionId }).catch(
+        (err) => notify(`Archive failed: ${String(err)}`),
+      );
+    },
+    unarchiveSession: (sessionId: string) => {
+      void sendMsg({ type: "unarchive_session", session_id: sessionId }).catch(
+        (err) => notify(`Unarchive failed: ${String(err)}`),
+      );
+    },
     // The registry's NavigateArg is structurally a subset of TanStack's
     // `NavigateOptions`, but TanStack's type is a deeply-generic union
     // over the route tree that won't accept a literal-typed arg

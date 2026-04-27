@@ -51,6 +51,11 @@ export interface ShortcutCtx {
   /** Every thread the sidebar would show, ordered project-by-project
    *  (sidebar order), then thread-by-thread within each project. */
   projectSessions: SessionSummary[];
+  /** Threads currently in the "Archived" sidebar bucket. Used by the
+   *  archive shortcut to decide whether to archive or unarchive the
+   *  active thread (it can be either, depending on which list it
+   *  appears in). */
+  archivedSessions: SessionSummary[];
   /** Open the cheatsheet modal. */
   openShortcutsHelp: () => void;
   /** Open the project picker (then provider dropdown) used by ⌘⇧N. */
@@ -58,6 +63,10 @@ export interface ShortcutCtx {
   /** Start a thread on the active session's project using the user's
    *  saved default provider/model. */
   startThreadOnCurrentProject: () => Promise<void>;
+  /** Move the given session into the archived bucket. */
+  archiveSession: (sessionId: string) => void;
+  /** Restore an archived session back into the active list. */
+  unarchiveSession: (sessionId: string) => void;
   /** Optional UI-feedback hook (toast in production, no-op in tests). */
   notify?: (message: string) => void;
 }
@@ -314,6 +323,33 @@ export const SHORTCUTS: Shortcut[] = [
     group: "Navigation",
     fireInTextInputs: true,
     run: () => window.dispatchEvent(new CustomEvent(ADD_PROJECT_EVENT)),
+  },
+  {
+    id: "toggle-archive-thread",
+    // Single binding toggles between archive and unarchive based on
+    // which bucket the active thread currently lives in. Keeping it
+    // one shortcut avoids burning a second chord on the inverse op
+    // — the user's intent ("flip this thread's archive state") is the
+    // same in either direction.
+    label: "Archive / unarchive current thread",
+    defaultBinding: "mod+shift+a",
+    group: "Navigation",
+    fireInTextInputs: true,
+    run: (ctx) => {
+      const id = ctx.activeSessionId;
+      if (!id) {
+        ctx.notify?.("Open a thread first to archive it");
+        return;
+      }
+      const isArchived = ctx.archivedSessions.some((s) => s.sessionId === id);
+      if (isArchived) {
+        ctx.unarchiveSession(id);
+        ctx.notify?.("Thread unarchived");
+      } else {
+        ctx.archiveSession(id);
+        ctx.notify?.("Thread archived");
+      }
+    },
   },
   {
     id: "show-shortcuts",
