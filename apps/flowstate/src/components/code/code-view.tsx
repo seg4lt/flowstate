@@ -344,18 +344,19 @@ export function CodeView(props: CodeViewProps) {
   const [fullscreenedPane, setFullscreenedPane] =
     React.useState<PaneIndex | null>(null);
 
-  // Editor preferences. vim/soft-wrap are global (true preferences,
-  // backed by localStorage and shared across panes via a
-  // module-singleton store) so toggling either flips both panes at
-  // once. gitMode is per-session — keyed by `sessionId` in the
-  // transient store, lost on reload, mirroring how diff-panel-open
-  // is per-thread. When `sessionId` is undefined (the standalone
-  // /code/$id route with no chat parent), the toggle reads as
-  // `false` and writes are no-ops.
+  // Editor preferences. vim is a global preference (backed by
+  // localStorage and shared across panes via a module-singleton
+  // store) so toggling it flips both panes at once. gitMode is
+  // per-session — keyed by `sessionId` in the transient store, lost
+  // on reload, mirroring how diff-panel-open is per-thread. When
+  // `sessionId` is undefined (the standalone /code/$id route with
+  // no chat parent), the toggle reads as `false` and writes are
+  // no-ops. Soft-wrap is no longer a knob — long lines were
+  // breaking the editor viewport, so it's hardcoded on inside
+  // CodeEditor.
   const {
     vimEnabled,
     setVimEnabled,
-    softWrap,
     gitModeEnabled,
     setGitModeEnabled,
   } = useEditorPrefs(sessionId);
@@ -1240,7 +1241,6 @@ export function CodeView(props: CodeViewProps) {
                     }}
                     sessionId={sessionId ?? null}
                     vimEnabled={vimEnabled}
-                    softWrap={softWrap}
                     gitModeEnabled={gitModeEnabled}
                     onSaveFile={handleSaveFile}
                     onDirtyChangeFile={handleDirtyChange}
@@ -1270,7 +1270,6 @@ export function CodeView(props: CodeViewProps) {
                       }}
                       sessionId={sessionId ?? null}
                       vimEnabled={vimEnabled}
-                      softWrap={softWrap}
                       gitModeEnabled={gitModeEnabled}
                       onSaveFile={handleSaveFile}
                       onDirtyChangeFile={handleDirtyChange}
@@ -1683,9 +1682,9 @@ interface TabPaneViewProps {
   /** Forwarded to DiffCommentOverlay so hover "+" works on the open
    *  file viewer. Null disables the overlay (passthrough). */
   sessionId: string | null;
-  /** Editor preferences forwarded into the CodeMirror instance. */
+  /** Editor preferences forwarded into the CodeMirror instance.
+   *  Soft-wrap is hardcoded on inside CodeEditor — no prop needed. */
   vimEnabled: boolean;
-  softWrap: boolean;
   gitModeEnabled: boolean;
   /** Save handler — bubbles all the way up to CodeView's
    *  `handleSaveFile` which writes the file via Tauri and updates
@@ -1714,7 +1713,6 @@ function TabPaneView({
   onDropTab,
   sessionId,
   vimEnabled,
-  softWrap,
   gitModeEnabled,
   onSaveFile,
   onDirtyChangeFile,
@@ -1770,7 +1768,6 @@ function TabPaneView({
           projectPath={projectPath}
           sessionId={sessionId}
           vimEnabled={vimEnabled}
-          softWrap={softWrap}
           gitModeEnabled={gitModeEnabled}
           onSave={handleSave}
           onDirtyChange={handleDirty}
@@ -1794,7 +1791,6 @@ interface CodeViewBodyProps {
    *  have a chat session to attach comments to. */
   sessionId: string | null;
   vimEnabled: boolean;
-  softWrap: boolean;
   gitModeEnabled: boolean;
   onSave: (contents: string) => Promise<void>;
   onDirtyChange: (dirty: boolean) => void;
@@ -1810,7 +1806,6 @@ const CodeViewBody = React.memo(function CodeViewBody({
   projectPath,
   sessionId,
   vimEnabled,
-  softWrap,
   gitModeEnabled,
   onSave,
   onDirtyChange,
@@ -1902,7 +1897,6 @@ const CodeViewBody = React.memo(function CodeViewBody({
             initialContent={loadedFile.contents}
             theme={resolvedTheme}
             vimEnabled={vimEnabled}
-            softWrap={softWrap}
             gitModeEnabled={gitModeEnabled}
             projectPath={projectPath}
             sessionId={sessionId}

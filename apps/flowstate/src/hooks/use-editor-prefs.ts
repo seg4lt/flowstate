@@ -6,10 +6,10 @@ import { sessionTransient } from "@/stores/session-transient-store";
 //
 // Two lifetime classes live in here:
 //
-//   * vimEnabled / softWrap — true preferences, one value per user.
-//     Backed by localStorage so the choice survives reloads, and
-//     broadcast through a module-level store so two editors in a
-//     split pane stay in sync without a React context.
+//   * vimEnabled — true preference, one value per user. Backed by
+//     localStorage so the choice survives reloads, and broadcast
+//     through a module-level store so two editors in a split pane
+//     stay in sync without a React context.
 //
 //   * gitModeEnabled — per-thread transient state. Stored in the
 //     `sessionTransient` store keyed by sessionId, so each chat
@@ -19,13 +19,15 @@ import { sessionTransient } from "@/stores/session-transient-store";
 //     session's id, or `null/undefined` if there is no session
 //     (the toggle is read-only off in that case).
 //
+// Soft-wrap used to live here as a togglable preference but is now
+// hardcoded on at the editor level — long lines were breaking the
+// CodeMirror viewport (horizontal blow-out on minified or wide
+// generated files). There's nothing to flip.
+//
 // v1 surfaces:
 //   * vimEnabled    — when true, `@replit/codemirror-vim` is included
 //                     in the editor's extension stack via a Compartment.
 //                     Default: true (the user explicitly asked for vim).
-//   * softWrap      — when true, `EditorView.lineWrapping` is included
-//                     via a Compartment. Default: false (most code
-//                     reads better with horizontal scrolling).
 //   * gitModeEnabled — when true, the code view replaces the project
 //                     tree with a flat list of changed files (vs HEAD)
 //                     and the editor paints gutter + line-bg markers
@@ -40,11 +42,9 @@ import { sessionTransient } from "@/stores/session-transient-store";
 // store at that point.
 
 const VIM_KEY = "flowstate:editor.vim-enabled";
-const WRAP_KEY = "flowstate:editor.soft-wrap";
 
 interface GlobalEditorPrefs {
   vimEnabled: boolean;
-  softWrap: boolean;
 }
 
 function readBool(key: string, fallback: boolean): boolean {
@@ -73,7 +73,6 @@ function getSnapshot(): GlobalEditorPrefs {
   if (cached === null) {
     cached = {
       vimEnabled: readBool(VIM_KEY, true),
-      softWrap: readBool(WRAP_KEY, false),
     };
   }
   return cached;
@@ -91,8 +90,6 @@ function notifyAll(): void {
 export interface EditorPrefsApi {
   vimEnabled: boolean;
   setVimEnabled: (value: boolean) => void;
-  softWrap: boolean;
-  setSoftWrap: (value: boolean) => void;
   gitModeEnabled: boolean;
   setGitModeEnabled: (value: boolean) => void;
 }
@@ -125,13 +122,6 @@ export function useEditorPrefs(
     notifyAll();
   }, []);
 
-  const setSoftWrap = React.useCallback((value: boolean) => {
-    if (cached?.softWrap === value) return;
-    cached = { ...getSnapshot(), softWrap: value };
-    writeBool(WRAP_KEY, value);
-    notifyAll();
-  }, []);
-
   const setGitModeEnabled = React.useCallback(
     (value: boolean) => {
       // No-op without a session — there's nowhere to remember the
@@ -147,8 +137,6 @@ export function useEditorPrefs(
   return {
     vimEnabled: snapshot.vimEnabled,
     setVimEnabled,
-    softWrap: snapshot.softWrap,
-    setSoftWrap,
     gitModeEnabled,
     setGitModeEnabled,
   };

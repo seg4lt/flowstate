@@ -86,10 +86,11 @@ import { commentExtension } from "./comment-extension";
 //     re-tokenize pass. Decorations from the previous tokenize
 //     are mapped through the change set so they stay visually
 //     anchored across the brief re-tokenize gap.
-//   * Vim, theme, soft-wrap, and read-only flags live behind
-//     Compartments — toggling any of them reconfigures in place
-//     without re-mounting the EditorView (cursor / scroll / undo
-//     all preserved).
+//   * Vim, theme, and read-only flags live behind Compartments —
+//     toggling any of them reconfigures in place without re-mounting
+//     the EditorView (cursor / scroll / undo all preserved). Soft-wrap
+//     used to be Compartment-backed too but is now hardcoded on; long
+//     lines were breaking the viewport and there was no UI toggle.
 
 // ─── shared module-level state ───────────────────────────────────
 
@@ -739,8 +740,6 @@ export interface CodeEditorProps {
   theme: "light" | "dark";
   /** Whether vim mode is active. Reconfigures via Compartment. */
   vimEnabled: boolean;
-  /** Whether soft-wrap is on. Reconfigures via Compartment. */
-  softWrap: boolean;
   /** Whether git mode is on. When true and `projectPath` is set,
    *  the editor fetches the {before, after} pair for the open file
    *  via `getGitDiffFile` once on mount and paints gutter +
@@ -774,7 +773,6 @@ export function CodeEditor({
   initialContent,
   theme,
   vimEnabled,
-  softWrap,
   gitModeEnabled = false,
   projectPath = null,
   sessionId = null,
@@ -792,11 +790,12 @@ export function CodeEditor({
 
   // Compartments are created once per mount and held in refs so
   // their identity stays stable across React re-renders. Each prop
-  // change (vim, theme, wrap, readOnly) reconfigures the matching
+  // change (vim, theme, readOnly) reconfigures the matching
   // compartment without rebuilding the whole extension array.
+  // Soft-wrap doesn't get a compartment — it's hardcoded on, so
+  // `EditorView.lineWrapping` lands directly in the extension array.
   const vimCompartmentRef = React.useRef(new Compartment());
   const themeCompartmentRef = React.useRef(new Compartment());
-  const wrapCompartmentRef = React.useRef(new Compartment());
   const readOnlyCompartmentRef = React.useRef(new Compartment());
   const gitDiffCompartmentRef = React.useRef(new Compartment());
   const commentCompartmentRef = React.useRef(new Compartment());
@@ -969,7 +968,11 @@ export function CodeEditor({
       readOnlyCompartmentRef.current.of(
         EditorState.readOnly.of(readOnly || overlong),
       ),
-      wrapCompartmentRef.current.of(softWrap ? EditorView.lineWrapping : []),
+      // Soft-wrap is hardcoded on — long lines were breaking the
+      // viewport on minified / generated files. No compartment, no
+      // toggle. If we ever need an off switch we can reintroduce
+      // both, but the user-facing toggle was already gone.
+      EditorView.lineWrapping,
       // Git diff markers compartment. Off by default; the effect
       // below reconfigures it to `gitDiffExtension()` when the
       // user flips git mode on, and clears decorations when off.
@@ -1098,16 +1101,8 @@ export function CodeEditor({
     // mid-mount picks up the right language.
   }, [theme, path, overlong]);
 
-  // Soft-wrap reactivity.
-  React.useEffect(() => {
-    const view = viewRef.current;
-    if (!view) return;
-    view.dispatch({
-      effects: wrapCompartmentRef.current.reconfigure(
-        softWrap ? EditorView.lineWrapping : [],
-      ),
-    });
-  }, [softWrap]);
+  // (Soft-wrap reactivity used to live here; now it's hardcoded on
+  // in the initial extension array — no Compartment to reconfigure.)
 
   // Read-only reactivity. Long-line files are forced read-only at
   // mount; this effect handles the explicit `readOnly` prop only.
