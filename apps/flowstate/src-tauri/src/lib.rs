@@ -35,6 +35,15 @@ static SHUTDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
 /// and have their WKWebView subprocesses reaped normally.
 const MAIN_WINDOW_LABEL: &str = "main";
 
+/// Menu id for the App > "Close Window" item that we wire to ⌘Q in
+/// place of muda's PredefinedMenuItem::quit (whose accelerator is
+/// hard-wired to ⌘Q → NSApp `terminate:`, sidestepping our
+/// `CloseRequested` → hide path). The Builder-level `on_menu_event`
+/// handler matches this id and calls `window.close()` on the
+/// focused window — same path as the red traffic light. macOS-only.
+#[cfg(target_os = "macos")]
+const FLOWSTATE_CLOSE_WINDOW_MENU_ID: &str = "flowstate-close-window";
+
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tauri::Emitter;
@@ -2414,6 +2423,42 @@ pub fn run() {
         // the accelerator itself happens in the `.setup()` block below
         // once we have an `AppHandle` to clone into the callback.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // ⌘Q on macOS routes through our custom "Close Window" menu
+        // item (id `FLOWSTATE_CLOSE_WINDOW_MENU_ID`) installed in the
+        // setup block below. Translate that menu click into
+        // `window.close()` on whichever window currently has focus —
+        // same path the red traffic light already takes, so the
+        // existing `WindowEvent::CloseRequested` arm decides between
+        // hiding the main window and destroying a popout based on
+        // `is_main`. Falls back to the main window if no focused
+        // window can be found (defensive — shouldn't happen for a
+        // menu-accelerator press, but cheap insurance). Registered
+        // unconditionally because non-macOS platforms install no
+        // menu at all, so the id never matches there.
+        .on_menu_event(|app, event| {
+            #[cfg(target_os = "macos")]
+            if event.id() == FLOWSTATE_CLOSE_WINDOW_MENU_ID {
+                let focused = app.webview_windows().into_iter().find_map(|(_, w)| {
+                    matches!(w.is_focused(), Ok(true)).then_some(w)
+                });
+                let target = focused
+                    .or_else(|| app.get_webview_window(MAIN_WINDOW_LABEL));
+                if let Some(window) = target {
+                    if let Err(e) = window.close() {
+                        tracing::warn!(
+                            %e,
+                            "⌘Q close-window: window.close() failed"
+                        );
+                    }
+                }
+            }
+            // Suppress unused-variable warnings on non-macOS where
+            // the cfg-gated body is empty.
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app, event);
+            }
+        })
         .manage(PtyManager::new())
         .manage(DiffTasks::default())
         // Holds the snapshot of provisioning failures seen during
@@ -2424,17 +2469,34 @@ pub fn run() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            // Install a default app menu on macOS.
+            // Install a custom app menu on macOS.
             //
-            // Why: Tauri v2 does NOT apply a default menu automatically.
-            // Without any menu, NSApplication has no menu item bound to
-            // `terminate:`, so Cmd+Q is a no-op — the user observes
-            // "flowstate doesn't quit on Cmd+Q". `Menu::default` builds
-            // the standard Apple-style menu (App > About / Quit, Edit,
-            // Window, View, Help) which wires Cmd+Q back into the
-            // normal NSApp terminate path. From there Tauri emits
-            // `RunEvent::ExitRequested`, which the builder's `run`
-            // closure below turns into a graceful daemon shutdown.
+            // We replicate the structure of `tauri::menu::Menu::default()`
+            // (App / Edit / View / Window submenus so all the standard
+            // input-editing accelerators — Cmd+C/V/X/A, Undo/Redo, etc. —
+            // keep working in the WKWebView) with two surgical
+            // departures:
+            //
+            //   1. The App submenu's "Quit" item is replaced with a
+            //      custom "Close Window" item bound to ⌘Q. muda's
+            //      PredefinedMenuItem::quit hard-wires ⌘Q to NSApp
+            //      `terminate:`, which goes straight to
+            //      `RunEvent::ExitRequested` and tears down the daemon.
+            //      The user wants ⌘Q to mirror the red traffic light
+            //      (hide the main window, destroy popouts) — the
+            //      `on_menu_event` handler on the Builder catches our
+            //      custom id and calls `window.close()` on the focused
+            //      window, which fires `WindowEvent::CloseRequested`
+            //      and goes through the existing per-label close path.
+            //
+            //   2. The Window submenu omits PredefinedMenuItem::close_window
+            //      entirely. That item's accelerator is hard-wired to
+            //      ⌘W in muda; leaving it in place would let macOS fire
+            //      `CloseRequested` (= hide main window) on every ⌘W
+            //      press, racing the JS-level handlers in CodeView
+            //      (close active tab) and AppShell (no-op everywhere
+            //      else). With no menu binding, ⌘W belongs to the JS
+            //      layer entirely.
             //
             // Non-macOS platforms keep no explicit menu (Linux/Windows
             // Tauri apps have no menubar by default and the
@@ -2442,16 +2504,112 @@ pub fn run() {
             // `WindowEvent::CloseRequested` arm below).
             #[cfg(target_os = "macos")]
             {
-                match tauri::menu::Menu::default(&app.handle().clone()) {
+                use tauri::menu::{
+                    AboutMetadata, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu,
+                };
+
+                let handle = app.handle().clone();
+                let pkg_info = handle.package_info();
+                let config = handle.config();
+                let about_metadata = AboutMetadata {
+                    name: Some(pkg_info.name.clone()),
+                    version: Some(pkg_info.version.to_string()),
+                    copyright: config.bundle.copyright.clone(),
+                    authors: config.bundle.publisher.clone().map(|p| vec![p]),
+                    ..Default::default()
+                };
+                let app_name = pkg_info.name.clone();
+
+                // Wrap the build in an inner closure that returns a
+                // `tauri::Result` so `?` can be used freely on each
+                // PredefinedMenuItem constructor without aborting setup
+                // — the outer `match` still logs and continues if
+                // anything fails (matches the original Menu::default
+                // tolerance).
+                let menu_result: tauri::Result<Menu<_>> = (|| {
+                    let close_window_item = MenuItemBuilder::with_id(
+                        FLOWSTATE_CLOSE_WINDOW_MENU_ID,
+                        "Close Window",
+                    )
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(&handle)?;
+
+                    let app_submenu = Submenu::with_items(
+                        &handle,
+                        app_name,
+                        true,
+                        &[
+                            &PredefinedMenuItem::about(
+                                &handle,
+                                None,
+                                Some(about_metadata),
+                            )?,
+                            &PredefinedMenuItem::separator(&handle)?,
+                            &PredefinedMenuItem::services(&handle, None)?,
+                            &PredefinedMenuItem::separator(&handle)?,
+                            &PredefinedMenuItem::hide(&handle, None)?,
+                            &PredefinedMenuItem::hide_others(&handle, None)?,
+                            &PredefinedMenuItem::show_all(&handle, None)?,
+                            &PredefinedMenuItem::separator(&handle)?,
+                            &close_window_item,
+                        ],
+                    )?;
+
+                    let edit_submenu = Submenu::with_items(
+                        &handle,
+                        "Edit",
+                        true,
+                        &[
+                            &PredefinedMenuItem::undo(&handle, None)?,
+                            &PredefinedMenuItem::redo(&handle, None)?,
+                            &PredefinedMenuItem::separator(&handle)?,
+                            &PredefinedMenuItem::cut(&handle, None)?,
+                            &PredefinedMenuItem::copy(&handle, None)?,
+                            &PredefinedMenuItem::paste(&handle, None)?,
+                            &PredefinedMenuItem::select_all(&handle, None)?,
+                        ],
+                    )?;
+
+                    let view_submenu = Submenu::with_items(
+                        &handle,
+                        "View",
+                        true,
+                        &[&PredefinedMenuItem::fullscreen(&handle, None)?],
+                    )?;
+
+                    // Window submenu intentionally omits close_window
+                    // — see (2) in the block comment above.
+                    let window_submenu = Submenu::with_items(
+                        &handle,
+                        "Window",
+                        true,
+                        &[
+                            &PredefinedMenuItem::minimize(&handle, None)?,
+                            &PredefinedMenuItem::maximize(&handle, None)?,
+                        ],
+                    )?;
+
+                    Menu::with_items(
+                        &handle,
+                        &[
+                            &app_submenu,
+                            &edit_submenu,
+                            &view_submenu,
+                            &window_submenu,
+                        ],
+                    )
+                })();
+
+                match menu_result {
                     Ok(menu) => {
-                        if let Err(e) = app.handle().set_menu(menu) {
+                        if let Err(e) = handle.set_menu(menu) {
                             tracing::warn!(
                                 %e,
-                                "failed to install default app menu; Cmd+Q will be inoperative"
+                                "failed to install custom app menu; ⌘Q close-window will be inoperative"
                             );
                         }
                     }
-                    Err(e) => tracing::warn!(%e, "failed to build default app menu"),
+                    Err(e) => tracing::warn!(%e, "failed to build custom app menu"),
                 }
             }
 

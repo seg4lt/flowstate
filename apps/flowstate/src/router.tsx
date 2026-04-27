@@ -162,6 +162,39 @@ function useTerminalShortcut() {
   }, [dispatch]);
 }
 
+// Cmd+W: app-wide no-op safety net.
+//
+// CodeView has its own ⌘W handler (close active editor tab) that
+// runs at the same `window` keydown phase and calls `preventDefault`
+// before returning. Here we install a global handler that *also*
+// preventDefaults ⌘W so on every other route — chat, project home,
+// settings, etc. — the press is swallowed instead of falling through
+// to the macOS Window menu's "Close Window" item (which fires
+// `WindowEvent::CloseRequested` and hides the main window). Both
+// listeners are attached to `window` and React effects mount in
+// child-before-parent order, so when CodeView is mounted its
+// listener runs first and the global no-op below never sees the
+// event (return-without-preventDefault here would still be safe,
+// but CodeView already prevents). When CodeView isn't mounted,
+// only this global runs and the keystroke quietly dies.
+//
+// Cmd+Shift+W is left alone — it's not bound by Tauri's default
+// macOS menu and a few existing shortcuts (e.g. registry entries)
+// could grow into that namespace later. Cmd+Ctrl+W and Cmd+Alt+W
+// are also left alone for the same reason.
+function useCmdWNoop() {
+  React.useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      const mod = e.metaKey || e.ctrlKey;
+      if (!mod || e.altKey || e.shiftKey) return;
+      if (e.key.toLowerCase() !== "w") return;
+      e.preventDefault();
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+}
+
 // Cmd/Ctrl +=, +-, +0 control the webview zoom. Same no-text-input-guard
 // rationale as useTerminalShortcut: these are chrome-level shortcuts.
 // useIsMobile observes documentElement via ResizeObserver, so it picks
@@ -298,6 +331,13 @@ function noopOpen(): void {
 function AppShell() {
   useTerminalShortcut();
   useZoomShortcuts();
+  // Swallow ⌘W everywhere except CodeView (which has its own
+  // tab-close handler). Without this the press falls through to the
+  // macOS Window menu's "Close Window" item and hides the main
+  // window — see useCmdWNoop's comment. Intentionally not mounted in
+  // PopoutShell: popouts are window-shaped, and ⌘W closing the
+  // popout matches platform expectations.
+  useCmdWNoop();
   // Gate the route `<Outlet />` on `state.ready` so route components
   // (ChatView, CodeView, ProjectHomeView, …) don't mount with an
   // empty `state.sessions` / `state.projects` before the daemon's
