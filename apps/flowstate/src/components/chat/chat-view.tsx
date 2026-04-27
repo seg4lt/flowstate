@@ -7,7 +7,10 @@ import { isPopoutWindow } from "@/lib/popout";
 import {
   TOGGLE_CONTEXT_EVENT,
   TOGGLE_DIFF_EVENT,
+  TOGGLE_CODE_VIEW_EVENT,
+  OPEN_CODE_VIEW_EVENT,
 } from "@/lib/keyboard-shortcuts";
+import { CodeView, type SearchMode } from "@/components/code/code-view";
 import { useApp, useSessionCommandCatalog } from "@/stores/app-store";
 import type {
   AttachedImage,
@@ -89,6 +92,7 @@ const sessionQueues = new Map<string, QueuedMessage[]>();
 // per-thread (plain useState) — it's a momentary intent.
 const sessionDiffOpen = new Map<string, boolean>();
 const sessionContextOpen = new Map<string, boolean>();
+const sessionCodeViewOpen = new Map<string, boolean>();
 
 // Trip the watchdog after this many seconds of silence while a tool
 // call is pending. Picked to be well past a normal tool round-trip
@@ -108,6 +112,10 @@ const DIFF_CHAT_MIN_WIDTH = 420;
 const CONTEXT_WIDTH_KEY = "flowstate:context-width";
 const CONTEXT_MIN_WIDTH = 320;
 const CONTEXT_DEFAULT_WIDTH = 440;
+
+const CODE_VIEW_WIDTH_KEY = "flowstate:code-view-width";
+const CODE_VIEW_MIN_WIDTH = 480;
+const CODE_VIEW_DEFAULT_WIDTH = 720;
 
 interface PermissionRequest {
   requestId: string;
@@ -628,6 +636,56 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return CONTEXT_DEFAULT_WIDTH;
   });
 
+  // Code-view panel state — same shape as the diff/context panels:
+  // per-session open flag in a module map so the choice survives
+  // thread switches, transient fullscreen flag (no need to persist
+  // it — momentary intent), and a localStorage-backed width.
+  // Mutually exclusive with diff/context inside the toggle handler.
+  const [codeViewOpen, setCodeViewOpenState] = React.useState<boolean>(
+    () => sessionCodeViewOpen.get(sessionId) ?? false,
+  );
+  const [codeViewFullscreen, setCodeViewFullscreen] = React.useState(false);
+  // Fresh-reference object passed down to CodeView's `searchRequest`
+  // prop. Each Cmd+P / Cmd+Shift+F press creates a new object so the
+  // effect on the other side fires even when the mode is unchanged
+  // (which is the common case — repeated Cmd+P should re-focus the
+  // input). Null between presses; never resets to null after first
+  // use (no need — CodeView's effect bails on null and the prop only
+  // matters at the moment of focus).
+  const [codeViewSearchRequest, setCodeViewSearchRequest] = React.useState<
+    { mode: SearchMode } | null
+  >(null);
+  const setCodeViewOpen = React.useCallback<
+    React.Dispatch<React.SetStateAction<boolean>>
+  >(
+    (value) => {
+      setCodeViewOpenState((prev) => {
+        const next =
+          typeof value === "function"
+            ? (value as (p: boolean) => boolean)(prev)
+            : value;
+        if (next) sessionCodeViewOpen.set(sessionId, true);
+        else sessionCodeViewOpen.delete(sessionId);
+        return next;
+      });
+    },
+    [sessionId],
+  );
+  const [codeViewWidth, setCodeViewWidth] = React.useState<number>(() => {
+    try {
+      const saved = window.localStorage.getItem(CODE_VIEW_WIDTH_KEY);
+      if (saved) {
+        const parsed = Number.parseInt(saved, 10);
+        if (Number.isFinite(parsed) && parsed >= CODE_VIEW_MIN_WIDTH) {
+          return parsed;
+        }
+      }
+    } catch {
+      /* storage may be unavailable */
+    }
+    return CODE_VIEW_DEFAULT_WIDTH;
+  });
+
   // Single toggle handler for the diff pane, shared by the header
   // button and the global ⌘⇧D shortcut. Encapsulates everything that
   // happens on "open": activating the streamed-diff subscription,
@@ -641,6 +699,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         refreshDiffs({ force: true });
         setContextOpen(false);
         setContextFullscreen(false);
+        setCodeViewOpen(false);
+        setCodeViewFullscreen(false);
       } else {
         setDiffFullscreen(false);
       }
@@ -653,7 +713,102 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setContextOpen,
     setContextFullscreen,
     setDiffFullscreen,
+    setCodeViewOpen,
+    setCodeViewFullscreen,
   ]);
+
+  // Code-view panel toggle. Mutually exclusive with diff/context —
+  // the panel column has one slot. On open, drops the other panels
+  // and any of their fullscreens; on close, drops fullscreen on
+  // self so a re-open isn't surprising.
+  const toggleCodeView = React.useCallback(() => {
+    setCodeViewOpen((v) => {
+      if (!v) {
+        setDiffOpen(false);
+        setDiffFullscreen(false);
+        setContextOpen(false);
+        setContextFullscreen(false);
+      } else {
+        setCodeViewFullscreen(false);
+      }
+      return !v;
+    });
+  }, [
+    setCodeViewOpen,
+    setDiffOpen,
+    setDiffFullscreen,
+    setContextOpen,
+    setContextFullscreen,
+    setCodeViewFullscreen,
+  ]);
+
+  // Bridge for the global Mod+Alt+E shortcut. Same indirection
+  // pattern as TOGGLE_DIFF_EVENT.
+  React.useEffect(() => {
+    window.addEventListener(TOGGLE_CODE_VIEW_EVENT, toggleCodeView);
+    return () =>
+      window.removeEventListener(TOGGLE_CODE_VIEW_EVENT, toggleCodeView);
+  }, [toggleCodeView]);
+
+  // Bridge for Cmd+P (files) / Cmd+Shift+F (content). The shortcuts
+  // dispatch OPEN_CODE_VIEW_EVENT with a `mode` detail. We force the
+  // panel open (mutually exclusive with diff/context) and push a
+  // fresh searchRequest object down to CodeView so it sets the mode
+  // and focuses the search input. The fresh-reference approach is
+  // what makes a second press of the same shortcut still re-focus.
+  React.useEffect(() => {
+    function onOpenCodeView(e: Event) {
+      const detail = (e as CustomEvent<{ mode?: SearchMode }>).detail;
+      const mode: SearchMode = detail?.mode ?? "files";
+      setCodeViewOpen(true);
+      setDiffOpen(false);
+      setDiffFullscreen(false);
+      setContextOpen(false);
+      setContextFullscreen(false);
+      // Always allocate a new object so the prop reference changes
+      // and CodeView's effect re-fires. `setCodeViewSearchRequest`
+      // is allowed to be called with the same value object only when
+      // the user genuinely hasn't pressed the shortcut again — but
+      // in practice the press IS the trigger, so always-new is
+      // correct and cheaper than equality checks.
+      setCodeViewSearchRequest({ mode });
+    }
+    window.addEventListener(OPEN_CODE_VIEW_EVENT, onOpenCodeView);
+    return () =>
+      window.removeEventListener(OPEN_CODE_VIEW_EVENT, onOpenCodeView);
+  }, [
+    setCodeViewOpen,
+    setDiffOpen,
+    setDiffFullscreen,
+    setContextOpen,
+    setContextFullscreen,
+  ]);
+
+  // Shift+Esc — toggle fullscreen on whichever side panel is open.
+  // Fires regardless of focus (chat composer, code editor, diff
+  // viewer all qualify) since it's a layout-level action. Mirrors
+  // the per-pane Shift+Esc that already lives in the standalone
+  // /code route — when the code view is mounted as a panel here,
+  // its internal Shift+Esc handler is suppressed via the `embedded`
+  // prop and this handler takes over with the more useful "expand
+  // the whole panel" semantic.
+  React.useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape" || !e.shiftKey) return;
+      if (codeViewOpen) {
+        e.preventDefault();
+        setCodeViewFullscreen((v) => !v);
+      } else if (diffOpen) {
+        e.preventDefault();
+        setDiffFullscreen((v) => !v);
+      } else if (contextOpen) {
+        e.preventDefault();
+        setContextFullscreen((v) => !v);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [codeViewOpen, diffOpen, contextOpen]);
 
   // Bridge for the global ⌘⇧D shortcut: useGlobalShortcuts dispatches
   // a window-level CustomEvent rather than calling into this component
@@ -1368,12 +1523,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       if (next) {
         setDiffOpen(false);
         setDiffFullscreen(false);
+        setCodeViewOpen(false);
+        setCodeViewFullscreen(false);
       } else {
         setContextFullscreen(false);
       }
       return next;
     });
-  }, []);
+  }, [setCodeViewOpen]);
 
   // Bridge for the global ⌘⇧K shortcut: same indirection as
   // TOGGLE_DIFF_EVENT above so the open/closed state stays owned by
@@ -1571,7 +1728,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <div
           className={cn(
             "flex min-w-0 flex-col",
-            diffFullscreen || contextFullscreen ? "hidden" : "flex-1",
+            diffFullscreen || contextFullscreen || codeViewFullscreen
+              ? "hidden"
+              : "flex-1",
           )}
         >
           <SessionProvider
@@ -1704,6 +1863,40 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 }}
                 isFullscreen={contextFullscreen}
                 onToggleFullscreen={() => setContextFullscreen((v) => !v)}
+              />
+            </aside>
+          </>
+        )}
+
+        {codeViewOpen && (
+          <>
+            {!codeViewFullscreen && (
+              <PanelDragHandle
+                containerRef={splitContainerRef}
+                width={codeViewWidth}
+                onResize={setCodeViewWidth}
+                storageKey={CODE_VIEW_WIDTH_KEY}
+                minWidth={CODE_VIEW_MIN_WIDTH}
+                ariaLabel="Resize code view panel"
+              />
+            )}
+            <aside
+              className={cn(
+                "border-l border-border bg-background",
+                codeViewFullscreen ? "flex-1" : "shrink-0",
+              )}
+              style={codeViewFullscreen ? undefined : { width: codeViewWidth }}
+            >
+              <CodeView
+                sessionId={sessionId}
+                embedded
+                onClose={() => {
+                  setCodeViewOpen(false);
+                  setCodeViewFullscreen(false);
+                }}
+                isFullscreen={codeViewFullscreen}
+                onToggleFullscreen={() => setCodeViewFullscreen((v) => !v)}
+                searchRequest={codeViewSearchRequest}
               />
             </aside>
           </>

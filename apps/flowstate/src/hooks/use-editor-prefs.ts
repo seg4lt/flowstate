@@ -7,25 +7,32 @@ import * as React from "react";
 // React context.
 //
 // v1 surfaces:
-//   * vimEnabled — when true, `@replit/codemirror-vim` is included
-//                  in the editor's extension stack via a Compartment.
-//                  Default: true (the user explicitly asked for vim).
-//   * softWrap   — when true, `EditorView.lineWrapping` is included
-//                  via a Compartment. Default: false (most code
-//                  reads better with horizontal scrolling).
+//   * vimEnabled    — when true, `@replit/codemirror-vim` is included
+//                     in the editor's extension stack via a Compartment.
+//                     Default: true (the user explicitly asked for vim).
+//   * softWrap      — when true, `EditorView.lineWrapping` is included
+//                     via a Compartment. Default: false (most code
+//                     reads better with horizontal scrolling).
+//   * gitModeEnabled — when true, the code view replaces the project
+//                     tree with a flat list of changed files (vs HEAD)
+//                     and the editor paints gutter + line-bg markers
+//                     for added / modified lines via a Compartment.
+//                     Default: false (off until the user asks for it).
 //
 // We deliberately don't use the existing settings store yet — the
-// editor only owns these two booleans and there's no value in
-// roundtripping through SQLite for a localStorage-class concern.
-// If the editor grows more prefs (font size, indent width, ...),
-// fold them into a proper store at that point.
+// editor only owns these booleans and there's no value in roundtripping
+// through SQLite for a localStorage-class concern. If the editor grows
+// more prefs (font size, indent width, ...), fold them into a proper
+// store at that point.
 
 const VIM_KEY = "flowstate:editor.vim-enabled";
 const WRAP_KEY = "flowstate:editor.soft-wrap";
+const GIT_MODE_KEY = "flowstate:editor.git-mode-enabled";
 
 interface EditorPrefs {
   vimEnabled: boolean;
   softWrap: boolean;
+  gitModeEnabled: boolean;
 }
 
 function readBool(key: string, fallback: boolean): boolean {
@@ -55,6 +62,7 @@ function getSnapshot(): EditorPrefs {
     cached = {
       vimEnabled: readBool(VIM_KEY, true),
       softWrap: readBool(WRAP_KEY, false),
+      gitModeEnabled: readBool(GIT_MODE_KEY, false),
     };
   }
   return cached;
@@ -74,6 +82,8 @@ export interface EditorPrefsApi {
   setVimEnabled: (value: boolean) => void;
   softWrap: boolean;
   setSoftWrap: (value: boolean) => void;
+  gitModeEnabled: boolean;
+  setGitModeEnabled: (value: boolean) => void;
 }
 
 export function useEditorPrefs(): EditorPrefsApi {
@@ -93,10 +103,19 @@ export function useEditorPrefs(): EditorPrefsApi {
     notifyAll();
   }, []);
 
+  const setGitModeEnabled = React.useCallback((value: boolean) => {
+    if (cached?.gitModeEnabled === value) return;
+    cached = { ...getSnapshot(), gitModeEnabled: value };
+    writeBool(GIT_MODE_KEY, value);
+    notifyAll();
+  }, []);
+
   return {
     vimEnabled: snapshot.vimEnabled,
     setVimEnabled,
     softWrap: snapshot.softWrap,
     setSoftWrap,
+    gitModeEnabled: snapshot.gitModeEnabled,
+    setGitModeEnabled,
   };
 }

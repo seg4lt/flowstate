@@ -61,6 +61,14 @@ import {
   ensureLanguageLoaded,
   getHighlighter,
 } from "@/lib/shiki-singleton";
+import { getGitDiffFile } from "@/lib/api";
+import {
+  diffLines,
+  gitDiffExtension,
+  setGitDiffEffect,
+  clearGitDiffEffect,
+} from "./git-diff-extension";
+import { commentExtension } from "./comment-extension";
 
 // Editable code editor — CodeMirror 6 with vim, find/replace,
 // multi-cursor, folding, and Shiki-driven syntax highlighting.
@@ -733,6 +741,20 @@ export interface CodeEditorProps {
   vimEnabled: boolean;
   /** Whether soft-wrap is on. Reconfigures via Compartment. */
   softWrap: boolean;
+  /** Whether git mode is on. When true and `projectPath` is set,
+   *  the editor fetches the {before, after} pair for the open file
+   *  via `getGitDiffFile` once on mount and paints gutter +
+   *  line-bg markers for added / modified lines. Recomputes only
+   *  on file open — not per keystroke. Reconfigures via Compartment
+   *  so flipping it off has zero overhead. */
+  gitModeEnabled?: boolean;
+  /** Project root for `getGitDiffFile`. Required when
+   *  `gitModeEnabled` is true; ignored otherwise. */
+  projectPath?: string | null;
+  /** Active chat session. When set, the line-comment affordance
+   *  (hover "+", `Mod-Alt-c` keymap, popup → composer) is mounted
+   *  via the comment extension. Null disables it entirely. */
+  sessionId?: string | null;
   /** When true, edits are blocked. The save flow still works (a
    *  no-op since nothing changed) but typing is rejected. */
   readOnly?: boolean;
@@ -753,6 +775,9 @@ export function CodeEditor({
   theme,
   vimEnabled,
   softWrap,
+  gitModeEnabled = false,
+  projectPath = null,
+  sessionId = null,
   readOnly = false,
   onSave,
   onDirtyChange,
@@ -773,6 +798,8 @@ export function CodeEditor({
   const themeCompartmentRef = React.useRef(new Compartment());
   const wrapCompartmentRef = React.useRef(new Compartment());
   const readOnlyCompartmentRef = React.useRef(new Compartment());
+  const gitDiffCompartmentRef = React.useRef(new Compartment());
+  const commentCompartmentRef = React.useRef(new Compartment());
 
   // Track the highlighter resolution state via refs so we can re-
   // tokenize when the grammar lazy-loads after the initial mount.
@@ -943,6 +970,20 @@ export function CodeEditor({
         EditorState.readOnly.of(readOnly || overlong),
       ),
       wrapCompartmentRef.current.of(softWrap ? EditorView.lineWrapping : []),
+      // Git diff markers compartment. Off by default; the effect
+      // below reconfigures it to `gitDiffExtension()` when the
+      // user flips git mode on, and clears decorations when off.
+      gitDiffCompartmentRef.current.of(
+        gitModeEnabled ? gitDiffExtension() : [],
+      ),
+      // Comment-to-composer compartment. Wires the hover gutter
+      // "+", the Mod-Alt-c keymap, and the popup tooltip when a
+      // chat session is attached. Empty when sessionId is null
+      // (e.g. /browse route) — same disable semantics as the
+      // diff-comment overlay.
+      commentCompartmentRef.current.of(
+        sessionId ? commentExtension({ path, sessionId }) : [],
+      ),
       // Theme compartment hosts both the editor theme and the Shiki
       // plugin so reconfiguring on theme change retokenizes against
       // the new theme without remounting. Starts with no Shiki —
@@ -1079,6 +1120,88 @@ export function CodeEditor({
       ),
     });
   }, [readOnly, overlong]);
+
+  // Git mode reactivity. Two phases:
+  //   1. Reconfigure the compartment so the field/gutter/theme are
+  //      either mounted or `[]` (zero overhead off-mode).
+  //   2. When ON, fetch the {before, after} pair from Rust once,
+  //      compute added / modified line numbers via the LCS in
+  //      `diffLines()`, and dispatch `setGitDiffEffect`. We do NOT
+  //      retry on keystrokes — the diff snapshot is taken at file
+  //      open / mode-flip time, then mapped through edits by the
+  //      StateField until the user reopens. This is the deliberate
+  //      perf line we drew (no per-keystroke recompute).
+  //
+  //   When the file isn't in the repo's diff (untracked-and-unchanged,
+  //   or the rust call returns matching before/after), `diffLines`
+  //   returns empty arrays and the editor renders normally — same
+  //   visual result as having git mode off, no error noise.
+  React.useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    let cancelled = false;
+    view.dispatch({
+      effects: gitDiffCompartmentRef.current.reconfigure(
+        gitModeEnabled ? gitDiffExtension() : [],
+      ),
+    });
+    if (!gitModeEnabled || !projectPath) {
+      // Make doubly sure stale decorations don't linger when we
+      // flip OFF — the compartment swap drops the field, but
+      // belt-and-braces.
+      view.dispatch({ effects: clearGitDiffEffect.of() });
+      return;
+    }
+    (async () => {
+      try {
+        const { before, after } = await getGitDiffFile(projectPath, path);
+        if (cancelled || viewRef.current !== view) return;
+        // Edge case: rust returned the same string on both sides
+        // (file at HEAD matches working tree). Skip the LCS work.
+        if (before === after) {
+          view.dispatch({
+            effects: setGitDiffEffect.of({ added: [], modified: [] }),
+          });
+          return;
+        }
+        const lines = diffLines(before, after);
+        if (cancelled || viewRef.current !== view) return;
+        view.dispatch({ effects: setGitDiffEffect.of(lines) });
+      } catch (err) {
+        if (cancelled || viewRef.current !== view) return;
+        if (import.meta.env.DEV) {
+          // Most common cause: file isn't tracked / project isn't a
+          // git repo. Silently leave decorations empty rather than
+          // surface a toast on every untracked file open.
+          console.debug("[code-editor] getGitDiffFile failed:", err);
+        }
+        view.dispatch({ effects: clearGitDiffEffect.of() });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // `path` is a dep so re-fetch when the file changes (the parent
+    // remounts the editor on path change anyway via the React.lazy
+    // key, so this only fires for the initial mount + git-mode flip).
+  }, [gitModeEnabled, projectPath, path]);
+
+  // Comment-extension reactivity. Reconfigure when sessionId
+  // appears / disappears / changes — the extension closes over
+  // sessionId at construction time, so we need a fresh extension
+  // any time it shifts. Path is also a dep because the extension's
+  // anchor uses it; in practice path changes remount the editor
+  // (see the `[path]` mount effect above), so this fires only on
+  // sessionId transitions during the editor's lifetime.
+  React.useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: commentCompartmentRef.current.reconfigure(
+        sessionId ? commentExtension({ path, sessionId }) : [],
+      ),
+    });
+  }, [sessionId, path]);
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-1 flex-col">

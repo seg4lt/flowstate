@@ -1,5 +1,4 @@
 import * as React from "react";
-import { useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -21,6 +20,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { openInEditor } from "@/lib/api";
+import { TOGGLE_CODE_VIEW_EVENT } from "@/lib/keyboard";
 import { prefetchProjectFiles } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import type { AggregatedFileDiff } from "@/lib/session-diff";
@@ -102,7 +102,6 @@ export function HeaderActions({
   onToggleContext,
   todoProgress,
 }: HeaderActionsProps) {
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
   // Terminal store is a global context — read it directly rather
   // than prop-drilling dockOpen through ChatView. The toggle button
@@ -359,11 +358,16 @@ export function HeaderActions({
         variant="outline"
         size="xs"
         onClick={() =>
-          navigate({ to: "/code/$sessionId", params: { sessionId } })
+          // Toggle the embedded code-view panel inside the chat —
+          // same destination Cmd+Alt+E reaches. Replaces the older
+          // navigate-to-/code-route flow so the search/file-tree
+          // experience opens as a side panel without losing the
+          // chat composer underneath.
+          window.dispatchEvent(new CustomEvent(TOGGLE_CODE_VIEW_EVENT))
         }
         onMouseEnter={handleSearchPrefetch}
         onFocus={handleSearchPrefetch}
-        title="Search project files"
+        title="Toggle code view panel (Cmd/Ctrl+Alt+E)"
       >
         <Search className="h-3 w-3" />
       </Button>

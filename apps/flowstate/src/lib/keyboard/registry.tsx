@@ -118,6 +118,12 @@ export interface Shortcut {
 
 export const TOGGLE_DIFF_EVENT = "flowstate:toggle-diff";
 export const TOGGLE_CONTEXT_EVENT = "flowstate:toggle-context";
+export const TOGGLE_CODE_VIEW_EVENT = "flowstate:toggle-code-view";
+/** Open the code view panel and focus its search input in a specific
+ *  mode. Detail: `{ mode: "files" | "content" }`. Distinct from the
+ *  toggle event because Cmd+P / Cmd+Shift+F should ALWAYS open + focus
+ *  rather than close-if-already-open. */
+export const OPEN_CODE_VIEW_EVENT = "flowstate:open-code-view";
 export const OPEN_EDITOR_PICKER_EVENT = "flowstate:open-editor-picker";
 export const LAUNCH_DEFAULT_EDITOR_EVENT = "flowstate:launch-default-editor";
 export const OPEN_MODEL_PICKER_EVENT = "flowstate:open-model-picker";
@@ -171,6 +177,14 @@ export const SHORTCUTS: Shortcut[] = [
     group: "View",
     fireInTextInputs: true,
     run: () => window.dispatchEvent(new CustomEvent(TOGGLE_CONTEXT_EVENT)),
+  },
+  {
+    id: "toggle-code-view",
+    label: "Toggle code view panel",
+    defaultBinding: "mod+alt+e",
+    group: "View",
+    fireInTextInputs: true,
+    run: () => window.dispatchEvent(new CustomEvent(TOGGLE_CODE_VIEW_EVENT)),
   },
   {
     id: "popout-thread",
@@ -231,6 +245,26 @@ export const SHORTCUTS: Shortcut[] = [
     run: () => window.dispatchEvent(new CustomEvent(OPEN_EDITOR_PICKER_EVENT)),
   },
   {
+    // Documentation entry. The actual binding is owned by the CM6
+    // `commentExtension` keymap (Prec.high) — when a file is focused
+    // its `.cm-content` is the active text input, so this global
+    // entry exits early via `!fireInTextInputs && isInTextInput(...)`
+    // and the editor's keymap handles the keystroke. Outside the
+    // editor (e.g. focus on a button or document.body) the run
+    // handler hints at where the shortcut belongs instead of
+    // silently consuming the keystroke.
+    id: "comment-on-line",
+    label: "Comment on current line",
+    defaultBinding: "mod+alt+c",
+    group: "View",
+    fireInTextInputs: false,
+    run: (ctx) => {
+      ctx.notify?.(
+        "Open a file in the code view to add a line comment",
+      );
+    },
+  },
+  {
     id: "open-model-picker",
     label: "Open model picker",
     defaultBinding: "mod+shift+m",
@@ -273,11 +307,13 @@ export const SHORTCUTS: Shortcut[] = [
         ctx.notify?.("Open a thread first to search its project files");
         return;
       }
-      ctx.navigate({
-        to: "/code/$sessionId",
-        params: { sessionId: ctx.activeSessionId },
-        search: { mode: "files" },
-      });
+      // Open the embedded code-view panel inside the active chat
+      // (split layout) instead of navigating to the standalone
+      // /code route. ChatView's listener opens the panel + sets
+      // search mode + focuses the input.
+      window.dispatchEvent(
+        new CustomEvent(OPEN_CODE_VIEW_EVENT, { detail: { mode: "files" } }),
+      );
     },
   },
   {
@@ -291,11 +327,11 @@ export const SHORTCUTS: Shortcut[] = [
         ctx.notify?.("Open a thread first to search its project contents");
         return;
       }
-      ctx.navigate({
-        to: "/code/$sessionId",
-        params: { sessionId: ctx.activeSessionId },
-        search: { mode: "content" },
-      });
+      window.dispatchEvent(
+        new CustomEvent(OPEN_CODE_VIEW_EVENT, {
+          detail: { mode: "content" },
+        }),
+      );
     },
   },
   {

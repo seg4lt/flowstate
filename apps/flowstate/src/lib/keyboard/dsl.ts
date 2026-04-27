@@ -193,10 +193,28 @@ export function chordToDsl(c: KeyChord): string {
  */
 export function matchChord(c: KeyChord, e: KeyboardEvent): boolean {
   const evKey = (e.key ?? "").toLowerCase();
-  const keyMatches =
+  let keyMatches =
     evKey === c.key ||
     (c.shift && c.key === "/" && evKey === "?") ||
     (c.shift && c.key === "?" && evKey === "/");
+
+  // Fallback to `event.code` for letter chords. Two cases this fixes:
+  //   1. macOS dead-key composition. Option+E delivers `event.key
+  //      === "´"` (the acute-accent dead-key glyph) instead of "e",
+  //      so Cmd+Option+E can never match a "mod+alt+e" chord with
+  //      the key compare alone. Same trap exists for Option+I (`ˆ`),
+  //      Option+N (`˜`), Option+U (`¨`), Option+` (` ` `).
+  //   2. AltGr / non-US layouts where modified letters resolve to a
+  //      symbol or a different letter on the keycap.
+  // `event.code` is layout- and dead-key-independent ("KeyE" always
+  // means the physical E key), so it's the right escape hatch.
+  // Scoped to single-letter chords to avoid surprising matches on
+  // punctuation / digit chords.
+  if (!keyMatches && c.key.length === 1 && /^[a-z]$/.test(c.key)) {
+    if (e.code === `Key${c.key.toUpperCase()}`) {
+      keyMatches = true;
+    }
+  }
   if (!keyMatches) return false;
   if (c.shift !== e.shiftKey) return false;
   if (c.alt !== e.altKey) return false;
