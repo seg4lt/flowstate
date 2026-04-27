@@ -43,6 +43,7 @@ pub mod probe;
 pub mod process_cache;
 pub mod skills_disk;
 mod types;
+pub mod user_mcp;
 
 pub use adapter::*;
 pub use binary_resolver::find_cli_binary;
@@ -57,7 +58,7 @@ pub use helpers::{
 };
 pub use mcp_config::{
     McpConfigFile, McpServerConfig, flowstate_mcp_config_file, flowstate_mcp_entry,
-    write_mcp_config_file,
+    validate_mcp_server_config, write_mcp_config_file,
 };
 pub use messages::*;
 pub use orchestration::{
@@ -69,6 +70,7 @@ pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
 pub use process_group::{enter_own_process_group, kill_process_group_best_effort};
 pub use types::*;
+pub use user_mcp::{McpSnapshot, RESERVED_FLOWSTATE_KEY, UserMcpRegistry};
 
 #[cfg(test)]
 mod tests {

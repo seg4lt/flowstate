@@ -14,9 +14,9 @@ use zenui_provider_api::{
     PermissionMode, ProbeCliOptions, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind,
     ProviderModel, ProviderSessionState, ProviderStatus, ProviderTurnEvent, ProviderTurnOutput,
     RateLimitInfo, RateLimitStatus, ReasoningEffort, SessionDetail, SkillSource, TokenUsage,
-    TurnEventSink, UserInput, UserInputQuestion, claude_bucket_label,
-    claude_file_change_from_tool_call, flowstate_mcp_config_file, parse_options_from_value,
-    probe_cli, session_cwd, skills_disk, write_mcp_config_file,
+    TurnEventSink, UserInput, UserInputQuestion, UserMcpRegistry, claude_bucket_label,
+    claude_file_change_from_tool_call, flowstate_mcp_entry, parse_options_from_value, probe_cli,
+    session_cwd, skills_disk, write_mcp_config_file,
 };
 
 // Effectively no turn-level wall clock. The adapter previously
@@ -240,6 +240,11 @@ pub struct ClaudeCliAdapter {
     /// on this adapter — sessions behave exactly like the
     /// pre-refactor Claude CLI.
     orchestration: Option<OrchestrationIpcHandle>,
+    /// Optional registry of user-defined global MCP servers loaded
+    /// from `~/.flowstate/mcp.json`. Merged with the flowstate
+    /// orchestration entry into the session-scoped `flowstate.mcp.json`
+    /// at spawn time. `None` means "no user MCPs" (legacy / tests).
+    user_mcp: Option<UserMcpRegistry>,
     /// One active process per session (for interrupt support).
     active_processes: Arc<Mutex<HashMap<String, Arc<Mutex<ClaudeCliProcess>>>>>,
     /// Per-session `system/init` payload cache. Populated inside
@@ -256,7 +261,7 @@ impl ClaudeCliAdapter {
     /// the default constructor so call sites that don't yet thread
     /// the orchestration IPC handle still compile unchanged.
     pub fn new(working_directory: PathBuf) -> Self {
-        Self::new_with_orchestration(working_directory, None)
+        Self::new_with_orchestration(working_directory, None, None)
     }
 
     /// Construct with an optional [`OrchestrationIpcHandle`]. When
@@ -270,10 +275,12 @@ impl ClaudeCliAdapter {
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
     ) -> Self {
         Self {
             working_directory,
             orchestration,
+            user_mcp,
             active_processes: Arc::new(Mutex::new(HashMap::new())),
             init_cache: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -349,7 +356,20 @@ impl ClaudeCliAdapter {
         // non-fatal: the session just won't see the
         // `flowstate_spawn` / `flowstate_send_and_await` tools.
         if let Some(ipc) = self.orchestration.as_ref().and_then(|h| h.get()) {
-            let cfg = flowstate_mcp_config_file(&ipc, &session.summary.session_id);
+            // Build the flowstate orchestration entry, then merge in
+            // user-defined MCPs from `~/.flowstate/mcp.json` (loaded
+            // fresh on every spawn — see UserMcpRegistry for the
+            // hot-reload trade-off). Claude CLI also auto-discovers
+            // its own `.mcp.json` in cwd; passing `--mcp-config`
+            // adds ours on top, so user MCPs registered here ride
+            // alongside any project-local ones the CLI finds.
+            let flowstate_entry = flowstate_mcp_entry(&ipc, &session.summary.session_id);
+            let user_snapshot = self
+                .user_mcp
+                .as_ref()
+                .map(|r| r.load())
+                .unwrap_or_default();
+            let cfg = UserMcpRegistry::merge_with_flowstate(flowstate_entry, &user_snapshot);
             let config_path = self
                 .working_directory
                 .join("sessions")
@@ -362,7 +382,8 @@ impl ClaudeCliAdapter {
                     debug!(
                         target: "provider-claude-cli",
                         ?path,
-                        "registered flowstate MCP server via --mcp-config"
+                        user_mcp_count = user_snapshot.servers.len(),
+                        "registered flowstate + user MCP servers via --mcp-config"
                     );
                 }
                 Err(err) => {

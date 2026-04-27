@@ -26,24 +26,70 @@ use crate::orchestration_ipc::OrchestrationIpcInfo;
 
 /// One entry in the `mcpServers` map. Mirrors the shape the MCP
 /// reference (`@modelcontextprotocol/server-*`) established and that
-/// every stdio-capable client we care about parses verbatim. We only
-/// emit `stdio` entries — the flowstate MCP server is always a local
-/// subprocess.
+/// every stdio-capable client we care about parses verbatim.
+///
+/// Supports three transports — `"stdio"` (subprocess; `command`
+/// required), `"http"` and `"sse"` (remote; `url` required). The
+/// flowstate orchestration entry is always stdio; user-defined MCPs
+/// loaded from `~/.flowstate/mcp.json` may use any of the three.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    /// Stable across clients. `"stdio"` is the universal transport.
-    /// Some clients (Claude CLI, Codex, Copilot CLI) accept it
-    /// implicitly when `command` is present; others (opencode SDK)
-    /// demand the field. Emitting it always is cheaper than branching.
-    /// Owned `String` rather than `&'static str` so the struct survives
-    /// `serde_json::from_str`'s lifetime rules in tests and callers
-    /// that read an existing `.mcp.json` back.
-    #[serde(rename = "type")]
+    /// Transport kind. One of `"stdio"`, `"http"`, `"sse"`. Defaults
+    /// to `"stdio"` for files written before the multi-transport
+    /// schema landed (Claude CLI / Codex `.mcp.json` historically
+    /// omitted the field when `command` was present). Owned `String`
+    /// so the struct survives `serde_json::from_str`'s lifetime rules
+    /// in tests and callers that read an existing `.mcp.json` back.
+    #[serde(rename = "type", default = "default_transport")]
     pub transport: String,
-    pub command: String,
+    /// Required for stdio; `None` for http/sse.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub command: Option<String>,
+    /// argv for stdio. `default` lets old/minimal entries omit the
+    /// field; `skip_serializing_if` keeps the rendered file tidy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Environment variables for stdio processes.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// Base URL for http/sse transport (e.g. `https://mcp.example.com/sse`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub url: Option<String>,
+}
+
+fn default_transport() -> String {
+    "stdio".to_string()
+}
+
+/// Validate a single MCP server entry against the transport rules.
+/// Returns `Err` with a human-readable reason on invalid shapes
+/// (unknown transport, stdio without command, http/sse without url).
+/// Used by [`crate::user_mcp::UserMcpRegistry`] to silently drop bad
+/// entries from `~/.flowstate/mcp.json` rather than fail-fast.
+pub fn validate_mcp_server_config(name: &str, cfg: &McpServerConfig) -> Result<(), String> {
+    match cfg.transport.as_str() {
+        "stdio" => {
+            if cfg.command.as_deref().unwrap_or("").is_empty() {
+                return Err(format!(
+                    "MCP server {name:?}: stdio transport requires non-empty `command`"
+                ));
+            }
+        }
+        "http" | "sse" => {
+            if cfg.url.as_deref().unwrap_or("").is_empty() {
+                return Err(format!(
+                    "MCP server {name:?}: {transport} transport requires non-empty `url`",
+                    transport = cfg.transport
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "MCP server {name:?}: unknown transport {other:?} (expected stdio|http|sse)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Full `{mcpServers: {…}}` envelope — the shape of a `.mcp.json`
@@ -79,7 +125,7 @@ pub fn flowstate_mcp_entry(info: &OrchestrationIpcInfo, session_id: &str) -> Mcp
 
     McpServerConfig {
         transport: "stdio".to_string(),
-        command: info.executable_path.to_string_lossy().into_owned(),
+        command: Some(info.executable_path.to_string_lossy().into_owned()),
         args: vec![
             "mcp-server".to_string(),
             "--http-base".to_string(),
@@ -88,6 +134,7 @@ pub fn flowstate_mcp_entry(info: &OrchestrationIpcInfo, session_id: &str) -> Mcp
             session_id.to_string(),
         ],
         env: Some(env),
+        url: None,
     }
 }
 
@@ -174,5 +221,104 @@ mod tests {
         let read: McpConfigFile =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(read.mcp_servers.len(), 1);
+    }
+
+    #[test]
+    fn schema_round_trips_http_entry() {
+        let json = r#"{
+            "type": "http",
+            "url": "https://mcp.example.com/v1"
+        }"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transport, "http");
+        assert_eq!(cfg.url.as_deref(), Some("https://mcp.example.com/v1"));
+        assert!(cfg.command.is_none());
+        let back = serde_json::to_string(&cfg).unwrap();
+        // command/env/args omitted (skip_serializing_if).
+        assert!(!back.contains("\"command\""));
+        assert!(!back.contains("\"args\""));
+    }
+
+    #[test]
+    fn schema_round_trips_sse_entry() {
+        let json = r#"{
+            "type": "sse",
+            "url": "https://mcp.example.com/sse"
+        }"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transport, "sse");
+        assert_eq!(cfg.url.as_deref(), Some("https://mcp.example.com/sse"));
+    }
+
+    #[test]
+    fn backward_compat_stdio_missing_transport_field() {
+        // Legacy `.mcp.json` files written before the multi-transport
+        // schema may omit `type` entirely. Default kicks in.
+        let json = r#"{
+            "command": "uvx",
+            "args": ["mcp-server-sqlite", "--db-path", "/tmp/x.db"]
+        }"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transport, "stdio");
+        assert_eq!(cfg.command.as_deref(), Some("uvx"));
+        assert_eq!(cfg.args.len(), 3);
+        assert!(cfg.url.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_stdio_without_command() {
+        let cfg = McpServerConfig {
+            transport: "stdio".to_string(),
+            command: None,
+            args: vec![],
+            env: None,
+            url: None,
+        };
+        assert!(validate_mcp_server_config("bad", &cfg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_http_without_url() {
+        let cfg = McpServerConfig {
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            env: None,
+            url: None,
+        };
+        assert!(validate_mcp_server_config("bad", &cfg).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_transport() {
+        let cfg = McpServerConfig {
+            transport: "websocket".to_string(),
+            command: None,
+            args: vec![],
+            env: None,
+            url: Some("ws://x".to_string()),
+        };
+        assert!(validate_mcp_server_config("bad", &cfg).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_entries() {
+        let stdio = McpServerConfig {
+            transport: "stdio".to_string(),
+            command: Some("/usr/local/bin/srv".to_string()),
+            args: vec!["--port".to_string(), "9000".to_string()],
+            env: None,
+            url: None,
+        };
+        assert!(validate_mcp_server_config("ok-stdio", &stdio).is_ok());
+
+        let http = McpServerConfig {
+            transport: "http".to_string(),
+            command: None,
+            args: vec![],
+            env: None,
+            url: Some("https://example.com".to_string()),
+        };
+        assert!(validate_mcp_server_config("ok-http", &http).is_ok());
     }
 }

@@ -10,10 +10,11 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use zenui_provider_api::{
-    OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProbeCliOptions, ProviderAdapter,
-    ProviderKind, ProviderModel, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
-    ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputAnswer,
-    UserInputOption, UserInputQuestion, probe_cli, session_cwd,
+    McpServerConfig, OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode,
+    ProbeCliOptions, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
+    ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, SessionDetail,
+    TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
+    UserMcpRegistry, probe_cli, session_cwd,
 };
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -39,6 +40,12 @@ pub struct CodexAdapter {
     /// `~/.codex/config.toml`; using it session-scoped keeps the
     /// user's global config untouched.
     orchestration: Option<OrchestrationIpcHandle>,
+    /// User-defined global MCPs from `~/.flowstate/mcp.json`. Each
+    /// stdio entry becomes an additional `-c mcp_servers.<name>=…`
+    /// override on the spawn cmdline. http/sse entries are skipped
+    /// with a warn (Codex's `-c` TOML override doesn't support
+    /// remote transports today). `None` means no user MCPs.
+    user_mcp: Option<UserMcpRegistry>,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CodexSessionProcess>>>>>,
 }
 
@@ -102,7 +109,7 @@ struct TurnCompletion {
 impl CodexAdapter {
     /// Construct without cross-provider orchestration wiring.
     pub fn new(working_directory: PathBuf) -> Self {
-        Self::new_with_orchestration(working_directory, None)
+        Self::new_with_orchestration(working_directory, None, None)
     }
 
     /// Construct with an optional [`OrchestrationIpcHandle`]. When
@@ -112,11 +119,13 @@ impl CodexAdapter {
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
     ) -> Self {
         Self {
             binary_path: Self::find_codex_binary(),
             working_directory,
             orchestration,
+            user_mcp,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -178,6 +187,37 @@ impl CodexAdapter {
             let toml_value = render_flowstate_toml_override(&ipc, &session.summary.session_id);
             cmd.arg("-c")
                 .arg(format!("mcp_servers.flowstate={toml_value}"));
+
+            // User-defined MCPs from `~/.flowstate/mcp.json`. One
+            // additional `-c mcp_servers.<name>=…` per stdio entry.
+            // http/sse entries are skipped with a warn — Codex's
+            // `-c` TOML override doesn't accept a `url`-typed remote
+            // transport in the version we target. Users who need
+            // remote MCPs in Codex specifically must add them to
+            // `~/.codex/config.toml` directly.
+            if let Some(registry) = &self.user_mcp {
+                let snapshot = registry.load();
+                for (name, cfg) in &snapshot.servers {
+                    match cfg.transport.as_str() {
+                        "stdio" => match render_stdio_toml_override(cfg) {
+                            Some(toml) => {
+                                cmd.arg("-c").arg(format!("mcp_servers.{name}={toml}"));
+                            }
+                            None => warn!(
+                                target: "provider-codex",
+                                %name,
+                                "skipping user MCP: stdio entry missing command"
+                            ),
+                        },
+                        other => warn!(
+                            target: "provider-codex",
+                            %name,
+                            transport = %other,
+                            "skipping user MCP: codex -c overrides only support stdio"
+                        ),
+                    }
+                }
+            }
         }
         cmd.current_dir(&cwd)
             .stdin(std::process::Stdio::piped())
@@ -1101,6 +1141,64 @@ fn render_flowstate_toml_override(info: &OrchestrationIpcInfo, session_id: &str)
     )
 }
 
+/// Render a user-defined stdio [`McpServerConfig`] as a TOML inline
+/// table for Codex's `-c mcp_servers.<name>={…}` flag. Returns
+/// `None` if the entry is malformed (missing `command`); the caller
+/// then logs and skips. Reuses the same backslash/quote escape rules
+/// as [`render_flowstate_toml_override`] — these are the only TOML
+/// escapes our user-supplied strings need (no control chars in
+/// realistic command paths / args / env values).
+fn render_stdio_toml_override(cfg: &McpServerConfig) -> Option<String> {
+    fn escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('"');
+        for ch in s.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    let command = cfg.command.as_deref()?;
+    if command.is_empty() {
+        return None;
+    }
+    let mut out = String::from("{ command = ");
+    out.push_str(&escape(command));
+    out.push_str(", args = [");
+    for (i, a) in cfg.args.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&escape(a));
+    }
+    out.push(']');
+    if let Some(env) = &cfg.env {
+        if !env.is_empty() {
+            out.push_str(", env = {");
+            for (i, (k, v)) in env.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                // Codex accepts bare-identifier keys for ASCII names;
+                // env var names are conventionally `[A-Z_][A-Z0-9_]*`
+                // so quoting is unnecessary in practice, but a key
+                // with unusual characters would still be safer
+                // quoted. We quote unconditionally.
+                out.push_str(&escape(k));
+                out.push_str(" = ");
+                out.push_str(&escape(v));
+            }
+            out.push('}');
+        }
+    }
+    out.push_str(" }");
+    Some(out)
+}
+
 #[cfg(test)]
 mod codex_mcp_tests {
     use super::*;
@@ -1127,6 +1225,64 @@ mod codex_mcp_tests {
         assert!(out.contains("sess-1"));
         // No auth token on the loopback — the bind is the boundary.
         assert!(!out.contains("FLOWSTATE_AUTH_TOKEN"));
+    }
+
+    #[test]
+    fn stdio_user_override_renders_command_and_args() {
+        let cfg = McpServerConfig {
+            transport: "stdio".to_string(),
+            command: Some("/usr/local/bin/srv".to_string()),
+            args: vec!["--port".to_string(), "9000".to_string()],
+            env: None,
+            url: None,
+        };
+        let out = render_stdio_toml_override(&cfg).expect("stdio override should render");
+        assert!(out.contains("command = \"/usr/local/bin/srv\""));
+        assert!(out.contains("args = [\"--port\", \"9000\"]"));
+        // env block is omitted entirely when there are no entries.
+        assert!(!out.contains("env = "));
+    }
+
+    #[test]
+    fn stdio_user_override_renders_env_when_present() {
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let cfg = McpServerConfig {
+            transport: "stdio".to_string(),
+            command: Some("srv".to_string()),
+            args: vec![],
+            env: Some(env),
+            url: None,
+        };
+        let out = render_stdio_toml_override(&cfg).unwrap();
+        assert!(out.contains("env = {"));
+        assert!(out.contains("\"FOO\" = \"bar\""));
+    }
+
+    #[test]
+    fn stdio_user_override_returns_none_without_command() {
+        let cfg = McpServerConfig {
+            transport: "stdio".to_string(),
+            command: None,
+            args: vec![],
+            env: None,
+            url: None,
+        };
+        assert!(render_stdio_toml_override(&cfg).is_none());
+    }
+
+    #[test]
+    fn stdio_user_override_escapes_special_chars() {
+        let cfg = McpServerConfig {
+            transport: "stdio".to_string(),
+            command: Some("/path with \"quote\" and \\slash".to_string()),
+            args: vec!["--arg=\"weird\"".to_string()],
+            env: None,
+            url: None,
+        };
+        let out = render_stdio_toml_override(&cfg).unwrap();
+        assert!(out.contains("\\\""));
+        assert!(out.contains("\\\\"));
     }
 
     #[test]

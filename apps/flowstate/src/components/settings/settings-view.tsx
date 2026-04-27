@@ -48,6 +48,7 @@ import {
   readWorktreeBasePath,
   writeWorktreeBasePath,
 } from "@/lib/worktree-settings";
+import { McpServersPanel } from "@/components/settings/mcp-servers-panel";
 import {
   readDefaultEffort,
   writeDefaultEffort,
@@ -1472,6 +1473,12 @@ export function SettingsView() {
                 onToggleEnabled={(enabled) => handleToggleEnabled(kind, enabled)}
               />
             ))}
+          </SettingsGroup>
+          <SettingsGroup
+            title="MCP servers"
+            description="Define MCP servers once and Flowstate registers them with every provider that supports MCP (Claude, Codex, Copilot, OpenCode). Backed by ~/.flowstate/mcp.json. Changes apply to new sessions only."
+          >
+            <McpServersPanel />
           </SettingsGroup>
           <SettingsGroup
             title="File checkpoints"

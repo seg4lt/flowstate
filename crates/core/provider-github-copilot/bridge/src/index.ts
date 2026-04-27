@@ -132,6 +132,60 @@ interface PendingPermission {
 }
 const pendingPermissions = new Map<string, PendingPermission>();
 
+/**
+ * Wire-shape user MCP entry shipped from Rust via
+ * `set_user_mcp_servers`. Mirrors `wire::CopilotUserMcpEntry`. Each
+ * entry is converted to the SDK's `mcpServers` SessionConfig shape
+ * (stdio / http / sse). The flowstate orchestration entry is added
+ * separately in `createSession` and always overrides any user entry
+ * named `"flowstate"`.
+ */
+interface CopilotUserMcpEntryWire {
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+}
+
+/**
+ * Most-recently-shipped user MCP map, keyed by entry name. Read by
+ * `createSession` when assembling `SessionConfig.mcpServers`.
+ * Rebuilt every time `set_user_mcp_servers` arrives.
+ */
+let userMcpServers: Record<string, unknown> = {};
+
+function applyUserMcpServers(entries: CopilotUserMcpEntryWire[]): void {
+  const next: Record<string, unknown> = {};
+  for (const entry of entries) {
+    if (!entry || !entry.name || entry.name === 'flowstate') continue;
+    if (entry.transport === 'stdio') {
+      if (!entry.command) continue;
+      next[entry.name] = {
+        type: 'stdio',
+        command: entry.command,
+        args: entry.args ?? [],
+        env: entry.env ?? {},
+      };
+    } else if (entry.transport === 'http' || entry.transport === 'sse') {
+      if (!entry.url) continue;
+      next[entry.name] = {
+        type: entry.transport,
+        url: entry.url,
+      };
+    } else {
+      console.error(
+        `[bridge] Skipping user MCP ${entry.name}: unknown transport ${entry.transport}`,
+      );
+    }
+  }
+  userMcpServers = next;
+  console.error(
+    `[bridge] Applied user MCP servers: ${Object.keys(next).join(', ') || '(none)'}`,
+  );
+}
+
 /** Write a stream event JSON line to stdout. */
 function writeStream(payload: Record<string, unknown>): void {
   process.stdout.write(JSON.stringify({ type: 'stream', ...payload }) + '\n');
@@ -420,7 +474,12 @@ class CopilotBridge {
     // what lets the stdio proxy watchdog flowstate's liveness and
     // self-exit on parent death (see `mcp-server`'s parent watchdog).
     const flowstatePid = process.env.FLOWSTATE_PID;
-    const mcpServers: Record<string, unknown> = {};
+    // User-defined MCP servers from `~/.flowstate/mcp.json` (shipped
+    // by Rust via `set_user_mcp_servers` right after the bridge ready
+    // signal). The flowstate orchestration entry is overlaid below
+    // and always wins on a key collision — defence in depth, since
+    // Rust already strips any user entry named "flowstate".
+    const mcpServers: Record<string, unknown> = { ...userMcpServers };
     if (
       flowstateSessionId &&
       flowstateHttpBase &&
@@ -986,6 +1045,25 @@ async function main(): Promise<void> {
         console.error(`[bridge] Received: ${msg.type}`);
 
         switch (msg.type) {
+          case 'set_user_mcp_servers': {
+            // Rust → bridge: list of user-defined MCPs from
+            // `~/.flowstate/mcp.json`. Stored on the bridge and
+            // merged into every subsequent session's
+            // `SessionConfig.mcpServers` alongside the flowstate
+            // orchestration entry. Older bridges hit the `default`
+            // arm; Rust treats no-handler as warn-and-continue.
+            const rawEntries =
+              (msg.servers as CopilotUserMcpEntryWire[] | undefined) ?? [];
+            try {
+              applyUserMcpServers(rawEntries);
+            } catch (err) {
+              console.error(
+                `[bridge] Failed to apply user MCP servers: ${(err as Error).message}`,
+              );
+            }
+            break;
+          }
+
           case 'create_session': {
             const cwd = (msg.cwd as string) ?? process.cwd();
             const model = msg.model as string | undefined;

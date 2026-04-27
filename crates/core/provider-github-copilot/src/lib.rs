@@ -22,7 +22,7 @@ use zenui_provider_api::{
     ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion, session_cwd, skills_disk,
+    UserInputQuestion, UserMcpRegistry, session_cwd, skills_disk,
 };
 
 use crate::config::copilot_models;
@@ -32,8 +32,8 @@ use crate::process::{
 };
 use crate::wire::{
     BridgeCopilotAgent, BridgeCopilotMcp, BridgeRequest, BridgeResponse, BridgeSkill,
-    CopilotBridgeImage, UserInputOutcome, parse_decision, permission_decision_to_str,
-    permission_mode_to_str,
+    CopilotBridgeImage, CopilotUserMcpEntry, UserInputOutcome, parse_decision,
+    permission_decision_to_str, permission_mode_to_str,
 };
 
 #[derive(Clone)]
@@ -48,13 +48,19 @@ pub struct GitHubCopilotAdapter {
     /// the `flowstate mcp-server` subprocess as part of each session.
     /// No auth token — the loopback bind is the only boundary.
     orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
+    /// User-defined global MCPs from `~/.flowstate/mcp.json`. Loaded
+    /// per-bridge-spawn and shipped to the TS bridge via
+    /// `set_user_mcp_servers`; the bridge merges them into every
+    /// `SessionConfig.mcpServers` it builds, alongside the flowstate
+    /// orchestration entry. `None` means no user MCPs.
+    user_mcp: Option<UserMcpRegistry>,
     sessions: Arc<zenui_provider_api::ProcessCache<CopilotBridgeProcess>>,
 }
 
 impl GitHubCopilotAdapter {
     /// Construct without cross-provider orchestration wiring.
     pub fn new(working_directory: PathBuf) -> Self {
-        Self::new_with_orchestration(working_directory, None)
+        Self::new_with_orchestration(working_directory, None, None)
     }
 
     /// Construct with an optional
@@ -66,10 +72,12 @@ impl GitHubCopilotAdapter {
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
     ) -> Self {
         Self {
             working_directory,
             orchestration,
+            user_mcp,
             sessions: Arc::new(zenui_provider_api::ProcessCache::new(
                 BRIDGE_IDLE_TIMEOUT_SECS,
                 BRIDGE_WATCHDOG_INTERVAL_SECS,
@@ -195,6 +203,34 @@ impl GitHubCopilotAdapter {
             }
             Err(_) => {
                 return Err("Timeout waiting for bridge ready signal".to_string());
+            }
+        }
+
+        // Ship the user MCP catalog. The bridge stashes it and merges
+        // entries into every future session's `SessionConfig.mcpServers`
+        // alongside the flowstate orchestration entry it builds from
+        // the env vars planted earlier. Skipped when no registry is
+        // wired or when the snapshot is empty — older bridges with
+        // no handler simply ignore the message.
+        if let Some(registry) = &self.user_mcp {
+            let snapshot = registry.load();
+            if !snapshot.is_empty() {
+                let entries: Vec<CopilotUserMcpEntry> = snapshot
+                    .servers
+                    .into_iter()
+                    .map(|(name, cfg)| CopilotUserMcpEntry {
+                        name,
+                        transport: cfg.transport,
+                        command: cfg.command,
+                        args: cfg.args,
+                        env: cfg.env,
+                        url: cfg.url,
+                    })
+                    .collect();
+                let req = BridgeRequest::SetUserMcpServers { servers: entries };
+                if let Err(err) = write_request(&process.stdin, &req).await {
+                    warn!(%err, "failed to ship user MCP catalog to Copilot bridge");
+                }
             }
         }
 

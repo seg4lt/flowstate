@@ -27,3 +27,9 @@ rand = "0.8"
 # opencode deployments don't exist yet.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Used by `tests/` and the in-tree `mod tests` for scratch dirs that
+# back the `opencode.json` writer's smoke tests. Workspace-pinned
+# version stays in sync with the rest of the codebase.
+tempfile = "3"

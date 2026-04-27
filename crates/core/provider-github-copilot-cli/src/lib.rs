@@ -18,7 +18,8 @@ use zenui_provider_api::{
     PermissionMode, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, TurnEventSink, UserInput, UserInputOption,
-    UserInputQuestion, flowstate_mcp_config_file, session_cwd, skills_disk, write_mcp_config_file,
+    UserInputQuestion, UserMcpRegistry, flowstate_mcp_entry, session_cwd, skills_disk,
+    write_mcp_config_file,
 };
 
 // Effectively no turn-level wall clock. The adapter previously
@@ -53,6 +54,11 @@ pub struct GitHubCopilotCliAdapter {
     /// Claude CLI's `--mcp-config`). `None` disables orchestration
     /// wiring on this adapter.
     orchestration: Option<OrchestrationIpcHandle>,
+    /// User-defined global MCPs from `~/.flowstate/mcp.json`, merged
+    /// into the session-scoped `flowstate.mcp.json` alongside the
+    /// orchestration entry. `None` means no user MCPs registered
+    /// (legacy / tests).
+    user_mcp: Option<UserMcpRegistry>,
     /// One process per ZenUI session. Backed by the shared
     /// `ProcessCache` helper so the idle-kill watchdog logic stays in
     /// lockstep with the SDK/bridge adapters.
@@ -65,7 +71,7 @@ impl GitHubCopilotCliAdapter {
     /// the default constructor so existing call sites compile
     /// unchanged.
     pub fn new(working_directory: PathBuf) -> Self {
-        Self::new_with_orchestration(working_directory, None)
+        Self::new_with_orchestration(working_directory, None, None)
     }
 
     /// Construct with an optional [`OrchestrationIpcHandle`]. When
@@ -74,10 +80,12 @@ impl GitHubCopilotCliAdapter {
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
     ) -> Self {
         Self {
             working_directory,
             orchestration,
+            user_mcp,
             active_processes: Arc::new(zenui_provider_api::ProcessCache::new(
                 CLI_IDLE_TIMEOUT_SECS,
                 CLI_WATCHDOG_INTERVAL_SECS,
@@ -236,7 +244,19 @@ impl GitHubCopilotCliAdapter {
             .as_ref()
             .and_then(|h| h.get())
             .and_then(|ipc| {
-                let cfg = flowstate_mcp_config_file(&ipc, &session.summary.session_id);
+                // Merge user-defined MCPs (loaded fresh per spawn)
+                // with the flowstate orchestration entry into the
+                // single session-scoped `flowstate.mcp.json` we
+                // hand to `--additional-mcp-config`.
+                let flowstate_entry =
+                    flowstate_mcp_entry(&ipc, &session.summary.session_id);
+                let user_snapshot = self
+                    .user_mcp
+                    .as_ref()
+                    .map(|r| r.load())
+                    .unwrap_or_default();
+                let cfg =
+                    UserMcpRegistry::merge_with_flowstate(flowstate_entry, &user_snapshot);
                 let config_path = self
                     .working_directory
                     .join("sessions")

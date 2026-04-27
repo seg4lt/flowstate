@@ -147,6 +147,34 @@ pub(crate) enum BridgeRequest {
     ListCapabilities,
     #[serde(rename = "interrupt")]
     Interrupt,
+    /// Rust → bridge: user-defined MCP server list from
+    /// `~/.flowstate/mcp.json`. The bridge merges each entry into
+    /// every subsequent `SessionConfig.mcpServers` it builds,
+    /// alongside the flowstate orchestration entry. Sent right after
+    /// the bridge ready signal so the very first session sees the
+    /// user MCPs. The flowstate key is reserved — Rust strips it on
+    /// load and the bridge writes the orchestration entry last
+    /// regardless. Older bridges with no handler ignore-and-continue.
+    #[serde(rename = "set_user_mcp_servers")]
+    SetUserMcpServers { servers: Vec<CopilotUserMcpEntry> },
+}
+
+/// Wire-shape user MCP entry for the Copilot bridge — same shape as
+/// the Claude SDK's `UserMcpEntry` (we keep the two definitions
+/// independent so a wire change in one provider doesn't ripple). The
+/// bridge picks the transport branch based on `transport`.
+#[derive(Debug, Serialize)]
+pub(crate) struct CopilotUserMcpEntry {
+    pub(crate) name: String,
+    pub(crate) transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
 }
 
 /// ZenUI Bridge Protocol Messages (TS → Rust)

@@ -484,6 +484,65 @@ const catalogLoaded: Promise<void> = new Promise((resolve) => {
   resolveCatalogLoaded = resolve;
 });
 
+/**
+ * Wire-shape user MCP entry shipped from Rust via the
+ * `set_user_mcp_servers` message. Mirrors `wire::UserMcpEntry`.
+ *
+ * Each entry is converted to the SDK's `mcpServers` SessionConfig
+ * shape — stdio entries become subprocess specs, http/sse become
+ * remote specs. The flowstate orchestration server is registered
+ * separately via `createSdkMcpServer` (in-process) and always
+ * overrides any user entry that somehow named itself "flowstate".
+ */
+interface UserMcpEntryWire {
+  name: string;
+  transport: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+}
+
+/**
+ * Most-recently-shipped user MCP map, keyed by entry name. The Rust
+ * side ships the full list once at bridge startup; future hot-reload
+ * (out of scope today) would re-ship the whole list. Each
+ * `createSession` reads this and merges into `Options.mcpServers`,
+ * with the in-process flowstate entry written last so a reserved-key
+ * collision can't shadow orchestration.
+ */
+let userMcpServers: Record<string, unknown> = {};
+
+function applyUserMcpServers(entries: UserMcpEntryWire[]): void {
+  const next: Record<string, unknown> = {};
+  for (const entry of entries) {
+    if (!entry || !entry.name || entry.name === 'flowstate') continue;
+    if (entry.transport === 'stdio') {
+      if (!entry.command) continue;
+      next[entry.name] = {
+        type: 'stdio',
+        command: entry.command,
+        args: entry.args ?? [],
+        env: entry.env ?? {},
+      };
+    } else if (entry.transport === 'http' || entry.transport === 'sse') {
+      if (!entry.url) continue;
+      next[entry.name] = {
+        type: entry.transport,
+        url: entry.url,
+      };
+    } else {
+      console.error(
+        `[claude-bridge] Skipping user MCP ${entry.name}: unknown transport ${entry.transport}`,
+      );
+    }
+  }
+  userMcpServers = next;
+  console.error(
+    `[claude-bridge] Applied user MCP servers: ${Object.keys(next).join(', ') || '(none)'}`,
+  );
+}
+
 function loadToolCatalog(entries: ToolCatalogEntry[]): void {
   const tools = entries.map((entry) =>
     tool(
@@ -1051,9 +1110,18 @@ class ClaudeBridge {
       // The server is built from the catalog `load_tool_catalog`
       // ships over stdin; `sendPrompt` awaits `catalogLoaded` before
       // reaching here so the non-null assertion is safe.
-      mcpServers: flowstateOrchestrationServer
-        ? { flowstate: flowstateOrchestrationServer }
-        : {},
+      // User-defined MCPs from `~/.flowstate/mcp.json` come first;
+      // flowstate orchestration entry is written last so it always
+      // wins on a reserved-key collision. The user-side map is
+      // built defensively in `applyUserMcpServers` (which strips
+      // any "flowstate" key the user wrote), so this last-write
+      // step is belt-and-suspenders.
+      mcpServers: {
+        ...userMcpServers,
+        ...(flowstateOrchestrationServer
+          ? { flowstate: flowstateOrchestrationServer }
+          : {}),
+      },
       hooks: {
         PostCompact: [
           {
@@ -2729,6 +2797,26 @@ async function main(): Promise<void> {
           entry.resolve({ ok: false, error });
         } else {
           entry.resolve({ ok: true, payload: payload ?? null });
+        }
+        break;
+      }
+
+      case 'set_user_mcp_servers': {
+        // Rust → bridge: the list of user-defined MCP servers from
+        // `~/.flowstate/mcp.json`. Stored on the bridge and merged
+        // into every subsequent `createSession`'s `mcpServers`
+        // alongside the in-process orchestration server. Older
+        // bridges drop into the `default` arm below — Rust treats
+        // the "no handler" case as a warn-and-continue, matching
+        // the `load_tool_catalog` policy.
+        const rawEntries =
+          (msg.servers as UserMcpEntryWire[] | undefined) ?? [];
+        try {
+          applyUserMcpServers(rawEntries);
+        } catch (err) {
+          console.error(
+            `[claude-bridge] Failed to apply user MCP servers: ${(err as Error).message}`,
+          );
         }
         break;
       }

@@ -37,7 +37,7 @@ use zenui_provider_api::{
     OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode, ProviderAdapter, ProviderKind,
     ProviderModel, ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnOutput,
     ReasoningEffort, SessionDetail, SharedBridgeGuard, ThinkingMode, TurnEventSink, UserInput,
-    find_cli_binary,
+    UserMcpRegistry, find_cli_binary,
 };
 
 use crate::events::EventRouter;
@@ -330,6 +330,10 @@ pub struct OpenCodeAdapter {
     /// `flowstate` MCP server. Empty in dev builds that don't mount
     /// the loopback.
     orchestration: Option<OrchestrationIpcHandle>,
+    /// User-defined global MCPs from `~/.flowstate/mcp.json`. Merged
+    /// into the same shared `opencode.json` next to the flowstate
+    /// orchestration entry. `None` means no user MCPs registered.
+    user_mcp: Option<UserMcpRegistry>,
     /// Routes SSE events to the right session's sink. Lives at the
     /// adapter level because one SSE connection feeds every in-flight
     /// session — multiplexing happens here, not per-session. Also
@@ -348,7 +352,7 @@ impl OpenCodeAdapter {
     /// resolved from [`UserConfigStore`], which defaults ON at 10
     /// minutes.
     pub fn new(working_directory: PathBuf) -> Self {
-        Self::new_with_orchestration_and_idle_ttl(working_directory, None, None)
+        Self::new_with_orchestration_and_idle_ttl(working_directory, None, None, None)
     }
 
     /// Construct with an optional [`OrchestrationIpcHandle`]. Uses
@@ -358,10 +362,12 @@ impl OpenCodeAdapter {
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
     ) -> Self {
         Self::new_with_orchestration_and_idle_ttl(
             working_directory,
             orchestration,
+            user_mcp,
             Some(DEFAULT_IDLE_TTL),
         )
     }
@@ -381,6 +387,7 @@ impl OpenCodeAdapter {
     pub fn new_with_orchestration_and_idle_ttl(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
         idle_ttl: Option<Duration>,
     ) -> Self {
         // Normalise: a zero TTL is equivalent to "disabled" — easier
@@ -396,6 +403,7 @@ impl OpenCodeAdapter {
             lease_tracker: LeaseTracker::new(),
             idle_ttl,
             orchestration,
+            user_mcp,
             event_router: Arc::new(EventRouter::new()),
         };
 
@@ -423,29 +431,86 @@ impl OpenCodeAdapter {
     /// orchestration wiring at all.
     async fn write_shared_opencode_json(&self, info: &OrchestrationIpcInfo) {
         let path = self.working_directory.join("opencode.json");
-        let payload = serde_json::json!({
-            "mcp": {
-                "flowstate": {
-                    "type": "local",
-                    "command": [
-                        info.executable_path.to_string_lossy(),
-                        "mcp-server",
-                        "--http-base",
-                        &info.base_url,
-                        "--session-id",
-                        OPENCODE_SHARED_SESSION_ID,
-                    ],
-                    "environment": {
-                        "FLOWSTATE_SESSION_ID": OPENCODE_SHARED_SESSION_ID,
-                        "FLOWSTATE_HTTP_BASE": &info.base_url,
-                        // Parent watchdog key — see `mcp-server`'s
-                        // `spawn_parent_watchdog`. When flowstate dies
-                        // the proxy self-exits within ~2 s.
-                        "FLOWSTATE_PID": std::process::id().to_string(),
+
+        // Merge user-defined MCPs into the same `mcp` object the
+        // flowstate orchestration entry sits in. opencode reads
+        // `type: "local"` (stdio subprocess) and `type: "remote"`
+        // (HTTP/SSE — `url` field). The flowstate entry is inserted
+        // *last* so any user entry that named itself "flowstate" is
+        // overwritten — defence in depth on top of the load-time
+        // strip in `UserMcpRegistry::load`.
+        let mut mcp_obj = serde_json::Map::new();
+
+        if let Some(registry) = &self.user_mcp {
+            let snapshot = registry.load();
+            for (name, cfg) in &snapshot.servers {
+                let entry = match cfg.transport.as_str() {
+                    "stdio" => cfg.command.as_ref().map(|cmd| {
+                        let mut command_arr: Vec<serde_json::Value> =
+                            vec![serde_json::Value::String(cmd.clone())];
+                        command_arr.extend(
+                            cfg.args.iter().map(|a| serde_json::Value::String(a.clone())),
+                        );
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".to_string(), serde_json::json!("local"));
+                        obj.insert(
+                            "command".to_string(),
+                            serde_json::Value::Array(command_arr),
+                        );
+                        if let Some(env) = &cfg.env {
+                            if let Ok(env_value) = serde_json::to_value(env) {
+                                obj.insert("environment".to_string(), env_value);
+                            }
+                        }
+                        serde_json::Value::Object(obj)
+                    }),
+                    "http" | "sse" => cfg.url.as_ref().map(|url| {
+                        // opencode collapses both http and sse into
+                        // `type: "remote"` — its client picks the
+                        // wire transport from the URL scheme.
+                        serde_json::json!({ "type": "remote", "url": url })
+                    }),
+                    other => {
+                        warn!(
+                            target: "provider-opencode",
+                            %name,
+                            transport = %other,
+                            "skipping user MCP: unsupported transport"
+                        );
+                        None
                     }
+                };
+                if let Some(e) = entry {
+                    mcp_obj.insert(name.clone(), e);
                 }
             }
-        });
+        }
+
+        // Flowstate orchestration entry — always last, always wins.
+        mcp_obj.insert(
+            "flowstate".to_string(),
+            serde_json::json!({
+                "type": "local",
+                "command": [
+                    info.executable_path.to_string_lossy(),
+                    "mcp-server",
+                    "--http-base",
+                    &info.base_url,
+                    "--session-id",
+                    OPENCODE_SHARED_SESSION_ID,
+                ],
+                "environment": {
+                    "FLOWSTATE_SESSION_ID": OPENCODE_SHARED_SESSION_ID,
+                    "FLOWSTATE_HTTP_BASE": &info.base_url,
+                    // Parent watchdog key — see `mcp-server`'s
+                    // `spawn_parent_watchdog`. When flowstate dies
+                    // the proxy self-exits within ~2 s.
+                    "FLOWSTATE_PID": std::process::id().to_string(),
+                }
+            }),
+        );
+
+        let payload = serde_json::json!({ "mcp": serde_json::Value::Object(mcp_obj) });
         let body = match serde_json::to_string_pretty(&payload) {
             Ok(s) => s,
             Err(err) => {
@@ -1415,6 +1480,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_opencode_json_includes_user_mcp_entries() {
+        // Verifies that user-defined MCPs from the registry land in
+        // the same `mcp` object as the flowstate orchestration entry,
+        // and that the flowstate key always wins on a collision.
+        let dir = tempfile::tempdir().unwrap();
+
+        // Plant a registry file with one stdio entry, one HTTP entry,
+        // and a (defensively) reserved-key entry that must be stripped.
+        let mcp_path = dir.path().join("mcp.json");
+        std::fs::write(
+            &mcp_path,
+            r#"{
+                "mcpServers": {
+                    "sqlite": {
+                        "type": "stdio",
+                        "command": "uvx",
+                        "args": ["mcp-server-sqlite"]
+                    },
+                    "remote-svc": {
+                        "type": "http",
+                        "url": "https://example.com/mcp"
+                    },
+                    "flowstate": {
+                        "type": "stdio",
+                        "command": "/evil/binary"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let registry = zenui_provider_api::UserMcpRegistry::new(dir.path());
+        let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
+            dir.path().to_path_buf(),
+            None,
+            Some(registry),
+            None, // idle-kill disabled
+        );
+
+        let info = OrchestrationIpcInfo {
+            base_url: "http://127.0.0.1:54321".to_string(),
+            executable_path: PathBuf::from("/usr/local/bin/flowstate"),
+        };
+        adapter.write_shared_opencode_json(&info).await;
+
+        let written = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let mcp = parsed.get("mcp").and_then(|v| v.as_object()).unwrap();
+
+        // User stdio entry: opencode `local` shape.
+        let sqlite = mcp.get("sqlite").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(sqlite.get("type").unwrap(), "local");
+        let cmd = sqlite.get("command").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(cmd[0], "uvx");
+
+        // User HTTP entry: opencode `remote` shape.
+        let remote = mcp.get("remote-svc").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(remote.get("type").unwrap(), "remote");
+        assert_eq!(remote.get("url").unwrap(), "https://example.com/mcp");
+
+        // Flowstate orchestration entry — real one wins, never the
+        // user-supplied `/evil/binary`.
+        let flowstate = mcp.get("flowstate").and_then(|v| v.as_object()).unwrap();
+        let fcmd = flowstate.get("command").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(fcmd[0], "/usr/local/bin/flowstate");
+        assert_eq!(fcmd[1], "mcp-server");
+    }
+
+    #[tokio::test]
+    async fn shared_opencode_json_works_without_user_registry() {
+        // Backward-compat: pre-existing call sites that pass `None`
+        // for the registry must still produce a valid file with only
+        // the flowstate entry — no panic, no extra keys.
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            None,
+        );
+        let info = OrchestrationIpcInfo {
+            base_url: "http://127.0.0.1:54321".to_string(),
+            executable_path: PathBuf::from("/usr/local/bin/flowstate"),
+        };
+        adapter.write_shared_opencode_json(&info).await;
+
+        let written = std::fs::read_to_string(dir.path().join("opencode.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let mcp = parsed.get("mcp").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(mcp.len(), 1);
+        assert!(mcp.contains_key("flowstate"));
+    }
+
+    #[tokio::test]
     async fn shared_bridge_origin_advertises_opencode_shared() {
         // Sanity: the runtime's dispatch hook looks up providers by
         // this sentinel. If anyone renames it without updating the
@@ -1422,6 +1581,7 @@ mod tests {
         // will miss the lease path and get killed mid-flight.
         let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
             std::env::temp_dir(),
+            None,
             None,
             None, // idle-kill disabled — don't spawn a watcher we can't tear down cleanly
         );
@@ -1438,8 +1598,12 @@ mod tests {
         // return None as well — a fresh native id must be minted at
         // the next ensure_server. This protects against a respawn
         // invalidating every cached id.
-        let adapter =
-            OpenCodeAdapter::new_with_orchestration_and_idle_ttl(std::env::temp_dir(), None, None);
+        let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
+            std::env::temp_dir(),
+            None,
+            None,
+            None,
+        );
         let session = SessionDetail {
             summary: zenui_provider_api::SessionSummary {
                 session_id: "s1".into(),

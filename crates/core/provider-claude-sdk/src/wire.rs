@@ -233,6 +233,37 @@ pub(crate) enum BridgeRequest {
     /// (`shouldQuery` field on `SDKUserMessage`).
     #[serde(rename = "append_user_message")]
     AppendUserMessage { text: String },
+    /// Rust → bridge: the user-defined MCP server list from
+    /// `~/.flowstate/mcp.json`. The bridge stashes the array and
+    /// merges each entry into every subsequent `createSession`'s
+    /// `SessionConfig.mcpServers` map, alongside the in-process
+    /// flowstate orchestration entry. Sent right after the
+    /// `LoadToolCatalog` handshake so the very first session sees
+    /// the user MCPs. The flowstate key is reserved — the Rust
+    /// side guarantees no entry with that name is shipped, and the
+    /// bridge defends in depth by always writing the orchestration
+    /// entry last.
+    #[serde(rename = "set_user_mcp_servers")]
+    SetUserMcpServers { servers: Vec<UserMcpEntry> },
+}
+
+/// Wire-shape user MCP entry shipped to the bridge. Fields mirror
+/// [`zenui_provider_api::McpServerConfig`] but flatten the
+/// transport-specific union — `command`/`args`/`env` populated for
+/// stdio, `url` populated for http/sse. The bridge picks the
+/// transport branch based on `transport`.
+#[derive(Debug, Serialize)]
+pub(crate) struct UserMcpEntry {
+    pub(crate) name: String,
+    pub(crate) transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

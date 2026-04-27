@@ -23,11 +23,11 @@ use tokio::process::{ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{debug, info, warn};
 use zenui_provider_api::{
-    CommandCatalog, CommandKind, McpServerInfo, PermissionDecision, PermissionMode,
-    ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
+    CommandCatalog, CommandKind, McpServerInfo, OrchestrationIpcHandle, PermissionDecision,
+    PermissionMode, ProviderAdapter, ProviderAgent, ProviderCommand, ProviderKind, ProviderModel,
     ProviderSessionState, ProviderStatus, ProviderStatusLevel, ProviderTurnEvent,
     ProviderTurnOutput, ReasoningEffort, SessionDetail, ThinkingMode, TurnEventSink, UserInput,
-    session_cwd, skills_disk,
+    UserMcpRegistry, session_cwd, skills_disk,
 };
 
 use crate::process::{
@@ -38,12 +38,30 @@ use crate::rpc::{BridgeRpcKind, BridgeRpcResponse};
 use crate::stream::forward_stream;
 use crate::wire::{
     BridgeAgent, BridgeCommand, BridgeImageAttachment, BridgeMcpServer, BridgeRequest,
-    BridgeResponse, QuestionOutcome, parse_claude_questions, parse_compact_trigger, parse_decision,
-    permission_decision_to_str, permission_mode_to_str,
+    BridgeResponse, QuestionOutcome, UserMcpEntry, parse_claude_questions, parse_compact_trigger,
+    parse_decision, permission_decision_to_str, permission_mode_to_str,
 };
 
 pub struct ClaudeSdkAdapter {
     working_directory: PathBuf,
+    /// Optional orchestration IPC handle. The Claude SDK registers
+    /// flowstate's orchestration tools in-process via
+    /// `createSdkMcpServer` (driven by the `LoadToolCatalog`
+    /// handshake), so this adapter doesn't need the IPC info to wire
+    /// orchestration. The field is kept for symmetry with the other
+    /// adapters and as a future hook in case we ever expose the
+    /// HTTP base to the bridge for non-tool reasons. Always `None`
+    /// in current builds — accepted for forward compatibility.
+    #[allow(dead_code)]
+    orchestration: Option<OrchestrationIpcHandle>,
+    /// User-defined global MCPs from `~/.flowstate/mcp.json`.
+    /// Loaded on every `spawn_bridge` and shipped to the TS bridge
+    /// via the `set_user_mcp_servers` message; the bridge merges
+    /// each entry into every subsequent session's
+    /// `SessionConfig.mcpServers` map alongside the in-process
+    /// orchestration entry. `None` means "no user MCPs" (legacy /
+    /// tests).
+    user_mcp: Option<UserMcpRegistry>,
     /// Monotonic counter for mid-turn RPC request IDs. A process-local
     /// counter is sufficient because request_id correlation happens
     /// entirely within this adapter instance (the bridge echoes it
@@ -74,8 +92,21 @@ type PendingRpcsMap = Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcRespons
 
 impl ClaudeSdkAdapter {
     pub fn new(working_directory: PathBuf) -> Self {
+        Self::new_with_orchestration(working_directory, None, None)
+    }
+
+    /// Construct with an optional orchestration handle (kept for API
+    /// symmetry — see field doc) and a user MCP registry. Both
+    /// `None` is the legacy in-process-only configuration.
+    pub fn new_with_orchestration(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
+    ) -> Self {
         Self {
             working_directory,
+            orchestration,
+            user_mcp,
             rpc_counter: Arc::new(AtomicU64::new(0)),
             sessions: Arc::new(zenui_provider_api::ProcessCache::new(
                 BRIDGE_IDLE_TIMEOUT_SECS,
@@ -360,6 +391,35 @@ impl ClaudeSdkAdapter {
             // tool-registration error on the first `spawn*` call from
             // the model, which is loud enough to debug.
             warn!(%err, "failed to ship tool catalog to Claude SDK bridge");
+        }
+
+        // Ship the user-defined MCP server list right after the
+        // catalog. The bridge stashes it and merges into every
+        // future `createSession`'s `SessionConfig.mcpServers` —
+        // alongside the in-process orchestration entry. Skipped
+        // when no registry is wired or when the snapshot is empty,
+        // both to avoid a noisy no-op and to keep older bridges
+        // (no `set_user_mcp_servers` handler) compatible.
+        if let Some(registry) = &self.user_mcp {
+            let snapshot = registry.load();
+            if !snapshot.is_empty() {
+                let entries: Vec<UserMcpEntry> = snapshot
+                    .servers
+                    .into_iter()
+                    .map(|(name, cfg)| UserMcpEntry {
+                        name,
+                        transport: cfg.transport,
+                        command: cfg.command,
+                        args: cfg.args,
+                        env: cfg.env,
+                        url: cfg.url,
+                    })
+                    .collect();
+                let req = BridgeRequest::SetUserMcpServers { servers: entries };
+                if let Err(err) = write_request(&process.stdin, &req).await {
+                    warn!(%err, "failed to ship user MCP catalog to Claude SDK bridge");
+                }
+            }
         }
 
         Ok(process)

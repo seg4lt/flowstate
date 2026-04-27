@@ -2028,6 +2028,60 @@ async fn set_user_config(
 }
 
 // ─────────────────────────────────────────────────────────────────
+// user MCP — global MCP-server list at ~/.flowstate/mcp.json
+// ─────────────────────────────────────────────────────────────────
+//
+// File is canonical: every provider adapter loads it on session
+// spawn, the UI reads/writes through these two commands. No SQLite
+// mirror — would create a second source of truth. New sessions pick
+// up changes immediately; running sessions keep their config.
+
+/// Read `~/.flowstate/mcp.json` and return the parsed
+/// [`zenui_provider_api::McpConfigFile`] envelope. Missing or
+/// invalid file → empty `{mcpServers: {}}` (matches what each
+/// adapter sees on a malformed config). The reserved `flowstate`
+/// key is stripped at load time and never returned to the UI.
+#[tauri::command]
+async fn get_user_mcp_servers(
+    registry: State<'_, zenui_provider_api::UserMcpRegistry>,
+) -> Result<zenui_provider_api::McpConfigFile, String> {
+    let snapshot = registry.load();
+    Ok(zenui_provider_api::McpConfigFile {
+        mcp_servers: snapshot.servers,
+    })
+}
+
+/// Atomically replace the contents of `~/.flowstate/mcp.json` with
+/// the supplied server map. Each entry is validated with
+/// [`zenui_provider_api::validate_mcp_server_config`] before any
+/// write happens — invalid input rejects the whole update so the
+/// file never lands in a broken state. The reserved `"flowstate"`
+/// key is silently dropped if present (orchestration owns it).
+///
+/// Returns the written contents on success so the UI can re-render
+/// from the canonical source.
+#[tauri::command]
+async fn set_user_mcp_servers(
+    registry: State<'_, zenui_provider_api::UserMcpRegistry>,
+    servers: std::collections::BTreeMap<String, zenui_provider_api::McpServerConfig>,
+) -> Result<zenui_provider_api::McpConfigFile, String> {
+    let mut clean = std::collections::BTreeMap::new();
+    for (name, cfg) in servers {
+        if name == zenui_provider_api::RESERVED_FLOWSTATE_KEY {
+            continue;
+        }
+        zenui_provider_api::validate_mcp_server_config(&name, &cfg)?;
+        clean.insert(name, cfg);
+    }
+    let cfg = zenui_provider_api::McpConfigFile {
+        mcp_servers: clean,
+    };
+    zenui_provider_api::write_mcp_config_file(registry.path(), &cfg)
+        .map_err(|e| format!("write mcp.json: {e}"))?;
+    Ok(cfg)
+}
+
+// ─────────────────────────────────────────────────────────────────
 // macOS caffeinate — display-sleep prevention while turns are running
 // ─────────────────────────────────────────────────────────────────
 //
@@ -2778,6 +2832,20 @@ pub fn run() {
             let user_config_for_caffeinate = user_config_store.clone();
             app.manage(user_config_store);
 
+            // User-defined global MCP servers (`~/.flowstate/mcp.json`).
+            // Cheap to clone (just a path); each adapter calls
+            // `load()` on the registry inside its own spawn path so
+            // file edits are picked up by new sessions without a
+            // daemon restart. Exposed to the Settings UI via
+            // `get_user_mcp_servers` / `set_user_mcp_servers` Tauri
+            // commands. Created here (outside the async spawn)
+            // because `app.manage` requires `&mut App`, which isn't
+            // `Send`.
+            let user_mcp_registry =
+                zenui_provider_api::UserMcpRegistry::new(&flowstate_root);
+            let user_mcp_for_adapters = user_mcp_registry.clone();
+            app.manage(user_mcp_registry);
+
             // Open the usage analytics store — a *third* sqlite file
             // at <app_data_dir>/usage.sqlite that backs the in-app
             // Usage dashboard. Kept separate from user_config so
@@ -3010,24 +3078,40 @@ pub fn run() {
                     ctrl
                 };
 
+                // User MCP registry: constructed outside the spawn
+                // (see `let user_mcp_registry = ...` above) and moved
+                // in here for adapter construction. Each adapter takes
+                // a clone; on session spawn it calls
+                // `registry.load()` to read fresh `~/.flowstate/mcp.json`
+                // and merges entries into its provider-native MCP
+                // injection path.
+                let user_mcp_registry = user_mcp_for_adapters;
+
                 config.adapters = vec![
-                    Arc::new(ClaudeSdkAdapter::new(flowstate_root.clone()))
-                        as Arc<dyn ProviderAdapter>,
+                    Arc::new(ClaudeSdkAdapter::new_with_orchestration(
+                        flowstate_root.clone(),
+                        Some(ipc_handle.clone()),
+                        Some(user_mcp_registry.clone()),
+                    )) as Arc<dyn ProviderAdapter>,
                     Arc::new(ClaudeCliAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
+                        Some(user_mcp_registry.clone()),
                     )),
                     Arc::new(CodexAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
+                        Some(user_mcp_registry.clone()),
                     )),
                     Arc::new(GitHubCopilotAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
+                        Some(user_mcp_registry.clone()),
                     )),
                     Arc::new(GitHubCopilotCliAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
+                        Some(user_mcp_registry.clone()),
                     )),
                     // Opencode runs as a shared-server singleton for
                     // startup-latency reasons (one `opencode serve`
@@ -3048,6 +3132,7 @@ pub fn run() {
                     Arc::new(OpenCodeAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
+                        Some(user_mcp_registry.clone()),
                     )),
                 ];
 
@@ -3394,6 +3479,8 @@ pub fn run() {
                         set_window_always_on_top,
                         get_user_config,
                         set_user_config,
+                        get_user_mcp_servers,
+                        set_user_mcp_servers,
                         set_session_display,
                         get_session_display,
                         list_session_display,
