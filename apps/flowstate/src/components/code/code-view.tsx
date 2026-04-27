@@ -819,8 +819,10 @@ export function CodeView(props: CodeViewProps) {
   );
 
   // Cmd/Ctrl+P focuses the picker in `files` mode; Cmd/Ctrl+Shift+F
-  // focuses it in `content` mode; Cmd/Ctrl+B toggles the file tree
-  // collapse. Mirrors VS Code muscle memory across all three.
+  // focuses it in `content` mode; Cmd/Ctrl+Shift+B toggles the file
+  // tree collapse. Bare Cmd/Ctrl+B is left to the app sidebar (chat
+  // list show/hide) so it keeps working while the code view has
+  // focus — Shift is the disambiguator.
   React.useEffect(() => {
     function isInTextInput(target: EventTarget | null): boolean {
       if (!(target instanceof HTMLElement)) return false;
@@ -849,23 +851,15 @@ export function CodeView(props: CodeViewProps) {
         inputRef.current?.select();
         return;
       }
-      if (!e.shiftKey && key === "b") {
-        // Skip when typing in a real text input so the shortcut
-        // doesn't clobber things like Cmd+B-as-bold in textareas.
-        if (isInTextInput(e.target)) return;
-        e.preventDefault();
-        toggleTreeCollapsed();
-        return;
-      }
       if (e.shiftKey && key === "b") {
-        // Cmd/Ctrl+Shift+B — same toggle as Cmd+B but fires
-        // unconditionally, including from inside the editor's
-        // contenteditable (where the bare Cmd+B is suppressed to
-        // preserve `bold` semantics in real text inputs). The
-        // listener only exists while CodeView is mounted, so this
-        // is a no-op when no editor / code view is open. The app
-        // sidebar's own Cmd+B handler explicitly excludes Shift, so
-        // there's no conflict between this and the sidebar toggle.
+        // Cmd/Ctrl+Shift+B — toggle the code view's file tree.
+        // Bare Cmd/Ctrl+B is intentionally NOT bound here: that
+        // shortcut belongs to the app sidebar (chat list show/hide)
+        // and the user wants it to keep working while focused on the
+        // code view. Shift is the disambiguator. Fires unconditionally
+        // — including from inside the editor's contenteditable — since
+        // the listener only exists while CodeView is mounted, so this
+        // is a no-op everywhere else.
         e.preventDefault();
         toggleTreeCollapsed();
         return;
@@ -1299,7 +1293,7 @@ export function CodeView(props: CodeViewProps) {
               variant="ghost"
               size="icon-xs"
               onClick={toggleTreeCollapsed}
-              title="Show file tree (Cmd/Ctrl+B)"
+              title="Show file tree (Cmd/Ctrl+Shift+B)"
               aria-label="Show file tree"
             >
               <PanelRight className="h-3 w-3" />
@@ -1325,7 +1319,7 @@ export function CodeView(props: CodeViewProps) {
                   variant="ghost"
                   size="icon-xs"
                   onClick={toggleTreeCollapsed}
-                  title="Hide file tree (Cmd/Ctrl+B)"
+                  title="Hide file tree (Cmd/Ctrl+Shift+B)"
                   aria-label="Hide file tree"
                 >
                   <PanelRightClose className="h-3 w-3" />
