@@ -35,7 +35,11 @@ import {
   type ContentSearchOptions,
 } from "@/lib/api";
 import { projectFilesQueryOptions } from "@/lib/queries";
-import { matchesAnyPattern, parsePatterns, splitGlobList } from "@/lib/glob";
+import {
+  matchesPickerQuery,
+  parsePickerQuery,
+  splitGlobList,
+} from "@/lib/glob";
 import { useTheme } from "@/hooks/use-theme";
 import { useEditorPrefs } from "@/hooks/use-editor-prefs";
 import { toast } from "@/hooks/use-toast";
@@ -479,15 +483,23 @@ export function CodeView(props: CodeViewProps) {
   // ─── filename filter (client-side, instant) ─────────────────
   // Glob + comma-list aware. Plain queries fall back to substring
   // matching so users don't have to remember `**/foo*` for the
-  // common "type half a name" case. See lib/glob.ts.
+  // common "type half a name" case. A SPACE in any comma-chunk
+  // splits it into a folder filter and a filename filter — Zed/
+  // IntelliJ-style scoped search. Examples:
+  //   "tabs"              substring match anywhere in the path
+  //   "src tabs.ts"       basename "tabs.ts" inside a path with "src"
+  //   "lib/api git.ts"    basename "git.ts" inside paths with "lib/api"
+  //   "**/code *.tsx"     basename matching "*.tsx" inside any "code" dir
+  // See lib/glob.ts for the parser.
   const filteredFiles = React.useMemo(() => {
     if (searchMode !== "files") return [];
     const trimmed = query.trim();
     if (!trimmed) return files.slice(0, PICKER_RESULT_LIMIT);
-    const patterns = parsePatterns(trimmed);
-    if (patterns.length === 0) return files.slice(0, PICKER_RESULT_LIMIT);
+    const parsed = parsePickerQuery(trimmed);
+    if (parsed.alternatives.length === 0)
+      return files.slice(0, PICKER_RESULT_LIMIT);
     return files
-      .filter((f) => matchesAnyPattern(f, patterns))
+      .filter((f) => matchesPickerQuery(f, parsed))
       .slice(0, PICKER_RESULT_LIMIT);
   }, [files, query, searchMode]);
 
@@ -1036,7 +1048,7 @@ export function CodeView(props: CodeViewProps) {
                 !projectPath
                   ? "No project for this session"
                   : searchMode === "files"
-                    ? "Search files…  (Cmd/Ctrl+P)"
+                    ? "Search files…  e.g. tabs.ts  ·  src tabs.ts"
                     : "Search file contents…  (Cmd/Ctrl+Shift+F)"
               }
               disabled={!projectPath}
