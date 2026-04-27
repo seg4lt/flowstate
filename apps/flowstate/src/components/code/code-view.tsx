@@ -37,6 +37,7 @@ import { useEditorPrefs } from "@/hooks/use-editor-prefs";
 import { toast } from "@/hooks/use-toast";
 import { hashContent } from "@/lib/content-hash";
 import { FileTree } from "./file-tree";
+import { ChangedFilesList } from "./changed-files-list";
 import { Multibuffer } from "./multibuffer";
 import { TabBar } from "./tab-bar";
 import { EditorPanes } from "./editor-panes";
@@ -285,10 +286,17 @@ export function CodeView(props: CodeViewProps) {
   // open clears the override.
   const [multibufferOverride, setMultibufferOverride] = React.useState(false);
 
-  // Editor preferences (vim mode, soft-wrap). Backed by localStorage
-  // and shared across panes via a module-singleton store, so toggling
-  // vim flips both panes' editors at once.
-  const { vimEnabled, setVimEnabled, softWrap } = useEditorPrefs();
+  // Editor preferences (vim mode, soft-wrap, git mode). Backed by
+  // localStorage and shared across panes via a module-singleton
+  // store, so toggling any of these flips both panes' editors at
+  // once.
+  const {
+    vimEnabled,
+    setVimEnabled,
+    softWrap,
+    gitModeEnabled,
+    setGitModeEnabled,
+  } = useEditorPrefs();
 
   // Confirm-close-with-unsaved-changes dialog state. This only
   // appears in the rare case where auto-save-on-blur has FAILED
@@ -667,6 +675,17 @@ export function CodeView(props: CodeViewProps) {
         toggleTreeCollapsed();
         return;
       }
+      if (e.shiftKey && key === "g") {
+        // Cmd/Ctrl+Shift+G — flip git mode (changed-files panel +
+        // editor diff markers). Skip when typing in a real text
+        // input so it doesn't clobber the user's keystroke. Note
+        // CM6 also binds Cmd+G (no shift) to gotoLine — that's
+        // not us; this branch is only the shift variant.
+        if (isInTextInput(e.target)) return;
+        e.preventDefault();
+        setGitModeEnabled(!gitModeEnabled);
+        return;
+      }
       // Tab-bar shortcuts — all guarded by "not typing in an input"
       // so regular form editing keeps working.
       if (isInTextInput(e.target)) return;
@@ -708,7 +727,7 @@ export function CodeView(props: CodeViewProps) {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [toggleTreeCollapsed, tabs]);
+  }, [toggleTreeCollapsed, tabs, gitModeEnabled, setGitModeEnabled]);
 
   function openFromPickerIndex(index: number) {
     // Files mode only — content mode uses the multibuffer, where
@@ -790,6 +809,21 @@ export function CodeView(props: CodeViewProps) {
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
           <Button
+            variant={gitModeEnabled ? "secondary" : "ghost"}
+            size="xs"
+            onClick={() => setGitModeEnabled(!gitModeEnabled)}
+            title={
+              gitModeEnabled
+                ? "Git mode is ON — showing changed files only and diff markers (Cmd/Ctrl+Shift+G)"
+                : "Git mode is OFF — click or press Cmd/Ctrl+Shift+G to enable"
+            }
+            aria-pressed={gitModeEnabled}
+          >
+            <span className="font-mono text-[10px] uppercase tracking-wide">
+              git {gitModeEnabled ? "on" : "off"}
+            </span>
+          </Button>
+          <Button
             variant={vimEnabled ? "secondary" : "ghost"}
             size="xs"
             onClick={() => setVimEnabled(!vimEnabled)}
@@ -841,11 +875,11 @@ export function CodeView(props: CodeViewProps) {
                 >
                   <PanelLeftClose className="h-3 w-3" />
                 </Button>
-                <span>Files</span>
-                {filesLoading && <span>· indexing…</span>}
+                <span>{gitModeEnabled ? "Changed" : "Files"}</span>
+                {!gitModeEnabled && filesLoading && <span>· indexing…</span>}
               </div>
               <div className="min-h-0 flex-1 overflow-auto">
-                {filesError ? (
+                {filesError && !gitModeEnabled ? (
                   <div className="px-3 py-3 text-[11px] text-destructive">
                     {filesError}
                   </div>
@@ -853,6 +887,16 @@ export function CodeView(props: CodeViewProps) {
                   <div className="px-3 py-3 text-[11px] text-muted-foreground">
                     No project for this session.
                   </div>
+                ) : gitModeEnabled ? (
+                  <ChangedFilesList
+                    projectPath={projectPath ?? null}
+                    selectedPath={focusedPane.activePath}
+                    onSelect={(p) => {
+                      tabs.openFile(p);
+                      setMultibufferOverride(false);
+                      setQuery("");
+                    }}
+                  />
                 ) : (
                   <FileTree
                     projectPath={projectPath ?? null}
@@ -996,6 +1040,7 @@ export function CodeView(props: CodeViewProps) {
                     fileErrors={fileErrors}
                     filesError={filesError}
                     hasProject={projectPath !== null}
+                    projectPath={projectPath}
                     onActivate={(p) => {
                       tabs.activateTab(p, 0);
                       setMultibufferOverride(false);
@@ -1010,6 +1055,7 @@ export function CodeView(props: CodeViewProps) {
                     sessionId={sessionId ?? null}
                     vimEnabled={vimEnabled}
                     softWrap={softWrap}
+                    gitModeEnabled={gitModeEnabled}
                     onSaveFile={handleSaveFile}
                     onDirtyChangeFile={handleDirtyChange}
                   />
@@ -1026,6 +1072,7 @@ export function CodeView(props: CodeViewProps) {
                       fileErrors={fileErrors}
                       filesError={filesError}
                       hasProject={projectPath !== null}
+                      projectPath={projectPath}
                       onActivate={(p) => {
                         tabs.activateTab(p, 1);
                         setMultibufferOverride(false);
@@ -1038,6 +1085,7 @@ export function CodeView(props: CodeViewProps) {
                       sessionId={sessionId ?? null}
                       vimEnabled={vimEnabled}
                       softWrap={softWrap}
+                      gitModeEnabled={gitModeEnabled}
                       onSaveFile={handleSaveFile}
                       onDirtyChangeFile={handleDirtyChange}
                     />
@@ -1332,6 +1380,9 @@ interface TabPaneViewProps {
   fileErrors: Map<string, string>;
   filesError: string | null;
   hasProject: boolean;
+  /** Project root, threaded through so the editor can call
+   *  `getGitDiffFile(projectPath, path)` when git mode is on. */
+  projectPath: string | null;
   onActivate: (path: string) => void;
   onClose: (path: string) => void;
   onFocus: () => void;
@@ -1344,6 +1395,7 @@ interface TabPaneViewProps {
   /** Editor preferences forwarded into the CodeMirror instance. */
   vimEnabled: boolean;
   softWrap: boolean;
+  gitModeEnabled: boolean;
   /** Save handler — bubbles all the way up to CodeView's
    *  `handleSaveFile` which writes the file via Tauri and updates
    *  the file cache + tab dirty bit. */
@@ -1362,6 +1414,7 @@ function TabPaneView({
   fileErrors,
   filesError,
   hasProject,
+  projectPath,
   onActivate,
   onClose,
   onFocus,
@@ -1371,6 +1424,7 @@ function TabPaneView({
   sessionId,
   vimEnabled,
   softWrap,
+  gitModeEnabled,
   onSaveFile,
   onDirtyChangeFile,
 }: TabPaneViewProps) {
@@ -1422,9 +1476,11 @@ function TabPaneView({
           error={error}
           filesError={filesError}
           hasProject={hasProject}
+          projectPath={projectPath}
           sessionId={sessionId}
           vimEnabled={vimEnabled}
           softWrap={softWrap}
+          gitModeEnabled={gitModeEnabled}
           onSave={handleSave}
           onDirtyChange={handleDirty}
         />
@@ -1440,11 +1496,15 @@ interface CodeViewBodyProps {
   error: string | null;
   filesError: string | null;
   hasProject: boolean;
+  /** Project root, threaded through so the editor can resolve git
+   *  diff content via `getGitDiffFile(projectPath, path)`. */
+  projectPath: string | null;
   /** Forwarded to DiffCommentOverlay — hover "+" only works when we
    *  have a chat session to attach comments to. */
   sessionId: string | null;
   vimEnabled: boolean;
   softWrap: boolean;
+  gitModeEnabled: boolean;
   onSave: (contents: string) => Promise<void>;
   onDirtyChange: (dirty: boolean) => void;
 }
@@ -1456,9 +1516,11 @@ const CodeViewBody = React.memo(function CodeViewBody({
   error,
   filesError,
   hasProject,
+  projectPath,
   sessionId,
   vimEnabled,
   softWrap,
+  gitModeEnabled,
   onSave,
   onDirtyChange,
 }: CodeViewBodyProps) {
@@ -1550,6 +1612,8 @@ const CodeViewBody = React.memo(function CodeViewBody({
             theme={resolvedTheme}
             vimEnabled={vimEnabled}
             softWrap={softWrap}
+            gitModeEnabled={gitModeEnabled}
+            projectPath={projectPath}
             onSave={onSave}
             onDirtyChange={onDirtyChange}
           />
