@@ -92,6 +92,40 @@ pub struct InProcessCore {
     pub lifecycle: Arc<DaemonLifecycle>,
 }
 
+/// Fan-out observer that broadcasts `on_turn_start` / `on_turn_end`
+/// to a fixed list of `TurnLifecycleObserver`s in registration order.
+///
+/// `RuntimeCore` accepts a single observer at construction time, but
+/// host apps occasionally need more than one — e.g. the daemon's own
+/// `DaemonLifecycle` (in-flight counter, idle watchdog) AND a
+/// host-app observer such as the flowstate macOS caffeinate
+/// controller (display-sleep prevention). `bootstrap_core_async`
+/// composes them through this helper when
+/// `DaemonConfig::extra_turn_observers` is non-empty so the standard
+/// single-observer fast path stays allocation-free.
+struct MultiTurnObserver {
+    observers: Vec<Arc<dyn TurnLifecycleObserver>>,
+}
+
+impl MultiTurnObserver {
+    fn new(observers: Vec<Arc<dyn TurnLifecycleObserver>>) -> Self {
+        Self { observers }
+    }
+}
+
+impl TurnLifecycleObserver for MultiTurnObserver {
+    fn on_turn_start(&self, session_id: &str) {
+        for obs in &self.observers {
+            obs.on_turn_start(session_id);
+        }
+    }
+    fn on_turn_end(&self, session_id: &str) {
+        for obs in &self.observers {
+            obs.on_turn_end(session_id);
+        }
+    }
+}
+
 /// Sync, runtime-owning bootstrap.
 ///
 /// # When to use this
@@ -194,7 +228,24 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
         .join("threads")
         .to_string_lossy()
         .into_owned();
-    let turn_observer: Arc<dyn TurnLifecycleObserver> = lifecycle.clone();
+    // The daemon-internal `DaemonLifecycle` is always the primary
+    // `TurnLifecycleObserver`. Host apps can register additional
+    // observers via `DaemonConfig::extra_turn_observers` (e.g. the
+    // flowstate Tauri shell wires a macOS caffeinate controller
+    // there) — when any are present we wrap everyone in a
+    // `MultiTurnObserver` that fans `on_turn_start` / `on_turn_end`
+    // to each in registration order. `DaemonLifecycle` always comes
+    // first so its in-flight counter is updated before any
+    // downstream observer that might query it.
+    let turn_observer: Arc<dyn TurnLifecycleObserver> = if config.extra_turn_observers.is_empty() {
+        lifecycle.clone()
+    } else {
+        let mut observers: Vec<Arc<dyn TurnLifecycleObserver>> =
+            Vec::with_capacity(1 + config.extra_turn_observers.len());
+        observers.push(lifecycle.clone());
+        observers.extend(config.extra_turn_observers.iter().cloned());
+        Arc::new(MultiTurnObserver::new(observers))
+    };
 
     // Checkpoint store — on-disk content-addressed snapshot backing
     // the `RewindFiles` / per-turn revert feature. Lives next to the

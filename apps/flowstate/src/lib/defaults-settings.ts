@@ -20,6 +20,7 @@ const CONFIG_KEY_MODEL_PREFIX = "defaults.model.";
 const CONFIG_KEY_PROVIDER_ENABLED_PREFIX = "provider.enabled.";
 const CONFIG_KEY_DEFAULT_PROVIDER = "defaults.provider";
 const CONFIG_KEY_STRICT_PLAN_MODE = "defaults.strict_plan_mode";
+const CONFIG_KEY_CAFFEINATE = "system.caffeinate";
 
 // --- Provider-enabled defaults ---
 
@@ -208,6 +209,37 @@ export async function readStrictPlanMode(): Promise<boolean> {
 export async function writeStrictPlanMode(enabled: boolean): Promise<void> {
   try {
     await setUserConfig(CONFIG_KEY_STRICT_PLAN_MODE, String(enabled));
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+// --- Caffeinate (macOS only) ---
+
+/**
+ * When `true` on macOS, the Tauri shell's `CaffeinateController`
+ * spawns `caffeinate -d -t <safety>` while any agent turn is in
+ * flight, preventing the display from sleeping (and the user from
+ * being auto-logged out) during long turns. The actual spawn
+ * coordination lives in Rust — this toggle just records intent.
+ *
+ * No-op on non-macOS: the controller is gated `#[cfg(target_os =
+ * "macos")]` and the `caffeinate_*` Tauri commands aren't
+ * registered, so the settings UI hides this row entirely on other
+ * platforms.
+ */
+export async function readCaffeinate(): Promise<boolean> {
+  try {
+    const raw = await getUserConfig(CONFIG_KEY_CAFFEINATE);
+    return raw === "true";
+  } catch {
+    return false;
+  }
+}
+
+export async function writeCaffeinate(enabled: boolean): Promise<void> {
+  try {
+    await setUserConfig(CONFIG_KEY_CAFFEINATE, String(enabled));
   } catch {
     /* storage may be unavailable */
   }

@@ -19,6 +19,8 @@
 //! version is that the future daemon bin needs this state without
 //! pulling Tauri.
 
+#[cfg(target_os = "macos")]
+pub mod caffeinate;
 pub mod git_worktree;
 pub mod http;
 pub mod orchestration_adapters;

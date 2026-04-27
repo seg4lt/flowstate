@@ -20,8 +20,12 @@ import {
   clearRuntimeCache,
   getAppDataDir,
   getCacheDir,
+  getCaffeinateStatus,
   getLogDir,
+  killCaffeinate,
+  refreshCaffeinate,
   retryProvisionPhase,
+  type CaffeinateStatus,
 } from "@/lib/api";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -55,6 +59,8 @@ import {
   writeDefaultProvider,
   readStrictPlanMode,
   writeStrictPlanMode,
+  readCaffeinate,
+  writeCaffeinate,
   DEFAULT_PROVIDER,
 } from "@/lib/defaults-settings";
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
@@ -341,6 +347,141 @@ function StrictPlanModeRow() {
         checked={enabled}
         onCheckedChange={handleChange}
         aria-label="Strict plan mode"
+      />
+    </div>
+  );
+}
+
+/**
+ * Probe whether the macOS caffeinate Tauri command is registered.
+ * The command is only registered when `cfg!(target_os = "macos")`,
+ * so an `invoke` failure here is the cleanest cross-platform signal
+ * — no extra `@tauri-apps/plugin-os` dep needed. Resolves to `true`
+ * once the probe succeeds, `false` once it fails, `null` while
+ * still in flight.
+ */
+function useCaffeinateSupport(): boolean | null {
+  const [supported, setSupported] = React.useState<boolean | null>(null);
+  React.useEffect(() => {
+    let cancelled = false;
+    getCaffeinateStatus()
+      .then(() => {
+        if (!cancelled) setSupported(true);
+      })
+      .catch(() => {
+        if (!cancelled) setSupported(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return supported;
+}
+
+function CaffeinateRow() {
+  const [enabled, setEnabled] = React.useState(false);
+  const [status, setStatus] = React.useState<CaffeinateStatus | null>(null);
+  const [killing, setKilling] = React.useState(false);
+
+  // Initial load: read the persisted toggle from user_config.
+  React.useEffect(() => {
+    let cancelled = false;
+    readCaffeinate().then((saved) => {
+      if (!cancelled) setEnabled(saved);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Status polling. Two seconds is fast enough to catch the
+  // "caffeinate just respawned after timeout" transition without
+  // making a meaningful CPU dent. The poll is paused while the tab
+  // is hidden — `setInterval` keeps firing but each invoke that
+  // fails (e.g. webview hidden) just keeps the previous status.
+  React.useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const s = await getCaffeinateStatus();
+        if (!cancelled) setStatus(s);
+      } catch {
+        /* command may not be available; useCaffeinateSupport handles that */
+      }
+    };
+    void refresh();
+    const id = window.setInterval(() => void refresh(), 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  async function handleToggle(next: boolean) {
+    setEnabled(next);
+    await writeCaffeinate(next);
+    // Tell the controller to act on the new value immediately
+    // rather than wait for the next turn boundary.
+    try {
+      await refreshCaffeinate();
+    } catch {
+      /* non-macOS — shouldn't happen since the row is gated, but ignore */
+    }
+    try {
+      setStatus(await getCaffeinateStatus());
+    } catch {
+      /* leave previous status */
+    }
+  }
+
+  async function handleKill() {
+    if (killing) return;
+    setKilling(true);
+    try {
+      await killCaffeinate();
+      setStatus(await getCaffeinateStatus());
+    } catch (err) {
+      toast({
+        description: `Force-kill failed: ${String(err)}`,
+        duration: 3000,
+      });
+    } finally {
+      setKilling(false);
+    }
+  }
+
+  const running = !!status?.running;
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Prevent display sleep</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Run <code className="font-mono text-[11px]">caffeinate -d</code>{" "}
+          while a request is in flight, so your display stays on (and you
+          aren't auto-logged out) during long agent turns. Re-spawned
+          automatically on a timer for crash safety.
+          {running && (
+            <span className="ml-1 text-emerald-600 dark:text-emerald-400">
+              Active{status?.pid ? ` (PID ${status.pid})` : ""}.
+            </span>
+          )}
+        </div>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => void handleKill()}
+        disabled={!running || killing}
+        aria-label="Force kill caffeinate"
+      >
+        {killing ? <Loader2 className="animate-spin" /> : null}
+        Force kill
+      </Button>
+      <Switch
+        checked={enabled}
+        onCheckedChange={(v) => void handleToggle(v)}
+        aria-label="Prevent display sleep while a request is in flight"
       />
     </div>
   );
@@ -1221,6 +1362,10 @@ export function SettingsView() {
   const [refreshingKind, setRefreshingKind] = React.useState<ProviderKind | null>(
     null,
   );
+  // macOS-only: probe whether the caffeinate Tauri commands are
+  // registered. Hides the entire "macOS" group on other platforms
+  // without needing a separate platform-detection dependency.
+  const caffeinateSupported = useCaffeinateSupport();
 
   const providerMap = React.useMemo(
     () => new Map(state.providers.map((p) => [p.kind, p])),
@@ -1340,6 +1485,14 @@ export function SettingsView() {
           >
             <PoolSizeRow />
           </SettingsGroup>
+          {caffeinateSupported && (
+            <SettingsGroup
+              title="macOS"
+              description="Settings that only apply on macOS."
+            >
+              <CaffeinateRow />
+            </SettingsGroup>
+          )}
           <SettingsGroup
             title="Git worktrees"
             description="Controls for where new git worktrees land on disk."

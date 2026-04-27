@@ -1808,6 +1808,25 @@ struct AppLifecycle {
     lifecycle: Arc<DaemonLifecycle>,
 }
 
+/// Tauri-managed state wrapping the macOS caffeinate controller. Only
+/// installed on macOS (the underlying module is gated behind
+/// `#[cfg(target_os = "macos")]`); commands that read this state are
+/// also macOS-only so non-macOS builds simply don't expose them.
+#[cfg(target_os = "macos")]
+struct CaffeinateState(Arc<flowstate_app_layer::caffeinate::CaffeinateController>);
+
+/// Payload sent from the daemon spawn task to the
+/// `flowstate-daemon-ready` thread once bootstrap completes. The thread
+/// owns the `AppHandle` clone needed for `manage(...)`, but the daemon
+/// task is where the relevant Arcs are constructed — so we hand them
+/// across the channel together. macOS adds a second field for the
+/// caffeinate controller; non-macOS builds compile without it.
+struct DaemonReadyPayload {
+    lifecycle: Arc<DaemonLifecycle>,
+    #[cfg(target_os = "macos")]
+    caffeinate: Arc<flowstate_app_layer::caffeinate::CaffeinateController>,
+}
+
 /// Initialize tracing. Debug builds stream to stderr so `cargo tauri dev`
 /// surfaces logs in the terminal; release builds keep writing to a log
 /// file alongside the daemon log.
@@ -2006,6 +2025,45 @@ async fn set_user_config(
     value: String,
 ) -> Result<(), String> {
     base_url.client().set_user_config(key, value).await
+}
+
+// ─────────────────────────────────────────────────────────────────
+// macOS caffeinate — display-sleep prevention while turns are running
+// ─────────────────────────────────────────────────────────────────
+//
+// Thin wrappers over the `CaffeinateController` Tauri-managed state.
+// All coordination (single-instance, timeout-based safety net,
+// event-driven respawn) lives in the controller; these commands just
+// surface user-driven actions and a status snapshot. macOS-only:
+// non-macOS builds do not register either the state or the commands.
+
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn caffeinate_status(
+    state: State<'_, CaffeinateState>,
+) -> flowstate_app_layer::caffeinate::CaffeinateStatus {
+    state.0.status()
+}
+
+/// Settings UI calls this after writing the `system.caffeinate` key
+/// so the controller acts on the change immediately (kill the running
+/// child if just disabled; spawn one if just enabled and turns are
+/// in flight). Without this hop the controller would still pick up
+/// the change at the next turn boundary, but the UI feels laggy.
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn caffeinate_refresh(state: State<'_, CaffeinateState>) {
+    state.0.refresh();
+}
+
+/// User clicked "Force kill" in settings. Kills the running
+/// caffeinate immediately. Setting stays enabled — caffeinate will
+/// respawn naturally on the next 0→1 turn transition (after current
+/// in-flight turns finish).
+#[cfg(target_os = "macos")]
+#[tauri::command]
+fn caffeinate_kill(state: State<'_, CaffeinateState>) {
+    state.0.force_kill();
 }
 
 // Per-session and per-project display metadata: titles, names,
@@ -2711,6 +2769,13 @@ pub fn run() {
             // `app.manage` takes ownership but UserConfigStore is
             // cheap to clone (Arc<Mutex<Connection>> inside).
             let user_config_for_orch = user_config_store.clone();
+            // Same trick for the macOS caffeinate controller: it
+            // reads the `system.caffeinate` toggle on every turn
+            // boundary to decide whether to spawn `caffeinate -d`.
+            // Constructed below inside the daemon task once we have
+            // a tokio Handle to spawn its watcher onto.
+            #[cfg(target_os = "macos")]
+            let user_config_for_caffeinate = user_config_store.clone();
             app.manage(user_config_store);
 
             // Open the usage analytics store — a *third* sqlite file
@@ -2915,6 +2980,36 @@ pub fn run() {
                 // subprocess differently (`SessionConfig.mcpServers`
                 // for Copilot SDK, `.mcp.json` for the CLIs,
                 // per-session `opencode.json` for opencode).
+                // macOS-only: build the display-sleep-prevention
+                // controller here so we can register it as an extra
+                // `TurnLifecycleObserver` BEFORE the bootstrap call
+                // wires the runtime's observer chain. The controller
+                // is `TurnLifecycleObserver`-aware: on the 0→1 turn
+                // transition it spawns `caffeinate -d -t <timeout>`,
+                // on 1→0 it kills it. Re-registers the same
+                // `Arc<CaffeinateController>` in two places (here as
+                // an observer, below as Tauri-managed state) so the
+                // settings UI can also drive `force_kill` / `status`
+                // through the Tauri command boundary.
+                //
+                // The controller spawns its watcher tasks on the
+                // current tokio runtime (this Tauri spawn block IS
+                // running inside it), and reads the `system.caffeinate`
+                // setting from `UserConfigStore` on every transition
+                // so a toggle flip is picked up at the next turn
+                // boundary without any plumbing.
+                #[cfg(target_os = "macos")]
+                let caffeinate_controller = {
+                    let ctrl = flowstate_app_layer::caffeinate::CaffeinateController::new(
+                        user_config_for_caffeinate,
+                        tokio::runtime::Handle::current(),
+                    );
+                    config.extra_turn_observers.push(
+                        ctrl.clone() as Arc<dyn zenui_runtime_core::TurnLifecycleObserver>,
+                    );
+                    ctrl
+                };
+
                 config.adapters = vec![
                     Arc::new(ClaudeSdkAdapter::new(flowstate_root.clone()))
                         as Arc<dyn ProviderAdapter>,
@@ -3080,7 +3175,11 @@ pub fn run() {
                 // `bootstrap_core_async`).
                 tracing::info!("daemon ready; connect command available");
                 ready_tx
-                    .send(core.lifecycle.clone())
+                    .send(DaemonReadyPayload {
+                        lifecycle: core.lifecycle.clone(),
+                        #[cfg(target_os = "macos")]
+                        caffeinate: caffeinate_controller.clone(),
+                    })
                     .expect("failed to signal ready");
 
                 core.lifecycle.wait_for_shutdown().await;
@@ -3151,8 +3250,8 @@ pub fn run() {
                 std::thread::Builder::new()
                     .name("flowstate-daemon-ready".into())
                     .spawn(move || {
-                        let lifecycle = match ready_rx.recv() {
-                            Ok(l) => l,
+                        let payload = match ready_rx.recv() {
+                            Ok(p) => p,
                             Err(e) => {
                                 // Daemon task early-exited (e.g.
                                 // provisioning failed). The splash
@@ -3169,9 +3268,12 @@ pub fn run() {
                                 return;
                             }
                         };
+                        let lifecycle = payload.lifecycle.clone();
                         app_handle_for_wire.manage(AppLifecycle {
                             lifecycle: lifecycle.clone(),
                         });
+                        #[cfg(target_os = "macos")]
+                        app_handle_for_wire.manage(CaffeinateState(payload.caffeinate.clone()));
 
                         // SIGTERM / SIGINT handler.
                         //
@@ -3248,64 +3350,82 @@ pub fn run() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            transport_tauri::commands::connect,
-            transport_tauri::commands::handle_message,
-            get_git_branch,
-            list_git_branches,
-            list_git_worktrees,
-            git_checkout,
-            git_create_branch,
-            git_delete_branch,
-            create_git_worktree,
-            remove_git_worktree,
-            resolve_git_root,
-            path_exists,
-            read_file_as_base64,
-            get_git_diff_summary,
-            get_git_diff_file,
-            watch_git_diff_summary,
-            stop_git_diff_summary,
-            list_project_files,
-            list_directory,
-            read_project_file,
-            write_project_file,
-            search_file_contents,
-            open_in_editor,
-            pty_open,
-            pty_write,
-            pty_resize,
-            pty_pause,
-            pty_resume,
-            pty_kill,
-            popout_thread,
-            set_window_always_on_top,
-            get_user_config,
-            set_user_config,
-            set_session_display,
-            get_session_display,
-            list_session_display,
-            delete_session_display,
-            set_project_display,
-            get_project_display,
-            list_project_display,
-            delete_project_display,
-            set_project_worktree,
-            get_project_worktree,
-            list_project_worktree,
-            delete_project_worktree,
-            get_usage_summary,
-            get_usage_timeseries,
-            get_top_sessions,
-            get_usage_by_agent,
-            get_usage_by_agent_role,
-            get_app_data_dir,
-            get_log_dir,
-            get_cache_dir,
-            clear_runtime_cache,
-            get_provision_failures,
-            retry_provision_phase,
-        ])
+        .invoke_handler({
+            // `tauri::generate_handler!` is a proc macro that doesn't
+            // process inline `#[cfg]` attributes on its arguments, so
+            // platform-conditional commands need to be added through
+            // a small helper macro that splices an extra-name list
+            // into the canonical handler list. The macOS-only
+            // caffeinate commands flow through this gate; every
+            // other command is unconditional.
+            macro_rules! flowstate_invoke_handler {
+                ($($extra:ident),* $(,)?) => {
+                    tauri::generate_handler![
+                        transport_tauri::commands::connect,
+                        transport_tauri::commands::handle_message,
+                        get_git_branch,
+                        list_git_branches,
+                        list_git_worktrees,
+                        git_checkout,
+                        git_create_branch,
+                        git_delete_branch,
+                        create_git_worktree,
+                        remove_git_worktree,
+                        resolve_git_root,
+                        path_exists,
+                        read_file_as_base64,
+                        get_git_diff_summary,
+                        get_git_diff_file,
+                        watch_git_diff_summary,
+                        stop_git_diff_summary,
+                        list_project_files,
+                        list_directory,
+                        read_project_file,
+                        write_project_file,
+                        search_file_contents,
+                        open_in_editor,
+                        pty_open,
+                        pty_write,
+                        pty_resize,
+                        pty_pause,
+                        pty_resume,
+                        pty_kill,
+                        popout_thread,
+                        set_window_always_on_top,
+                        get_user_config,
+                        set_user_config,
+                        set_session_display,
+                        get_session_display,
+                        list_session_display,
+                        delete_session_display,
+                        set_project_display,
+                        get_project_display,
+                        list_project_display,
+                        delete_project_display,
+                        set_project_worktree,
+                        get_project_worktree,
+                        list_project_worktree,
+                        delete_project_worktree,
+                        get_usage_summary,
+                        get_usage_timeseries,
+                        get_top_sessions,
+                        get_usage_by_agent,
+                        get_usage_by_agent_role,
+                        get_app_data_dir,
+                        get_log_dir,
+                        get_cache_dir,
+                        clear_runtime_cache,
+                        get_provision_failures,
+                        retry_provision_phase,
+                        $($extra,)*
+                    ]
+                };
+            }
+            #[cfg(target_os = "macos")]
+            { flowstate_invoke_handler!(caffeinate_status, caffeinate_kill, caffeinate_refresh) }
+            #[cfg(not(target_os = "macos"))]
+            { flowstate_invoke_handler!() }
+        })
         .on_window_event(|window, event| {
             // The handler is registered globally and fires for *every*
             // window — main + every `thread-<id>` popout. Main-window

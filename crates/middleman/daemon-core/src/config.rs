@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zenui_provider_api::ProviderAdapter;
+use zenui_runtime_core::TurnLifecycleObserver;
 
 /// Transport-agnostic runtime configuration for the daemon. Any
 /// transport-specific settings (bind address, socket path, frontend
@@ -44,6 +45,13 @@ pub struct DaemonConfig {
     /// When `None`, falls back to the pre-existing
     /// `project_root.join(database_name)` behaviour.
     pub explicit_data_dir: Option<PathBuf>,
+    /// Extra `TurnLifecycleObserver`s registered alongside the
+    /// daemon-internal `DaemonLifecycle`. Lets host apps inject
+    /// turn-edge hooks without forking middleman. Today the flowstate
+    /// Tauri shell uses this to wire the macOS caffeinate controller
+    /// (display-sleep prevention while a turn is in flight). Default
+    /// empty so existing callers and tests are unaffected.
+    pub extra_turn_observers: Vec<Arc<dyn TurnLifecycleObserver>>,
 }
 
 impl DaemonConfig {
@@ -62,6 +70,7 @@ impl DaemonConfig {
             adapters: Vec::new(),
             app_name: "zenui".to_string(),
             explicit_data_dir: None,
+            extra_turn_observers: Vec::new(),
         }
     }
 
@@ -106,6 +115,7 @@ impl DaemonConfig {
             adapters: Vec::new(),
             app_name: "zenui".to_string(),
             explicit_data_dir: None,
+            extra_turn_observers: Vec::new(),
         }
     }
 }

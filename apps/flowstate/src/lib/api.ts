@@ -536,6 +536,34 @@ export function clearUserConfigCache(): void {
   userConfigCache.clear();
 }
 
+// ─────────────────────────────────────────────────────────────────
+// macOS caffeinate — display-sleep prevention. Commands are only
+// registered on macOS by the Tauri shell, so callers must guard on
+// platform before invoking. The settings UI uses the shared
+// `platform()` import from `@tauri-apps/plugin-os` for that gate.
+// ─────────────────────────────────────────────────────────────────
+
+export interface CaffeinateStatus {
+  enabled: boolean;
+  running: boolean;
+  pid: number | null;
+}
+
+export function getCaffeinateStatus(): Promise<CaffeinateStatus> {
+  return invoke<CaffeinateStatus>("caffeinate_status");
+}
+
+/** Tell the controller to re-evaluate now (after a toggle write). */
+export function refreshCaffeinate(): Promise<void> {
+  return invoke<void>("caffeinate_refresh");
+}
+
+/** Force-kill the running caffeinate child. Setting stays enabled —
+ *  caffeinate respawns on the next 0→1 turn transition. */
+export function killCaffeinate(): Promise<void> {
+  return invoke<void>("caffeinate_kill");
+}
+
 // Per-session and per-project display metadata: titles, names,
 // previews, ordering. Persisted in the same `user_config.sqlite`
 // file as the kv store above, in dedicated tables. The agent SDK
