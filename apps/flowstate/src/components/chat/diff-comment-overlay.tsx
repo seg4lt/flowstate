@@ -5,6 +5,7 @@ import {
   type DiffCommentAnchor,
 } from "@/lib/diff-comments-store";
 import { cn } from "@/lib/utils";
+import { CommentPopup } from "./comment-popup";
 
 /** Shared review-commenting affordance that wraps a `MultiFileDiff`
  *  (or any similar per-file content surface) and surfaces a hover
@@ -300,105 +301,6 @@ export function DiffCommentOverlay({
           onCancel={() => setActivePopup(null)}
         />
       )}
-    </div>
-  );
-}
-
-// --- Popup -----------------------------------------------------------
-
-function CommentPopup({
-  top,
-  left,
-  anchorLabel,
-  onSubmit,
-  onCancel,
-}: {
-  top: number;
-  left: number;
-  anchorLabel: string;
-  onSubmit: (text: string) => void;
-  onCancel: () => void;
-}) {
-  const [text, setText] = React.useState("");
-  const taRef = React.useRef<HTMLTextAreaElement>(null);
-  const rootRef = React.useRef<HTMLDivElement>(null);
-
-  React.useEffect(() => {
-    taRef.current?.focus();
-  }, []);
-
-  // Outside-click: cancel. Uses mousedown so a click that starts
-  // outside the popup and drags in doesn't count as "inside".
-  React.useEffect(() => {
-    function onMouseDown(e: MouseEvent) {
-      const root = rootRef.current;
-      if (!root) return;
-      if (!root.contains(e.target as Node)) {
-        onCancel();
-      }
-    }
-    // Delay attaching by one tick so the click that opened the popup
-    // doesn't immediately close it.
-    const raf = requestAnimationFrame(() => {
-      document.addEventListener("mousedown", onMouseDown, true);
-    });
-    return () => {
-      cancelAnimationFrame(raf);
-      document.removeEventListener("mousedown", onMouseDown, true);
-    };
-  }, [onCancel]);
-
-  function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      onSubmit(text);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      e.stopPropagation(); // don't bubble to ChatView's interrupt
-      onCancel();
-    }
-  }
-
-  return (
-    <div
-      ref={rootRef}
-      style={{ top: top + 4, left }}
-      data-overlay-chrome=""
-      className="absolute z-20 w-72 rounded-lg border border-border bg-popover p-2 text-sm text-popover-foreground shadow-lg ring-1 ring-foreground/10"
-      onMouseDown={(e) => e.stopPropagation()}
-    >
-      <div
-        className="mb-1 truncate font-mono text-[10px] text-muted-foreground"
-        title={anchorLabel}
-      >
-        {anchorLabel}
-      </div>
-      <textarea
-        ref={taRef}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={onKeyDown}
-        rows={3}
-        placeholder="Leave a comment… (Enter to add, Esc to cancel)"
-        className="w-full resize-none rounded border border-input bg-background px-2 py-1.5 text-xs focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-      />
-      <div className="mt-1.5 flex justify-end gap-1.5">
-        <button
-          type="button"
-          onClick={onCancel}
-          className="rounded border border-border bg-background px-2 py-0.5 text-[11px] hover:bg-accent"
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          disabled={text.trim().length === 0}
-          onClick={() => onSubmit(text)}
-          className="rounded bg-primary px-2 py-0.5 text-[11px] text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-        >
-          Add
-        </button>
-      </div>
     </div>
   );
 }

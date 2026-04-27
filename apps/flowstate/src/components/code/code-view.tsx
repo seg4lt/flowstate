@@ -1614,6 +1614,7 @@ const CodeViewBody = React.memo(function CodeViewBody({
             softWrap={softWrap}
             gitModeEnabled={gitModeEnabled}
             projectPath={projectPath}
+            sessionId={sessionId}
             onSave={onSave}
             onDirtyChange={onDirtyChange}
           />
