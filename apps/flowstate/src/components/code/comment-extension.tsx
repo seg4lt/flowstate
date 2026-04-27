@@ -423,6 +423,13 @@ function makeTooltip(
 
       function close(): void {
         view.dispatch({ effects: clearPopupEffect.of() });
+        // Hand focus back to the editor — the popup's textarea had
+        // it. Without this the user lands on `document.body` and
+        // typing does nothing until they click back into the
+        // editor. Defer one tick so the unmount completes first;
+        // calling `focus()` synchronously while the textarea is
+        // still in the DOM is racy.
+        queueMicrotask(() => view.focus());
       }
 
       function submit(text: string): void {

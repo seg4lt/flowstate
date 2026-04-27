@@ -107,11 +107,17 @@ function SidebarProvider({
     return isMobile ? setOpenMobile((open) => !open) : setOpen((open) => !open)
   }, [isMobile, setOpen, setOpenMobile])
 
-  // Adds a keyboard shortcut to toggle the sidebar.
+  // Adds a keyboard shortcut to toggle the sidebar. Cmd/Ctrl+B
+  // only — Shift must NOT be held. Without the `!shiftKey` guard,
+  // Cmd+Shift+B also toggles the sidebar on macOS WebKit (where
+  // `event.key` stays "b" lowercase even with Shift in some
+  // modifier combinations), which collides with reserving the
+  // Shift+B namespace for editor / view shortcuts.
   React.useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (
         event.key === SIDEBAR_KEYBOARD_SHORTCUT &&
+        !event.shiftKey &&
         (event.metaKey || event.ctrlKey)
       ) {
         event.preventDefault()

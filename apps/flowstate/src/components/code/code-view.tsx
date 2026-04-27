@@ -729,6 +729,25 @@ export function CodeView(props: CodeViewProps) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [toggleTreeCollapsed, tabs, gitModeEnabled, setGitModeEnabled]);
 
+  // Refocus the focused pane's CodeMirror editor — used after Esc
+  // from the search input, or after closing other transient UIs
+  // that stole focus. The editor is wrapped by `<div
+  // data-code-path={path}>` (set by `CodeViewBody` so the comment
+  // overlay can locate it), and the editable area is `.cm-content`
+  // inside CM6's DOM. We resolve via DOM query rather than refs
+  // because the editor sits inside a `React.lazy` boundary several
+  // layers deep — threading a ref through every level would be
+  // strictly worse for the value.
+  const focusActiveEditor = React.useCallback(() => {
+    const path = focusedPane.activePath;
+    if (!path) return;
+    const wrapper = document.querySelector(
+      `[data-code-path="${CSS.escape(path)}"]`,
+    );
+    const content = wrapper?.querySelector(".cm-content") as HTMLElement | null;
+    content?.focus();
+  }, [focusedPane.activePath]);
+
   function openFromPickerIndex(index: number) {
     // Files mode only — content mode uses the multibuffer, where
     // Enter on the input is a no-op (user clicks Open per chunk).
@@ -739,6 +758,10 @@ export function CodeView(props: CodeViewProps) {
       setMultibufferOverride(false);
       setQuery("");
       inputRef.current?.blur();
+      // Hand focus to the just-opened file. queueMicrotask defers
+      // until after React commits the new tab, so the editor's
+      // `.cm-content` exists by the time we focus it.
+      queueMicrotask(focusActiveEditor);
     }
   }
 
@@ -747,6 +770,7 @@ export function CodeView(props: CodeViewProps) {
       if (e.key === "Escape") {
         setQuery("");
         inputRef.current?.blur();
+        focusActiveEditor();
       }
       return;
     }
@@ -761,8 +785,15 @@ export function CodeView(props: CodeViewProps) {
       openFromPickerIndex(highlightedIndex);
     } else if (e.key === "Escape") {
       e.preventDefault();
-      if (query) setQuery("");
-      else inputRef.current?.blur();
+      // Two-step Esc: first clears the query (stay in input so the
+      // user can refine), second blurs + returns to editor. Mirrors
+      // VS Code's command palette / quick-open behaviour.
+      if (query) {
+        setQuery("");
+      } else {
+        inputRef.current?.blur();
+        focusActiveEditor();
+      }
     }
   }
 
