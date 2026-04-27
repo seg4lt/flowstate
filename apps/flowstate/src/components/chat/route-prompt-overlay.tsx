@@ -1,5 +1,5 @@
 import * as React from "react";
-import { useMatches } from "@tanstack/react-router";
+import { useLocation, useMatches } from "@tanstack/react-router";
 import { sendMessage } from "@/lib/api";
 import { useApp } from "@/stores/app-store";
 import { readStrictPlanMode } from "@/lib/defaults-settings";
@@ -42,20 +42,26 @@ import { QuestionPrompt } from "./question-prompt";
 export function RoutePromptOverlay() {
   const { state, dispatch } = useApp();
   const matches = useMatches();
+  const location = useLocation();
 
-  // Extract sessionId from the current route, plus a flag for whether
-  // we're on the chat route (where ChatView renders its own inline
-  // prompt and we should yield).
+  // Extract sessionId from whichever match in the chain carries it.
+  // Detect the chat route via pathname rather than `m.routeId`: the
+  // route-id string TanStack generates from `path: "/chat/$sessionId"`
+  // is not part of the stable public API and has, in practice, not
+  // matched the literal `"/chat/$sessionId"` we used to compare
+  // against — which left `onChatRoute` false on the chat route, so
+  // this overlay rendered alongside ChatView's own inline
+  // PermissionPrompt and the "Plan ready for review" panel appeared
+  // twice, stacked. Pathname is the unambiguous source of truth.
   let sessionId: string | null = null;
-  let onChatRoute = false;
   for (const m of matches) {
     const params = m.params as Record<string, string> | undefined;
     if (params?.sessionId) {
       sessionId = params.sessionId;
-      onChatRoute = m.routeId === "/chat/$sessionId";
       break;
     }
   }
+  const onChatRoute = location.pathname.startsWith("/chat/");
 
   const pendingPermissions = sessionId
     ? state.pendingPermissionsBySession.get(sessionId) ?? []
