@@ -109,6 +109,69 @@ jobs:
         shell: bash
         run: pnpm tauri build ${{ matrix.tauri-args }}
 
+      # `flow` CLI — small Rust binary the desktop app's Settings
+      # page installs onto the user's PATH. We compile it for the
+      # same target triple as the app and copy it into the bundled
+      # `.app` so Settings → Command line → Install can resolve a
+      # sibling binary via current_exe().parent().join("flow").
+      # Built AFTER `pnpm tauri build` because the Tauri build only
+      # compiles the flowstate package; `flow` is a separate
+      # workspace member.
+      - name: Build flow CLI
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p flow
+
+      - name: Bundle flow CLI into app (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_PATH=$(find . -name "flowstate.app" -path "*/release/bundle/macos/*" | head -1)
+          FLOW_BIN="target/${{ matrix.target }}/release/flow"
+          if [ ! -x "$FLOW_BIN" ]; then
+            echo "flow binary missing at $FLOW_BIN — Build flow CLI step failed?" >&2
+            exit 1
+          fi
+          cp "$FLOW_BIN" "$APP_PATH/Contents/MacOS/flow"
+          chmod +x "$APP_PATH/Contents/MacOS/flow"
+          # Codesign so Gatekeeper doesn't kill the binary on launch
+          # — ad-hoc is fine since it's invoked only by the user's
+          # own shell, not over the network. The app itself is
+          # signed by the Tauri bundler upstream of this step.
+          codesign --force --sign - "$APP_PATH/Contents/MacOS/flow"
+
+          # Regenerate the updater artifacts so future auto-updates
+          # preserve the bundled flow binary. The Tauri bundler
+          # produced `<name>.app.tar.gz` + matching `.sig` BEFORE we
+          # added flow to the .app, so without this step every
+          # update would silently strip the CLI. We re-tar the
+          # modified .app and re-sign with the same minisign key.
+          MACOS_DIR=$(dirname "$APP_PATH")
+          APP_NAME=$(basename "$APP_PATH")
+          (
+            cd "$MACOS_DIR"
+            TAR_NAME="${APP_NAME}.tar.gz"
+            tar -czf "$TAR_NAME" "$APP_NAME"
+            # Older `.sig` is now stale — overwrite via the Tauri
+            # signer. `--password ""` is required by the CLI even
+            # when the key has no password.
+            rm -f "${TAR_NAME}.sig"
+          )
+          pnpm --dir apps/flowstate exec tauri signer sign \
+            --private-key "${TAURI_SIGNING_PRIVATE_KEY}" \
+            --password "" \
+            "$MACOS_DIR/${APP_NAME}.tar.gz"
+
+      # Windows build paused (matrix entry commented out). When
+      # re-enabling, add a step here that copies
+      # target/<triple>/release/flow.exe next to flowstate.exe in
+      # the NSIS staging dir BEFORE the NSIS pack — easiest path is
+      # to switch the `flow` binary to a Tauri externalBin sidecar
+      # so the Tauri bundler picks it up itself.
+
       - name: Repackage DMG with install script (macOS)
         if: runner.os == 'macOS'
         shell: bash

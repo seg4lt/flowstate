@@ -47,15 +47,33 @@ use crate::usage::{
 };
 use crate::user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
+/// Sender side of the open-project signal. The HTTP route
+/// `/api/open-project` (called by the `flow` CLI) pushes paths
+/// onto this channel; the Tauri shell's setup task drains it and
+/// forwards each path to the webview as an `"open-project"`
+/// event. We use an `UnboundedSender` rather than `watch` so two
+/// rapid `flow .` invocations don't coalesce — each one should
+/// open a thread.
+///
+/// The receiver lives in `apps/flowstate/src-tauri/src/lib.rs`;
+/// the sender is cloned into `AppLayerApiState` and held by the
+/// axum handler. Embedders that don't care about open-project
+/// (headless tests, the future standalone daemon) can pass a
+/// dropped receiver — the send becomes a cheap no-op error and
+/// is logged.
+pub type OpenProjectSender = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// Bundled state handed to every handler. `user_config` is cheap
 /// to `Clone` (Arc<Mutex<Connection>> inside). `usage` is wrapped in
 /// `Arc` because `UsageStore` is not Clone, and `Option` because
 /// embedders whose usage store failed to open can still expose the
-/// config surface.
+/// config surface. `open_project` is `Option` for embedders that
+/// don't wire the CLI bridge — a `None` returns 503 from the route.
 #[derive(Clone)]
 pub struct AppLayerApiState {
     pub user_config: UserConfigStore,
     pub usage: Option<Arc<UsageStore>>,
+    pub open_project: Option<OpenProjectSender>,
 }
 
 /// Construct the router. Already `.with_state()`-stamped so the
@@ -96,6 +114,11 @@ pub fn router(state: AppLayerApiState) -> Router<()> {
         .route("/api/usage/top_sessions", post(usage_top_sessions_h))
         .route("/api/usage/by_agent", post(usage_by_agent_h))
         .route("/api/usage/by_agent_role", post(usage_by_agent_role_h))
+        // CLI bridge — the `flow` binary POSTs the user's project
+        // path here. The Tauri shell drains the channel and emits
+        // an `open-project` event the webview consumes to spawn
+        // a new thread on the project.
+        .route("/api/open-project", post(open_project_h))
         .with_state(state)
 }
 
@@ -360,4 +383,48 @@ async fn usage_by_agent_role_h(
     };
     let r: Result<UsageAgentPayload, String> = store.summary_by_agent_role(body.range);
     into_response(r)
+}
+
+// ─── CLI bridge ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct OpenProjectBody {
+    /// Absolute, canonical path to the project directory the user
+    /// ran `flow` against. The CLI canonicalizes before sending so
+    /// the daemon's project-list dedupe (keyed by path) is reliable.
+    path: String,
+}
+
+/// Hand the path off to the Tauri shell. The route returns as soon
+/// as the path is queued — the actual project-creation /
+/// session-spawn work happens in the webview, which the shell will
+/// nudge via a `"open-project"` event. Returning early means a
+/// rapid `flow .` doesn't block the user's terminal while the app
+/// brings its window forward.
+async fn open_project_h(
+    State(state): State<AppLayerApiState>,
+    Json(body): Json<OpenProjectBody>,
+) -> Response {
+    let path = body.path.trim().to_string();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path must not be empty".to_string()).into_response();
+    }
+    let Some(tx) = state.open_project.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "open-project bridge not wired in this embedder".to_string(),
+        )
+            .into_response();
+    };
+    if let Err(e) = tx.send(path) {
+        // The receiver was dropped — likely means the Tauri shell
+        // is mid-shutdown. Surface a 503 so the CLI prints a clean
+        // "could not reach Flowstate" rather than a generic 500.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("open-project receiver gone: {e}"),
+        )
+            .into_response();
+    }
+    (StatusCode::OK, Json(serde_json::json!({}))).into_response()
 }

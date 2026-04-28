@@ -1,0 +1,30 @@
+[package]
+name = "flow"
+version.workspace = true
+edition.workspace = true
+description = "Flowstate command-line companion. Opens a thread on a directory in the running Flowstate desktop app."
+
+# The binary is named `flow` — matches the user-facing command. The
+# package itself is also called `flow` so `cargo build -p flow`
+# stays terse. The desktop app bundles this binary and the in-app
+# "Install CLI" button copies/symlinks it onto the user's PATH.
+[[bin]]
+name = "flow"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+# Tiny synchronous HTTP client. We make exactly one POST to the
+# loopback handshake URL — no async runtime, no tokio, no rustls.
+# Keeps the binary small (~1.5 MB stripped on macOS) and the
+# startup latency negligible.
+ureq = { version = "2.10", default-features = false, features = ["json"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

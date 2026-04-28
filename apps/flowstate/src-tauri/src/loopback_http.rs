@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use flowstate_app_layer::http::{router as app_layer_router, AppLayerApiState};
+use flowstate_app_layer::http::{router as app_layer_router, AppLayerApiState, OpenProjectSender};
 use flowstate_app_layer::usage::UsageStore;
 use flowstate_app_layer::user_config::UserConfigStore;
 use serde::Serialize;
@@ -115,6 +115,7 @@ fn write_handshake_atomic(path: &Path, hs: &Handshake) -> Result<()> {
 ///
 /// Writes the handshake file at `<data_dir>/daemon.handshake` with
 /// 0600 perms.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     data_dir: &Path,
     runtime: Arc<RuntimeCore>,
@@ -123,6 +124,7 @@ pub fn spawn(
     user_config: UserConfigStore,
     usage: Option<Arc<UsageStore>>,
     daemon_base_url: crate::daemon_client::DaemonBaseUrl,
+    open_project: OpenProjectSender,
 ) -> Result<LoopbackHttp> {
     let bind_addr: SocketAddr = "127.0.0.1:0"
         .parse()
@@ -131,7 +133,11 @@ pub fn spawn(
     // loopback port the transport-http orchestration routes use.
     // The router is pre-`.with_state()`-stamped, so the HttpTransport
     // just needs to merge the raw `Router<()>` at serve time.
-    let extra_router = app_layer_router(AppLayerApiState { user_config, usage });
+    let extra_router = app_layer_router(AppLayerApiState {
+        user_config,
+        usage,
+        open_project: Some(open_project),
+    });
     let transport: Box<dyn Transport> =
         Box::new(HttpTransport::new(bind_addr).with_extra_router(extra_router));
     let bound = transport.bind().context("bind loopback HTTP listener")?;

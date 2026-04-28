@@ -2,6 +2,7 @@
 members = [
   "apps/flowstate/src-tauri",
   "crates/app-layer",
+  "crates/cli",
   "crates/core/runtime-core",
   "crates/core/provider-api",
   "crates/core/persistence",
