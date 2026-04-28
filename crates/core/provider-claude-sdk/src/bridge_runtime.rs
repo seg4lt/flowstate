@@ -261,6 +261,17 @@ fn write_glue_sentinel(cache_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// True when the orphan sweep should be skipped: debug builds (cargo
+/// run / cargo test, where the binary fingerprint won't match the
+/// user's installed app) or the `ZENUI_SKIP_ORPHAN_SWEEP` env-var
+/// escape hatch (for release-mode test runs in CI).
+fn should_skip_orphan_sweep() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    std::env::var_os("ZENUI_SKIP_ORPHAN_SWEEP").is_some()
+}
+
 /// Delete sibling `claude-sdk-bridge-<other>/` directories whose deps
 /// fingerprint doesn't match the current build. Each old dir holds
 /// ~100 MB+ of `@anthropic-ai/claude-agent-sdk-<platform>` native
@@ -271,7 +282,21 @@ fn write_glue_sentinel(cache_root: &Path) -> Result<()> {
 /// provisioning is what matters; cleanup is bonus. We only touch
 /// `claude-sdk-bridge-*` siblings — the Copilot crate sweeps its
 /// own `copilot-bridge-*` dirs on its own first-launch.
+///
+/// Skipped in dev/debug builds and when `ZENUI_SKIP_ORPHAN_SWEEP` is
+/// set. A `cargo test` or `cargo run` build carries a different
+/// fingerprint than the user's installed app build, so without this
+/// guard a single test run on a dev box would delete the user's
+/// production cache and force a multi-minute, ~100 MB+ re-install on
+/// the next real launch. Release builds (the shipped app) still sweep.
 fn sweep_orphan_caches(cache_parent: &Path) {
+    if should_skip_orphan_sweep() {
+        tracing::debug!(
+            cache_parent = %cache_parent.display(),
+            "skipping Claude SDK bridge orphan sweep (debug build or ZENUI_SKIP_ORPHAN_SWEEP set)"
+        );
+        return;
+    }
     let entries = match fs::read_dir(cache_parent) {
         Ok(e) => e,
         Err(_) => return,
