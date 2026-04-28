@@ -64,6 +64,7 @@ use pty::{PtyEvent, PtyId, PtyManager};
 mod shell_env;
 
 mod daemon_client;
+mod install_cli;
 mod loopback_http;
 mod orphan_scan;
 use daemon_client::DaemonBaseUrl;
@@ -2897,6 +2898,41 @@ pub fn run() {
             // handlers can obtain a `DaemonClient` per call.
             app.manage(daemon_base_url.clone());
 
+            // CLI bridge channel — the `flow` CLI POSTs project paths
+            // to `/api/open-project` (handled in
+            // `flowstate-app-layer::http`); the handler pushes the
+            // path onto this mpsc, and the bridge task below
+            // forwards each path to the webview as an
+            // `"open-project"` event. Mpsc (not watch) so two rapid
+            // `flow .` invocations queue independently rather than
+            // coalesce. The webview handler reads the user's saved
+            // default provider/model/effort/permission_mode and
+            // calls `create_project` + `start_session` (existing
+            // app-store flow).
+            let (open_project_tx, mut open_project_rx) =
+                tokio::sync::mpsc::unbounded_channel::<String>();
+            let open_project_emit_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(path) = open_project_rx.recv().await {
+                    tracing::info!(path = %path, "CLI open-project request received");
+                    // Bring the main window to front so the user sees
+                    // the new thread immediately. `get_webview_window`
+                    // returns None if the main window was already
+                    // destroyed (shouldn't happen on macOS where close
+                    // hides; on other OSes close exits the process).
+                    if let Some(main) =
+                        open_project_emit_handle.get_webview_window(MAIN_WINDOW_LABEL)
+                    {
+                        let _ = main.show();
+                        let _ = main.unminimize();
+                        let _ = main.set_focus();
+                    }
+                    if let Err(e) = open_project_emit_handle.emit("open-project", &path) {
+                        tracing::warn!(%e, path = %path, "emit open-project event failed");
+                    }
+                }
+            });
+
             // Clone the app handle once for the provisioning reporter
             // below. The spawn block moves the original; this clone
             // lives inside the spawn_blocking closure so each
@@ -3236,6 +3272,7 @@ pub fn run() {
                     user_config_for_orch.clone(),
                     usage_http,
                     daemon_base_url.clone(),
+                    open_project_tx.clone(),
                 ) {
                     Ok(l) => Some(l),
                     Err(err) => {
@@ -3504,6 +3541,8 @@ pub fn run() {
                         clear_runtime_cache,
                         get_provision_failures,
                         retry_provision_phase,
+                        install_cli::install_cli,
+                        install_cli::install_cli_status,
                         $($extra,)*
                     ]
                 };

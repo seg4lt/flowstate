@@ -802,6 +802,79 @@ export function clearRuntimeCache(): Promise<number> {
   return invoke<number>("clear_runtime_cache");
 }
 
+// CLI installation. Copies/symlinks the bundled `flow` binary onto
+// the user's PATH so they can run `flow .` from any terminal.
+//
+// `target`:
+//   - "user_local"  → ~/.local/bin/flow on macOS/Linux, or
+//                     %LOCALAPPDATA%\Programs\flowstate\bin\flow.exe
+//                     on Windows. No password prompt.
+//   - "system"      → /usr/local/bin/flow on macOS/Linux via the
+//                     OS admin password dialog. Unsupported on
+//                     Windows (the command rejects with a clear
+//                     error message).
+export type InstallCliTarget = "user_local" | "system";
+
+export interface InstallCliReport {
+  installedPath: string;
+  sourcePath: string;
+  /** True when the install dir is on the user's PATH. */
+  onPath: boolean;
+  target: InstallCliTarget;
+}
+
+export interface InstallCliStatus {
+  installed: boolean;
+  installedPath: string | null;
+  sourcePath: string;
+  /** True when the existing install resolves to the same binary
+   *  shipping with this Flowstate version. False signals a stale
+   *  link from a moved or upgraded app — the UI offers Reinstall. */
+  pointsAtCurrent: boolean;
+  onPath: boolean;
+}
+
+// Rust returns snake_case keys via serde. We translate to
+// camelCase here so call sites read like idiomatic TS without
+// littering the components with `installed_path` reads.
+interface InstallCliReportWire {
+  installed_path: string;
+  source_path: string;
+  on_path: boolean;
+  target: InstallCliTarget;
+}
+
+interface InstallCliStatusWire {
+  installed: boolean;
+  installed_path: string | null;
+  source_path: string;
+  points_at_current: boolean;
+  on_path: boolean;
+}
+
+export async function installCli(
+  target: InstallCliTarget,
+): Promise<InstallCliReport> {
+  const wire = await invoke<InstallCliReportWire>("install_cli", { target });
+  return {
+    installedPath: wire.installed_path,
+    sourcePath: wire.source_path,
+    onPath: wire.on_path,
+    target: wire.target,
+  };
+}
+
+export async function installCliStatus(): Promise<InstallCliStatus> {
+  const wire = await invoke<InstallCliStatusWire>("install_cli_status");
+  return {
+    installed: wire.installed,
+    installedPath: wire.installed_path,
+    sourcePath: wire.source_path,
+    pointsAtCurrent: wire.points_at_current,
+    onPath: wire.on_path,
+  };
+}
+
 // Re-run a single runtime-provisioning phase ("node" | "claude-sdk"
 // | "copilot-sdk"). Used by the Settings page Retry buttons.
 // Resolves on success; rejects with the error string from Rust on

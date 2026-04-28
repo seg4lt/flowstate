@@ -22,10 +22,14 @@ import {
   getCacheDir,
   getCaffeinateStatus,
   getLogDir,
+  installCli,
+  installCliStatus,
   killCaffeinate,
   refreshCaffeinate,
   retryProvisionPhase,
   type CaffeinateStatus,
+  type InstallCliStatus,
+  type InstallCliTarget,
 } from "@/lib/api";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
@@ -921,6 +925,132 @@ function WorktreeBasePathRow() {
   );
 }
 
+// "Install CLI" row. Renders the current install status and a
+// pair of install buttons. The user picks where the bundled `flow`
+// binary should land:
+//
+//   - "Install for me" → ~/.local/bin/flow on macOS/Linux,
+//                        %LOCALAPPDATA%\Programs\flowstate\bin on
+//                        Windows. No password prompt; the row
+//                        also shows whether the install dir is
+//                        on the user's $PATH so they can fix it
+//                        manually if not.
+//   - "Install system-wide" → /usr/local/bin/flow via osascript /
+//                             pkexec on macOS/Linux. Hidden on
+//                             Windows (per-user install only in v1).
+//
+// On mount we call install_cli_status to seed the display so a
+// returning user sees "Installed at /Users/foo/.local/bin/flow"
+// instead of a fresh-install state. After a successful install
+// the status is re-fetched so the UI reflects the new state.
+function CliInstallRow() {
+  const [status, setStatus] = React.useState<InstallCliStatus | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [busy, setBusy] = React.useState<InstallCliTarget | null>(null);
+  const isWindows = navigator.userAgent.includes("Windows");
+
+  const refresh = React.useCallback(async () => {
+    try {
+      const s = await installCliStatus();
+      setStatus(s);
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function handleInstall(target: InstallCliTarget) {
+    setBusy(target);
+    setError(null);
+    try {
+      const report = await installCli(target);
+      toast({
+        description: report.onPath
+          ? `Installed flow at ${report.installedPath}. Try it now: \`flow .\` in any new terminal.`
+          : `Installed flow at ${report.installedPath}. Add the parent folder to your PATH to use it.`,
+        duration: 6000,
+      });
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  // Heuristic: on macOS and Linux the conventional advice for
+  // adding ~/.local/bin to PATH is the same single line in the
+  // user's shell rc. We default to zsh (macOS default) but show
+  // the bash equivalent as an aside.
+  const pathHint = isWindows
+    ? "Open a new terminal — newly-launched shells inherit the updated PATH."
+    : "Add this line to ~/.zshrc (or ~/.bashrc):\n\n  export PATH=\"$HOME/.local/bin:$PATH\"";
+
+  return (
+    <div className="flex flex-col gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="text-sm">
+        {status === null && error === null ? (
+          <span className="text-muted-foreground">Loading status…</span>
+        ) : status?.installed ? (
+          <span>
+            Installed at{" "}
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
+              {status.installedPath}
+            </code>
+            {!status.pointsAtCurrent && (
+              <span className="ml-2 text-amber-600 dark:text-amber-400">
+                (points at an older Flowstate — reinstall to refresh)
+              </span>
+            )}
+            {!status.onPath && (
+              <span className="ml-2 text-amber-600 dark:text-amber-400">
+                (install location not on PATH)
+              </span>
+            )}
+          </span>
+        ) : (
+          <span className="text-muted-foreground">Not installed.</span>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-2">
+        <Button
+          size="sm"
+          variant="default"
+          onClick={() => handleInstall("user_local")}
+          disabled={busy !== null}
+        >
+          {busy === "user_local" && <Loader2 className="animate-spin" />}
+          {status?.installed ? "Reinstall for me" : "Install for me"}
+        </Button>
+        {!isWindows && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => handleInstall("system")}
+            disabled={busy !== null}
+          >
+            {busy === "system" && <Loader2 className="animate-spin" />}
+            Install system-wide (requires password)
+          </Button>
+        )}
+      </div>
+
+      {status && status.installed && !status.onPath && (
+        <pre className="overflow-x-auto rounded-md border border-border bg-muted/30 p-2 font-mono text-[11px] text-foreground">
+          {pathHint}
+        </pre>
+      )}
+
+      {error && <div className="text-[11px] text-destructive">{error}</div>}
+    </div>
+  );
+}
+
 // Read-only display of the cross-platform app data directory
 // (where the daemon database, threads dir, and user_config sqlite
 // all live). Resolved by the rust side via Tauri's path resolver
@@ -1505,6 +1635,12 @@ export function SettingsView() {
             description="Controls for where new git worktrees land on disk."
           >
             <WorktreeBasePathRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Command line"
+            description="Run `flow .` (or `flow <dir>`) from any terminal to open a new thread on a project, using your saved default provider, model, and permission mode."
+          >
+            <CliInstallRow />
           </SettingsGroup>
           <SettingsGroup
             title="Diagnostics"

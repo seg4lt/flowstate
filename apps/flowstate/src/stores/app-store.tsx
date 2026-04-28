@@ -35,7 +35,13 @@ import type {
   SessionSummary,
   UserInputQuestion,
 } from "@/lib/types";
-import { ALL_PROVIDER_KINDS } from "@/lib/defaults-settings";
+import {
+  ALL_PROVIDER_KINDS,
+  DEFAULT_PROVIDER,
+  readDefaultModel,
+  readDefaultProvider,
+} from "@/lib/defaults-settings";
+import { useNavigate } from "@tanstack/react-router";
 
 /** Single permission prompt awaiting the user's answer. */
 export interface PendingPermission {
@@ -1282,6 +1288,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [state, dispatch] = React.useReducer(appReducer, initialState);
   const dispatchRef = React.useRef(dispatch);
   dispatchRef.current = dispatch;
+  // Router instance for the CLI bridge below — when `flow .` arrives
+  // we navigate to the freshly-spawned thread. Stored in a ref
+  // because the listener lives inside an effect and `useNavigate`'s
+  // identity isn't guaranteed stable across renders.
+  const navigate = useNavigate();
+  const navigateRef = React.useRef(navigate);
+  navigateRef.current = navigate;
   // Mirror state into a ref so the callbacks below can read the latest
   // display maps without stale closures or useCallback dependency churn.
   const stateRef = React.useRef(state);
@@ -1819,6 +1832,145 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     [],
   );
+
+  // CLI bridge — handle `open-project` events the Tauri shell emits
+  // when the `flow` binary POSTs `/api/open-project`. Each event
+  // carries the canonicalized project path. We:
+  //
+  //   1. Wait for bootstrap (`state.ready`) — a CLI invocation that
+  //      lands during cold start gets queued and drained once the
+  //      welcome event + display hydration finish, so the project
+  //      list is populated before we look it up.
+  //   2. Find the project by path (canonical comparison via
+  //      `pendingKey`); create it via the existing `createProject`
+  //      flow if missing.
+  //   3. Read the user's saved default provider / per-provider model
+  //      and send `start_session` over the existing `sendMessage`
+  //      transport.
+  //   4. Navigate to `/chat/$sessionId` so the user lands directly
+  //      on the new thread.
+  //
+  // Errors at any step log to the console and abort that one path —
+  // a failure on path A doesn't block path B if the user fired two
+  // `flow` invocations in quick succession.
+  React.useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    const queue: string[] = [];
+    let draining = false;
+
+    async function waitForReady() {
+      // Poll on stateRef rather than a state-deps useEffect because
+      // the listener is set up once and must work across the
+      // ready=false → ready=true transition without resubscribing.
+      // 100 ms cadence keeps cold-start latency invisible without
+      // pegging a worker.
+      while (!cancelled && !stateRef.current.ready) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+
+    async function processPath(path: string) {
+      await waitForReady();
+      if (cancelled) return;
+
+      // Look up by canonical path key (same `pendingKey` the
+      // createProject flow uses for dedupe).
+      const key = pendingKey(path);
+      let projectId =
+        stateRef.current.projects.find(
+          (p) => pendingKey(p.path ?? "") === key,
+        )?.projectId ?? null;
+
+      if (!projectId) {
+        // Derive a friendly default name from the basename of the
+        // path. The user can rename later from the sidebar; this
+        // matches what the existing "New project" sidebar flow does.
+        const basename =
+          path.split(/[\\/]/).filter((s) => s.length > 0).pop() ?? path;
+        try {
+          projectId = await createProject(path, basename);
+        } catch (err) {
+          console.error("[app-store] open-project: createProject failed", err);
+          return;
+        }
+      }
+
+      // Resolve the user's saved defaults. Falls back to the same
+      // hardcoded defaults the sidebar provider dropdown uses
+      // (DEFAULT_PROVIDER = "claude", and provider catalog's first
+      // model when no per-provider override is set).
+      const provider = (await readDefaultProvider()) ?? DEFAULT_PROVIDER;
+      const savedModel = await readDefaultModel(provider);
+      const catalogFirst = stateRef.current.providers.find(
+        (p) => p.kind === provider,
+      )?.models[0]?.value;
+      const model = savedModel ?? catalogFirst;
+
+      let res: ServerMessage | null;
+      try {
+        res = await send({
+          type: "start_session",
+          provider,
+          model,
+          project_id: projectId,
+        });
+      } catch (err) {
+        console.error("[app-store] open-project: start_session failed", err);
+        return;
+      }
+      if (res && res.type === "session_created") {
+        navigateRef.current({
+          to: "/chat/$sessionId",
+          params: { sessionId: res.session.sessionId },
+        });
+      } else {
+        console.warn(
+          "[app-store] open-project: unexpected start_session response",
+          res,
+        );
+      }
+    }
+
+    async function drain() {
+      if (draining) return;
+      draining = true;
+      try {
+        while (!cancelled && queue.length > 0) {
+          const next = queue.shift()!;
+          await processPath(next);
+        }
+      } finally {
+        draining = false;
+      }
+    }
+
+    (async () => {
+      try {
+        const u = await listen<string>("open-project", ({ payload }) => {
+          if (typeof payload !== "string" || payload.length === 0) return;
+          queue.push(payload);
+          void drain();
+        });
+        if (cancelled) {
+          u();
+        } else {
+          unlisten = u;
+        }
+      } catch (err) {
+        console.warn("[app-store] open-project subscription failed:", err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+    // `createProject` and `send` are useCallback'd with empty deps
+    // and stable for the life of the component — included so the
+    // listener body always sees the freshest closure even if a
+    // future refactor adds deps to them.
+  }, [createProject, send]);
 
   const updateSessionPreview = React.useCallback(
     async (sessionId: string, preview: string) => {
