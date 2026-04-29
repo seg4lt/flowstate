@@ -1,4 +1,5 @@
 import * as React from "react";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Command,
   CommandEmpty,
@@ -34,6 +35,16 @@ import { getOverrideStore, type ShortcutOverrideStore } from "./overrides";
 // Shift+Tab mode cycling, ⌘J terminal toggle, etc.) intentionally stay
 // in their own files — this registry is only for *global* shortcuts
 // that fire regardless of focus or current route.
+//
+// EXCEPTION — `documentationOnly: true` rows. A few shortcuts are
+// implemented inline in the components that own the relevant state
+// (sidebar toggle, terminal-dock toggle, zoom in/out/reset, mode
+// cycling). Their inline `keydown` listeners are the source of truth
+// for behavior. We list them here purely so they show up in the
+// cheatsheet — the dispatcher skips them entirely (no match, no
+// preventDefault, no run), so there is zero risk of double-firing
+// or fighting the inline handler. Each doc-only row carries a
+// comment pointing at the file:line that actually handles it.
 //
 // Each entry stores ONE canonical `defaultBinding` DSL string. The
 // match predicate is auto-derived via `parseDsl` + `matchChord`, and
@@ -104,7 +115,18 @@ export interface Shortcut {
   popoutOnly?: boolean;
   /** When true, the shortcut only fires in the main window. */
   mainWindowOnly?: boolean;
-  /** Handler — receives the per-press context and runs the action. */
+  /** When true, the row is a documentation-only entry — it appears
+   *  in the cheatsheet but the dispatcher skips it (no preventDefault,
+   *  no run). Use for shortcuts whose behavior is implemented by an
+   *  inline `keydown` listener in the component that owns the
+   *  relevant state (sidebar toggle, zoom, mode cycling). The inline
+   *  handler is the source of truth; this row only exists so the
+   *  user can discover the binding from the help dialog. `run` should
+   *  be a no-op for these. */
+  documentationOnly?: boolean;
+  /** Handler — receives the per-press context and runs the action.
+   *  Always declared (no-op for `documentationOnly` rows) so the
+   *  type stays uniform across the registry. */
   run: (ctx: ShortcutCtx) => void;
 }
 
@@ -398,6 +420,94 @@ export const SHORTCUTS: Shortcut[] = [
     fireInTextInputs: true,
     run: (ctx) => ctx.openShortcutsHelp(),
   },
+  {
+    // Hard quit. The macOS menu's ⌘Q is intentionally rebound to
+    // "Close Window" (hide on macOS), so this is the only in-app
+    // affordance for "actually terminate the process — daemon, PTYs,
+    // and all". The Rust `quit_app` command calls
+    // `app.exit(0)`, which re-enters the `RunEvent::ExitRequested`
+    // gate and runs the same graceful-shutdown sequence as
+    // SIGTERM/SIGINT.
+    id: "quit-app",
+    label: "Quit Flowstate",
+    defaultBinding: "mod+alt+q",
+    group: "Help",
+    fireInTextInputs: true,
+    run: (ctx) => {
+      void invoke("quit_app").catch((err) => {
+        ctx.notify?.(`Quit failed: ${String(err)}`);
+      });
+    },
+  },
+  // ─── Documentation-only rows ─────────────────────────────────────
+  // The bindings below are implemented by inline keydown listeners
+  // in the components that own the relevant state. Listing them here
+  // surfaces them in the cheatsheet without taking ownership of the
+  // behavior; the dispatcher skips `documentationOnly: true` rows so
+  // the inline handlers run untouched.
+  {
+    id: "toggle-sidebar",
+    label: "Toggle sidebar",
+    defaultBinding: "mod+b",
+    group: "View",
+    fireInTextInputs: true,
+    documentationOnly: true,
+    // Behavior: components/ui/sidebar.tsx (SidebarProvider keydown).
+    run: () => {},
+  },
+  {
+    id: "toggle-terminal-dock",
+    label: "Toggle terminal dock",
+    defaultBinding: "mod+j",
+    group: "View",
+    fireInTextInputs: true,
+    documentationOnly: true,
+    // Behavior: router.tsx useTerminalShortcut (around line 150).
+    run: () => {},
+  },
+  {
+    id: "zoom-in",
+    label: "Zoom in",
+    // Display "⌘ =". The inline handler also accepts ⌘+ (Shift+=) so
+    // both keycap forms work; we list the unshifted form here because
+    // that's what's printed on the key.
+    defaultBinding: "mod+=",
+    group: "View",
+    fireInTextInputs: true,
+    documentationOnly: true,
+    // Behavior: router.tsx useZoomShortcuts.
+    run: () => {},
+  },
+  {
+    id: "zoom-out",
+    label: "Zoom out",
+    defaultBinding: "mod+-",
+    group: "View",
+    fireInTextInputs: true,
+    documentationOnly: true,
+    // Behavior: router.tsx useZoomShortcuts.
+    run: () => {},
+  },
+  {
+    id: "zoom-reset",
+    label: "Reset zoom",
+    defaultBinding: "mod+0",
+    group: "View",
+    fireInTextInputs: true,
+    documentationOnly: true,
+    // Behavior: router.tsx useZoomShortcuts.
+    run: () => {},
+  },
+  {
+    id: "cycle-permission-mode",
+    label: "Cycle permission mode (Default → Accept Edits → Plan → Bypass → Auto)",
+    defaultBinding: "shift+tab",
+    group: "Navigation",
+    fireInTextInputs: true,
+    documentationOnly: true,
+    // Behavior: hooks/useModeCycleShortcut.ts (also wired in chat-view.tsx).
+    run: () => {},
+  },
 ];
 
 /**
@@ -438,6 +548,11 @@ export function detectConflicts(
   for (const s of shortcuts) {
     if (s.popoutOnly && !inPopout) continue;
     if (s.mainWindowOnly && inPopout) continue;
+    // Doc-only rows don't dispatch, so they can't conflict with
+    // anything in the registry. Skipping them keeps the warning log
+    // signal-only — a real (`run`-having) row colliding with another
+    // real row.
+    if (s.documentationOnly) continue;
     const dsl = effectiveBinding(s, overrides);
     if (dsl === null) continue;
     let canonical: string;

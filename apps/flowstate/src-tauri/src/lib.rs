@@ -106,6 +106,26 @@ fn path_exists(path: String) -> bool {
     Path::new(&path).exists()
 }
 
+/// Hard quit — fully terminate the process, including the daemon and
+/// every PTY/subprocess it owns. Bound to ⌘⌥Q in the frontend
+/// keyboard registry; the menu's ⌘Q (custom "Close Window" item)
+/// only hides the main window on macOS, so this is the only
+/// in-app affordance for "actually exit".
+///
+/// Implementation: just `app_handle.exit(0)`. The `RunEvent::ExitRequested`
+/// gate at the bottom of `run()` is fully idempotent — it raises
+/// `lifecycle.request_shutdown()`, kills the PTY pool, and installs
+/// the 10 s watchdog before letting the daemon task drain. So this
+/// command intentionally does NOT pre-call `request_shutdown()`
+/// itself; doing so would just duplicate work the gate already does
+/// (and risk drifting from the canonical sequence if it ever
+/// changes).
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    tracing::info!("quit_app: user-triggered shutdown via ⌘⌥Q");
+    app.exit(0);
+}
+
 /// Payload returned by `read_file_as_base64` — enough for the chat
 /// composer to turn a dropped file into an `AttachedImage`-shaped
 /// attachment without re-guessing the media type on the TS side.
@@ -3543,6 +3563,7 @@ pub fn run() {
                         retry_provision_phase,
                         install_cli::install_cli,
                         install_cli::install_cli_status,
+                        quit_app,
                         $($extra,)*
                     ]
                 };

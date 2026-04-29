@@ -137,6 +137,13 @@ export function useGlobalShortcuts(params: {
       for (const { shortcut, chord } of resolved) {
         if (!matchChord(chord, e)) continue;
 
+        // Documentation-only rows show up in the cheatsheet but are
+        // implemented by an inline keydown listener elsewhere (see
+        // registry.tsx). Skip without preventDefault so the inline
+        // handler — registered on the same `window` keydown phase —
+        // still receives the event with its default modifier state.
+        if (shortcut.documentationOnly) continue;
+
         if (!shortcut.fireInTextInputs && isInTextInput(e.target)) {
           return;
         }
