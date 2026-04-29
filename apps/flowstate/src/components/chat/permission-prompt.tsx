@@ -24,19 +24,44 @@ interface PermissionPromptProps {
    *  slides in; showing "1 of 3" tells the user why clicking Allow
    *  doesn't make the prompt disappear. Defaults to 1. */
   queueDepth?: number;
+  /** Whether the currently selected model exposes the Claude Agent
+   *  SDK's `"auto"` permission mode (the model-classifier path). When
+   *  true, the plan-exit picker grows a fourth "Auto" button alongside
+   *  Default / Accept Edits / Bypass. Sourced from
+   *  `ProviderModel.supportsAutoMode` (per-model, not provider-level —
+   *  a Claude provider can list models that don't carry the flag). */
+  supportsAutoMode?: boolean;
 }
 
-const PLAN_EXIT_MODES: { mode: PermissionMode; label: string; hint: string }[] = [
-  { mode: "default", label: "Default", hint: "ask before each edit" },
-  { mode: "accept_edits", label: "Accept Edits", hint: "edits without asking" },
-  { mode: "bypass", label: "Bypass Permissions", hint: "no permission prompts at all" },
-];
+/** Build the plan-exit mode list for the current model. Returns the
+ *  three always-on options, plus `"auto"` when the active model
+ *  supports it. Kept as a function (rather than a static constant) so
+ *  every render reflects the live capability — switching models
+ *  mid-prompt updates the picker without a remount. */
+function planExitModes(
+  supportsAutoMode: boolean,
+): { mode: PermissionMode; label: string; hint: string }[] {
+  const modes: { mode: PermissionMode; label: string; hint: string }[] = [
+    { mode: "default", label: "Default", hint: "ask before each edit" },
+    { mode: "accept_edits", label: "Accept Edits", hint: "edits without asking" },
+    { mode: "bypass", label: "Bypass Permissions", hint: "no permission prompts at all" },
+  ];
+  if (supportsAutoMode) {
+    modes.push({
+      mode: "auto",
+      label: "Auto",
+      hint: "model decides per tool call",
+    });
+  }
+  return modes;
+}
 
 function PermissionPromptInner({
   toolName,
   input,
   onDecision,
   queueDepth = 1,
+  supportsAutoMode = false,
 }: PermissionPromptProps) {
   const planExit = isPlanExitTool(toolName);
   const planEnter = isPlanEnterTool(toolName);
@@ -49,7 +74,11 @@ function PermissionPromptInner({
         </div>
       )}
       {planExit ? (
-        <PlanExitPrompt input={input} onDecision={onDecision} />
+        <PlanExitPrompt
+          input={input}
+          onDecision={onDecision}
+          supportsAutoMode={supportsAutoMode}
+        />
       ) : planEnter ? (
         <PlanEnterPrompt onDecision={onDecision} />
       ) : (
@@ -131,6 +160,7 @@ function DefaultPrompt({
 function PlanExitPrompt({
   input,
   onDecision,
+  supportsAutoMode,
 }: {
   input: unknown;
   onDecision: (
@@ -138,7 +168,12 @@ function PlanExitPrompt({
     modeOverride?: PermissionMode,
     feedback?: string,
   ) => void;
+  supportsAutoMode: boolean;
 }) {
+  const modes = React.useMemo(
+    () => planExitModes(supportsAutoMode),
+    [supportsAutoMode],
+  );
   const [pending, setPending] = React.useState(false);
   // Free-form feedback surfaced to the model on deny. Sending it
   // resolves the pending canUseTool with `{behavior:'deny', message}`,
@@ -193,7 +228,7 @@ function PlanExitPrompt({
       />
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs text-muted-foreground">Approve and switch to:</span>
-        {PLAN_EXIT_MODES.map((opt) => (
+        {modes.map((opt) => (
           <button
             key={opt.mode}
             type="button"

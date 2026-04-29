@@ -875,6 +875,25 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setThinkingMode,
   ]);
 
+  // Currently selected model's catalog entry. Same lookup as
+  // `chat-toolbar.tsx` — prefer the picked-alias cache over
+  // `session.model` because the SDK's `model_resolved` event replaces
+  // `session.model` with a pinned id that has no catalog entry on
+  // turn 1. Used to gate the per-model "Auto" plan-exit option on
+  // `entry.supportsAutoMode` (Claude Agent SDK exposes this as a
+  // per-model flag — a Claude provider can list models that don't
+  // carry it). Memoized so PermissionPrompt's `supportsAutoMode`
+  // prop is referentially stable across renders.
+  const modelEntry = React.useMemo(() => {
+    if (!session?.model) return undefined;
+    const pickedModel = readPickedModel(sessionId);
+    return resolveModelDisplay(
+      pickedModel ?? session.model,
+      session.provider,
+      state.providers,
+    ).entry;
+  }, [sessionId, session?.model, session?.provider, state.providers]);
+
   // Provider feature flags — drives capability-gated UI (mode
   // selector, effort selector, etc.). Used locally to exclude `auto`
   // from the Shift+Tab cycle when the provider doesn't support a
@@ -1940,6 +1959,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           input={pendingPermissions[0].input}
           onDecision={handlePermissionDecision}
           queueDepth={pendingPermissions.length}
+          // Per-model gate for the plan-exit "Auto" option. Strictly
+          // tighter than the toolbar ModeSelector's provider-level
+          // gate — see comment on `modelEntry` above for why.
+          supportsAutoMode={modelEntry?.supportsAutoMode === true}
         />
       )}
       {isArchived && (
