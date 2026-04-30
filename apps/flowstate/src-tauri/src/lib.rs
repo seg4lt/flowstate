@@ -3158,32 +3158,87 @@ pub fn run() {
                         let app_handle_for_signal = app_handle_for_wire.clone();
                         let lifecycle_for_signal = lifecycle.clone();
                         tauri::async_runtime::spawn(async move {
-                            let mut sigterm = match tokio::signal::unix::signal(
-                                tokio::signal::unix::SignalKind::terminate(),
-                            ) {
-                                Ok(s) => s,
-                                Err(err) => {
-                                    tracing::warn!(
-                                        %err,
-                                        "failed to install SIGTERM handler; graceful \
-                                         shutdown on external signals will be unavailable"
-                                    );
-                                    return;
+                            // Unix path: SIGTERM + SIGINT, the canonical
+                            // "please stop now" signals. SIGKILL is still
+                            // uncatchable; the orphan-scan helper covers
+                            // that path.
+                            #[cfg(unix)]
+                            let signal_name = {
+                                let mut sigterm = match tokio::signal::unix::signal(
+                                    tokio::signal::unix::SignalKind::terminate(),
+                                ) {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            %err,
+                                            "failed to install SIGTERM handler; graceful \
+                                             shutdown on external signals will be unavailable"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let mut sigint = match tokio::signal::unix::signal(
+                                    tokio::signal::unix::SignalKind::interrupt(),
+                                ) {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        tracing::warn!(%err, "failed to install SIGINT handler");
+                                        return;
+                                    }
+                                };
+                                tokio::select! {
+                                    _ = sigterm.recv() => "SIGTERM",
+                                    _ = sigint.recv() => "SIGINT",
                                 }
                             };
-                            let mut sigint = match tokio::signal::unix::signal(
-                                tokio::signal::unix::SignalKind::interrupt(),
-                            ) {
-                                Ok(s) => s,
-                                Err(err) => {
-                                    tracing::warn!(%err, "failed to install SIGINT handler");
-                                    return;
+
+                            // Windows path: there's no SIGTERM. Watch the
+                            // three console-control events that map onto
+                            // "user / system asked us to stop":
+                            //   * Ctrl+C in an attached console
+                            //   * Ctrl+Close — console host closing
+                            //   * Ctrl+Shutdown — system is shutting down
+                            // ctrl_logoff and ctrl_break are intentionally
+                            // skipped: logoff races with WM_ENDSESSION
+                            // (Tauri already wires that up via window
+                            // lifecycle), and ctrl_break is too aggressive
+                            // for a graceful teardown. TerminateProcess
+                            // (the SIGKILL analogue) is still uncatchable;
+                            // orphan-scan covers that case here too.
+                            #[cfg(windows)]
+                            let signal_name = {
+                                let mut ctrl_c = match tokio::signal::windows::ctrl_c() {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        tracing::warn!(
+                                            %err,
+                                            "failed to install Ctrl+C handler; graceful \
+                                             shutdown on external signals will be unavailable"
+                                        );
+                                        return;
+                                    }
+                                };
+                                let mut ctrl_close = match tokio::signal::windows::ctrl_close() {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        tracing::warn!(%err, "failed to install Ctrl+Close handler");
+                                        return;
+                                    }
+                                };
+                                let mut ctrl_shutdown = match tokio::signal::windows::ctrl_shutdown() {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        tracing::warn!(%err, "failed to install Ctrl+Shutdown handler");
+                                        return;
+                                    }
+                                };
+                                tokio::select! {
+                                    _ = ctrl_c.recv() => "Ctrl+C",
+                                    _ = ctrl_close.recv() => "Ctrl+Close",
+                                    _ = ctrl_shutdown.recv() => "Ctrl+Shutdown",
                                 }
                             };
-                            let signal_name = tokio::select! {
-                                _ = sigterm.recv() => "SIGTERM",
-                                _ = sigint.recv() => "SIGINT",
-                            };
+
                             tracing::info!(
                                 signal = signal_name,
                                 "received termination signal; requesting daemon shutdown"

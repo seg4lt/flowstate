@@ -18,3 +18,8 @@
 [tools]
 node = "24"
 pnpm = "latest"
+# Used as the cross-compile linker via cargo-zigbuild for `just
+# build-windows`. Pinned to "latest" because zig releases are
+# generally backward-compatible for this use case and we always
+# want the freshest mingw / Windows-compat patches.
+zig = "latest"
