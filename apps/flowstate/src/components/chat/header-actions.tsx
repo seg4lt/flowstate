@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   Compass,
+  Copy,
   Diff,
   ExternalLink,
   FolderOpen,
@@ -13,6 +14,9 @@ import {
   Terminal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useCopy } from "@/hooks/use-copy";
+import { threadToMarkdown } from "@/lib/thread-to-markdown";
+import type { TurnRecord } from "@/lib/types";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -54,6 +58,11 @@ interface HeaderActionsProps {
   // session's latest main-agent TodoWrite has at least one item.
   // Null hides the badge entirely.
   todoProgress: { completed: number; total: number } | null;
+  // Full turn history for the active session, used by the
+  // "Copy thread as markdown" button. Passed in (not pulled from
+  // useQuery here) so HeaderActions stays a dumb view layer — same
+  // pattern as `diffs`.
+  turns: TurnRecord[];
 }
 
 // Known editors we offer in the Open dropdown. Each `command` is
@@ -101,8 +110,25 @@ export function HeaderActions({
   contextOpen,
   onToggleContext,
   todoProgress,
+  turns,
 }: HeaderActionsProps) {
   const queryClient = useQueryClient();
+  // Clipboard helper — wraps navigator.clipboard.writeText with the
+  // standard "Copied"/"Copy failed" toasts so we don't reinvent that
+  // plumbing here.
+  const copy = useCopy();
+  // Brief Check-icon flash on success, mirroring the in-message
+  // CopyButton's UX. Inlined (not the shared CopyButton component)
+  // because the header row uses variant="outline" while
+  // messages/copy-button.tsx is variant="ghost" for in-message
+  // overlay — visual consistency wins over sharing 6 lines of state.
+  const [justCopiedThread, setJustCopiedThread] = React.useState(false);
+  const handleCopyThread = React.useCallback(async () => {
+    const md = threadToMarkdown(turns);
+    await copy(md, "Thread copied");
+    setJustCopiedThread(true);
+    window.setTimeout(() => setJustCopiedThread(false), 1200);
+  }, [copy, turns]);
   // Terminal store is a global context — read it directly rather
   // than prop-drilling dockOpen through ChatView. The toggle button
   // below dispatches the same `toggle_dock` action the Cmd+J
@@ -370,6 +396,19 @@ export function HeaderActions({
         title="Toggle code view panel (Cmd/Ctrl+Alt+E)"
       >
         <Search className="h-3 w-3" />
+      </Button>
+      <Button
+        variant="outline"
+        size="icon-xs"
+        onClick={handleCopyThread}
+        title="Copy thread as markdown"
+        aria-label="Copy thread as markdown"
+      >
+        {justCopiedThread ? (
+          <Check className="h-3 w-3" />
+        ) : (
+          <Copy className="h-3 w-3" />
+        )}
       </Button>
       <DropdownMenu open={editorMenuOpen} onOpenChange={setEditorMenuOpen}>
         <DropdownMenuTrigger asChild>

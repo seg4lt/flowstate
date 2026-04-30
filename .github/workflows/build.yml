@@ -21,17 +21,11 @@ jobs:
             tauri-args: --target aarch64-apple-darwin
             bundle-subpath: aarch64-apple-darwin/release/bundle
 
-          # Windows build paused — uncomment to re-enable. Keeps
-          # the matrix entry side-by-side with the macOS one so
-          # diffs stay tight. When re-enabling, also un-comment the
-          # "Enable long paths (Windows)" step, the WIN_SIG read +
-          # windows-x86_64 block in "Generate updater manifest",
-          # and the Windows rows in the release body below.
-          # - name: windows-x64
-          #   runner: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   tauri-args: ""
-          #   bundle-subpath: release/bundle
+          - name: windows-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            tauri-args: ""
+            bundle-subpath: release/bundle
 
           # - name: linux-x64
           #   runner: ubuntu-22.04
@@ -46,9 +40,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # - name: Enable long paths (Windows)
-      #   if: runner.os == 'Windows'
-      #   run: git config --system core.longpaths true
+      - name: Enable long paths (Windows)
+        if: runner.os == 'Windows'
+        run: git config --system core.longpaths true
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -92,6 +86,39 @@ jobs:
         working-directory: apps/flowstate
         run: pnpm install --frozen-lockfile
 
+      # `flow` CLI — small Rust binary the desktop app's Settings
+      # page installs onto the user's PATH. We compile it for the
+      # same target triple as the app so Settings → Command line →
+      # Install can resolve a sibling binary via
+      # current_exe().parent().join("flow").
+      #
+      # Built BEFORE `pnpm tauri build` because on Windows we stage
+      # it as a Tauri externalBin sidecar (see the next step +
+      # tauri.windows.conf.json) which the bundler reads during its
+      # own build. macOS uses a post-build copy (Bundle flow CLI
+      # into app step further down) so the ordering doesn't matter
+      # there — building first is just simpler than splitting the
+      # step by OS.
+      - name: Build flow CLI
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p flow
+
+      # Stage flow.exe as a Tauri externalBin sidecar so the NSIS /
+      # MSI bundlers place it next to flowstate.exe in the install
+      # dir. Tauri expects the source file to be named with the
+      # target triple appended (and `.exe` on Windows); after
+      # bundling the suffix is stripped, leaving plain `flow.exe`
+      # which install_cli.rs's current_exe()-based lookup picks up.
+      # tauri.windows.conf.json declares the sidecar entry.
+      - name: Stage flow CLI as Tauri sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apps/flowstate/src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/flow.exe" \
+             "apps/flowstate/src-tauri/binaries/flow-${{ matrix.target }}.exe"
+
       - name: Build
         working-directory: apps/flowstate
         env:
@@ -124,18 +151,6 @@ jobs:
         # Linux matrix rows are reinstated.
         shell: bash
         run: env -u CI pnpm tauri build ${{ matrix.tauri-args }}
-
-      # `flow` CLI — small Rust binary the desktop app's Settings
-      # page installs onto the user's PATH. We compile it for the
-      # same target triple as the app and copy it into the bundled
-      # `.app` so Settings → Command line → Install can resolve a
-      # sibling binary via current_exe().parent().join("flow").
-      # Built AFTER `pnpm tauri build` because the Tauri build only
-      # compiles the flowstate package; `flow` is a separate
-      # workspace member.
-      - name: Build flow CLI
-        shell: bash
-        run: cargo build --release --target ${{ matrix.target }} -p flow
 
       - name: Bundle flow CLI into app (macOS)
         if: runner.os == 'macOS'
@@ -186,12 +201,12 @@ jobs:
             --password "" \
             "$TAR_PATH"
 
-      # Windows build paused (matrix entry commented out). When
-      # re-enabling, add a step here that copies
-      # target/<triple>/release/flow.exe next to flowstate.exe in
-      # the NSIS staging dir BEFORE the NSIS pack — easiest path is
-      # to switch the `flow` binary to a Tauri externalBin sidecar
-      # so the Tauri bundler picks it up itself.
+      # No Windows post-build flow step — the externalBin sidecar
+      # declared in tauri.windows.conf.json (staged by "Stage flow
+      # CLI as Tauri sidecar (Windows)" before the Tauri build)
+      # makes the NSIS / MSI bundlers place flow.exe next to
+      # flowstate.exe natively, so install_cli.rs finds it via
+      # current_exe().parent() with no extra work here.
 
       - name: Repackage DMG with install script (macOS)
         if: runner.os == 'macOS'
@@ -302,8 +317,7 @@ jobs:
           # scheme is deterministic from tag + filename, so we can
           # precompute them here.
           MAC_SIG="$(cat "release-assets/Flowstate-${TAG}-macos-arm64.app.tar.gz.sig")"
-          # Windows build paused — re-add when the matrix entry comes back:
-          # WIN_SIG="$(cat "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig")"
+          WIN_SIG="$(cat "release-assets/Flowstate-${TAG}-windows-x64-setup.exe.sig")"
 
           cat > release-assets/latest.json <<EOF
           {
@@ -314,16 +328,14 @@ jobs:
               "darwin-aarch64": {
                 "signature": "${MAC_SIG}",
                 "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-macos-arm64.app.tar.gz"
+              },
+              "windows-x86_64": {
+                "signature": "${WIN_SIG}",
+                "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-windows-x64-setup.exe"
               }
             }
           }
           EOF
-          # When Windows comes back, add a comma after the
-          # darwin-aarch64 block above and insert:
-          #   "windows-x86_64": {
-          #     "signature": "${WIN_SIG}",
-          #     "url": "https://github.com/${REPO}/releases/download/${TAG}/Flowstate-${TAG}-windows-x64-setup.exe"
-          #   }
 
           echo "--- latest.json ---"
           cat release-assets/latest.json
@@ -343,20 +355,16 @@ jobs:
             | Platform | File |
             |----------|------|
             | macOS (Apple Silicon) | `Flowstate-${{ github.ref_name }}-macos-arm64.dmg` |
-            <!-- Windows build paused. When re-enabling, add back:
             | Windows (x64) MSI | `Flowstate-${{ github.ref_name }}-windows-x64.msi` |
             | Windows (x64) Setup | `Flowstate-${{ github.ref_name }}-windows-x64-setup.exe` |
-            -->
 
             ### macOS Installation
             1. Download the `.dmg` file
             2. Open it and double-click "Install Flowstate.command"
             3. This installs to /Applications and clears the quarantine flag
 
-            <!-- Windows build paused. When re-enabling, add back:
             ### Windows Installation
             Download either the `.msi` (standard Windows Installer) or the `-setup.exe` (NSIS installer).
-            -->
 
             ### Auto-updates
             Existing installs will see this version via the in-app

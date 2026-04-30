@@ -12,3 +12,9 @@
 # Local-only Tauri config overlay (e.g. disables updater artifacts so
 # builds don't require TAURI_SIGNING_PRIVATE_KEY). Do not commit.
 tauri.local.conf.json
+
+# Staging dir for Tauri externalBin sidecars (the `flow` CLI on
+# Windows — see tauri.windows.conf.json). Populated by the GitHub
+# Actions build before `tauri build` runs; never committed because
+# the artifact is target-triple-specific and rebuilt per CI run.
+/binaries/

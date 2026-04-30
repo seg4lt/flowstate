@@ -1721,6 +1721,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             diffOpen={diffOpen}
             contextOpen={contextOpen}
             todoProgress={todoProgress}
+            turns={turns}
             onToggleContext={handleToggleContext}
             // First interaction with the diff button of any kind
             // activates the streamed-diff subscription and bumps the

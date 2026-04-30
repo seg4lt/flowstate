@@ -58,7 +58,12 @@ Latest builds: [Releases](https://github.com/seg4lt/flowstate/releases/latest).
 Open the DMG and double-click **Install Flowstate.command** to copy
 the app to `/Applications` and clear the quarantine flag.
 
-Windows and Linux builds are paused; the rows are kept commented in
+- **Windows (x64)** — `Flowstate-<version>-windows-x64-setup.exe`
+  (NSIS) or `Flowstate-<version>-windows-x64.msi` (Windows Installer).
+
+Run either installer; the app installs per-user, no admin prompt.
+
+The Linux build is still paused; its row is kept commented in
 `.github/workflows/build.yml` and can be re-enabled without changes.
 
 ## Develop
