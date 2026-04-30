@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "flow"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -1404,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "flowstate"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1449,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "flowstate-app-layer"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "flowstate-mcp-server"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "libc",
@@ -7424,7 +7424,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-checkpoints"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "blake3",
@@ -7442,7 +7442,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-daemon-core"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7464,7 +7464,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-embedded-node"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -7478,7 +7478,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-persistence"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7494,7 +7494,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-api"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "libc",
@@ -7510,7 +7510,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-claude-cli"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "serde",
@@ -7522,7 +7522,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-claude-sdk"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7538,7 +7538,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-codex"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "serde_json",
@@ -7549,7 +7549,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-github-copilot"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7565,7 +7565,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-github-copilot-cli"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "serde",
@@ -7578,7 +7578,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-provider-opencode"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -7595,7 +7595,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-runtime-core"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7614,7 +7614,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-transport-http"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7632,7 +7632,7 @@ dependencies = [
 
 [[package]]
 name = "zenui-transport-tauri"
-version = "0.1.0"
+version = "0.2.17"
 dependencies = [
  "anyhow",
  "async-trait",
