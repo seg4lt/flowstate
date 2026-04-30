@@ -133,6 +133,20 @@ jobs:
           # (no password), so the PASSWORD env var can stay empty.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          # Embed the WebView2 loader directly into flowstate.exe
+          # instead of dynamically linking `WebView2Loader.dll`.
+          # webview2-com-sys's link declaration is gated to
+          # `target_env = "msvc"` for the static branch — on the
+          # windows-x64 matrix row this flips Cargo's link line from
+          # `link(name = "WebView2Loader.dll")` to
+          # `link(name = "WebView2LoaderStatic", kind = "static")`.
+          # Net effect: the shipped exe is self-contained and won't
+          # error with "WebView2Loader.dll was not found" if a user
+          # extracts just the binary from the install dir. macOS /
+          # Linux rows compile webview2-com-sys out entirely (it's
+          # `cfg(target_os = "windows")`), so this env var is a
+          # harmless no-op on non-Windows runners.
+          WEBVIEW2_STATIC: "1"
         # `env -u CI`: fff-search 0.5.2's build.rs hard-panics
         # whenever the `CI` env var is set (gate is
         # `env::var("CI").is_ok()`, so "false" / "" all trip it)
