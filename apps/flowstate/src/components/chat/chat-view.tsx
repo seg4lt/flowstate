@@ -1224,10 +1224,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // If thread A had the lightbox open, switching to B would keep
     // A's image pinned over B's entire view.
     setPersistedLightboxRef(null);
-    // Inline title editor — if the user had opened the rename input
-    // on A's header and switched away, B's header would mount with
-    // an open editor bound to A's draft.
-    setEditingTitle(false);
     // Async "Load older" spinner — belongs to the in-flight request
     // for the thread we're leaving; a new thread click wants a
     // clean slate, and the previous fetch resolves into its own
@@ -1615,29 +1611,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   const title = state.sessionDisplay.get(sessionId)?.title || "New thread";
 
-  const [editingTitle, setEditingTitle] = React.useState(false);
-  const [titleDraft, setTitleDraft] = React.useState(title);
-  const titleInputRef = React.useRef<HTMLInputElement>(null);
-
-  React.useEffect(() => {
-    setTitleDraft(title);
-  }, [title]);
-
-  React.useEffect(() => {
-    if (editingTitle) {
-      titleInputRef.current?.focus();
-      titleInputRef.current?.select();
-    }
-  }, [editingTitle]);
-
-  function commitTitleRename() {
-    const trimmed = titleDraft.trim();
-    setEditingTitle(false);
-    if (trimmed && trimmed !== title) {
-      void renameSession(sessionId, trimmed);
-    }
-  }
-
   // Mode changes update local state (picked up by next `send_turn`)
   // AND push `update_permission_mode` when a turn is running so the
   // in-flight adapter honors the new mode for tools still to be
@@ -1695,36 +1668,26 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             a thread popout (the stripped PopoutShell in router.tsx
             doesn't mount AppSidebar), so hide it there. */}
         {!isPopoutWindow() && <SidebarTrigger />}
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          {editingTitle ? (
-            <input
-              ref={titleInputRef}
-              data-tauri-drag-region={false}
-              className="min-w-0 flex-1 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
-              value={titleDraft}
-              onChange={(e) => setTitleDraft(e.target.value)}
-              onBlur={commitTitleRename}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") commitTitleRename();
-                if (e.key === "Escape") {
-                  setTitleDraft(title);
-                  setEditingTitle(false);
-                }
-              }}
-            />
-          ) : (
-            // Opt the span out so a single click triggers the edit
-            // flow instead of starting a window drag — span isn't an
-            // interactive HTML element, so without this Tauri's drag
-            // region steals the click on macOS.
-            <span
-              data-tauri-drag-region={false}
-              className="min-w-0 flex-1 cursor-pointer truncate font-medium hover:text-muted-foreground"
-              onClick={() => setEditingTitle(true)}
-            >
-              {title}
-            </span>
-          )}
+        <div
+          // Drag region on the inner wrapper too so the small gaps
+          // between title / branch / badge are also draggable —
+          // Tauri's drag.js reads `e.target` directly, no ancestor
+          // walk, so the parent <header>'s attribute alone isn't
+          // enough to drag from gaps inside this child.
+          data-tauri-drag-region
+          className="flex min-w-0 flex-1 items-center gap-2"
+        >
+          {/* Read-only title in the chat header. Renaming lives in
+              the sidebar's thread row instead. With the drag-region
+              attribute Tauri's drag.js handles both single click +
+              drag (move window) and double-click (toggle maximize)
+              natively — no JS handlers needed here. */}
+          <span
+            data-tauri-drag-region
+            className="min-w-0 flex-1 truncate font-medium select-none"
+          >
+            {title}
+          </span>
           {gitBranch && projectPath && session && parentProjectId && parentGitRoot && (
             <BranchSwitcher
               projectPath={projectPath}
