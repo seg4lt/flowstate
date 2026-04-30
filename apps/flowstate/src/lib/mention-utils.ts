@@ -1,3 +1,5 @@
+import { fuzzyScore } from "./fuzzy";
+
 // Pure helpers for `@<filename>` mention autocomplete in the chat
 // composer. Keeping them as standalone functions (no React, no I/O)
 // makes the trigger / ranking / caret math unit-testable in isolation.
@@ -62,8 +64,10 @@ export function detectMentionContext(
   return { atIndex: start, query };
 }
 
-/** Maximum number of results surfaced to the popup. Keeps the list
- *  scannable and the render cheap even on 20k-entry projects. */
+/** Default cap for the `@mention` autocomplete popup. The Cmd+P
+ *  picker passes its own (larger) cap — see `code-view.tsx` — so the
+ *  bigger virtualised list isn't constrained by the mention popup's
+ *  desire to stay scannable. */
 const MAX_RESULTS = 50;
 
 interface Scored {
@@ -73,21 +77,53 @@ interface Scored {
   index: number;
 }
 
-/** Filter + lightly rank `files` against `query`. Matching is
- *  case-insensitive. An empty query returns the first `MAX_RESULTS`
- *  entries in the input's order (alphabetical, per
- *  `listProjectFiles`).
+/** Ranking mode for {@link rankFileMatches}.
  *
- *  Scoring (lower = better):
+ *  - `"substring"` (default): the original 5-tier scorer. Fast, no
+ *    typo tolerance — every char of `query` must appear contiguously.
+ *    What the chat composer's `@mention` popup wants since users
+ *    typing `@hand` expect "handler.ts", not "h-and.ts".
+ *  - `"fuzzy"`: subsequence matcher from `lib/fuzzy.ts`. Each query
+ *    char must appear in order but gaps are allowed; survivors are
+ *    weighted by basename hits, word boundaries, and consecutive
+ *    runs. Drives the Cmd+P picker's "Fz" toggle. */
+export type RankMode = "substring" | "fuzzy";
+
+/** Filter + lightly rank `files` against `query`. Matching is
+ *  case-insensitive. An empty query returns the first `limit`
+ *  entries in the input's order (alphabetical, per
+ *  `listProjectFiles`) — no scoring work for the no-input case.
+ *
+ *  In `"substring"` mode (default), scoring is (lower = better):
  *    0  basename exact match
  *    1  basename starts with query
  *    2  any segment boundary starts with query (path-prefix)
  *    3  basename contains query
  *    4  full path contains query
- *  Non-matches are dropped. */
-export function rankFileMatches(files: string[], query: string): string[] {
+ *  Non-matches are dropped.
+ *
+ *  In `"fuzzy"` mode, scoring delegates to `fuzzyScore` from
+ *  `lib/fuzzy.ts` — subsequence match required, ranked by basename /
+ *  boundary / consecutive-run bonuses (higher = better, mapped into
+ *  the same "lower = better" comparator via negation so we share the
+ *  result-shape).
+ *
+ *  Pass `limit = Infinity` to keep every match (the caller is
+ *  responsible for slicing). The Cmd+P picker uses this so its
+ *  "+N more — refine query" header can show a true overflow count
+ *  rather than capping at 50 first. */
+export function rankFileMatches(
+  files: readonly string[],
+  query: string,
+  limit: number = MAX_RESULTS,
+  mode: RankMode = "substring",
+): string[] {
   if (query.length === 0) {
-    return files.slice(0, MAX_RESULTS);
+    return limit === Infinity ? files.slice() : files.slice(0, limit);
+  }
+
+  if (mode === "fuzzy") {
+    return rankFileMatchesFuzzy(files, query, limit);
   }
 
   const q = query.toLowerCase();
@@ -115,7 +151,38 @@ export function rankFileMatches(files: string[], query: string): string[] {
   scored.sort((a, b) =>
     a.score !== b.score ? a.score - b.score : a.index - b.index,
   );
-  return scored.slice(0, MAX_RESULTS).map((s) => s.path);
+  const limited = limit === Infinity ? scored : scored.slice(0, limit);
+  return limited.map((s) => s.path);
+}
+
+/** Fuzzy-mode helper. Hoisted into a separate function to keep the
+ *  hot substring path tight (no branch on `mode` per file). Lowercases
+ *  the query exactly once before iterating; `fuzzyScore` itself
+ *  lowercases path chars on the fly via the ASCII charCode trick so
+ *  we don't allocate a lowercased copy of every path. */
+function rankFileMatchesFuzzy(
+  files: readonly string[],
+  query: string,
+  limit: number,
+): string[] {
+  const queryLower = query.toLowerCase();
+  // Higher score = better in fuzzy mode; we mirror substring mode's
+  // "lower = better" comparator by negating so the sort logic below
+  // (and any future merging) doesn't have to fork on direction.
+  const scored: Scored[] = [];
+  for (let i = 0; i < files.length; i++) {
+    const path = files[i]!;
+    const s = fuzzyScore(path, queryLower);
+    if (s > 0) {
+      scored.push({ path, score: -s, index: i });
+    }
+  }
+
+  scored.sort((a, b) =>
+    a.score !== b.score ? a.score - b.score : a.index - b.index,
+  );
+  const limited = limit === Infinity ? scored : scored.slice(0, limit);
+  return limited.map((s) => s.path);
 }
 
 /** Replace the partial mention token at `[atIndex, caret)` with

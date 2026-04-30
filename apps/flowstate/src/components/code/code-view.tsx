@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   SlidersHorizontal,
+  Sparkles,
   X,
 } from "lucide-react";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
@@ -42,6 +43,7 @@ import {
   parsePickerQuery,
   splitGlobList,
 } from "@/lib/glob";
+import { rankFileMatches } from "@/lib/mention-utils";
 import { useTheme } from "@/hooks/use-theme";
 import { useEditorPrefs } from "@/hooks/use-editor-prefs";
 import { toast } from "@/hooks/use-toast";
@@ -97,7 +99,14 @@ const MAX_EDITABLE_BYTES = 10 * 1024 * 1024;
 //  * Syntax highlighting + virtualization: @pierre/diffs <File>
 //    inside <Virtualizer>, sharing the worker pool from main.tsx
 
-const PICKER_RESULT_LIMIT = 50;
+// Hard cap on rendered picker rows. We rank with `rankFileMatches`
+// first (basename-exact > basename-prefix > path-segment > basename-
+// contains > path-contains), then take the top `PICKER_RESULT_LIMIT`.
+// 200 is high enough that a real "what was that file called" search
+// finds it without scrolling, low enough that the popup stays
+// scannable. Overflow is surfaced as a numeric "+N more — refine"
+// hint in the header so users know the cap is biting.
+const PICKER_RESULT_LIMIT = 200;
 // Trailing-edge debounce for the content-search call. 600ms is
 // deliberately on the patient side — long enough that even slow
 // typists don't fire a ripgrep walk per keystroke, and any
@@ -135,6 +144,11 @@ interface ContentSearchUiOptions {
   include: string;
   exclude: string;
   useRegex: boolean;
+  /** Fuzzy-match each line against the query using fff-search's
+   *  Smith-Waterman scorer. Typo-tolerant and inherently
+   *  case-insensitive — wins over `useRegex` when both are set
+   *  (the Rust side enforces the same precedence). */
+  useFuzzy: boolean;
   caseSensitive: boolean;
 }
 
@@ -144,6 +158,7 @@ function defaultContentSearchUiOptions(): ContentSearchUiOptions {
     include: "",
     exclude: "",
     useRegex: false,
+    useFuzzy: false,
     caseSensitive: true,
   };
 }
@@ -264,21 +279,30 @@ export function CodeView(props: CodeViewProps) {
   }, []);
 
   // ─── file list / picker state ────────────────────────────────
-  // Hover-driven cache: refreshed only when the user hovers/focuses
-  // the chat header's Search button (prefetchProjectFiles) or on the
-  // very first cold mount here. NO automatic refetch — see
-  // projectFilesQueryOptions in lib/queries.ts for the rationale.
-  // Preserving that property is a hard constraint; do not introduce
-  // refetchOnMount, refetchInterval, or any other auto-refresh.
+  // Backed by fff-search's per-worktree mmap-mounted index. The query
+  // returns a `ProjectFileListing` snapshot — `files` is everything
+  // walked so far (no cap), `indexing` flips to false once fff's
+  // background scanner finishes. While indexing is true, React Query
+  // re-polls every 750 ms (see `projectFilesQueryOptions`) so the
+  // picker visibly fills in on huge repos. The chat session's
+  // `turn_completed` event explicitly invalidates this query so
+  // agent-created files appear immediately.
   const filesQuery = useQuery(projectFilesQueryOptions(projectPath));
   // structuralSharing keeps the same array reference when a refresh
   // returns identical data, so the FileTree useMemo dependency stays
   // stable on no-op refreshes. EMPTY_FILES is a frozen module-level
   // sentinel for the same reason.
-  const files = (filesQuery.data ?? EMPTY_FILES) as string[];
-  // Only show the "indexing…" badge on a true cold fetch (no cached
-  // data yet). A populated cache means the picker is already usable
-  // and we should not flash a loading state on remount.
+  const files = (filesQuery.data?.files ?? EMPTY_FILES) as string[];
+  // True while fff-search's cold scan is still walking the worktree.
+  // Surfaced in the picker header alongside the live file count so
+  // the user can see "Indexing 47 312 files…" instead of an empty
+  // popup on a 100k-file repo. React Query re-polls every 750 ms
+  // until this flips to false (see `projectFilesQueryOptions`).
+  const indexing = filesQuery.data?.indexing ?? false;
+  // Only show the "loading…" placeholder on a true cold fetch (no
+  // cached data yet). A populated cache means the picker is already
+  // usable and we should not flash a loading state on remount; the
+  // separate `indexing` badge handles the "still walking" state.
   const filesLoading = filesQuery.isPending && !!projectPath;
   const filesError = filesQuery.error ? String(filesQuery.error) : null;
 
@@ -308,6 +332,13 @@ export function CodeView(props: CodeViewProps) {
   >(null);
   const [contentOptions, setContentOptions] =
     React.useState<ContentSearchUiOptions>(defaultContentSearchUiOptions);
+  // Fuzzy-mode toggle for the FILE picker (Cmd+P). Independent from
+  // the content-search fuzzy flag because the matchers are different:
+  // file fuzzy is the JS-side subsequence scorer in `lib/fuzzy.ts`
+  // (instant, no IPC), content fuzzy goes through fff-search's
+  // Smith-Waterman grep mode on the Rust side. Persisted in
+  // component state — flipping search modes preserves it.
+  const [useFuzzyFiles, setUseFuzzyFiles] = React.useState(false);
 
   // ─── tabs + panes layout ─────────────────────────────────────
   // `useEditorTabs` owns the per-project tab/pane layout and
@@ -576,17 +607,63 @@ export function CodeView(props: CodeViewProps) {
   //   "lib/api git.ts"    basename "git.ts" inside paths with "lib/api"
   //   "**/code *.tsx"     basename matching "*.tsx" inside any "code" dir
   // See lib/glob.ts for the parser.
-  const filteredFiles = React.useMemo(() => {
-    if (searchMode !== "files") return [];
+  // Two-stage match: glob/scoped query first (handles `src tabs.ts`,
+  // `**/code *.tsx`, comma alternatives — see `lib/glob.ts`), then
+  // ranking on the survivors via `rankFileMatches`. Two ranking
+  // backends:
+  //   * `useFuzzyFiles=false` (default) — substring scorer:
+  //     basename-exact > basename-prefix > path-segment-prefix >
+  //     basename-contains > path-contains. Fast, no typo tolerance.
+  //   * `useFuzzyFiles=true` — subsequence scorer in `lib/fuzzy.ts`:
+  //     each query char must appear in path order, ranked by
+  //     basename hits + word boundaries + consecutive runs. Tolerates
+  //     typos / out-of-order chars / dropped chars.
+  //
+  // Glob queries (`*.ts`, `**/lib *.ts`) bypass the ranker's typo
+  // tolerance regardless of mode — the glob predicate is exact and
+  // the ranker just orders the survivors.
+  //
+  // We expose both the trimmed top-N (`rows`) and the full match
+  // count (`total`) so the header can render a numeric "+N more —
+  // refine query" hint when the cap is biting.
+  const pickerMatch = React.useMemo<{
+    rows: string[];
+    total: number;
+  }>(() => {
+    if (searchMode !== "files") return { rows: [], total: 0 };
     const trimmed = query.trim();
-    if (!trimmed) return files.slice(0, PICKER_RESULT_LIMIT);
+    if (!trimmed) {
+      return {
+        rows: files.slice(0, PICKER_RESULT_LIMIT),
+        total: files.length,
+      };
+    }
     const parsed = parsePickerQuery(trimmed);
-    if (parsed.alternatives.length === 0)
-      return files.slice(0, PICKER_RESULT_LIMIT);
-    return files
-      .filter((f) => matchesPickerQuery(f, parsed))
-      .slice(0, PICKER_RESULT_LIMIT);
-  }, [files, query, searchMode]);
+    const survivors =
+      parsed.alternatives.length === 0
+        ? (files as string[])
+        : files.filter((f) => matchesPickerQuery(f, parsed));
+    // Strip the optional folder/glob qualifier off for the ranker:
+    // it scores on the full path so passing the original query is
+    // fine for plain substring/fuzzy queries; for scoped queries
+    // (`src tabs.ts`) we hand the file part to the ranker so the
+    // basename-priority kicks in.
+    const rankerQuery = trimmed.includes(" ")
+      ? trimmed.split(" ").pop()!
+      : trimmed;
+    const ranked = rankFileMatches(
+      survivors,
+      rankerQuery,
+      Infinity,
+      useFuzzyFiles ? "fuzzy" : "substring",
+    );
+    return {
+      rows: ranked.slice(0, PICKER_RESULT_LIMIT),
+      total: ranked.length,
+    };
+  }, [files, query, searchMode, useFuzzyFiles]);
+  const filteredFiles = pickerMatch.rows;
+  const pickerTotalMatches = pickerMatch.total;
 
   // ─── content search (debounced, server-side via ripgrep libs) ─
   React.useEffect(() => {
@@ -609,6 +686,7 @@ export function CodeView(props: CodeViewProps) {
     const apiOptions: ContentSearchOptions = {
       ...defaultContentSearchOptions(),
       useRegex: contentOptions.useRegex,
+      useFuzzy: contentOptions.useFuzzy,
       caseSensitive: contentOptions.caseSensitive,
       includes: splitGlobList(contentOptions.include),
       excludes: splitGlobList(contentOptions.exclude),
@@ -641,6 +719,7 @@ export function CodeView(props: CodeViewProps) {
     query,
     projectPath,
     contentOptions.useRegex,
+    contentOptions.useFuzzy,
     contentOptions.caseSensitive,
     contentOptions.include,
     contentOptions.exclude,
@@ -1155,6 +1234,27 @@ export function CodeView(props: CodeViewProps) {
               className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-muted-foreground"
             />
             <SearchModeToggle mode={searchMode} onChange={setSearchMode} />
+            {searchMode === "files" && (
+              // Files-mode fuzzy toggle. Subsequence + word-boundary
+              // ranking via `lib/fuzzy.ts`. Useful when you remember
+              // a few characters but not the exact substring (e.g.
+              // typing `tbsv` to find `tabs-view.tsx`). Off by default
+              // because exact substring is what most "I know the file
+              // name" jumps want.
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-pressed={useFuzzyFiles}
+                onClick={() => setUseFuzzyFiles((v) => !v)}
+                title="Fuzzy file match (typo-tolerant subsequence)"
+                aria-label="Toggle fuzzy file matching"
+                className={
+                  useFuzzyFiles ? "bg-muted text-foreground" : undefined
+                }
+              >
+                <Sparkles className="h-3 w-3" />
+              </Button>
+            )}
             {searchMode === "content" && (
               <Button
                 variant="ghost"
@@ -1182,6 +1282,8 @@ export function CodeView(props: CodeViewProps) {
               filesLoading={filesLoading}
               filesTotal={files.length}
               filteredCount={filteredFiles.length}
+              totalMatches={pickerTotalMatches}
+              indexing={indexing}
               contentSearching={contentSearching}
               contentMatchCount={contentMatchCount}
             />
@@ -1500,13 +1602,21 @@ function ContentSearchAdvancedRow({
         variant="ghost"
         size="icon-xs"
         aria-pressed={options.useRegex}
+        // Fuzzy mode wins over regex on the Rust side (see the
+        // `build_query_plan` precedence table in file_index.rs), so
+        // disable the regex toggle while fuzzy is on to make the
+        // mutual-exclusivity visible. Otherwise users see the regex
+        // button "pressed" but get fuzzy results — confusing.
+        disabled={options.useFuzzy}
         onClick={() =>
           onChange((prev) => ({
             ...prev,
             useRegex: !prev.useRegex,
           }))
         }
-        title="Use regex (.*)"
+        title={
+          options.useFuzzy ? "Disabled while fuzzy is on" : "Use regex (.*)"
+        }
         aria-label="Toggle regex matching"
         className={options.useRegex ? "bg-muted text-foreground" : undefined}
       >
@@ -1515,14 +1625,43 @@ function ContentSearchAdvancedRow({
       <Button
         variant="ghost"
         size="icon-xs"
+        aria-pressed={options.useFuzzy}
+        onClick={() =>
+          onChange((prev) => ({
+            ...prev,
+            useFuzzy: !prev.useFuzzy,
+            // Flipping fuzzy ON forces regex OFF — the Rust precedence
+            // table makes regex+fuzzy resolve to fuzzy anyway, but we
+            // sync the UI flags so the user can see what's actually
+            // running.
+            useRegex: !prev.useFuzzy ? false : prev.useRegex,
+          }))
+        }
+        title="Fuzzy match (typo-tolerant, case-insensitive)"
+        aria-label="Toggle fuzzy matching"
+        className={options.useFuzzy ? "bg-muted text-foreground" : undefined}
+      >
+        <Sparkles className="h-3 w-3" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-xs"
         aria-pressed={options.caseSensitive}
+        // Fuzzy mode is inherently case-insensitive on the Rust side,
+        // so this toggle is a no-op while fuzzy is on. Disable to make
+        // that obvious rather than letting the press do nothing.
+        disabled={options.useFuzzy}
         onClick={() =>
           onChange((prev) => ({
             ...prev,
             caseSensitive: !prev.caseSensitive,
           }))
         }
-        title="Case sensitive (aA)"
+        title={
+          options.useFuzzy
+            ? "Fuzzy is always case-insensitive"
+            : "Case sensitive (aA)"
+        }
         aria-label="Toggle case sensitivity"
         className={
           options.caseSensitive ? "bg-muted text-foreground" : undefined
@@ -1578,6 +1717,15 @@ interface SearchStatusBadgeProps {
   filesLoading: boolean;
   filesTotal: number;
   filteredCount: number;
+  /** Total ranked matches before the `PICKER_RESULT_LIMIT` slice.
+   *  Drives the numeric "+N more" overflow hint so users know when
+   *  the cap is biting and they should refine the query. */
+  totalMatches: number;
+  /** True while fff-search's background scanner is still walking the
+   *  worktree on a cold open. Surfaces an "indexing N files…" badge
+   *  alongside the live count so users know the picker is filling
+   *  in. Goes away the moment the scan settles. */
+  indexing: boolean;
   contentSearching: boolean;
   contentMatchCount: number;
 }
@@ -1587,6 +1735,8 @@ function SearchStatusBadge({
   filesLoading,
   filesTotal,
   filteredCount,
+  totalMatches,
+  indexing,
   contentSearching,
   contentMatchCount,
 }: SearchStatusBadgeProps) {
@@ -1598,10 +1748,17 @@ function SearchStatusBadge({
         </span>
       );
     if (filesTotal === 0) return null;
+    // While the cold scan is still running show "indexing N files…"
+    // alongside the regular count so the live-fill is visible. We
+    // do NOT replace the count — partial results are real results
+    // and the user can already act on them.
+    const overflow =
+      filteredCount < totalMatches ? totalMatches - filteredCount : 0;
     return (
       <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
         {filteredCount}
-        {filteredCount === PICKER_RESULT_LIMIT && "+"} / {filesTotal}
+        {overflow > 0 ? ` +${overflow}` : ""} / {filesTotal}
+        {indexing ? " · indexing…" : ""}
       </span>
     );
   }

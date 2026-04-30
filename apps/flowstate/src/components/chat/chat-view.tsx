@@ -1277,6 +1277,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   useSessionStreamSubscription({
     sessionId,
     sessionIdRef,
+    // Worktree threads pass their own worktree path here so
+    // reindex-on-turn-completion targets the right fff-search
+    // FilePicker (each worktree has its own index, keyed by
+    // canonicalised path on the Rust side).
+    projectPath,
     setPendingInput,
     setLastEventAt,
     setStuckSince,

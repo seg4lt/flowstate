@@ -106,8 +106,24 @@ jobs:
           # (no password), so the PASSWORD env var can stay empty.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        # `env -u CI`: fff-search 0.5.2's build.rs hard-panics
+        # whenever the `CI` env var is set (gate is
+        # `env::var("CI").is_ok()`, so "false" / "" all trip it)
+        # unless the zig-backed `zlob` SIMD feature is enabled. We
+        # deliberately don't enable zlob to avoid forcing a zig
+        # install on every release-matrix platform (macOS / Windows
+        # / Linux each need a different package manager). Stripping
+        # CI from the process tree for this step picks the same
+        # pure-Rust grep path local dev uses. See
+        # apps/flowstate/src-tauri/Cargo.toml for the full rationale
+        # inline on the fff-search dep.
+        #
+        # `shell: bash` is required for `env -u` — the default pwsh
+        # on Windows runners doesn't recognise it. Git Bash ships on
+        # every GitHub runner image so this works once the Windows /
+        # Linux matrix rows are reinstated.
         shell: bash
-        run: pnpm tauri build ${{ matrix.tauri-args }}
+        run: env -u CI pnpm tauri build ${{ matrix.tauri-args }}
 
       # `flow` CLI — small Rust binary the desktop app's Settings
       # page installs onto the user's PATH. We compile it for the

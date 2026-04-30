@@ -4,9 +4,11 @@ import { useNavigate } from "@tanstack/react-router";
 import { useApp } from "@/stores/app-store";
 import { applyEventToTurns } from "@/lib/session-event-reducer";
 import {
+  projectFilesQueryOptions,
   sessionQueryKey,
   type SessionPage,
 } from "@/lib/queries";
+import { reindexProjectFiles } from "@/lib/api";
 import { toast } from "@/hooks/use-toast";
 import type {
   PermissionMode,
@@ -24,6 +26,12 @@ import type {
 export interface SessionStreamHandlers {
   sessionId: string;
   sessionIdRef: React.MutableRefObject<string>;
+  /** Resolved project root for the visible session, used to reindex
+   *  the fff-search file picker after every `turn_completed` event.
+   *  Null for folder-less sessions; the reindex hook short-circuits
+   *  on null. Worktree threads pass their worktree path here, not
+   *  the parent project — each worktree has its own index. */
+  projectPath: string | null;
   setPendingInput: (value: string | null) => void;
   setLastEventAt: (ts: number) => void;
   setStuckSince: (value: number | null) => void;
@@ -138,6 +146,24 @@ export function useSessionStreamSubscription(
           // — non-blocking for the UI.
           h.activateDiffSubscription();
           h.refreshDiffs();
+          // Reindex the fff-search file picker so newly-created
+          // files (the agent likely just touched several) appear in
+          // the next Cmd+P open. We drop the cached FilePicker on
+          // the Rust side AND invalidate the React Query cache so
+          // the next `listProjectFiles` fires a fresh cold scan.
+          // macOS FSEvents and Linux inotify both coalesce bursty
+          // edits, so the watcher's incremental updates can't be
+          // fully trusted on a turn that touches dozens of files in
+          // quick succession; a deliberate re-walk closes that gap.
+          // Failures (canonicalisation errors, etc.) are swallowed —
+          // the next list call will index cold for free.
+          if (h.projectPath) {
+            const path = h.projectPath;
+            void reindexProjectFiles(path).catch(() => {});
+            queryClient.invalidateQueries({
+              queryKey: projectFilesQueryOptions(path).queryKey,
+            });
+          }
           break;
 
         case "content_delta":

@@ -10,7 +10,12 @@ import {
   resolveGitRoot,
   sendMessage,
 } from "./api";
-import type { DirEntry, GitBranchList, GitWorktree } from "./api";
+import type {
+  DirEntry,
+  GitBranchList,
+  GitWorktree,
+  ProjectFileListing,
+} from "./api";
 import type { SessionDetail } from "./types";
 
 // Pagination page size for session loads. Requesting the most
@@ -213,28 +218,63 @@ export function attachmentQueryOptions(id: string | null) {
 // project — not one per mouse-enter event.
 const PROJECT_FILES_PREFETCH_THROTTLE_MS = 1_500;
 
+/// While fff-search's background scanner is still walking the
+/// worktree, React Query re-polls on this interval so the picker
+/// fills in live without the user touching anything. The first
+/// response with `indexing: false` flips the polling off (see
+/// `refetchInterval` below). 750 ms keeps the picker visibly alive
+/// without hammering the IPC bridge.
+const PROJECT_FILES_INDEXING_POLL_MS = 750;
+
+/// Once indexing has settled, treat the cached file list as fresh
+/// for 30 s. Short enough that newly-created files appear quickly
+/// when the user re-focuses the picker; long enough that the
+/// picker's open animation never blocks on a re-walk for typical
+/// edit-and-flip-back flows. The `turn_completed` reindex hook
+/// (see `useSessionStreamSubscription`) explicitly invalidates this
+/// query, so agent-created files don't have to wait for staleness.
+const PROJECT_FILES_STALE_MS = 30_000;
+
 // Project file list for the /code editor view's picker + tree.
-// Cache lives forever once populated and is refreshed on explicit
-// user signal only (Search-button hover/focus → prefetchProjectFiles
-// below, or first cold mount of CodeView). NO automatic refetches:
-// no staleTime countdown, no refetchOnMount, no refetchInterval, no
-// refetchOnWindowFocus / Reconnect, no FS-watcher invalidation. The
-// user is in a long-running agent flow and explicitly does not want
-// the app walking thousands of files for data they might never look
-// at. A future change here must preserve that — see the plan at
-// `~/.claude/plans/lovely-singing-abelson.md` for the rationale.
+//
+// Backed by fff-search's per-worktree mmap-mounted index — one cold
+// scan per worktree, then live updates from the fs-watcher. While
+// the cold scan is in progress the response carries `indexing: true`
+// and React Query re-polls every `PROJECT_FILES_INDEXING_POLL_MS`
+// until the scanner settles, so the picker visibly fills in on huge
+// repos instead of looking empty.
+//
+// Cache freshness:
+//   * `staleTime: PROJECT_FILES_STALE_MS` — quick re-fetches on
+//     window focus / next mount when the user has been away briefly
+//   * `refetchOnWindowFocus: true` — picks up files created while
+//     the user was in another app
+//   * Explicit `invalidateQueries` from the chat session's
+//     `turn_completed` event — agent edits land in the picker
+//     immediately on the next open
+//
+// Why this changed: the previous policy was `staleTime: Infinity`
+// + no refetchOnMount, on the assumption that walking a tree was
+// expensive. With fff-search the steady-state cost is a memcpy
+// against the mmap'd index, so we can afford active freshness.
 export function projectFilesQueryOptions(path: string | null) {
   return queryOptions({
     queryKey: ["code", "project-files", path] as const,
-    queryFn: async (): Promise<string[]> => {
-      if (!path) return [];
+    queryFn: async (): Promise<ProjectFileListing> => {
+      if (!path) return { files: [], indexing: false, scanned: 0 };
       return listProjectFiles(path);
     },
     enabled: !!path,
-    staleTime: Infinity,
-    // Global default in main.tsx is already false, but be explicit
-    // so a future global change doesn't quietly start refetching.
+    staleTime: PROJECT_FILES_STALE_MS,
+    refetchOnWindowFocus: true,
     refetchOnMount: false,
+    // Auto-poll only while fff is still walking the cold scan; flip
+    // off as soon as `indexing` reports `false`. React Query passes
+    // the live Query object so we can read the latest data.
+    refetchInterval: (query) => {
+      const data = query.state.data as ProjectFileListing | undefined;
+      return data?.indexing ? PROJECT_FILES_INDEXING_POLL_MS : false;
+    },
     gcTime: 30 * 60 * 1000,
   });
 }

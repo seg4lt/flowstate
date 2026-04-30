@@ -44,7 +44,7 @@ const MAIN_WINDOW_LABEL: &str = "main";
 #[cfg(target_os = "macos")]
 const FLOWSTATE_CLOSE_WINDOW_MENU_ID: &str = "flowstate-close-window";
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::ipc::Channel;
 use tauri::Emitter;
 use tauri::Manager;
@@ -64,10 +64,12 @@ use pty::{PtyEvent, PtyId, PtyManager};
 mod shell_env;
 
 mod daemon_client;
+mod file_index;
 mod install_cli;
 mod loopback_http;
 mod orphan_scan;
 use daemon_client::DaemonBaseUrl;
+use file_index::{ContentSearchOptions, FileIndexRegistry, ProjectFileListing, SearchTasks};
 // Phase 3 — user_config / usage / orchestration_adapters / git_worktree
 // moved into `flowstate-app-layer` so the future daemon bin can link
 // them without pulling Tauri. The Tauri crate now depends on the
@@ -1179,101 +1181,48 @@ fn stop_git_diff_summary(tasks: State<'_, DiffTasks>, token: u64) {
 // /code editor view — file picker + single-file read
 // ─────────────────────────────────────────────────────────────────
 
-/// Cap the picker list so we never send a million entries to the
-/// frontend for a huge repo. 20k is more than enough for a Cmd+P
-/// picker.
-const PROJECT_FILE_LIST_MAX: usize = 20_000;
-
 /// Maximum file size we'll inline into the code view. The editor
 /// uses @pierre/diffs' Virtualizer so a 10k-line plain-text file is
 /// fine, but anything past this is probably generated / binary /
 /// not useful to read inline and we return a placeholder marker.
 const CODE_VIEW_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
-/// List every file in `path` that isn't ignored by .gitignore,
-/// .ignore, etc. Respects hidden-file convention (skips dotfiles)
-/// and avoids the usual suspects (node_modules, target, dist, …)
-/// via `ignore::WalkBuilder`'s standard filters. Returns relative
-/// paths (forward-slash), sorted, capped at PROJECT_FILE_LIST_MAX.
+/// List the project's files via the per-worktree fff-search index
+/// (see `file_index.rs`). Returns a `ProjectFileListing` snapshot —
+/// `files` is whatever's been walked so far, `indexing` flips to
+/// `false` when fff's background scanner finishes, and React Query
+/// re-fetches on a short stale window so the picker fills in live.
 ///
-/// Uses `WalkBuilder::build_parallel` so the gitignore walk fans
-/// out across CPU cores. On a multi-core machine with SSD this is
-/// 2-4x faster than the serial walker for large repos, which is
-/// the dominant cost on a cold open of the /code view's picker.
+/// We deliberately do NOT cap the list (no `PROJECT_FILE_LIST_MAX`
+/// cut). The previous `ignore::WalkBuilder` impl quit at 20k files
+/// across all parallel threads, which on a 100k-file repo silently
+/// dropped ~80% of paths and made it impossible to find files even
+/// by typing the exact name. fff's mmap-backed file table makes the
+/// full list cheap to materialise.
 #[tauri::command]
-fn list_project_files(path: String) -> Vec<String> {
-    use ignore::WalkState;
-    use std::sync::Mutex;
+fn list_project_files(
+    path: String,
+    state: State<Arc<FileIndexRegistry>>,
+) -> ProjectFileListing {
+    file_index::list_project_files(state.inner(), &path)
+}
 
-    let project_path = Path::new(&path);
-    if !project_path.is_dir() {
-        return Vec::new();
-    }
-
-    // Match `git status` visibility: honor .gitignore (local, global,
-    // and .git/info/exclude), but don't silently drop dotfolders or
-    // `.ignore` files the way ripgrep does by default.
-    let entries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let project_path_owned = project_path.to_path_buf();
-
-    let thread_count = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
-    ignore::WalkBuilder::new(project_path)
-        .hidden(false)
-        .ignore(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .require_git(false)
-        .threads(thread_count)
-        .build_parallel()
-        .run(|| {
-            let entries = Arc::clone(&entries);
-            let project_path = project_path_owned.clone();
-            Box::new(move |result| {
-                let Ok(entry) = result else {
-                    return WalkState::Continue;
-                };
-                // Only files — directories get walked into automatically.
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
-                    return WalkState::Continue;
-                }
-                let abs = entry.path();
-                let Ok(rel) = abs.strip_prefix(&project_path) else {
-                    return WalkState::Continue;
-                };
-                // Forward-slash path, platform-normalised, so the
-                // frontend can pattern-match without caring about
-                // Windows back-slashes.
-                let rel_str = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join("/");
-                if rel_str.is_empty() {
-                    return WalkState::Continue;
-                }
-                let mut guard = match entries.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if guard.len() >= PROJECT_FILE_LIST_MAX {
-                    return WalkState::Quit;
-                }
-                guard.push(rel_str);
-                WalkState::Continue
-            })
-        });
-
-    let mut entries = Arc::try_unwrap(entries)
-        .ok()
-        .and_then(|m| m.into_inner().ok())
-        .unwrap_or_default();
-    entries.sort();
-    entries
+/// Drop the cached `FilePicker` for `path` so the next
+/// `list_project_files` call rebuilds it from a fresh scan. Wired up
+/// from the `turn_completed` session event in
+/// `useSessionStreamSubscription` — agent edits that touch many
+/// files in quick succession can outrun fs-event coalescing on
+/// macOS, so we trigger an explicit re-walk at the moment the user
+/// is most likely to look at the picker again.
+///
+/// No-op when `path` was never indexed; the next list call indexes
+/// it cold for free.
+#[tauri::command]
+fn reindex_project_files(
+    path: String,
+    state: State<Arc<FileIndexRegistry>>,
+) -> Result<(), String> {
+    state.inner().reindex(Path::new(&path))
 }
 
 /// Return the contents of a single project file as a UTF-8 string.
@@ -1501,328 +1450,52 @@ fn open_in_editor(editor: String, path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// One line inside a `ContentBlock`. `is_match` distinguishes the
-/// matching line(s) from the surrounding context lines so the
-/// frontend can highlight them.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BlockLine {
-    line: u64,
-    text: String,
-    is_match: bool,
-}
-
-/// A contiguous run of lines from one file that contains at least
-/// one match plus its surrounding context. Matches close together
-/// in the same file share a single block (`grep_searcher` issues
-/// a `context_break` between disjoint groups, which we use as the
-/// block boundary).
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ContentBlock {
-    path: String,
-    /// 1-based line number of the first line in `lines` — handy
-    /// for the frontend gutter even though every line carries its
-    /// own `line` field too.
-    start_line: u64,
-    lines: Vec<BlockLine>,
-}
-
-/// How many context lines to capture on each side of every match.
-/// Three is the Zed multibuffer default and it's what the picker
-/// header explains as "top 3 / bottom 3".
-const CONTENT_SEARCH_CONTEXT_LINES: usize = 3;
-
-/// Soft cap on total lines streamed across all blocks for one
-/// query. Bounds the IPC payload so a pathological query (`a`)
-/// can't ship megabytes through the bridge. Each line averages
-/// around 60–80 chars, so 3000 lines ≈ ~200 KB of JSON.
-const CONTENT_SEARCH_MAX_TOTAL_LINES: usize = 3_000;
-
-/// Per-line truncation. Long lines (minified bundles, lockfiles)
-/// get clipped + ellipsised so a single 100k-char line can't blow
-/// up the payload either.
-const CONTENT_SEARCH_MAX_LINE_LEN: usize = 240;
-
-/// Custom `grep_searcher::Sink` that builds `ContentBlock`s as it
-/// receives lines from the searcher. The default `sinks::UTF8`
-/// only forwards match lines; we need both match AND context, so
-/// we implement Sink ourselves and use `context_break` events to
-/// separate disjoint match groups within a file.
-struct BlockSink {
-    rel_path: String,
-    finished_blocks: Vec<ContentBlock>,
-    current: Option<ContentBlock>,
-    /// Shared budget across all files for one query. Decremented
-    /// on every line we accept; once it hits zero we tell the
-    /// searcher to stop by returning `Ok(false)`.
-    line_budget_remaining: usize,
-}
-
-impl BlockSink {
-    fn new(rel_path: String, line_budget_remaining: usize) -> Self {
-        Self {
-            rel_path,
-            finished_blocks: Vec::new(),
-            current: None,
-            line_budget_remaining,
-        }
-    }
-
-    fn push_line(&mut self, line_number: u64, text: String, is_match: bool) {
-        if self.current.is_none() {
-            self.current = Some(ContentBlock {
-                path: self.rel_path.clone(),
-                start_line: line_number,
-                lines: Vec::new(),
-            });
-        }
-        if let Some(block) = self.current.as_mut() {
-            block.lines.push(BlockLine {
-                line: line_number,
-                text,
-                is_match,
-            });
-            self.line_budget_remaining = self.line_budget_remaining.saturating_sub(1);
-        }
-    }
-
-    fn flush_current(&mut self) {
-        if let Some(block) = self.current.take() {
-            // Only keep blocks that actually contain at least one
-            // match. A pure-context block (no matched lines) means
-            // the searcher emitted before/after context for a match
-            // we already accounted for in a previous block — skip.
-            if block.lines.iter().any(|l| l.is_match) {
-                self.finished_blocks.push(block);
-            }
-        }
-    }
-}
-
-fn truncate_line(raw: &[u8]) -> String {
-    let text = std::str::from_utf8(raw).unwrap_or("");
-    let text = text.trim_end_matches(['\n', '\r']);
-    if text.len() > CONTENT_SEARCH_MAX_LINE_LEN {
-        // Find a char boundary at or before the cap so we don't
-        // split a multi-byte character mid-codepoint.
-        let mut cut = CONTENT_SEARCH_MAX_LINE_LEN;
-        while cut > 0 && !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let mut t = text[..cut].to_string();
-        t.push('…');
-        t
-    } else {
-        text.to_string()
-    }
-}
-
-impl grep_searcher::Sink for BlockSink {
-    type Error = std::io::Error;
-
-    fn matched(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-        mat: &grep_searcher::SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
-        if self.line_budget_remaining == 0 {
-            return Ok(false);
-        }
-        let line_number = mat.line_number().unwrap_or(0);
-        let text = truncate_line(mat.bytes());
-        self.push_line(line_number, text, true);
-        Ok(self.line_budget_remaining > 0)
-    }
-
-    fn context(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-        ctx: &grep_searcher::SinkContext<'_>,
-    ) -> Result<bool, Self::Error> {
-        if self.line_budget_remaining == 0 {
-            return Ok(false);
-        }
-        let line_number = ctx.line_number().unwrap_or(0);
-        let text = truncate_line(ctx.bytes());
-        self.push_line(line_number, text, false);
-        Ok(self.line_budget_remaining > 0)
-    }
-
-    fn context_break(&mut self, _searcher: &grep_searcher::Searcher) -> Result<bool, Self::Error> {
-        self.flush_current();
-        Ok(self.line_budget_remaining > 0)
-    }
-
-    fn finish(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-        _finish: &grep_searcher::SinkFinish,
-    ) -> Result<(), Self::Error> {
-        self.flush_current();
-        Ok(())
-    }
-}
-
-/// Per-search options sent from the frontend's advanced controls.
-/// Defaults intentionally match "boring literal case-sensitive
-/// search with no path filtering" so omitting the field on the
-/// frontend behaves like the old two-arg command.
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct ContentSearchOptions {
-    /// When true the query is treated as a `regex` crate regex,
-    /// matching ripgrep's default dialect. When false the query
-    /// is passed to grep-regex with `.fixed_strings(true)` so
-    /// users can paste raw code fragments without escaping.
-    #[serde(default)]
-    use_regex: bool,
-    /// Default true (matches the user's expectation that "Foo"
-    /// doesn't match "foo" out of the box). The `aA` toggle in
-    /// the UI flips this off.
-    #[serde(default = "default_true")]
-    case_sensitive: bool,
-    /// Glob patterns to RESTRICT the walk to (ripgrep
-    /// OverrideBuilder includes). Empty list means "everywhere".
-    #[serde(default)]
-    includes: Vec<String>,
-    /// Glob patterns to EXCLUDE from the walk. The frontend sends
-    /// plain globs; we prefix them with `!` for OverrideBuilder
-    /// since that's the convention it expects.
-    #[serde(default)]
-    excludes: Vec<String>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Live content search across the project, ripgrep-style. Walks
-/// the same gitignore-aware tree as `list_project_files` (with
-/// optional include/exclude glob overrides) and runs each file
-/// through ripgrep's own `Searcher`. The query is literal by
-/// default (`fixed_strings(true)`) so users can paste raw code
-/// fragments like `fn foo(` or `->` without escaping; flipping
-/// `useRegex` switches into the full `regex` crate dialect.
-/// `caseSensitive` defaults to true; flip it off for an
-/// `aA`-style insensitive search.
+/// Live content search across the project, backed by fff-search's
+/// mmap-mounted file index (see `file_index::search_file_contents`).
+/// Supports literal / regex / fuzzy modes via `ContentSearchOptions`,
+/// with include/exclude globs filtering the indexed file list before
+/// the grep pass.
+///
+/// `cancel_token` registers a cooperative cancellation flag so the
+/// frontend can interrupt a slow search by calling
+/// `stop_content_search`. Pass `None` for fire-and-forget calls (the
+/// chat composer's @-mention preview, for example).
 ///
 /// Returns one `ContentBlock` per disjoint match group per file:
-/// each block is the match line(s) plus 3 lines of context on
-/// either side. The frontend renders these as Zed-style
-/// multibuffer chunks.
+/// each block is the match line(s) plus
+/// `CONTENT_SEARCH_CONTEXT_LINES` lines of context on either side.
+/// The frontend renders these as Zed-style multibuffer chunks.
 #[tauri::command]
 fn search_file_contents(
     path: String,
     query: String,
     options: ContentSearchOptions,
-) -> Result<Vec<ContentBlock>, String> {
-    use grep_regex::RegexMatcherBuilder;
-    use grep_searcher::SearcherBuilder;
-    use ignore::overrides::OverrideBuilder;
-
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
+    cancel_token: Option<u64>,
+    registry: State<Arc<FileIndexRegistry>>,
+    tasks: State<Arc<SearchTasks>>,
+) -> Result<Vec<file_index::ContentBlock>, String> {
+    // Register / look up the cancellation flag *before* doing any
+    // work so a `stop_content_search(token)` racing the start of
+    // this call still cancels it.
+    let flag = cancel_token.map(|t| tasks.inner().register(t));
+    let result = file_index::search_file_contents(
+        registry.inner(),
+        &path,
+        &query,
+        &options,
+        flag.as_deref(),
+    );
+    if let Some(t) = cancel_token {
+        tasks.inner().unregister(t);
     }
-    let project_path = Path::new(&path);
-    if !project_path.is_dir() {
-        return Ok(Vec::new());
-    }
+    result
+}
 
-    let matcher = RegexMatcherBuilder::new()
-        .case_insensitive(!options.case_sensitive)
-        .fixed_strings(!options.use_regex)
-        .build(trimmed)
-        .map_err(|e| format!("regex build: {e}"))?;
-
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .before_context(CONTENT_SEARCH_CONTEXT_LINES)
-        .after_context(CONTENT_SEARCH_CONTEXT_LINES)
-        .build();
-
-    // Build glob overrides from include/exclude lists, if any.
-    // OverrideBuilder treats a leading `!` as "exclude" and bare
-    // patterns as "include" — we hide that detail from users and
-    // let them type plain globs in the exclude box.
-    let overrides = if !options.includes.is_empty() || !options.excludes.is_empty() {
-        let mut ob = OverrideBuilder::new(project_path);
-        for inc in &options.includes {
-            let trimmed = inc.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            ob.add(trimmed)
-                .map_err(|e| format!("include glob `{trimmed}`: {e}"))?;
-        }
-        for exc in &options.excludes {
-            let trimmed = exc.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let pat = if trimmed.starts_with('!') {
-                trimmed.to_string()
-            } else {
-                format!("!{trimmed}")
-            };
-            ob.add(&pat)
-                .map_err(|e| format!("exclude glob `{trimmed}`: {e}"))?;
-        }
-        Some(ob.build().map_err(|e| format!("override build: {e}"))?)
-    } else {
-        None
-    };
-
-    let mut wb = ignore::WalkBuilder::new(project_path);
-    wb.hidden(false)
-        .ignore(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
-        .require_git(false);
-    if let Some(ov) = overrides {
-        wb.overrides(ov);
-    }
-
-    let mut all_blocks: Vec<ContentBlock> = Vec::new();
-    let mut lines_remaining = CONTENT_SEARCH_MAX_TOTAL_LINES;
-
-    'walk: for result in wb.build() {
-        if lines_remaining == 0 {
-            break;
-        }
-        let Ok(entry) = result else { continue };
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let abs = entry.path();
-        let Ok(rel) = abs.strip_prefix(project_path) else {
-            continue;
-        };
-        let rel_str = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        if rel_str.is_empty() {
-            continue;
-        }
-
-        let mut sink = BlockSink::new(rel_str, lines_remaining);
-        let _ = searcher.search_path(&matcher, abs, &mut sink);
-        // The sink decrements its own budget; carry the remainder
-        // into the next file's sink so the global cap holds.
-        lines_remaining = sink.line_budget_remaining;
-        all_blocks.append(&mut sink.finished_blocks);
-
-        if lines_remaining == 0 {
-            break 'walk;
-        }
-    }
-
-    Ok(all_blocks)
+/// Cancel the in-flight content search registered under `token`.
+/// Idempotent — unknown tokens are silently ignored.
+#[tauri::command]
+fn stop_content_search(token: u64, tasks: State<Arc<SearchTasks>>) {
+    tasks.inner().cancel(token);
 }
 
 struct AppLifecycle {
@@ -1852,8 +1525,18 @@ struct DaemonReadyPayload {
 /// surfaces logs in the terminal; release builds keep writing to a log
 /// file alongside the daemon log.
 fn init_tracing() {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("flowstate=info,zenui=info,warn"));
+    // `fff_search::file_picker=off` suppresses a known false-positive
+    // ERROR in fff-search 0.5.2: its filesystem walker filters out
+    // binary files (icons, build artifacts) from the in-memory index,
+    // but a parallel `git status --include-untracked` thread returns
+    // every tracked path regardless. When the status applier can't
+    // find the filtered-out entry it logs ERROR per file, spamming
+    // hundreds of lines on every refresh in a repo with many icon
+    // assets. Demote to `off` until either an .fffignore mechanism
+    // ships upstream or we patch the crate. See `file_index.rs`.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("flowstate=info,zenui=info,fff_search::file_picker=off,warn")
+    });
 
     if cfg!(debug_assertions) {
         let _ = tracing_subscriber::fmt()
@@ -2605,6 +2288,17 @@ pub fn run() {
         })
         .manage(PtyManager::new())
         .manage(DiffTasks::default())
+        // Per-worktree fff-search file pickers. Lazily populated on
+        // first `list_project_files` call per worktree; the
+        // `reindex_project_files` command drops entries (next list
+        // re-walks). Wrapped in `Arc` so cancellation tokens and
+        // command handlers can clone cheaply.
+        .manage(Arc::new(FileIndexRegistry::default()))
+        // Cancellation registry for `search_file_contents` — mirrors
+        // `DiffTasks` above. `stop_content_search(token)` flips the
+        // registered `AtomicBool` and the in-flight grep bails on
+        // its next cooperative check.
+        .manage(Arc::new(SearchTasks::default()))
         // Holds the snapshot of provisioning failures seen during
         // `provision_runtimes()` (and any subsequent retries from the
         // Settings page). Frontend pulls via `get_provision_failures`
@@ -3532,10 +3226,12 @@ pub fn run() {
                         watch_git_diff_summary,
                         stop_git_diff_summary,
                         list_project_files,
+                        reindex_project_files,
                         list_directory,
                         read_project_file,
                         write_project_file,
                         search_file_contents,
+                        stop_content_search,
                         open_in_editor,
                         pty_open,
                         pty_write,

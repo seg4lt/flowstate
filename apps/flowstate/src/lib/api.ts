@@ -437,12 +437,44 @@ export function watchGitDiffSummary(
   };
 }
 
+// Snapshot of the per-worktree file index returned by
+// `list_project_files`. Mirrors the Rust `ProjectFileListing` struct
+// (camelCase from serde's `rename_all = "camelCase"`).
+//
+// `files` is the full forward-slash relative-path list as currently
+// indexed by fff-search. There is **no** server-side cap — on a
+// 100k-file repo it's ~8 MB of JSON and the picker virtualises it
+// client-side. While `indexing` is true the background scanner is
+// still walking; React Query refetches on a short stale window so
+// the picker fills in live.
+export interface ProjectFileListing {
+  files: string[];
+  indexing: boolean;
+  // Files indexed so far (== files.length). Surfaced separately so
+  // the picker header can show "Indexing N files…" without
+  // recomputing.
+  scanned: number;
+}
+
 // Every file in `path` that isn't ignored by .gitignore / .ignore,
-// returned as forward-slash relative paths. Used by the /code
-// editor view's Cmd+P-style picker. Capped at 20k entries on the
-// Rust side so huge monorepos don't blow up the IPC bridge.
-export function listProjectFiles(path: string): Promise<string[]> {
-  return invoke<string[]>("list_project_files", { path });
+// returned as forward-slash relative paths inside a
+// `ProjectFileListing`. Used by the /code editor view's Cmd+P-style
+// picker. **Not capped** — the previous 20k cap silently dropped
+// most files on a 100k-file repo and made it impossible to find
+// files even by typing the exact name.
+export function listProjectFiles(path: string): Promise<ProjectFileListing> {
+  return invoke<ProjectFileListing>("list_project_files", { path });
+}
+
+// Drop the cached fff-search file picker for `path` so the next
+// `listProjectFiles` rebuilds it from a fresh scan. Wired up from
+// the chat session's `turn_completed` event — agent edits that
+// touch many files in quick succession can outrun fs-event
+// coalescing on macOS, so we explicitly reindex at the moment the
+// user is most likely to look at the picker again. No-op when
+// `path` was never indexed.
+export function reindexProjectFiles(path: string): Promise<void> {
+  return invoke<void>("reindex_project_files", { path });
 }
 
 // One entry returned by `listDirectory`. `isIgnored` is true when the
@@ -1085,9 +1117,15 @@ export interface ContentBlock {
 // behavior with no path filtering — callers that don't care about
 // the advanced options can pass `defaultContentSearchOptions()`.
 export interface ContentSearchOptions {
-  /** Treat the query as a `regex` crate regex instead of a
-   *  literal string. Default false. */
+  /** Treat the query as a regex (ripgrep dialect) instead of a
+   *  literal string. Default false. Ignored when `useFuzzy` is
+   *  true. */
   useRegex: boolean;
+  /** Fuzzy-match each line against the query using fff-search's
+   *  Smith-Waterman scorer — typo-tolerant and inherently
+   *  case-insensitive. Takes precedence over `useRegex`. Default
+   *  false. */
+  useFuzzy: boolean;
   /** Default true. The `aA` toggle in the UI flips this off. */
   caseSensitive: boolean;
   /** Glob patterns restricting which files are searched. */
@@ -1100,6 +1138,7 @@ export interface ContentSearchOptions {
 export function defaultContentSearchOptions(): ContentSearchOptions {
   return {
     useRegex: false,
+    useFuzzy: false,
     caseSensitive: true,
     includes: [],
     excludes: [],
@@ -1183,23 +1222,39 @@ export function killPty(id: PtyId): Promise<void> {
   return invoke<void>("pty_kill", { id });
 }
 
-// Live content search across the project, ripgrep-style. The
-// `options` arg controls regex vs literal matching, case
-// sensitivity, and include/exclude glob filters (all defaulted
-// to the conservative "search everything literally, case-
-// sensitive" behavior). Returns one ContentBlock per disjoint
-// match group with ±3 lines of surrounding context — designed
-// for a Zed-style multibuffer renderer. Total lines streamed
-// are capped server-side so pathological queries can't flood
-// the bridge.
+// Monotonic token allocator for `searchFileContents` cancellation.
+// Each call gets a fresh token; pass it to `stopContentSearch` to
+// cooperatively interrupt the in-flight grep. We mint tokens
+// client-side (rather than asking Rust for one) so the caller can
+// tear down a stale search the moment a new one starts, without an
+// extra round-trip.
+let nextSearchToken = 1;
+export function nextContentSearchToken(): number {
+  return nextSearchToken++;
+}
+
+// Live content search across the project. Backed by fff-search's
+// indexed grep (literal / regex / fuzzy modes via `options`); the
+// `cancelToken` is registered with a Rust-side `AtomicBool` flag so
+// `stopContentSearch(token)` can interrupt a slow query. Returns
+// one ContentBlock per disjoint match group with ±3 lines of
+// context — designed for a Zed-style multibuffer renderer.
 export function searchFileContents(
   path: string,
   query: string,
   options: ContentSearchOptions,
+  cancelToken?: number,
 ): Promise<ContentBlock[]> {
   return invoke<ContentBlock[]>("search_file_contents", {
     path,
     query,
     options,
+    cancelToken: cancelToken ?? null,
   });
+}
+
+// Cancel the content search registered under `token`. Idempotent —
+// unknown tokens are silently ignored on the Rust side.
+export function stopContentSearch(token: number): Promise<void> {
+  return invoke<void>("stop_content_search", { token });
 }

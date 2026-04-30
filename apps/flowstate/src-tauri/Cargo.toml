@@ -118,16 +118,28 @@ portable-pty = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# ripgrep's gitignore-aware walker — used by the /code editor view's
-# file picker + content search. Honors .gitignore automatically so we
-# don't walk into node_modules/ etc.
+# File-finder + grep SDK backing the /code view's picker and content
+# search. Replaces the ripgrep-stack (`ignore` + `grep-regex` +
+# `grep-searcher`) we briefly bounced back to in `53993c5` — that
+# revert was triggered by fff-search's *defaults* silently dropping
+# matches (200 hits/file, 4 MiB file cap, 2 s cold-open cut, 90+
+# binary-extension skips, 50 % fuzzy threshold). Those are the knobs
+# in `src/file_index.rs`; we now disable / widen every one of them so
+# the picker never silently truncates on a 100k-file repo.
+#
+# Build-time gotcha: fff-search's `build.rs` panics under `CI=true`
+# even without the `zlob` feature enabled. Every workflow step that
+# compiles this crate uses `env -u CI` (or `CI: "false"`) — search
+# `.github/workflows/*.yml` for the rationale inline. Local dev is
+# unaffected because shells don't set `CI=true`.
+fff-search = "0.5.2"
+# Compile user-supplied include/exclude globs (`*.rs`, `target/*`) for
+# pre-filtering the indexed file list before content search.
+globset = "0.4.18"
+# Retained for `list_directory` (the lazy file tree, which still wants
+# the gitignore-aware walker for its single-level reads). The picker
+# and content search go through fff-search now.
 ignore = "0.4"
-# ripgrep's matcher + line searcher. Same lineage as `ignore`, used by
-# `search_file_contents` to produce Zed-style multibuffer blocks with
-# ±3 lines of context per match.
-grep-regex = "0.1"
-grep-searcher = "0.1"
-grep-matcher = "0.1"
 
 # Process enumeration for the startup orphan scan (see
 # `src/orphan_scan.rs`). The scan walks every running process at

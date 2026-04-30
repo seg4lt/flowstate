@@ -140,6 +140,12 @@ const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
  *  `Read` tool rather than us bundling the bytes. */
 const MEDIA_MIME_PREFIXES = ["image/", "audio/", "video/"];
 
+/** Stable empty-array sentinel for the `@mention` autocomplete's
+ *  ranking memo: keeps the dependency identity steady when the
+ *  query hasn't returned yet, so we don't re-rank-and-rerender on
+ *  every poll cycle while fff-search's cold scan is still walking. */
+const EMPTY_MENTION_FILES: readonly string[] = Object.freeze([]);
+
 /** Does `mediaType` classify as drag-and-drop media (image/audio/video)? */
 function isMediaMimeType(mediaType: string): boolean {
   return MEDIA_MIME_PREFIXES.some((prefix) => mediaType.startsWith(prefix));
@@ -353,20 +359,20 @@ export function ChatInput({
   }, [matches.length, inputToken]);
 
   // --- `@<filename>` mention autocomplete ---
-  // The project file list comes from `list_project_files` (ripgrep's
-  // gitignore walker) and is cached forever via
-  // `projectFilesQueryOptions`, so the second mention in the same
-  // session is instant. When `projectPath` is
-  // null (unlikely but possible for degenerate sessions) the query
-  // short-circuits and we get an empty list, which turns the popup
-  // off naturally.
+  // The project file list comes from fff-search's per-worktree
+  // index via `projectFilesQueryOptions`. The query returns a
+  // `ProjectFileListing` (full list under `.files`, plus an
+  // `indexing` flag). While the cold scan is still running React
+  // Query re-polls every 750 ms so newly-indexed files appear in
+  // the popup live. When `projectPath` is null (unlikely but
+  // possible for degenerate sessions) the query short-circuits and
+  // we get an empty list, which turns the popup off naturally.
   const filesQuery = useQuery(projectFilesQueryOptions(projectPath ?? null));
+  const mentionFiles = filesQuery.data?.files ?? EMPTY_MENTION_FILES;
   const mentionMatches = React.useMemo(
     () =>
-      mentionCtx
-        ? rankFileMatches(filesQuery.data ?? [], mentionCtx.query)
-        : [],
-    [mentionCtx, filesQuery.data],
+      mentionCtx ? rankFileMatches(mentionFiles, mentionCtx.query) : [],
+    [mentionCtx, mentionFiles],
   );
   // The slash-command popup wins if both could render on the same
   // draft — in practice they can't (different prefixes) but keep the
