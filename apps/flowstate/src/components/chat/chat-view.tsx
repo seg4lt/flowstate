@@ -1,9 +1,9 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
-import { isPopoutWindow } from "@/lib/popout";
+import { isMacOS, isPopoutWindow } from "@/lib/popout";
 import {
   TOGGLE_CONTEXT_EVENT,
   TOGGLE_DIFF_EVENT,
@@ -245,6 +245,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const sessionQuery = useQuery(sessionQueryOptions(sessionId));
   const turns: TurnRecord[] = sessionQuery.data?.detail.turns ?? [];
   const loading = sessionQuery.isLoading && !sessionQuery.data;
+
+  // macOS traffic-light spacer is only needed when the chat header is
+  // the leftmost element of the window. With the sidebar expanded the
+  // traffic lights sit over the SidebarHeader instead, so the spacer
+  // here would just be wasted space. In a popout there's no sidebar
+  // mounted at all, so always show the spacer there.
+  const { state: sidebarState } = useSidebar();
+  const inPopoutWindow = isPopoutWindow();
+  const showMacTrafficSpacer =
+    isMacOS() && (inPopoutWindow || sidebarState === "collapsed");
 
   // Ref tracking the currently-visible session. Used by the stream
   // handler to decide whether an incoming event should mutate
@@ -1667,16 +1677,30 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   return (
     <div className="flex h-svh min-w-0 flex-col overflow-hidden">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
+      <header
+        data-tauri-drag-region
+        className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-sm"
+      >
+        {/* macOS traffic-light spacer. Tagged as a drag region too so
+            the cleared area still drags the window. titleBarStyle:
+            Overlay overlays the buttons on top of this 64px slot. Only
+            rendered when the chat header is actually leftmost (sidebar
+            collapsed, or we're in a popout where the sidebar isn't
+            mounted at all). When the sidebar is expanded the lights
+            sit over SidebarHeader's spacer instead. */}
+        {showMacTrafficSpacer && (
+          <div className="w-16 shrink-0" data-tauri-drag-region />
+        )}
         {/* SidebarTrigger has no sidebar to toggle when rendered in
             a thread popout (the stripped PopoutShell in router.tsx
             doesn't mount AppSidebar), so hide it there. */}
         {!isPopoutWindow() && <SidebarTrigger />}
-        <div className="flex min-w-0 flex-col leading-tight">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
           {editingTitle ? (
             <input
               ref={titleInputRef}
-              className="min-w-0 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
+              data-tauri-drag-region={false}
+              className="min-w-0 flex-1 truncate rounded border border-input bg-background px-1.5 py-0.5 text-sm font-medium outline-none"
               value={titleDraft}
               onChange={(e) => setTitleDraft(e.target.value)}
               onBlur={commitTitleRename}
@@ -1689,33 +1713,39 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               }}
             />
           ) : (
+            // Opt the span out so a single click triggers the edit
+            // flow instead of starting a window drag — span isn't an
+            // interactive HTML element, so without this Tauri's drag
+            // region steals the click on macOS.
             <span
-              className="cursor-pointer truncate font-medium hover:text-muted-foreground"
+              data-tauri-drag-region={false}
+              className="min-w-0 flex-1 cursor-pointer truncate font-medium hover:text-muted-foreground"
               onClick={() => setEditingTitle(true)}
             >
               {title}
             </span>
           )}
-          <div className="flex items-center gap-2">
-            {gitBranch && projectPath && session && parentProjectId && parentGitRoot && (
-              <BranchSwitcher
-                projectPath={projectPath}
-                currentBranch={gitBranch}
-                parentProjectId={parentProjectId}
-                parentProjectPath={parentGitRoot}
-                provider={session.provider}
-                model={session.model ?? null}
-                onCheckedOut={() => refreshDiffs({ force: true })}
-              />
-            )}
-            {providerDisabled && (
-              <span className="inline-flex shrink-0 items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
-                Provider disabled
-              </span>
-            )}
-          </div>
+          {gitBranch && projectPath && session && parentProjectId && parentGitRoot && (
+            <BranchSwitcher
+              projectPath={projectPath}
+              currentBranch={gitBranch}
+              parentProjectId={parentProjectId}
+              parentProjectPath={parentGitRoot}
+              provider={session.provider}
+              model={session.model ?? null}
+              onCheckedOut={() => refreshDiffs({ force: true })}
+            />
+          )}
+          {providerDisabled && (
+            <span className="inline-flex shrink-0 items-center rounded-full border border-destructive/30 bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive">
+              Provider disabled
+            </span>
+          )}
         </div>
-        <div className="ml-auto flex items-center gap-2">
+        <div
+          className="ml-auto flex items-center gap-2"
+          data-tauri-drag-region={false}
+        >
           <HeaderActions
             sessionId={sessionId}
             projectPath={projectPath}

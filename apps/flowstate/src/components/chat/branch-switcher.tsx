@@ -313,10 +313,10 @@ export function BranchSwitcher({
           {trigger ?? (
             <button
               type="button"
-              className="inline-flex min-w-0 cursor-pointer items-center gap-1 truncate text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground"
+              className="inline-flex shrink-0 cursor-pointer items-center gap-1 text-[11px] text-muted-foreground outline-none transition-colors hover:text-foreground"
             >
               <GitBranch className="h-3 w-3 shrink-0" />
-              <span className="truncate">{currentBranch}</span>
+              <span>{currentBranch}</span>
             </button>
           )}
         </PopoverTrigger>

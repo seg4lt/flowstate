@@ -11,7 +11,8 @@ import {
   Sun,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
+import { isMacOS } from "@/lib/popout";
 import { Switch } from "@/components/ui/switch";
 import { useApp, useProvisionFailures } from "@/stores/app-store";
 import { useTheme, type ThemePreference } from "@/hooks/use-theme";
@@ -1490,6 +1491,8 @@ function ClearCacheButton({ path }: { path: string | null }) {
 export function SettingsView() {
   const { state, send } = useApp();
   const { setProviderEnabled } = useProviderEnabled();
+  const { state: sidebarState } = useSidebar();
+  const showMacTrafficSpacer = isMacOS() && sidebarState === "collapsed";
   const [refreshingKind, setRefreshingKind] = React.useState<ProviderKind | null>(
     null,
   );
@@ -1555,7 +1558,13 @@ export function SettingsView() {
 
   return (
     <div className="flex h-svh flex-col">
-      <header className="flex h-12 items-center gap-2 border-b border-border px-2 text-sm">
+      <header
+        data-tauri-drag-region
+        className="flex h-9 items-center gap-1 border-b border-border px-2 text-sm"
+      >
+        {showMacTrafficSpacer && (
+          <div className="w-16 shrink-0" data-tauri-drag-region />
+        )}
         <SidebarTrigger />
         <span className="font-medium">Settings</span>
       </header>

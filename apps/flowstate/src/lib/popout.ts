@@ -47,6 +47,23 @@ export function isPopoutWindow(): boolean {
   return cachedIsPopout;
 }
 
+/** True when running on macOS. The frameless titlebar overlay
+ *  (`titleBarStyle: Overlay` + `hiddenTitle: true`) is macOS-only,
+ *  so the route headers add a left pad to clear the traffic-light
+ *  buttons — that pad must not apply on Linux/Windows where the OS
+ *  draws its own decorations. Cached at first call. */
+let cachedIsMacOS: boolean | null = null;
+export function isMacOS(): boolean {
+  if (typeof window === "undefined") return false;
+  if (cachedIsMacOS === null) {
+    const platform =
+      (navigator as Navigator & { userAgentData?: { platform?: string } })
+        .userAgentData?.platform ?? navigator.platform ?? "";
+    cachedIsMacOS = /mac/i.test(platform);
+  }
+  return cachedIsMacOS;
+}
+
 /** Read the user's last pin preference. Defaults to `false` so
  *  first-time popouts don't surprise users by floating above
  *  everything — the pin toggle inside the popout is the intended

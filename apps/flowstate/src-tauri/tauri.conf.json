@@ -19,7 +19,9 @@
         "minHeight": 400,
         "center": true,
         "backgroundColor": "#252525",
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {

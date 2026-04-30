@@ -1,4 +1,5 @@
-import { SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
+import { isMacOS } from "@/lib/popout";
 import { UsageKpiCards } from "./usage-kpi-cards";
 import { UsageCostChart } from "./usage-cost-chart";
 import { UsageTokensChart } from "./usage-tokens-chart";
@@ -53,6 +54,8 @@ function ErrorState({ error }: { error: unknown }) {
 
 export function UsageView() {
   const [range, setRange] = useUsageRange();
+  const { state: sidebarState } = useSidebar();
+  const showMacTrafficSpacer = isMacOS() && sidebarState === "collapsed";
 
   const summaryQuery = useUsageSummary(range, "by_provider");
   const modelsQuery = useUsageSummary(range, "by_model");
@@ -81,10 +84,18 @@ export function UsageView() {
 
   return (
     <div className="flex h-svh flex-col">
-      <header className="flex h-12 items-center gap-2 border-b border-border px-2">
+      <header
+        data-tauri-drag-region
+        className="flex h-9 items-center gap-1 border-b border-border px-2"
+      >
+        {showMacTrafficSpacer && (
+          <div className="w-16 shrink-0" data-tauri-drag-region />
+        )}
         <SidebarTrigger />
         <div className="flex-1 text-sm font-medium">Usage</div>
-        <UsageRangePicker value={range} onChange={setRange} />
+        <div data-tauri-drag-region={false}>
+          <UsageRangePicker value={range} onChange={setRange} />
+        </div>
       </header>
 
       <div className="flex-1 overflow-auto">

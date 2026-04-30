@@ -15,7 +15,8 @@ import {
   Trash2,
 } from "lucide-react";
 
-import { SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
+import { isMacOS } from "@/lib/popout";
 import { useApp } from "@/stores/app-store";
 import { BranchSwitcher } from "@/components/chat/branch-switcher";
 import {
@@ -94,6 +95,12 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   const { dispatch: terminalDispatch } = useTerminal();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+
+  // macOS traffic-light spacer is only needed when the sidebar is
+  // collapsed (route header is then the window's leftmost element).
+  // When expanded, the lights sit over SidebarHeader's own spacer.
+  const { state: sidebarState } = useSidebar();
+  const showMacTrafficSpacer = isMacOS() && sidebarState === "collapsed";
 
   const project = state.projects.find((p) => p.projectId === projectId);
   const displayName =
@@ -419,7 +426,13 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   if (!project || !projectPath) {
     return (
       <div className="flex h-svh flex-col">
-        <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm text-muted-foreground">
+        <header
+          data-tauri-drag-region
+          className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-sm text-muted-foreground"
+        >
+          {showMacTrafficSpacer && (
+            <div className="w-16 shrink-0" data-tauri-drag-region />
+          )}
           <SidebarTrigger />
           <span>Project not found</span>
         </header>
@@ -432,26 +445,35 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
   return (
     <div className="flex h-svh min-w-0 flex-col overflow-hidden">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
+      <header
+        data-tauri-drag-region
+        className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-sm"
+      >
+        {showMacTrafficSpacer && (
+          <div className="w-16 shrink-0" data-tauri-drag-region />
+        )}
         <SidebarTrigger />
-        <div className="flex min-w-0 flex-col leading-tight">
-          <span className="truncate font-medium">{displayName}</span>
-          <div className="flex items-center gap-2">
-            <BranchSwitcher
-              projectPath={gitRoot ?? projectPath}
-              currentBranch={currentBranch || "HEAD"}
-              parentProjectId={projectId}
-              parentProjectPath={gitRoot ?? projectPath}
-              provider={defaultProvider}
-              model={null}
-              onCheckedOut={() => {
-                void branchQuery.refetch();
-                void worktreeQuery.refetch();
-              }}
-            />
-          </div>
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="min-w-0 flex-1 truncate font-medium">
+            {displayName}
+          </span>
+          <BranchSwitcher
+            projectPath={gitRoot ?? projectPath}
+            currentBranch={currentBranch || "HEAD"}
+            parentProjectId={projectId}
+            parentProjectPath={gitRoot ?? projectPath}
+            provider={defaultProvider}
+            model={null}
+            onCheckedOut={() => {
+              void branchQuery.refetch();
+              void worktreeQuery.refetch();
+            }}
+          />
         </div>
-        <div className="ml-auto flex items-center gap-1">
+        <div
+          className="ml-auto flex items-center gap-1"
+          data-tauri-drag-region={false}
+        >
           <ProviderDropdown
             projectId={projectId}
             projectPath={gitRoot ?? projectPath}

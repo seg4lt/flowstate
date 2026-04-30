@@ -15,7 +15,7 @@ import {
   SlidersHorizontal,
   X,
 } from "lucide-react";
-import { SidebarTrigger } from "@/components/ui/sidebar";
+import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { useApp } from "@/stores/app-store";
 import { cn } from "@/lib/utils";
+import { isMacOS } from "@/lib/popout";
 import {
   defaultContentSearchOptions,
   readProjectFile,
@@ -199,6 +200,13 @@ export function CodeView(props: CodeViewProps) {
   const navigate = useNavigate();
   const embedded = props.embedded === true;
   const { onClose, isFullscreen, onToggleFullscreen } = props;
+
+  // Top-level CodeView is the window's titlebar — show the macOS
+  // traffic-light spacer only when the sidebar is actually collapsed.
+  // Embedded mode is a split-pane header; never needs the spacer.
+  const { state: sidebarState } = useSidebar();
+  const showMacTrafficSpacer =
+    !embedded && isMacOS() && sidebarState === "collapsed";
 
   // Participate in the Pierre worker-pool lifecycle: wake the pool
   // if it was killed during long idle, and keep it alive while this
@@ -1000,7 +1008,25 @@ export function CodeView(props: CodeViewProps) {
         embedded ? "h-full" : "h-svh",
       )}
     >
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-2 text-sm">
+      <header
+        // Only the top-level code route is the window's titlebar — when
+        // embedded inside another route's split pane it must not be
+        // draggable (would steal clicks/drags from the host header) or
+        // hold a spacer for traffic lights (those live in the host
+        // header).
+        data-tauri-drag-region={embedded ? undefined : ""}
+        className={cn(
+          "flex shrink-0 items-center gap-1 border-b border-border px-2 text-sm",
+          // Top-level mode is the window's titlebar — match the
+          // h-9 used by chat/project headers. Embedded mode is a
+          // split-pane header below the chat titlebar; line it up
+          // with the sibling diff/context panel headers (h-10).
+          embedded ? "h-10" : "h-9",
+        )}
+      >
+        {showMacTrafficSpacer && (
+          <div className="w-16 shrink-0" data-tauri-drag-region />
+        )}
         {!embedded && <SidebarTrigger />}
         {!embedded && (
           <Button
@@ -1035,7 +1061,10 @@ export function CodeView(props: CodeViewProps) {
             </>
           )}
         </div>
-        <div className="ml-auto flex shrink-0 items-center gap-1">
+        <div
+          className="ml-auto flex shrink-0 items-center gap-1"
+          data-tauri-drag-region={false}
+        >
           <Button
             variant={gitModeEnabled ? "secondary" : "ghost"}
             size="xs"

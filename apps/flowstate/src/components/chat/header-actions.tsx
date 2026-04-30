@@ -269,7 +269,7 @@ export function HeaderActions({
   }, [defaultEditor, launchEditor]);
 
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center gap-0.5">
       <Button
         variant={contextOpen ? "secondary" : "outline"}
         size="xs"
@@ -313,7 +313,7 @@ export function HeaderActions({
       </Button>
       <Button
         variant={dockOpen ? "secondary" : "outline"}
-        size="xs"
+        size="icon-xs"
         onClick={() =>
           terminalDispatch({ type: "toggle_dock", sessionId })
         }
@@ -329,7 +329,7 @@ export function HeaderActions({
       {inPopout ? (
         <Button
           variant={pinned ? "secondary" : "outline"}
-          size="xs"
+          size="icon-xs"
           onClick={handleTogglePin}
           aria-pressed={pinned}
           title={
@@ -347,7 +347,7 @@ export function HeaderActions({
       ) : (
         <Button
           variant="outline"
-          size="xs"
+          size="icon-xs"
           onClick={handlePopout}
           title="Pop out this thread into its own window"
         >
@@ -356,7 +356,7 @@ export function HeaderActions({
       )}
       <Button
         variant="outline"
-        size="xs"
+        size="icon-xs"
         onClick={() =>
           // Toggle the embedded code-view panel inside the chat —
           // same destination Cmd+Alt+E reaches. Replaces the older
@@ -385,7 +385,7 @@ export function HeaderActions({
                 ? `Open project in ${defaultEditor.label}  (Cmd/Ctrl+O · ⇧ for picker)`
                 : "Pick an editor to open the project in (Cmd/Ctrl+Shift+O)"
             }
-            className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
+            className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-1.5 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
           >
             <FolderOpen className="h-3 w-3" />
             <ChevronDown className="h-3 w-3" />

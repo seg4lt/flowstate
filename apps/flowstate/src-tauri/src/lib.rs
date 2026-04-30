@@ -1991,11 +1991,22 @@ async fn popout_thread(
     // query string is what the frontend keys off to render the
     // stripped shell — see `isPopoutWindow` in `src/lib/popout.ts`.
     let url = format!("/chat/{session_id}?popout=1");
-    tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
+    let builder = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
         .title("flowstate — thread")
         .inner_size(480.0, 720.0)
         .min_inner_size(360.0, 480.0)
-        .always_on_top(always_on_top)
+        .always_on_top(always_on_top);
+
+    // Overlay traffic-light buttons over our custom in-app header so
+    // popouts match the main window's frameless look. macOS-only — the
+    // `title_bar_style` / `hidden_title` builder methods don't exist on
+    // other platforms in Tauri 2.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true);
+
+    builder
         .build()
         .map(|_| ())
         .map_err(|e| e.to_string())

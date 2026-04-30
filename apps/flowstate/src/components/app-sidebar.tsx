@@ -63,6 +63,7 @@ import {
 import { useApp, useProvisionFailures } from "@/stores/app-store";
 import { useAttentionTone } from "@/hooks/use-attention-tone";
 import { cn } from "@/lib/utils";
+import { isMacOS } from "@/lib/popout";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
@@ -409,10 +410,22 @@ function AppSidebarBody() {
 
   return (
     <Sidebar collapsible="offcanvas">
-      <SidebarHeader className="h-12 flex-row items-center justify-start border-b border-sidebar-border px-4 py-0">
-        <span className="text-sm font-semibold tracking-tight [[data-collapsible=icon]_&]:hidden">
-          flowstate
-        </span>
+      <SidebarHeader
+        data-tauri-drag-region
+        className="h-9 flex-row items-center justify-start border-b border-sidebar-border px-4 py-0"
+      >
+        {/* macOS traffic-light spacer when the sidebar is expanded —
+            traffic lights overlay the window's top-left corner, which
+            is here. Tagged as a drag region so the cleared area still
+            drags the window. */}
+        {isMacOS() && (
+          <div className="-ml-2 w-16 shrink-0" data-tauri-drag-region />
+        )}
+        {/* Wordmark removed — the overlay-style titlebar uses the route
+            header on the right of the split as the window's drag bar
+            (see chat-view.tsx etc), so the sidebar's top-left now just
+            holds the optional attention dot. The h-12 height stays so
+            the divider lines up with the route header on the right. */}
         {attentionTone && (
           <span
             aria-label={
@@ -426,7 +439,7 @@ function AppSidebarBody() {
                 : "One or more threads finished"
             }
             className={cn(
-              "ml-2 inline-block size-1.5 rounded-full [[data-collapsible=icon]_&]:hidden",
+              "inline-block size-1.5 rounded-full [[data-collapsible=icon]_&]:hidden",
               attentionTone === "awaiting" ? "bg-blue-500" : "bg-green-500",
             )}
           />

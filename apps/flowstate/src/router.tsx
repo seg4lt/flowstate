@@ -30,7 +30,7 @@ import { Toaster } from "@/components/ui/toaster";
 import { UpdateBanner } from "@/components/update-banner";
 import { ProvisioningSplash } from "@/components/provisioning-splash";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { isPopoutWindow } from "@/lib/popout";
+import { isMacOS, isPopoutWindow } from "@/lib/popout";
 import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import { ShortcutsDialog } from "@/lib/keyboard-shortcuts";
 import { ProjectProviderPicker } from "@/components/project/project-provider-picker";
@@ -477,9 +477,17 @@ const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
   component: function IndexPage() {
+    const { state: sidebarState } = useSidebar();
+    const showMacTrafficSpacer = isMacOS() && sidebarState === "collapsed";
     return (
       <div className="flex h-svh flex-col">
-        <header className="flex h-12 items-center gap-2 border-b border-border px-2 text-sm text-muted-foreground">
+        <header
+          data-tauri-drag-region
+          className="flex h-9 items-center gap-1 border-b border-border px-2 text-sm text-muted-foreground"
+        >
+          {showMacTrafficSpacer && (
+            <div className="w-16 shrink-0" data-tauri-drag-region />
+          )}
           <SidebarTrigger />
           <span>No active thread</span>
         </header>

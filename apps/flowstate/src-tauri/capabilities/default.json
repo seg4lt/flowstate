@@ -11,6 +11,7 @@
     "core:webview:allow-set-webview-zoom",
     "core:window:default",
     "core:window:allow-set-badge-count",
+    "core:window:allow-start-dragging",
     "opener:default",
     "dialog:default",
     "updater:default",
