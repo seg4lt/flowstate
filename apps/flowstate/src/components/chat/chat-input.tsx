@@ -146,6 +146,12 @@ const MEDIA_MIME_PREFIXES = ["image/", "audio/", "video/"];
  *  every poll cycle while fff-search's cold scan is still walking. */
 const EMPTY_MENTION_FILES: readonly string[] = Object.freeze([]);
 
+/** Soft cap on rows rendered inside the `@mention` popup. Kept small
+ *  (the popup's max-height is ~20 rows) but surfaced via a "+N more"
+ *  footer when the ranker has more matches — the previous behavior
+ *  silently dropped the long tail at 50 with no UI signal. */
+const MENTION_POPUP_LIMIT = 50;
+
 /** Does `mediaType` classify as drag-and-drop media (image/audio/video)? */
 function isMediaMimeType(mediaType: string): boolean {
   return MEDIA_MIME_PREFIXES.some((prefix) => mediaType.startsWith(prefix));
@@ -369,11 +375,27 @@ export function ChatInput({
   // we get an empty list, which turns the popup off naturally.
   const filesQuery = useQuery(projectFilesQueryOptions(projectPath ?? null));
   const mentionFiles = filesQuery.data?.files ?? EMPTY_MENTION_FILES;
-  const mentionMatches = React.useMemo(
-    () =>
-      mentionCtx ? rankFileMatches(mentionFiles, mentionCtx.query) : [],
-    [mentionCtx, mentionFiles],
-  );
+  // Rank with no cap then slice client-side so we can render a
+  // "+N more" footer in `MentionPopup` when the cap is biting. The
+  // previous code passed the default `MAX_RESULTS = 50` cap straight
+  // into `rankFileMatches`, silently hiding the long tail with no UI
+  // signal — same class of silent-truncation bug as the picker's old
+  // 20k-file walker. The limit itself stays at 50 (small popup, must
+  // be scannable) but the user now sees that more matches exist.
+  const mentionDisplayLimit = MENTION_POPUP_LIMIT;
+  const mentionMatch = React.useMemo<{
+    rows: string[];
+    total: number;
+  }>(() => {
+    if (!mentionCtx) return { rows: [], total: 0 };
+    const ranked = rankFileMatches(mentionFiles, mentionCtx.query, Infinity);
+    return {
+      rows: ranked.slice(0, mentionDisplayLimit),
+      total: ranked.length,
+    };
+  }, [mentionCtx, mentionFiles, mentionDisplayLimit]);
+  const mentionMatches = mentionMatch.rows;
+  const mentionTotalMatches = mentionMatch.total;
   // The slash-command popup wins if both could render on the same
   // draft — in practice they can't (different prefixes) but keep the
   // guard so a future edit can't cross-trigger them.
@@ -1169,6 +1191,7 @@ export function ChatInput({
             {showMentionPopup && (
               <MentionPopup
                 matches={mentionMatches}
+                totalMatches={mentionTotalMatches}
                 selectedIndex={mentionIndex}
                 onSelect={acceptMention}
               />

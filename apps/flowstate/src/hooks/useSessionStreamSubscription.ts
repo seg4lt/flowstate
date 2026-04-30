@@ -155,14 +155,33 @@ export function useSessionStreamSubscription(
           // edits, so the watcher's incremental updates can't be
           // fully trusted on a turn that touches dozens of files in
           // quick succession; a deliberate re-walk closes that gap.
-          // Failures (canonicalisation errors, etc.) are swallowed —
-          // the next list call will index cold for free.
+          //
+          // Order matters: we MUST await `reindexProjectFiles`
+          // before the React Query invalidate, because the
+          // invalidate triggers an immediate refetch that calls
+          // `listProjectFiles` — and if that races ahead of the
+          // reindex, it hits the still-cached old FilePicker and
+          // returns the stale list. Awaiting the registry-drop
+          // guarantees the next list call rebuilds from a fresh
+          // cold scan.
+          //
+          // Failures (canonicalisation errors, dropped path) are
+          // swallowed — `reindex` is best-effort and the next list
+          // call indexes cold for free regardless. We still fire
+          // the invalidate in the catch path so a Cmd+P open after
+          // a transient reindex failure isn't stuck on the cached
+          // pre-turn snapshot.
           if (h.projectPath) {
             const path = h.projectPath;
-            void reindexProjectFiles(path).catch(() => {});
-            queryClient.invalidateQueries({
-              queryKey: projectFilesQueryOptions(path).queryKey,
-            });
+            const queryKey = projectFilesQueryOptions(path).queryKey;
+            void (async () => {
+              try {
+                await reindexProjectFiles(path);
+              } catch {
+                // Intentional swallow — see comment above.
+              }
+              queryClient.invalidateQueries({ queryKey });
+            })();
           }
           break;
 

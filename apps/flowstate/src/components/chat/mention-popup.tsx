@@ -2,8 +2,14 @@ import * as React from "react";
 import { FileText } from "lucide-react";
 
 interface MentionPopupProps {
-  /** Forward-slash relative file paths (already filtered + ranked). */
+  /** Forward-slash relative file paths (already filtered + ranked).
+   *  Capped to the popup's display limit by the caller. */
   matches: string[];
+  /** Total ranked matches BEFORE the display-limit slice. Used to
+   *  render a "+N more" hint in the footer so the user knows when
+   *  the cap is biting and they should keep typing to refine.
+   *  Equal to `matches.length` when nothing is hidden. */
+  totalMatches: number;
   selectedIndex: number;
   onSelect: (path: string) => void;
 }
@@ -23,6 +29,7 @@ function splitPath(path: string): [string, string] {
  *  (basename + muted dirname hint) and the file icon. */
 export function MentionPopup({
   matches,
+  totalMatches,
   selectedIndex,
   onSelect,
 }: MentionPopupProps) {
@@ -76,8 +83,17 @@ export function MentionPopup({
           </div>
         );
       })}
-      <div className="mt-1 border-t border-border/50 px-2 pt-1 text-[10px] text-muted-foreground/70">
-        Enter to insert · Esc to close
+      <div className="mt-1 flex items-center justify-between gap-2 border-t border-border/50 px-2 pt-1 text-[10px] text-muted-foreground/70">
+        <span>Enter to insert · Esc to close</span>
+        {totalMatches > matches.length && (
+          // "+N more" hint when the display cap is hiding ranked
+          // matches. Without this signal users would think the
+          // popup found everything that exists (the bug we just
+          // fixed in the file picker — same class).
+          <span className="tabular-nums">
+            +{totalMatches - matches.length} more — keep typing
+          </span>
+        )}
       </div>
     </div>
   );

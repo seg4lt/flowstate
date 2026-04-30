@@ -31,8 +31,10 @@ import { cn } from "@/lib/utils";
 import { isMacOS } from "@/lib/popout";
 import {
   defaultContentSearchOptions,
+  nextContentSearchToken,
   readProjectFile,
   searchFileContents,
+  stopContentSearch,
   writeProjectFile,
   type ContentBlock,
   type ContentSearchOptions,
@@ -638,11 +640,59 @@ export function CodeView(props: CodeViewProps) {
         total: files.length,
       };
     }
-    const parsed = parsePickerQuery(trimmed);
-    const survivors =
-      parsed.alternatives.length === 0
-        ? (files as string[])
-        : files.filter((f) => matchesPickerQuery(f, parsed));
+
+    // Classify the query so we can route around the substring
+    // pre-filter when fuzzy is on. The pre-filter uses
+    // `matchesPickerQuery` (substring `.includes()` under the hood),
+    // which silently drops anything not literally containing the
+    // query — fatal for fuzzy (typing `tbsv` returns zero before the
+    // fuzzy ranker ever sees the list).
+    const hasComma = trimmed.includes(",");
+    const hasGlob = /[*?]/.test(trimmed);
+    const spaceIdx = trimmed.indexOf(" ");
+    const isScopedQuery = !hasComma && !hasGlob && spaceIdx > 0;
+    const isPlainQuery = !hasComma && !hasGlob && spaceIdx < 0;
+
+    // ── Three branches when fuzzy is on ──
+    //
+    //   1. Plain query (`tbsv`)            → no pre-filter; fuzzy
+    //                                        ranks the full list.
+    //   2. Scoped query (`src tbsv`)       → substring-filter by the
+    //                                        FOLDER portion only;
+    //                                        fuzzy ranks survivors
+    //                                        on basename. The user
+    //                                        opted into folder
+    //                                        scoping, so we honor
+    //                                        it — but the basename
+    //                                        substring check has to
+    //                                        be skipped or fuzzy
+    //                                        gets an empty list
+    //                                        again.
+    //   3. Glob / comma query              → keep the existing
+    //                                        substring pre-filter
+    //                                        (explicit user intent).
+    //                                        Fuzzy then orders.
+    //
+    // Substring mode (default) always falls through to the existing
+    // pre-filter pipeline — no behaviour change.
+    let survivors: string[];
+    if (useFuzzyFiles && isPlainQuery) {
+      survivors = files as string[];
+    } else if (useFuzzyFiles && isScopedQuery) {
+      const folderPart = trimmed.slice(0, spaceIdx).trim().toLowerCase();
+      survivors = (files as string[]).filter((p) => {
+        const slash = p.lastIndexOf("/");
+        const dir = slash >= 0 ? p.slice(0, slash).toLowerCase() : "";
+        return dir.includes(folderPart);
+      });
+    } else {
+      const parsed = parsePickerQuery(trimmed);
+      survivors =
+        parsed.alternatives.length === 0
+          ? (files as string[])
+          : files.filter((f) => matchesPickerQuery(f, parsed));
+    }
+
     // Strip the optional folder/glob qualifier off for the ranker:
     // it scores on the full path so passing the original query is
     // fine for plain substring/fuzzy queries; for scoped queries
@@ -691,11 +741,22 @@ export function CodeView(props: CodeViewProps) {
       includes: splitGlobList(contentOptions.include),
       excludes: splitGlobList(contentOptions.exclude),
     };
+    // Mint a fresh cancellation token per query and pass it to the
+    // Rust side. When this effect tears down (next keystroke,
+    // search-mode flip, unmount) the cleanup calls
+    // `stopContentSearch(token)` which flips an AtomicBool inside
+    // the running grep — the in-flight search bails on its next
+    // cooperative check instead of running to completion. Without
+    // this, three rapid keystrokes ("a" → "ab" → "abc") would start
+    // three full-tree greps and only the last one's results would
+    // be used; the first two burn CPU until their 30 s budgets
+    // expire.
+    const token = nextContentSearchToken();
     let cancelled = false;
     setContentSearching(true);
     setContentSearchError(null);
     const handle = window.setTimeout(() => {
-      searchFileContents(projectPath, q, apiOptions)
+      searchFileContents(projectPath, q, apiOptions, token)
         .then((blocks) => {
           if (cancelled) return;
           setContentBlocks(blocks);
@@ -713,6 +774,10 @@ export function CodeView(props: CodeViewProps) {
     return () => {
       cancelled = true;
       window.clearTimeout(handle);
+      // Idempotent — the Rust registry silently no-ops on unknown
+      // tokens, so racing with the search's own unregister-on-
+      // completion is safe.
+      void stopContentSearch(token).catch(() => {});
     };
   }, [
     searchMode,
