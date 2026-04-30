@@ -1502,22 +1502,26 @@ struct AppLifecycle {
     lifecycle: Arc<DaemonLifecycle>,
 }
 
-/// Tauri-managed state wrapping the macOS caffeinate controller. Only
-/// installed on macOS (the underlying module is gated behind
-/// `#[cfg(target_os = "macos")]`); commands that read this state are
-/// also macOS-only so non-macOS builds simply don't expose them.
-#[cfg(target_os = "macos")]
+/// Tauri-managed state wrapping the cross-platform sleep-prevention
+/// controller. macOS implements it via `caffeinate`; Windows via
+/// `SetThreadExecutionState`. Linux and other platforms have no
+/// backing OS hook today, so the state — and the commands that read
+/// it — aren't installed there. The frontend probes for command
+/// availability at startup (`useCaffeinateSupport()`), so an absent
+/// command simply hides the toggle in Settings.
+#[cfg(any(target_os = "macos", windows))]
 struct CaffeinateState(Arc<flowstate_app_layer::caffeinate::CaffeinateController>);
 
 /// Payload sent from the daemon spawn task to the
 /// `flowstate-daemon-ready` thread once bootstrap completes. The thread
 /// owns the `AppHandle` clone needed for `manage(...)`, but the daemon
 /// task is where the relevant Arcs are constructed — so we hand them
-/// across the channel together. macOS adds a second field for the
-/// caffeinate controller; non-macOS builds compile without it.
+/// across the channel together. macOS + Windows add a second field
+/// for the sleep-prevention controller; other platforms compile
+/// without it.
 struct DaemonReadyPayload {
     lifecycle: Arc<DaemonLifecycle>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     caffeinate: Arc<flowstate_app_layer::caffeinate::CaffeinateController>,
 }
 
@@ -1797,16 +1801,18 @@ async fn set_user_mcp_servers(
 }
 
 // ─────────────────────────────────────────────────────────────────
-// macOS caffeinate — display-sleep prevention while turns are running
+// Sleep prevention — keeps the display awake while turns are running
 // ─────────────────────────────────────────────────────────────────
 //
 // Thin wrappers over the `CaffeinateController` Tauri-managed state.
-// All coordination (single-instance, timeout-based safety net,
-// event-driven respawn) lives in the controller; these commands just
-// surface user-driven actions and a status snapshot. macOS-only:
-// non-macOS builds do not register either the state or the commands.
+// All coordination (single-instance, respawn semantics, force-kill)
+// lives in the controller; these commands just surface user-driven
+// actions and a status snapshot. macOS implements the underlying
+// hook with `caffeinate`; Windows with `SetThreadExecutionState`.
+// Other platforms don't register the state or the commands; the
+// settings UI hides the toggle when the command isn't available.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[tauri::command]
 fn caffeinate_status(
     state: State<'_, CaffeinateState>,
@@ -1815,21 +1821,21 @@ fn caffeinate_status(
 }
 
 /// Settings UI calls this after writing the `system.caffeinate` key
-/// so the controller acts on the change immediately (kill the running
-/// child if just disabled; spawn one if just enabled and turns are
-/// in flight). Without this hop the controller would still pick up
-/// the change at the next turn boundary, but the UI feels laggy.
-#[cfg(target_os = "macos")]
+/// so the controller acts on the change immediately (release the
+/// hook if just disabled; arm it if just enabled and turns are in
+/// flight). Without this hop the controller would still pick up the
+/// change at the next turn boundary, but the UI feels laggy.
+#[cfg(any(target_os = "macos", windows))]
 #[tauri::command]
 fn caffeinate_refresh(state: State<'_, CaffeinateState>) {
     state.0.refresh();
 }
 
-/// User clicked "Force kill" in settings. Kills the running
-/// caffeinate immediately. Setting stays enabled — caffeinate will
-/// respawn naturally on the next 0→1 turn transition (after current
-/// in-flight turns finish).
-#[cfg(target_os = "macos")]
+/// User clicked "Force kill" in settings. Releases the active hook
+/// immediately. Setting stays enabled — caffeinate will re-arm
+/// naturally on the next 0→1 turn transition (after current in-flight
+/// turns finish).
+#[cfg(any(target_os = "macos", windows))]
 #[tauri::command]
 fn caffeinate_kill(state: State<'_, CaffeinateState>) {
     state.0.force_kill();
@@ -2549,12 +2555,14 @@ pub fn run() {
             // `app.manage` takes ownership but UserConfigStore is
             // cheap to clone (Arc<Mutex<Connection>> inside).
             let user_config_for_orch = user_config_store.clone();
-            // Same trick for the macOS caffeinate controller: it
+            // Same trick for the sleep-prevention controller: it
             // reads the `system.caffeinate` toggle on every turn
-            // boundary to decide whether to spawn `caffeinate -d`.
-            // Constructed below inside the daemon task once we have
-            // a tokio Handle to spawn its watcher onto.
-            #[cfg(target_os = "macos")]
+            // boundary to decide whether to arm the OS hook (macOS
+            // `caffeinate` subprocess; Windows
+            // `SetThreadExecutionState`). Constructed below inside
+            // the daemon task once we have a tokio Handle to spawn
+            // any watcher onto.
+            #[cfg(any(target_os = "macos", windows))]
             let user_config_for_caffeinate = user_config_store.clone();
             app.manage(user_config_store);
 
@@ -2809,25 +2817,30 @@ pub fn run() {
                 // subprocess differently (`SessionConfig.mcpServers`
                 // for Copilot SDK, `.mcp.json` for the CLIs,
                 // per-session `opencode.json` for opencode).
-                // macOS-only: build the display-sleep-prevention
-                // controller here so we can register it as an extra
+                // Sleep-prevention controller (macOS + Windows):
+                // built here so we can register it as an extra
                 // `TurnLifecycleObserver` BEFORE the bootstrap call
                 // wires the runtime's observer chain. The controller
                 // is `TurnLifecycleObserver`-aware: on the 0→1 turn
-                // transition it spawns `caffeinate -d -t <timeout>`,
-                // on 1→0 it kills it. Re-registers the same
+                // transition it arms the OS sleep hook (macOS:
+                // `caffeinate -d -t <timeout>`; Windows:
+                // `SetThreadExecutionState(ES_CONTINUOUS |
+                // ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`), on
+                // 1→0 it releases it. Re-registers the same
                 // `Arc<CaffeinateController>` in two places (here as
                 // an observer, below as Tauri-managed state) so the
                 // settings UI can also drive `force_kill` / `status`
                 // through the Tauri command boundary.
                 //
-                // The controller spawns its watcher tasks on the
-                // current tokio runtime (this Tauri spawn block IS
-                // running inside it), and reads the `system.caffeinate`
-                // setting from `UserConfigStore` on every transition
-                // so a toggle flip is picked up at the next turn
-                // boundary without any plumbing.
-                #[cfg(target_os = "macos")]
+                // On macOS the controller spawns watcher tasks on
+                // the current tokio runtime (this Tauri spawn block
+                // IS running inside it). Windows has no watcher —
+                // the execution-state flag stays armed until we
+                // clear it. Either way, the controller reads the
+                // `system.caffeinate` setting from `UserConfigStore`
+                // on every transition so a toggle flip is picked up
+                // at the next turn boundary without any plumbing.
+                #[cfg(any(target_os = "macos", windows))]
                 let caffeinate_controller = {
                     let ctrl = flowstate_app_layer::caffeinate::CaffeinateController::new(
                         user_config_for_caffeinate,
@@ -3024,7 +3037,7 @@ pub fn run() {
                 ready_tx
                     .send(DaemonReadyPayload {
                         lifecycle: core.lifecycle.clone(),
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", windows))]
                         caffeinate: caffeinate_controller.clone(),
                     })
                     .expect("failed to signal ready");
@@ -3119,7 +3132,7 @@ pub fn run() {
                         app_handle_for_wire.manage(AppLifecycle {
                             lifecycle: lifecycle.clone(),
                         });
-                        #[cfg(target_os = "macos")]
+                        #[cfg(any(target_os = "macos", windows))]
                         app_handle_for_wire.manage(CaffeinateState(payload.caffeinate.clone()));
 
                         // SIGTERM / SIGINT handler.
@@ -3330,9 +3343,9 @@ pub fn run() {
                     ]
                 };
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             { flowstate_invoke_handler!(caffeinate_status, caffeinate_kill, caffeinate_refresh) }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             { flowstate_invoke_handler!() }
         })
         .on_window_event(|window, event| {

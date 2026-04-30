@@ -31,22 +31,20 @@ const TURN_TIMEOUT_SECS: u64 = u32::MAX as u64;
 
 struct ClaudeCliProcess {
     child: Child,
-    /// Process-group id the `claude` CLI child leads. Captured right
-    /// after spawn; used by `Drop` + the idle watchdog's `kill_fn`
-    /// to `killpg(pgid, SIGTERM)` the whole subtree. The CLI forks
-    /// subshells + MCP proxies per tool call — without this, those
-    /// grandchildren reparent to PID 1 when the cached process is
-    /// reaped. See `zenui_provider_api::process_group`.
-    pgid: Option<i32>,
+    /// Cross-platform process-group / Job-Object owning the
+    /// `claude` CLI subtree. Used by `Drop` + the idle watchdog's
+    /// `kill_fn` to reap the whole tree. The CLI forks subshells +
+    /// MCP proxies per tool call; without this they'd survive when
+    /// the cached process is reaped. See
+    /// `zenui_provider_api::ProcessGroup`.
+    process_group: zenui_provider_api::ProcessGroup,
     stdin: Arc<Mutex<ChildStdin>>,
     stdout: Lines<BufReader<ChildStdout>>,
 }
 
 impl Drop for ClaudeCliProcess {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid {
-            zenui_provider_api::kill_process_group_best_effort(pgid);
-        }
+        self.process_group.kill_best_effort();
         let _ = self.child.start_kill();
     }
 }
@@ -411,13 +409,14 @@ impl ClaudeCliAdapter {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         // `claude` CLI forks subshells + MCP servers per tool call;
-        // place them all in this child's process group so `killpg`
-        // at teardown reaps the subtree atomically.
-        zenui_provider_api::enter_own_process_group(&mut cmd);
+        // place them all in this child's process group / Job Object
+        // so `kill_best_effort` at teardown reaps the subtree
+        // atomically.
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn claude CLI ('{binary}'): {e}"))?;
-        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        process_group.attach(&child);
 
         let stdin = child
             .stdin
@@ -443,7 +442,7 @@ impl ClaudeCliAdapter {
 
         Ok(ClaudeCliProcess {
             child,
-            pgid,
+            process_group,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
         })

@@ -38,12 +38,11 @@ pub(crate) struct ServerCallback {
 
 pub(crate) struct CopilotCliProcess {
     pub(crate) child: Child,
-    /// Process-group id the `copilot` CLI child leads. Captured
-    /// right after spawn; the `Drop` below `killpg(pgid, SIGTERM)`s
-    /// the whole subtree so any per-session agent workers / MCP
-    /// subprocesses the CLI forked die with the parent. See
-    /// `zenui_provider_api::process_group`.
-    pub(crate) pgid: Option<i32>,
+    /// Cross-platform process-group / Job-Object owning the
+    /// `copilot` CLI subtree. The `Drop` below reaps any per-session
+    /// agent workers / MCP subprocesses the CLI forked so they die
+    /// with the parent. See `zenui_provider_api::ProcessGroup`.
+    pub(crate) process_group: zenui_provider_api::ProcessGroup,
     pub(crate) stdin: Arc<Mutex<ChildStdin>>,
     pub(crate) pending: PendingMap,
     pub(crate) next_id: Arc<Mutex<u64>>,
@@ -60,9 +59,7 @@ pub(crate) struct CopilotCliProcess {
 
 impl Drop for CopilotCliProcess {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid {
-            zenui_provider_api::kill_process_group_best_effort(pgid);
-        }
+        self.process_group.kill_best_effort();
         let _ = self.child.start_kill();
     }
 }

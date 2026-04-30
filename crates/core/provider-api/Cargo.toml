@@ -27,9 +27,23 @@ ts-rs = { version = "12", features = ["serde-compat", "serde-json-impl"], option
 
 # `killpg` / `setpgid` for the shared process-group helpers every
 # provider adapter uses at spawn + drop time — see `process_group.rs`.
-# Unix-only by design; non-Unix builds get no-op stubs.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows Job Objects are the cross-platform analogue of Unix process
+# groups for `process_group.rs`. CreateJobObjectW + AssignProcessToJobObject
+# + TerminateJobObject pull from JobObjects; CloseHandle / HANDLE come
+# from Foundation.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    # `CreateJobObjectW` takes a `*const SECURITY_ATTRIBUTES` (we pass
+    # null), so the function declaration is gated behind Win32_Security
+    # in windows-sys 0.59.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -19,7 +19,11 @@
 //! version is that the future daemon bin needs this state without
 //! pulling Tauri.
 
-#[cfg(target_os = "macos")]
+// Sleep-prevention controller. macOS implements it via the
+// `caffeinate` subprocess; Windows via `SetThreadExecutionState`.
+// Other platforms have no backing OS hook so the module isn't
+// compiled there.
+#[cfg(any(target_os = "macos", windows))]
 pub mod caffeinate;
 pub mod git_worktree;
 pub mod http;

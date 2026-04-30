@@ -96,6 +96,16 @@ anyhow.workspace = true
 # the Tauri shell; this crate only emits.
 tracing.workspace = true
 
+# `SetThreadExecutionState` is the Windows analogue of macOS's
+# `caffeinate` for the sleep-prevention controller in
+# `caffeinate.rs`. Lives under `Win32_System_Power`; uses
+# `Win32_Foundation` for the EXECUTION_STATE return type.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Power",
+] }
+
 [dev-dependencies]
 # In-memory SQLite for unit tests (no temp files on disk).
 tempfile.workspace = true

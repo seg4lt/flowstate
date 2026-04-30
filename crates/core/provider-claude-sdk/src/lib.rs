@@ -156,14 +156,13 @@ impl ClaudeSdkAdapter {
                     pending.retain(|_, v| !Arc::ptr_eq(v, &pending_arc));
                 }
                 let mut process = cached.inner().lock().await;
-                // Kill the whole process group first so any `claude`
-                // CLI child the SDK forked for tool use dies with
-                // the bridge. Drop order on the `ClaudeBridgeProcess`
-                // handles the same case on scope exit, but the idle
-                // watchdog gets here before the struct is dropped.
-                if let Some(pgid) = process.pgid {
-                    zenui_provider_api::kill_process_group_best_effort(pgid);
-                }
+                // Kill the whole process group / Job Object first so
+                // any `claude` CLI child the SDK forked for tool use
+                // dies with the bridge. Drop order on the
+                // `ClaudeBridgeProcess` handles the same case on
+                // scope exit, but the idle watchdog gets here before
+                // the struct is dropped.
+                process.process_group.kill_best_effort();
                 let _ = process.child.start_kill();
             }
         });
@@ -308,15 +307,15 @@ impl ClaudeSdkAdapter {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Put the Node bridge (and anything it forks) in its own
-        // process group so Drop can `killpg` the whole subtree —
-        // the SDK can spawn the `claude` CLI internally for tool
-        // use, and tokio's `kill_on_drop` only terminates the
-        // direct child. See `zenui_provider_api::process_group`.
-        zenui_provider_api::enter_own_process_group(&mut cmd);
+        // process group / Job Object so Drop can reap the whole
+        // subtree — the SDK can spawn the `claude` CLI internally
+        // for tool use, and tokio's `kill_on_drop` only terminates
+        // the direct child. See `zenui_provider_api::ProcessGroup`.
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn bridge: {e}"))?;
-        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        process_group.attach(&child);
 
         let stdin = child
             .stdin
@@ -345,7 +344,7 @@ impl ClaudeSdkAdapter {
 
         let mut process = ClaudeBridgeProcess {
             child,
-            pgid,
+            process_group,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
             bridge_session_id: String::new(),

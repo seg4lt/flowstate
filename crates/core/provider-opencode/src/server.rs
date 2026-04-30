@@ -41,16 +41,14 @@ pub struct OpenCodeServer {
     /// in an `Option` so `shutdown()` can take ownership of the handle
     /// and join it without leaving the mutex in a moved-out state.
     child: Mutex<Option<Child>>,
-    /// Process-group id that `opencode serve` leads. Captured right
-    /// after spawn — we pass `.process_group(0)` so the child becomes
-    /// its own group leader (pgid == child pid). Stored separately so
-    /// Drop / shutdown can `killpg(pgid, SIGTERM)` even if the child
-    /// handle was already moved out of the mutex.
-    ///
-    /// `None` on non-Unix builds (no process-group concept) or if the
-    /// child died before we could read its pid. Both cases degrade to
-    /// the tokio `kill_on_drop` behaviour.
-    child_pgid: Option<i32>,
+    /// Cross-platform process-group / Job-Object handle owning the
+    /// `opencode serve` subtree. Stored separately from `child` so
+    /// Drop / shutdown can signal the whole group even if the child
+    /// handle was already moved out of the mutex by `shutdown()`.
+    /// On Unix it carries a pgid (= child pid); on Windows it owns
+    /// a Job Object handle with `KILL_ON_JOB_CLOSE`. See
+    /// `zenui_provider_api::ProcessGroup`.
+    process_group: zenui_provider_api::ProcessGroup,
 }
 
 impl OpenCodeServer {
@@ -89,49 +87,33 @@ impl OpenCodeServer {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        // Put opencode in its own process group so shutdown can kill
-        // the whole subtree atomically. `process_group(0)` tells the
-        // kernel to `setpgid(child_pid, child_pid)` after fork — the
-        // child becomes group leader and any grandchildren it spawns
-        // (per-session agent workers, its own mcp-server subprocesses)
-        // inherit the group. One `killpg(pgid, SIGTERM)` later
-        // reaps everything; the `Drop` path below uses exactly that.
+        // Put opencode in its own process group / Job Object so
+        // shutdown can kill the whole subtree atomically. Unix
+        // `setpgid(0, 0)` runs in pre_exec; Windows creates a Job
+        // Object now and the spawned child is assigned to it
+        // post-spawn via `process_group.attach(&child)` below. Either
+        // way, grandchildren opencode forks (per-session agent
+        // workers, its own mcp-server subprocesses) inherit the
+        // group, and one `kill_best_effort` call reaps the whole
+        // tree.
         //
         // Without this, a SIGKILL of flowstate would trigger
         // `kill_on_drop` only on the immediate `opencode serve` PID;
-        // children opencode had spawned would reparent to PID 1 and
-        // leak. (In practice opencode is good about tearing down its
-        // own children, but relying on that is fragile — the belt is
-        // cheap.) See Phase 2.5.c in the plan.
-        // tokio's `Command::pre_exec` is Unix-only; the `#[cfg(unix)]`
-        // gate keeps non-Unix builds compiling by simply skipping the
-        // pre-exec hook.
-        #[cfg(unix)]
-        // Safety: `setpgid(0, 0)` is an async-signal-safe syscall
-        // and is the documented pre-exec use case.
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
+        // children opencode had spawned would reparent to PID 1 (or
+        // become orphans on Windows) and leak.
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
 
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn `{binary} serve`: {e}"))?;
 
-        // Capture pgid now — after `setpgid(0,0)` in pre_exec the
-        // child's pid equals its pgid, and `child.id()` is Some until
-        // the child is awaited. `Option<u32> → Option<i32>` with an
-        // explicit `try_into` fall-back so stub builds on unsupported
-        // platforms compile cleanly.
-        #[cfg(unix)]
-        let child_pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
-        #[cfg(not(unix))]
-        let child_pgid: Option<i32> = None;
+        // Bind the spawned child to the group. On Unix the pgid
+        // equals the child pid (we set it in pre_exec). On Windows
+        // this calls `AssignProcessToJobObject` against the Job
+        // Object created above. Both are best-effort; if attach
+        // fails the struct degrades to tokio's `kill_on_drop`
+        // behaviour for the direct child only.
+        process_group.attach(&child);
 
         let stdout = child
             .stdout
@@ -185,7 +167,7 @@ impl OpenCodeServer {
             password,
             client,
             child: Mutex::new(Some(child)),
-            child_pgid,
+            process_group,
         })
     }
 
@@ -228,15 +210,11 @@ impl OpenCodeServer {
     /// fallback for paths that bypass graceful shutdown entirely
     /// (hard aborts, SIGKILL).
     pub async fn shutdown(&self) {
-        #[cfg(unix)]
-        if let Some(pgid) = self.child_pgid {
-            // Safety: `killpg` with a valid pgid is a standard POSIX
-            // syscall. ESRCH (already reaped) is the expected outcome
-            // on a clean shutdown and silently ignored.
-            unsafe {
-                libc::killpg(pgid, libc::SIGTERM);
-            }
-        }
+        // Polite signal to the whole opencode subtree. Unix sends
+        // SIGTERM to the process group; Windows TerminateJobObject's
+        // every member of the Job Object. ESRCH / "already reaped"
+        // are silently ignored either way.
+        self.process_group.kill_best_effort();
         let mut guard = self.child.lock().await;
         if let Some(mut child) = guard.take() {
             // Bounded wait. 3s matches what opencode's own
@@ -276,15 +254,13 @@ impl Drop for OpenCodeServer {
         // Hard SIGKILL escalation lives in the startup orphan scan
         // (runs before the next flowstate binds its port, so any
         // stubborn survivors get reaped there).
-        #[cfg(unix)]
-        if let Some(pgid) = self.child_pgid {
-            // Safety: `killpg` with a valid pgid is a standard POSIX
-            // syscall. ESRCH (group already empty) is expected on
-            // clean shutdown and silently ignored.
-            unsafe {
-                libc::killpg(pgid, libc::SIGTERM);
-            }
-        }
+        // Polite signal to the whole subtree (SIGTERM on Unix,
+        // TerminateJobObject on Windows). ESRCH / "already reaped"
+        // are silently ignored. The Drop impl on `process_group`
+        // itself runs after this and is a belt-and-braces no-op on
+        // Unix / a CloseHandle on Windows (which kills any survivors
+        // again via JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE).
+        self.process_group.kill_best_effort();
         if let Ok(mut guard) = self.child.try_lock() {
             if let Some(mut child) = guard.take() {
                 let _ = child.start_kill();

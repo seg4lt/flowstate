@@ -93,13 +93,12 @@ impl GitHubCopilotAdapter {
     fn ensure_watchdog(&self) {
         self.sessions.ensure_watchdog(|cached| async move {
             let mut process = cached.inner().lock().await;
-            // Reap the process group first so the `copilot` CLI the
-            // bridge spawned via `useStdio: true` dies alongside the
-            // Node bridge — tokio's `start_kill` on the direct child
-            // doesn't cascade to that grandchild.
-            if let Some(pgid) = process.pgid {
-                zenui_provider_api::kill_process_group_best_effort(pgid);
-            }
+            // Reap the process group / Job Object first so the
+            // `copilot` CLI the bridge spawned via `useStdio: true`
+            // dies alongside the Node bridge — tokio's `start_kill`
+            // on the direct child doesn't cascade to that
+            // grandchild.
+            process.process_group.kill_best_effort();
             let _ = process.child.start_kill();
         });
     }
@@ -147,18 +146,18 @@ impl GitHubCopilotAdapter {
             // note in `crates/core/provider-api/src/mcp_config.rs`.
             cmd.env("FLOWSTATE_PID", std::process::id().to_string());
         }
-        // Put the Node bridge in its own process group so the
-        // `copilot` CLI subprocess it internally spawns (via
+        // Put the Node bridge in its own process group / Job Object
+        // so the `copilot` CLI subprocess it internally spawns (via
         // `new CopilotClient({ useStdio: true })`) dies with the
         // bridge when flowstate exits or the idle watchdog reaps
-        // the cache entry. Without this the CLI grandchild
-        // reparents to PID 1 and survives. See
-        // `zenui_provider_api::process_group`.
-        zenui_provider_api::enter_own_process_group(&mut cmd);
+        // the cache entry. Without this the CLI grandchild would
+        // reparent to PID 1 (Unix) / orphan (Windows) and survive.
+        // See `zenui_provider_api::ProcessGroup`.
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn bridge: {e}"))?;
-        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        process_group.attach(&child);
 
         let stdin = child
             .stdin
@@ -182,7 +181,7 @@ impl GitHubCopilotAdapter {
 
         let mut process = CopilotBridgeProcess {
             child,
-            pgid,
+            process_group,
             stdin: Arc::new(Mutex::new(stdin)),
             stdout: BufReader::new(stdout).lines(),
             bridge_session_id: String::new(),

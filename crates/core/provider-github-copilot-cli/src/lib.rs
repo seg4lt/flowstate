@@ -98,13 +98,11 @@ impl GitHubCopilotCliAdapter {
     fn ensure_watchdog(&self) {
         self.active_processes.ensure_watchdog(|cached| async move {
             let mut proc = cached.inner().lock().await;
-            // Reap the process group first so MCP/subshell
-            // grandchildren die with the CLI; tokio's `start_kill`
-            // on `child` only terminates the direct `copilot`
-            // process.
-            if let Some(pgid) = proc.pgid {
-                zenui_provider_api::kill_process_group_best_effort(pgid);
-            }
+            // Reap the process group / Job Object first so MCP /
+            // subshell grandchildren die with the CLI; tokio's
+            // `start_kill` on `child` only terminates the direct
+            // `copilot` process.
+            proc.process_group.kill_best_effort();
             let _ = proc.child.start_kill();
         });
     }
@@ -153,12 +151,13 @@ impl GitHubCopilotCliAdapter {
             .kill_on_drop(true);
         // `copilot` CLI forks per-session agent workers + MCP
         // subprocesses; place them all in this child's process
-        // group so `killpg` at teardown reaps the subtree.
-        zenui_provider_api::enter_own_process_group(&mut cmd);
+        // group / Job Object so `kill_best_effort` at teardown reaps
+        // the subtree.
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn copilot CLI ('{binary}'): {e}"))?;
-        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        process_group.attach(&child);
 
         let stdin = child
             .stdin
@@ -199,7 +198,7 @@ impl GitHubCopilotCliAdapter {
 
         Ok(CopilotCliProcess {
             child,
-            pgid,
+            process_group,
             stdin,
             pending,
             next_id: Arc::new(Mutex::new(1)),

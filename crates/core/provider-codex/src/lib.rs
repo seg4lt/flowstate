@@ -52,12 +52,11 @@ pub struct CodexAdapter {
 #[derive(Debug)]
 struct CodexSessionProcess {
     child: Child,
-    /// Process-group id the `codex app-server` child leads. Captured
-    /// right after spawn; the `Drop` below `killpg(pgid, SIGTERM)`s
-    /// the whole subtree so any per-session agent workers / MCP
-    /// subprocesses Codex itself forked die with the parent. See
-    /// `zenui_provider_api::process_group` for the rationale.
-    pgid: Option<i32>,
+    /// Cross-platform process-group / Job-Object owning the `codex
+    /// app-server` subtree. The `Drop` below reaps any per-session
+    /// agent workers / MCP subprocesses Codex itself forked. See
+    /// `zenui_provider_api::ProcessGroup`.
+    process_group: zenui_provider_api::ProcessGroup,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
     stderr_task: JoinHandle<()>,
@@ -68,9 +67,7 @@ struct CodexSessionProcess {
 
 impl Drop for CodexSessionProcess {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid {
-            zenui_provider_api::kill_process_group_best_effort(pgid);
-        }
+        self.process_group.kill_best_effort();
         let _ = self.child.start_kill();
         // `stderr_task` is an `AbortHandle`-ish `JoinHandle`; aborting
         // it prevents the drain loop from dangling after the child
@@ -226,12 +223,13 @@ impl CodexAdapter {
             .kill_on_drop(true);
         // `codex app-server` forks per-session agent workers and MCP
         // subprocesses; place them all in this child's process group
-        // so `killpg` at teardown reaps the subtree atomically.
-        zenui_provider_api::enter_own_process_group(&mut cmd);
+        // / Job Object so `kill_best_effort` at teardown reaps the
+        // subtree atomically.
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|error| format!("failed to launch Codex app-server: {error}"))?;
-        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        process_group.attach(&child);
 
         let stdin = child
             .stdin
@@ -249,7 +247,7 @@ impl CodexAdapter {
         let stderr_task = spawn_stderr_drain(stderr);
         let mut process = CodexSessionProcess {
             child,
-            pgid,
+            process_group,
             stdin,
             stdout: BufReader::new(stdout).lines(),
             stderr_task,
@@ -356,11 +354,11 @@ impl ProviderAdapter for CodexAdapter {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        zenui_provider_api::enter_own_process_group(&mut cmd);
+        let mut process_group = zenui_provider_api::ProcessGroup::before_spawn(&mut cmd);
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to launch codex app-server for model list: {e}"))?;
-        let pgid: Option<i32> = child.id().and_then(|p| i32::try_from(p).ok());
+        process_group.attach(&child);
         let stdin = child
             .stdin
             .take()
@@ -373,7 +371,7 @@ impl ProviderAdapter for CodexAdapter {
 
         let mut process = CodexSessionProcess {
             child,
-            pgid,
+            process_group,
             stdin,
             stdout: BufReader::new(stdout).lines(),
             stderr_task: tokio::spawn(async {}),

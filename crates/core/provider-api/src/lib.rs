@@ -68,7 +68,7 @@ pub use orchestration::{
 pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
 pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
-pub use process_group::{enter_own_process_group, kill_process_group_best_effort};
+pub use process_group::ProcessGroup;
 pub use types::*;
 pub use user_mcp::{McpSnapshot, RESERVED_FLOWSTATE_KEY, UserMcpRegistry};
 
