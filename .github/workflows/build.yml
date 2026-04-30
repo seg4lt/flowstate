@@ -149,21 +149,26 @@ jobs:
           # added flow to the .app, so without this step every
           # update would silently strip the CLI. We re-tar the
           # modified .app and re-sign with the same minisign key.
-          MACOS_DIR=$(dirname "$APP_PATH")
+          #
+          # Path note: `pnpm --dir apps/flowstate exec` changes the
+          # signer's cwd to apps/flowstate, but `target/` lives at
+          # the repo root. Pass the tarball as an absolute path so
+          # the signer can find it regardless of cwd.
+          MACOS_DIR_ABS="$(cd "$(dirname "$APP_PATH")" && pwd)"
           APP_NAME=$(basename "$APP_PATH")
+          TAR_PATH="${MACOS_DIR_ABS}/${APP_NAME}.tar.gz"
           (
-            cd "$MACOS_DIR"
-            TAR_NAME="${APP_NAME}.tar.gz"
-            tar -czf "$TAR_NAME" "$APP_NAME"
+            cd "$MACOS_DIR_ABS"
+            tar -czf "${APP_NAME}.tar.gz" "$APP_NAME"
             # Older `.sig` is now stale — overwrite via the Tauri
             # signer. `--password ""` is required by the CLI even
             # when the key has no password.
-            rm -f "${TAR_NAME}.sig"
+            rm -f "${APP_NAME}.tar.gz.sig"
           )
           pnpm --dir apps/flowstate exec tauri signer sign \
             --private-key "${TAURI_SIGNING_PRIVATE_KEY}" \
             --password "" \
-            "$MACOS_DIR/${APP_NAME}.tar.gz"
+            "$TAR_PATH"
 
       # Windows build paused (matrix entry commented out). When
       # re-enabling, add a step here that copies
