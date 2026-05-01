@@ -61,8 +61,21 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
     } = options;
     let label = kind.label().to_string();
 
-    let mut version_cmd = Command::new(binary);
+    // Resolve to an absolute path through the workspace resolver so
+    // the OS launcher uses the user's configured extras + platform
+    // fallbacks (Windows `CreateProcessW` ignores any PATH env we
+    // set on the child for module resolution). Most callers already
+    // pass an absolute path here — `resolve_cli_command` is a fast
+    // pass-through in that case, since `find_cli_binary` short-
+    // circuits on a hit in the first PATH walk.
+    let resolved_binary = crate::resolve_cli_command(binary);
+    let mut version_cmd = Command::new(&resolved_binary);
     crate::hide_console_window_tokio(&mut version_cmd);
+    // Augment the child's PATH so any subprocess the probe forks
+    // sees the user's configured extras too. Critical on Windows
+    // where GUI launches inherit a stripped PATH and the user has
+    // pointed flowstate at e.g. C:\Users\foo\.local\bin.
+    version_cmd.env("PATH", crate::path_with_extras(&[]));
     let version_output = version_cmd.args(version_args).output().await;
     let version_output = match version_output {
         Ok(out) => out,
@@ -91,8 +104,9 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
     let version = first_non_empty_line(&version_output.stdout)
         .or_else(|| first_non_empty_line(&version_output.stderr));
 
-    let mut auth_cmd = Command::new(binary);
+    let mut auth_cmd = Command::new(&resolved_binary);
     crate::hide_console_window_tokio(&mut auth_cmd);
+    auth_cmd.env("PATH", crate::path_with_extras(&[]));
     match auth_cmd.args(auth_args).output().await {
         Ok(auth_output) => {
             let authenticated = auth_output.status.success();
@@ -196,8 +210,9 @@ pub async fn probe_update_check(
     binary: &str,
     args: &[&str],
 ) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
-    let mut cmd = Command::new(binary);
+    let mut cmd = Command::new(crate::resolve_cli_command(binary));
     crate::hide_console_window_tokio(&mut cmd);
+    cmd.env("PATH", crate::path_with_extras(&[]));
     cmd.args(args)
         .output()
         .await

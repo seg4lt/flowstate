@@ -73,6 +73,10 @@ impl OpenCodeServer {
         let mut cmd = Command::new(binary);
         cmd.args(["serve", "--hostname", hostname, "--port", &port.to_string()])
             .current_dir(working_directory)
+            // Augment PATH so opencode and anything it forks (git,
+            // its own MCP subprocesses) sees the user's configured
+            // extra search dirs.
+            .env("PATH", zenui_provider_api::path_with_extras(&[]))
             // Opencode's server reads this to gate requests. We
             // regenerate it on every spawn so a lingering stale
             // process from a previous crash can't answer for us.

@@ -485,14 +485,10 @@ fn npm_cache_dir() -> Result<PathBuf> {
         .join("npm-cache"))
 }
 
-fn prepend_path(extra: &Path) -> String {
-    let existing = std::env::var("PATH").unwrap_or_default();
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    if existing.is_empty() {
-        extra.display().to_string()
-    } else {
-        format!("{}{sep}{existing}", extra.display())
-    }
+fn prepend_path(extra: &Path) -> std::ffi::OsString {
+    // Same rationale as the Claude SDK bridge — see
+    // `provider-claude-sdk/src/bridge_runtime.rs::prepend_path`.
+    zenui_provider_api::path_with_extras(&[extra])
 }
 
 #[cfg(unix)]

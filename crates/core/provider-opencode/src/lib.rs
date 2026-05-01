@@ -981,6 +981,7 @@ impl ProviderAdapter for OpenCodeAdapter {
         // proof, so we try to start it next.
         let mut version_cmd = tokio::process::Command::new(&binary);
         zenui_provider_api::hide_console_window_tokio(&mut version_cmd);
+        version_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
         let version = match version_cmd
             .arg("--version")
             .output()
@@ -1169,8 +1170,10 @@ impl ProviderAdapter for OpenCodeAdapter {
         // single distribution channel that works on every platform
         // (`brew` only covers macOS, the curl installer doesn't
         // self-update). Reinstall the latest tag globally.
-        let mut npm_cmd = tokio::process::Command::new("npm");
+        let mut npm_cmd =
+            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
         zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
         let output = npm_cmd
             .args(["install", "-g", "opencode-ai@latest"])
             .output()

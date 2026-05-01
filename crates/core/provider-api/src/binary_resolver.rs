@@ -78,6 +78,91 @@ pub fn extra_search_paths() -> Vec<PathBuf> {
     }
 }
 
+/// Resolve a CLI binary name to an absolute path through
+/// [`find_cli_binary`], falling back to the bare name on miss.
+///
+/// Always pair with [`path_with_extras`] when constructing a
+/// `Command`: the absolute path makes sure the OS-level binary
+/// resolver finds the right executable (critical on Windows, where
+/// `CreateProcessW` uses the *parent's* PATH and ignores any PATH
+/// env you set on the child via `cmd.env`); the augmented PATH then
+/// makes sure anything the child spawns inherits the user's
+/// configured extra search dirs.
+///
+/// The fallback to the bare name preserves the historical behavior
+/// for callers that ran on machines where the binary *was* on PATH
+/// — losing nothing — while fixing the broken Windows-GUI case.
+///
+/// Already-absolute paths (and relative paths containing a separator)
+/// are passed through unchanged — `find_cli_binary` is a name lookup,
+/// not a "does this file exist?" check, so re-running it on a path
+/// the caller has already resolved would waste cycles and risk
+/// re-resolving to a different file if the user changed PATH.
+pub fn resolve_cli_command(name: &str) -> std::ffi::OsString {
+    let looks_like_path = std::path::Path::new(name)
+        .components()
+        .any(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)))
+        || name.contains(std::path::MAIN_SEPARATOR);
+    if looks_like_path {
+        return std::ffi::OsString::from(name);
+    }
+    match find_cli_binary(name) {
+        Some(path) => path.into_os_string(),
+        None => std::ffi::OsString::from(name),
+    }
+}
+
+/// Build a PATH env value for a child subprocess, composed (in order):
+///   1. `prefix_dirs` supplied by the caller — for example the embedded
+///      Node bin dir, which must outrank everything else so the bridge
+///      resolves `node` to the version we shipped, not whatever the
+///      user has on PATH.
+///   2. The user-configured extra search directories
+///      ([`extra_search_paths`]). Same ones [`find_cli_binary`]
+///      consults, so subprocesses that do their own PATH-based
+///      resolution (the Node bridges, `npm`, `gh`, `git`, …) see
+///      every binary the user has explicitly told flowstate about.
+///   3. The parent process's existing `PATH`.
+///
+/// On Windows the separator is `;`, elsewhere `:`. Empty entries are
+/// dropped, dedup is **not** applied (PATH walking is short-circuit,
+/// so a duplicate later in the list is harmless and preserving order
+/// keeps the user's explicit-overrides-first intent intact).
+///
+/// Use this everywhere we spawn a subprocess that itself does PATH
+/// resolution — every adapter, every Node bridge, every shell-out in
+/// the Tauri shell. Callers that previously inherited `PATH`
+/// implicitly (no `cmd.env("PATH", ...)`) should instead call
+/// `cmd.env("PATH", path_with_extras(&[]))` so the user's extra
+/// directories actually reach the child.
+pub fn path_with_extras(prefix_dirs: &[&std::path::Path]) -> std::ffi::OsString {
+    let sep: &str = if cfg!(windows) { ";" } else { ":" };
+    let mut out = std::ffi::OsString::new();
+    let mut wrote_any = false;
+
+    let mut push = |segment: &std::ffi::OsStr| {
+        if segment.is_empty() {
+            return;
+        }
+        if wrote_any {
+            out.push(sep);
+        }
+        out.push(segment);
+        wrote_any = true;
+    };
+
+    for dir in prefix_dirs {
+        push(dir.as_os_str());
+    }
+    for dir in extra_search_paths() {
+        push(dir.as_os_str());
+    }
+    if let Some(existing) = std::env::var_os("PATH") {
+        push(&existing);
+    }
+    out
+}
+
 /// Locate a CLI binary by name across PATH, user-configured extra
 /// search directories, and a curated list of well-known install
 /// locations.

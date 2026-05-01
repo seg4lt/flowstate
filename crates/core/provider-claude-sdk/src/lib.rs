@@ -289,14 +289,14 @@ impl ClaudeSdkAdapter {
 
         // The Claude Agent SDK spawns a child `node` process internally,
         // so the embedded node's directory must be on PATH or the SDK
-        // fails with ENOENT when it tries to re-exec itself.
-        let existing_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = if existing_path.is_empty() {
-            node.bin_dir.to_string_lossy().into_owned()
-        } else {
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            format!("{}{sep}{}", node.bin_dir.display(), existing_path)
-        };
+        // fails with ENOENT when it tries to re-exec itself. We also
+        // prepend the user's configured extra search dirs so the JS
+        // bridge — which does its own PATH-based resolution to locate
+        // a local `claude` CLI before falling back to the SDK's
+        // bundled one — can see binaries the user has explicitly told
+        // flowstate about (matters on Windows where GUI launches
+        // inherit a stripped PATH).
+        let new_path = zenui_provider_api::path_with_extras(&[node.bin_dir.as_path()]);
 
         let mut cmd = Command::new(&node.node_bin);
         cmd.arg(&bridge.script)

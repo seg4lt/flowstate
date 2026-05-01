@@ -116,14 +116,12 @@ impl GitHubCopilotAdapter {
         info!("Using embedded node at: {}", node.node_bin.display());
 
         // Put the embedded node on PATH so the Copilot SDK's internal
-        // `node` subprocess calls resolve to the same runtime.
-        let existing_path = std::env::var("PATH").unwrap_or_default();
-        let new_path = if existing_path.is_empty() {
-            node.bin_dir.to_string_lossy().into_owned()
-        } else {
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            format!("{}{sep}{}", node.bin_dir.display(), existing_path)
-        };
+        // `node` subprocess calls resolve to the same runtime; also
+        // weave in the user's configured extra search dirs so any
+        // grandchild subprocess (`git`, etc.) finds tools the user
+        // has explicitly told flowstate about — same rationale as
+        // the Claude SDK bridge spawn.
+        let new_path = zenui_provider_api::path_with_extras(&[node.bin_dir.as_path()]);
 
         let mut cmd = Command::new(&node.node_bin);
         cmd.arg(&bridge.script)

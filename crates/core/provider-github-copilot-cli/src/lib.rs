@@ -145,6 +145,10 @@ impl GitHubCopilotCliAdapter {
             cmd.arg(arg);
         }
         cmd.current_dir(cwd)
+            // Augment PATH so anything copilot forks (git, MCP
+            // subprocesses, editor invocations) inherits the user's
+            // configured extra search dirs.
+            .env("PATH", zenui_provider_api::path_with_extras(&[]))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -971,8 +975,10 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     async fn upgrade(&self) -> Result<String, String> {
         // The copilot CLI ships as a `gh` extension; the canonical
         // upgrade path is `gh extension upgrade github/gh-copilot`.
-        let mut gh_cmd = tokio::process::Command::new("gh");
+        let mut gh_cmd =
+            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("gh"));
         zenui_provider_api::hide_console_window_tokio(&mut gh_cmd);
+        gh_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
         let output = gh_cmd
             .args(["extension", "upgrade", "github/gh-copilot"])
             .output()

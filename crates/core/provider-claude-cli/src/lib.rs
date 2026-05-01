@@ -401,6 +401,12 @@ impl ClaudeCliAdapter {
         let mut cmd = Command::new(&binary);
         cmd.args(&args)
             .current_dir(&cwd)
+            // Augment PATH with the user's configured extra search
+            // dirs so the claude CLI's own subprocesses (git, MCP
+            // servers, tool subshells) inherit them too. Critical
+            // when the GUI launch's PATH is missing locations the
+            // user added explicitly in Settings.
+            .env("PATH", zenui_provider_api::path_with_extras(&[]))
             .env("CLAUDE_CODE_ENTRYPOINT", "zenui")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_ASKPASS", "")
@@ -1060,8 +1066,17 @@ impl ProviderAdapter for ClaudeCliAdapter {
         // Claude CLI is published as `@anthropic-ai/claude-code` on
         // npm. Run a synchronous global install of the latest tag —
         // npm overwrites the existing global binary in place.
-        let mut npm_cmd = tokio::process::Command::new("npm");
+        // Resolve `npm` to an absolute path through the workspace
+        // resolver — required because `cmd.env("PATH", ...)` only
+        // affects the child's view, not the OS-level resolution that
+        // launches npm itself (Windows `CreateProcessW` uses the
+        // parent's PATH for module lookup).
+        let mut npm_cmd =
+            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
         zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        // Augment PATH for the child so anything npm forks — git,
+        // node-gyp, postinstall hooks — finds the same tools.
+        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
         let output = npm_cmd
             .args([
                 "install",

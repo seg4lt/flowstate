@@ -593,14 +593,14 @@ fn pnpm_store_dir() -> Result<PathBuf> {
         .join("pnpm-store"))
 }
 
-fn prepend_path(extra: &Path) -> String {
-    let existing = std::env::var("PATH").unwrap_or_default();
-    let sep = if cfg!(windows) { ';' } else { ':' };
-    if existing.is_empty() {
-        extra.display().to_string()
-    } else {
-        format!("{}{sep}{existing}", extra.display())
-    }
+fn prepend_path(extra: &Path) -> std::ffi::OsString {
+    // Delegate to the workspace-shared helper so the user's
+    // configured extra search dirs (`binaries.search_paths`) are
+    // also visible to the hydration subprocesses (corepack, pnpm,
+    // npm, and anything they fork like `git`). Without this the
+    // hydration runs with the GUI's stripped PATH on Windows and
+    // can't find tools the user added explicitly in Settings.
+    zenui_provider_api::path_with_extras(&[extra])
 }
 
 #[cfg(unix)]

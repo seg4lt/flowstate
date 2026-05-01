@@ -235,15 +235,20 @@ fn install_system(source: &Path) -> Result<InstallCliReport, String> {
             "do shell script \"{}\" with administrator privileges",
             shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
         );
-        std::process::Command::new("osascript")
+        std::process::Command::new(zenui_provider_api::resolve_cli_command("osascript"))
             .args(["-e", &osa])
+            // Augment PATH so osascript itself resolves on machines
+            // where the GUI launch's PATH is missing /usr/bin (rare,
+            // but matches the rationale for the Settings escape hatch).
+            .env("PATH", zenui_provider_api::path_with_extras(&[]))
             .output()
             .map_err(|e| format!("invoke osascript: {e}"))?
     };
 
     #[cfg(all(unix, not(target_os = "macos")))]
-    let output = std::process::Command::new("pkexec")
+    let output = std::process::Command::new(zenui_provider_api::resolve_cli_command("pkexec"))
         .args(["sh", "-c", &shell_cmd])
+        .env("PATH", zenui_provider_api::path_with_extras(&[]))
         .output()
         .map_err(|e| {
             format!(

@@ -217,6 +217,10 @@ impl CodexAdapter {
             }
         }
         cmd.current_dir(&cwd)
+            // Augment PATH with the user's configured extra search
+            // dirs so codex's MCP-server subprocesses (and anything
+            // codex itself forks: git, editors, etc.) inherit them.
+            .env("PATH", zenui_provider_api::path_with_extras(&[]))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -368,9 +372,14 @@ impl ProviderAdapter for CodexAdapter {
 
     async fn upgrade(&self) -> Result<String, String> {
         // Codex distributes as `@openai/codex` on npm. Reinstall the
-        // latest tag globally — npm overwrites in place.
-        let mut npm_cmd = tokio::process::Command::new("npm");
+        // latest tag globally — npm overwrites in place. Resolve npm
+        // to an absolute path so OS-level binary lookup uses the
+        // user's extras (Windows CreateProcessW ignores the env PATH
+        // we set on the child for binary resolution).
+        let mut npm_cmd =
+            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
         zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
         let output = npm_cmd
             .args(["install", "-g", "@openai/codex@latest"])
             .output()
@@ -394,6 +403,7 @@ impl ProviderAdapter for CodexAdapter {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("app-server")
             .current_dir(&self.working_directory)
+            .env("PATH", zenui_provider_api::path_with_extras(&[]))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

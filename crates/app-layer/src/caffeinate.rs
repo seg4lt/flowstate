@@ -210,10 +210,15 @@ impl CaffeinateController {
 
         #[cfg(target_os = "macos")]
         {
-            let mut cmd = Command::new("caffeinate");
+            // Resolve `caffeinate` through the workspace binary
+            // resolver so user-configured extras + platform fallbacks
+            // apply (`/usr/bin/caffeinate` is the standard location,
+            // and the resolver's macOS fallbacks include it).
+            let mut cmd = Command::new(zenui_provider_api::resolve_cli_command("caffeinate"));
             cmd.arg("-d") // prevent display sleep
                 .arg("-t")
                 .arg(SAFETY_TIMEOUT_SECS.to_string())
+                .env("PATH", zenui_provider_api::path_with_extras(&[]))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

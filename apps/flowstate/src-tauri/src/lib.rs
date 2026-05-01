@@ -288,9 +288,19 @@ async fn get_git_branch(path: String) -> Option<String> {
 /// flash a cmd window on Windows GUI launches. No-op on non-Windows.
 /// Tiny helper because every git spawn in this file would otherwise
 /// need the same two-line dance.
+///
+/// Resolves `git` through the workspace binary resolver so the
+/// user's `binaries.search_paths` setting (and platform fallbacks
+/// like `/opt/homebrew/bin`) take effect — critical on Windows,
+/// where the OS launcher would otherwise only consult the GUI
+/// process's stripped PATH and miss explicit overrides. Also sets
+/// the child's PATH to the augmented value so anything `git` itself
+/// forks (ssh, hooks, the configured editor, ...) inherits the
+/// extras.
 fn git_cmd() -> Command {
-    let mut c = Command::new("git");
+    let mut c = Command::new(zenui_provider_api::resolve_cli_command("git"));
     zenui_provider_api::hide_console_window_std(&mut c);
+    c.env("PATH", zenui_provider_api::path_with_extras(&[]));
     c
 }
 
@@ -532,8 +542,9 @@ fn remove_git_worktree(
     if worktree_path.trim().is_empty() {
         return Err("empty worktree path".into());
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(zenui_provider_api::resolve_cli_command("git"));
     zenui_provider_api::hide_console_window_std(&mut cmd);
+    cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
     cmd.args(["-C", &project_path, "worktree", "remove"]);
     if force {
         cmd.arg("--force");
@@ -571,8 +582,9 @@ fn git_checkout(path: String, branch: String, create_track: Option<String>) -> R
     if branch.trim().is_empty() {
         return Err("empty branch name".into());
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(zenui_provider_api::resolve_cli_command("git"));
     zenui_provider_api::hide_console_window_std(&mut cmd);
+    cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
     cmd.args(["-C", &path, "checkout"]);
     match &create_track {
         Some(remote_ref) => {
@@ -1453,8 +1465,14 @@ fn open_in_editor(editor: String, path: String) -> Result<(), String> {
     if !project_path.is_dir() {
         return Err(format!("not a directory: {path}"));
     }
-    let mut editor_cmd = Command::new(trimmed);
+    // Resolve the editor name to an absolute path through the
+    // workspace binary resolver — picks up the user's configured
+    // extras and platform fallbacks. Especially important here
+    // because users routinely point this at editor shims like
+    // `code`, `cursor`, `zed` that live in non-system bin dirs.
+    let mut editor_cmd = Command::new(zenui_provider_api::resolve_cli_command(trimmed));
     zenui_provider_api::hide_console_window_std(&mut editor_cmd);
+    editor_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
     let mut child = editor_cmd
         .arg(".")
         .current_dir(project_path)
