@@ -552,10 +552,21 @@ function loadToolCatalog(entries: ToolCatalogEntry[]): void {
       async (args) => dispatchRuntimeCall(entry.name, args),
     ),
   );
+  // `alwaysLoad: true` (added in claude-agent-sdk 0.2.126) opts out
+  // of the SDK's tool-search deferred-loading. Without it, our
+  // orchestration tools (`flowstate_spawn`, `flowstate_send`,
+  // `list_providers`, ...) would only be surfaced to the model
+  // after a tool-search round-trip, which delays cross-session
+  // delegation by ~one tool call and makes "spawn another agent"
+  // feel laggy. Our entire server's tool surface is small and
+  // load-bearing for orchestration, so flagging it always-load
+  // is the right call. Equivalent to `defer_loading: false` on
+  // the API.
   flowstateOrchestrationServer = createSdkMcpServer({
     name: 'flowstate',
     version: '0.1.0',
     tools,
+    alwaysLoad: true,
   });
   if (resolveCatalogLoaded) {
     resolveCatalogLoaded();
@@ -1201,16 +1212,8 @@ class ClaudeBridge {
     // parent_tool_use_id-bearing messages into per-agent buckets
     // (see `agentUsage` map), so lighting this option up surfaces
     // those same messages incrementally instead of in a final lump.
-    //
-    // Field exists on the SDK's internal `SDKControlInitializeRequest`
-    // and is forwarded to the spawned Claude Code process at session
-    // init, but as of v0.2.119 the public `Options` type doesn't yet
-    // expose it. The SDK accepts unknown extra fields on Options and
-    // passes them through, so we set it here via a one-line type
-    // widen and revisit when the type is exposed publicly. Listed in
-    // the v0.2.119 changelog. Safe to remove the cast once the public
-    // type catches up.
-    (options as Options & { forwardSubagentText?: boolean }).forwardSubagentText = true;
+    // Public on `Options` since SDK 0.2.126.
+    options.forwardSubagentText = true;
 
     const inputQueue = new PushableAsyncIterable<SDKUserMessage>();
     this.inputQueue = inputQueue;
