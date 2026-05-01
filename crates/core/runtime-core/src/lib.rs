@@ -1409,9 +1409,20 @@ impl RuntimeCore {
                 Err(error) => Some(ServerMessage::Error { message: error }),
             },
             ClientMessage::RefreshModels { provider } => {
+                // Users expect this button to refresh "everything for
+                // this provider." Without re-running `health()` here
+                // the installed-version chip and the update-available
+                // dot stay frozen until the 24h cache TTL expires —
+                // there's no other surface to bust that cache short
+                // of restarting the app or toggling the provider
+                // off/on. The probe is cheap (`claude doctor` etc.
+                // run in well under a second) and dedupes via
+                // `in_flight_health_checks` so a rapid double-click
+                // can't stack.
+                self.spawn_health_check(provider);
                 self.spawn_model_refresh(provider);
                 Some(ServerMessage::Ack {
-                    message: format!("Refreshing models for {}.", provider.label()),
+                    message: format!("Refreshing {}.", provider.label()),
                 })
             }
             ClientMessage::RefreshSessionCommands { session_id } => {

@@ -950,9 +950,18 @@ function ProviderRow({
         : (provider.message ?? provider.status)
       : "checking...";
   // Trim the leading "v" so "v0.0.41" / "0.0.41" both render as
-  // `v0.0.41` consistently.
+  // `v0.0.41` consistently. Sentinel strings the daemon may return
+  // (e.g. "bundled" for the Claude SDK adapter falling back to its
+  // vendored binary) are kept verbatim — `versionLabel` below
+  // detects whether to prepend a `v`.
   const installedVersion = provider?.version
     ? provider.version.trim().replace(/^v/i, "")
+    : null;
+  const isBundled = installedVersion === "bundled";
+  const versionLabel = installedVersion
+    ? /^[\d]/.test(installedVersion)
+      ? `v${installedVersion}`
+      : installedVersion
     : null;
 
   return (
@@ -986,33 +995,48 @@ function ProviderRow({
         </div>
         <div className="truncate text-xs text-muted-foreground">
           {statusText}
-          {installedVersion ? (
-            <span className="ml-2 font-mono text-[11px] text-muted-foreground/80">
-              v{installedVersion}
+          {versionLabel ? (
+            <span
+              className="ml-2 font-mono text-[11px] text-muted-foreground/80"
+              title={
+                isBundled
+                  ? "Using the SDK's vendored claude-code binary. Install claude on PATH (or add its directory to Settings → Extra binary search paths) to switch to a local install."
+                  : undefined
+              }
+            >
+              {versionLabel}
             </span>
           ) : null}
         </div>
       </div>
-      {updateAvailable ? (
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={upgrading}
-          onClick={onUpgrade}
-          title={
-            provider?.latestVersion
-              ? `Upgrade to v${provider.latestVersion}`
-              : "Upgrade to the latest version"
-          }
-        >
-          {upgrading ? (
-            <Loader2 className="animate-spin" />
-          ) : (
-            <ArrowUpCircle />
-          )}
-          Upgrade
-        </Button>
-      ) : null}
+      {/* Always render the Upgrade button so the affordance has a
+          stable place in the row. Disabled when no update is
+          available (or the provider is off / not ready / already
+          upgrading), enabled only when the daemon's update probe
+          flagged this provider as outdated. The amber dot next to
+          the label remains the passive notification — the button
+          itself stays present whether or not there's something to
+          upgrade. */}
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!updateAvailable || upgrading || !enabled}
+        onClick={onUpgrade}
+        title={
+          !enabled
+            ? `${label} is disabled`
+            : updateAvailable
+              ? provider?.latestVersion
+                ? `Upgrade to v${provider.latestVersion}`
+                : "Upgrade to the latest version"
+              : isBundled
+                ? "Bundled with Flowstate — updates ship with the app itself"
+                : "Up to date"
+        }
+      >
+        {upgrading ? <Loader2 className="animate-spin" /> : <ArrowUpCircle />}
+        Upgrade
+      </Button>
       <Button
         variant="outline"
         size="sm"

@@ -1200,7 +1200,16 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                         });
                     (update_available, version_string)
                 }
-                None => (false, None),
+                // No local claude on PATH / extras / fallbacks. The
+                // bridge will use the SDK's vendored `claude-code`
+                // binary; we surface "bundled" in the version chip
+                // so the user can tell at a glance which install is
+                // in play. Bundle freshness is governed by the
+                // flowstate update channel itself, so there's no
+                // upgrade affordance for this case (the Upgrade
+                // button stays disabled because update_available is
+                // false).
+                None => (false, Some("bundled".to_string())),
             };
 
         ProviderStatus {
