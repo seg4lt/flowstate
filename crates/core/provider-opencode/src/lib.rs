@@ -966,6 +966,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                     models: Vec::new(),
                     enabled: true,
                     features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                    update_available: false,
+                    latest_version: None,
                 };
             }
         };
@@ -999,6 +1001,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                     models: Vec::new(),
                     enabled: true,
                     features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                    update_available: false,
+                    latest_version: None,
                 };
             }
         };
@@ -1031,6 +1035,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                             models: Vec::new(),
                             enabled: true,
                             features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                            update_available: false,
+                            latest_version: None,
                         };
                     }
                     Err(err) => {
@@ -1045,6 +1051,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                             models: Vec::new(),
                             enabled: true,
                             features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                            update_available: false,
+                            latest_version: None,
                         };
                     }
                 }
@@ -1065,6 +1073,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                     models: Vec::new(),
                     enabled: true,
                     features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                    update_available: false,
+                    latest_version: None,
                 };
             }
         }
@@ -1072,7 +1082,7 @@ impl ProviderAdapter for OpenCodeAdapter {
         // Idle-kill disabled: historical path — ensure_server spawns
         // on demand so the first health probe after daemon boot
         // warms the server up.
-        let status = match self.ensure_server().await {
+        let mut status = match self.ensure_server().await {
             // Lease is held for the duration of the health probe and
             // dropped when the arm falls out of scope. Phase B's idle
             // watcher can kill the server immediately after — that's
@@ -1090,6 +1100,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                     models: Vec::new(),
                     enabled: true,
                     features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                    update_available: false,
+                    latest_version: None,
                 },
                 Err(err) => ProviderStatus {
                     kind: ProviderKind::OpenCode,
@@ -1104,6 +1116,8 @@ impl ProviderAdapter for OpenCodeAdapter {
                     models: Vec::new(),
                     enabled: true,
                     features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                    update_available: false,
+                    latest_version: None,
                 },
             },
             Err(err) => ProviderStatus {
@@ -1117,10 +1131,55 @@ impl ProviderAdapter for OpenCodeAdapter {
                 models: Vec::new(),
                 enabled: true,
                 features: zenui_provider_api::features_for_kind(ProviderKind::OpenCode),
+                update_available: false,
+                latest_version: None,
             },
         };
 
+        // Best-effort update probe via `opencode upgrade --check`. The
+        // CLI exits non-zero with a "newer version" / "update
+        // available" message when one exists; we just look for those
+        // tokens in the combined output. Skipped silently if the probe
+        // command can't be spawned (older opencode builds).
+        if status.installed {
+            if let Some((_st, stdout, stderr)) =
+                zenui_provider_api::probe_update_check(&binary, &["upgrade", "--check"]).await
+            {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )
+                .to_ascii_lowercase();
+                if combined.contains("update available")
+                    || combined.contains("newer version")
+                    || combined.contains("new version")
+                {
+                    status.update_available = true;
+                }
+            }
+        }
         status
+    }
+
+    async fn upgrade(&self) -> Result<String, String> {
+        // opencode is published as `opencode-ai` on npm; that's the
+        // single distribution channel that works on every platform
+        // (`brew` only covers macOS, the curl installer doesn't
+        // self-update). Reinstall the latest tag globally.
+        let output = tokio::process::Command::new("npm")
+            .args(["install", "-g", "opencode-ai@latest"])
+            .output()
+            .await
+            .map_err(|err| format!("failed to invoke npm: {err}"))?;
+        if output.status.success() {
+            Ok("opencode upgraded.".to_string())
+        } else {
+            Err(format!(
+                "npm install failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
     }
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {

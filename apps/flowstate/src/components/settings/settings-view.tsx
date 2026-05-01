@@ -1,6 +1,7 @@
 import * as React from "react";
 import {
   AlertCircle,
+  ArrowUpCircle,
   ChevronDown,
   ChevronUp,
   FolderOpen,
@@ -707,18 +708,23 @@ function ProviderRow({
   onRefresh,
   refreshing,
   onToggleEnabled,
+  onUpgrade,
+  upgrading,
 }: {
   kind: ProviderKind;
   provider: ProviderStatus | undefined;
   onRefresh: () => void;
   refreshing: boolean;
   onToggleEnabled: (enabled: boolean) => void;
+  onUpgrade: () => void;
+  upgrading: boolean;
 }) {
   const { isProviderEnabled } = useProviderEnabled();
   const label = PROVIDER_LABELS[kind];
   const modelCount = provider?.models.length ?? 0;
   const isReady = provider?.status === "ready";
   const enabled = isProviderEnabled(kind);
+  const updateAvailable = enabled && (provider?.updateAvailable ?? false);
   const statusText = !enabled
     ? "Disabled"
     : provider
@@ -726,6 +732,11 @@ function ProviderRow({
         ? `${modelCount} model${modelCount === 1 ? "" : "s"}`
         : (provider.message ?? provider.status)
       : "checking...";
+  // Trim the leading "v" so "v0.0.41" / "0.0.41" both render as
+  // `v0.0.41` consistently.
+  const installedVersion = provider?.version
+    ? provider.version.trim().replace(/^v/i, "")
+    : null;
 
   return (
     <div
@@ -739,11 +750,52 @@ function ProviderRow({
         }`}
       />
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium">{label}</div>
+        <div className="flex items-center gap-2 truncate text-sm font-medium">
+          <span className="truncate">{label}</span>
+          {updateAvailable ? (
+            // Soft amber dot — no toast, no banner. The Upgrade
+            // button next to the row is the actionable affordance;
+            // this is just the "you have a notification" indicator.
+            <span
+              className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
+              aria-label="Update available"
+              title={
+                provider?.latestVersion
+                  ? `Update available (v${provider.latestVersion})`
+                  : "Update available"
+              }
+            />
+          ) : null}
+        </div>
         <div className="truncate text-xs text-muted-foreground">
           {statusText}
+          {installedVersion ? (
+            <span className="ml-2 font-mono text-[11px] text-muted-foreground/80">
+              v{installedVersion}
+            </span>
+          ) : null}
         </div>
       </div>
+      {updateAvailable ? (
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={upgrading}
+          onClick={onUpgrade}
+          title={
+            provider?.latestVersion
+              ? `Upgrade to v${provider.latestVersion}`
+              : "Upgrade to the latest version"
+          }
+        >
+          {upgrading ? (
+            <Loader2 className="animate-spin" />
+          ) : (
+            <ArrowUpCircle />
+          )}
+          Upgrade
+        </Button>
+      ) : null}
       <Button
         variant="outline"
         size="sm"
@@ -1496,6 +1548,9 @@ export function SettingsView() {
   const [refreshingKind, setRefreshingKind] = React.useState<ProviderKind | null>(
     null,
   );
+  const [upgradingKind, setUpgradingKind] = React.useState<ProviderKind | null>(
+    null,
+  );
   // macOS-only: probe whether the caffeinate Tauri commands are
   // registered. Hides the entire "macOS" group on other platforms
   // without needing a separate platform-detection dependency.
@@ -1542,14 +1597,41 @@ export function SettingsView() {
     }
   }
 
+  async function handleUpgrade(kind: ProviderKind) {
+    setUpgradingKind(kind);
+    try {
+      // Wait for the daemon's Ack/Error response. Runtime-core
+      // forces a fresh health probe after the upgrade either way,
+      // and the broadcast `ProviderHealthUpdated` event clears the
+      // amber dot once the probe lands.
+      const reply = await send({ type: "upgrade_provider_cli", provider: kind });
+      const description =
+        reply && reply.type === "ack"
+          ? reply.message
+          : `${PROVIDER_LABELS[kind]} upgrade requested.`;
+      toast({ description, duration: 3000 });
+    } catch (err) {
+      toast({
+        description: `Failed to upgrade ${PROVIDER_LABELS[kind]}: ${
+          (err as Error).message
+        }`,
+        duration: 4000,
+      });
+    } finally {
+      setUpgradingKind(null);
+    }
+  }
+
   function handleToggleEnabled(kind: ProviderKind, enabled: boolean) {
     setProviderEnabled(kind, enabled);
-    // When enabling, also tell the daemon so it starts health-checking
-    // and reporting models for this provider. Disabling is app-level
-    // only — the daemon always keeps all providers active.
-    if (enabled) {
-      send({ type: "set_provider_enabled", provider: kind, enabled: true }).catch(() => {});
-    }
+    // Propagate both directions to the daemon: enabling so it starts
+    // health-checking / reporting models, disabling so the SDK's
+    // `provider_enablement` table reflects the user's choice. The
+    // latter is what makes the MCP `list_providers` tool omit
+    // disabled providers and what blocks `spawn` calls against them.
+    send({ type: "set_provider_enabled", provider: kind, enabled }).catch(
+      () => {},
+    );
     toast({
       description: `${PROVIDER_LABELS[kind]} ${enabled ? "enabled" : "disabled"}`,
       duration: 2000,
@@ -1610,6 +1692,8 @@ export function SettingsView() {
                 onRefresh={() => handleRefresh(kind)}
                 refreshing={refreshingKind === kind}
                 onToggleEnabled={(enabled) => handleToggleEnabled(kind, enabled)}
+                onUpgrade={() => void handleUpgrade(kind)}
+                upgrading={upgradingKind === kind}
               />
             ))}
           </SettingsGroup>

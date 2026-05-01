@@ -69,6 +69,8 @@ impl ProviderAdapter for FsWritingAdapter {
             models: vec![],
             enabled: true,
             features: Default::default(),
+            update_available: false,
+            latest_version: None,
         }
     }
 

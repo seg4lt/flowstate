@@ -66,7 +66,7 @@ pub use orchestration::{
     RuntimeCallOrigin, RuntimeCallResult, SessionCreator, SessionDigest, WorktreeSummary,
 };
 pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
-pub use probe::{ProbeCliOptions, probe_cli};
+pub use probe::{ProbeCliOptions, UpdateCheckOutcome, probe_cli, probe_update_check};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
 pub use process_group::ProcessGroup;
 pub use types::*;

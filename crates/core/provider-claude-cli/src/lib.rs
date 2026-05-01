@@ -1007,7 +1007,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
 
     async fn health(&self) -> ProviderStatus {
         let binary = Self::find_claude_binary();
-        probe_cli(ProbeCliOptions {
+        let mut status = probe_cli(ProbeCliOptions {
             kind: ProviderKind::ClaudeCli,
             binary: &binary,
             version_args: &["--version"],
@@ -1025,11 +1025,58 @@ impl ProviderAdapter for ClaudeCliAdapter {
             // capability that doesn't exist.
             auth_err_is_ok: true,
         })
-        .await
+        .await;
+        // Best-effort update probe via `claude doctor`. The CLI prints
+        // a "Your version is out of date" / "newer version available"
+        // line on stderr when an update exists. We don't surface a
+        // "latest version" string because the doctor output isn't
+        // structured — just the boolean is enough to drive the UI dot.
+        if status.installed {
+            if let Some((_status, stdout, stderr)) =
+                zenui_provider_api::probe_update_check(&binary, &["doctor"]).await
+            {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )
+                .to_ascii_lowercase();
+                if combined.contains("out of date")
+                    || combined.contains("newer version")
+                    || combined.contains("update available")
+                {
+                    status.update_available = true;
+                }
+            }
+        }
+        status
     }
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
         Ok(claude_cli_models())
+    }
+
+    async fn upgrade(&self) -> Result<String, String> {
+        // Claude CLI is published as `@anthropic-ai/claude-code` on
+        // npm. Run a synchronous global install of the latest tag —
+        // npm overwrites the existing global binary in place.
+        let output = tokio::process::Command::new("npm")
+            .args([
+                "install",
+                "-g",
+                "@anthropic-ai/claude-code@latest",
+            ])
+            .output()
+            .await
+            .map_err(|err| format!("failed to invoke npm: {err}"))?;
+        if output.status.success() {
+            Ok("Claude CLI upgraded.".to_string())
+        } else {
+            Err(format!(
+                "npm install failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
     }
 
     async fn execute_turn(

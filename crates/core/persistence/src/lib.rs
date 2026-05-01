@@ -2054,6 +2054,8 @@ mod tests {
             models: Vec::new(),
             enabled: true,
             features: bogus_features,
+            update_available: false,
+            latest_version: None,
         };
         service
             .set_cached_health(ProviderKind::Claude, &status)

@@ -343,7 +343,25 @@ enabled: boolean,
  * deserialize cleanly because both the field and the struct are
  * `#[serde(default)]`.
  */
-features: ProviderFeatures, };
+features: ProviderFeatures, 
+/**
+ * Whether the provider's CLI has reported that a newer version is
+ * available. Populated by each adapter's own update probe (e.g.
+ * `claude doctor`, `gh extension list`). Drives the small
+ * "update available" dot in the Settings provider row and the
+ * gating for the Upgrade button. Defaults to `false` for
+ * providers without a native update probe; never set by the
+ * frontend — always reset by `health()` based on the latest
+ * probe result.
+ */
+updateAvailable: boolean, 
+/**
+ * The newer version string the provider's update probe reported,
+ * when known. Used as a tooltip ("Upgrade to 0.0.42") next to
+ * the per-provider Upgrade button. `None` when the probe didn't
+ * surface a specific version (only "an update is available").
+ */
+latestVersion?: string, };
 
 export type CommandKind = { "kind": "builtin" } | { "kind": "user_skill", source: SkillSource, };
 
@@ -478,7 +496,7 @@ permission_mode_override?: PermissionMode,
  * turn. Primarily intended for `ExitPlanMode` rejections where
  * the user wants to steer the plan without restarting the turn.
  */
-reason?: string, } | { "type": "answer_question", session_id: string, request_id: string, answers: Array<UserInputAnswer>, } | { "type": "cancel_question", session_id: string, request_id: string, } | { "type": "accept_plan", session_id: string, plan_id: string, } | { "type": "reject_plan", session_id: string, plan_id: string, } | { "type": "refresh_models", provider: ProviderKind, } | { "type": "set_provider_enabled", provider: ProviderKind, enabled: boolean, } | { "type": "create_project", path?: string, } | { "type": "delete_project", project_id: string, } | { "type": "assign_session_to_project", session_id: string, project_id?: string, } | { "type": "update_session_model", session_id: string, model: string, } | { "type": "archive_session", session_id: string, } | { "type": "unarchive_session", session_id: string, } | { "type": "list_archived_sessions" } | { "type": "refresh_session_commands", session_id: string, } | { "type": "get_context_usage", session_id: string, } | { "type": "rewind_files", session_id: string, turn_id: string, dry_run: boolean, confirm_conflicts: boolean, } | { "type": "set_checkpoints_enabled", enabled: boolean, } | { "type": "get_checkpoint_settings" };
+reason?: string, } | { "type": "answer_question", session_id: string, request_id: string, answers: Array<UserInputAnswer>, } | { "type": "cancel_question", session_id: string, request_id: string, } | { "type": "accept_plan", session_id: string, plan_id: string, } | { "type": "reject_plan", session_id: string, plan_id: string, } | { "type": "refresh_models", provider: ProviderKind, } | { "type": "set_provider_enabled", provider: ProviderKind, enabled: boolean, } | { "type": "upgrade_provider_cli", provider: ProviderKind, } | { "type": "create_project", path?: string, } | { "type": "delete_project", project_id: string, } | { "type": "assign_session_to_project", session_id: string, project_id?: string, } | { "type": "update_session_model", session_id: string, model: string, } | { "type": "archive_session", session_id: string, } | { "type": "unarchive_session", session_id: string, } | { "type": "list_archived_sessions" } | { "type": "refresh_session_commands", session_id: string, } | { "type": "get_context_usage", session_id: string, } | { "type": "rewind_files", session_id: string, turn_id: string, dry_run: boolean, confirm_conflicts: boolean, } | { "type": "set_checkpoints_enabled", enabled: boolean, } | { "type": "get_checkpoint_settings" };
 
 export type ServerMessage = { "type": "welcome", bootstrap: BootstrapPayload, } | { "type": "snapshot", snapshot: AppSnapshot, } | { "type": "session_loaded", session: SessionDetail, } | { "type": "session_created", session: SessionSummary, } | { "type": "pong" } | { "type": "ack", message: string, } | { "type": "event", event: RuntimeEvent, } | { "type": "error", message: string, } | { "type": "archived_sessions_list", sessions: Array<SessionSummary>, } | { "type": "attachment", data: AttachmentData, } | { "type": "context_usage", session_id: string, breakdown?: ContextBreakdown, } | { "type": "rewind_files_result", session_id: string, turn_id: string, outcome: RewindOutcomeWire, } | { "type": "checkpoint_settings_snapshot", settings: CheckpointSettings, };
 

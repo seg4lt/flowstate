@@ -727,6 +727,8 @@ impl RuntimeCore {
                 models: Vec::new(),
                 enabled,
                 features: zenui_provider_api::ProviderFeatures::default(),
+                update_available: false,
+                latest_version: None,
             },
         };
         self.publish(RuntimeEvent::ProviderHealthUpdated { status });
@@ -1473,6 +1475,31 @@ impl RuntimeCore {
                         if enabled { "enabled" } else { "disabled" }
                     ),
                 })
+            }
+            ClientMessage::UpgradeProviderCli { provider } => {
+                let adapter = match self.adapters.get(&provider) {
+                    Some(a) => a.clone(),
+                    None => {
+                        return Some(ServerMessage::Error {
+                            message: format!(
+                                "{} adapter is not registered.",
+                                provider.label()
+                            ),
+                        });
+                    }
+                };
+                let result = adapter.upgrade().await;
+                // Whether the upgrade succeeded or failed, force a
+                // fresh health probe so the per-row "update available"
+                // dot clears (or stays, if nothing actually moved) and
+                // the displayed version updates. The probe is fire-
+                // and-forget; the broadcasted `ProviderHealthUpdated`
+                // event drives the UI refresh.
+                self.spawn_health_check(provider);
+                match result {
+                    Ok(message) => Some(ServerMessage::Ack { message }),
+                    Err(message) => Some(ServerMessage::Error { message }),
+                }
             }
             ClientMessage::RewindFiles {
                 session_id,
@@ -3557,6 +3584,15 @@ impl RuntimeCore {
 
         let mut providers: Vec<ProviderCatalogEntry> = Vec::new();
         for &kind in self.adapters.keys() {
+            // Skip providers the user has disabled in settings so
+            // external agents calling `list_providers` (via the MCP
+            // server) don't see them at all. The `enabled` flag
+            // stays on the response struct for wire-compat with
+            // older clients that read it, but it will always be
+            // `true` after this filter.
+            if !self.is_provider_enabled(kind) {
+                continue;
+            }
             let cached_health = self.persistence.get_cached_health(kind).await;
             let cached_models = self
                 .persistence
@@ -3564,7 +3600,7 @@ impl RuntimeCore {
                 .await
                 .map(|(_, m)| m)
                 .unwrap_or_default();
-            let enabled = self.is_provider_enabled(kind);
+            let enabled = true;
 
             let (label, status_tag, status_message, features, models) = match cached_health {
                 Some((_, status)) => {
@@ -4050,6 +4086,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -4094,6 +4132,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -4191,6 +4231,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -4518,6 +4560,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -4635,6 +4679,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -4714,6 +4760,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -4869,6 +4917,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
 
@@ -5361,6 +5411,8 @@ mod tests {
             models,
             enabled: true,
             features: Default::default(),
+            update_available: false,
+            latest_version: None,
         }
     }
 
@@ -5743,6 +5795,8 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
+                update_available: false,
+                latest_version: None,
             }
         }
         async fn execute_turn(
@@ -5872,6 +5926,8 @@ mod tests {
                     models: vec![],
                     enabled: true,
                     features: Default::default(),
+                    update_available: false,
+                    latest_version: None,
                 }
             }
             async fn execute_turn(

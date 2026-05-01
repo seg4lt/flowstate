@@ -478,6 +478,16 @@ pub enum ClientMessage {
         provider: ProviderKind,
         enabled: bool,
     },
+    /// Run the provider adapter's `upgrade()` shell-out (e.g.
+    /// `npm install -g @anthropic-ai/claude-code@latest`). On
+    /// completion the runtime forces a fresh health probe so the
+    /// per-row "update available" dot clears and the displayed
+    /// version updates. Adapters without an upgrade flow respond
+    /// with an explanatory `ProviderUpgradeFinished { success: false,
+    /// message }` instead of attempting anything destructive.
+    UpgradeProviderCli {
+        provider: ProviderKind,
+    },
     CreateProject {
         #[serde(default)]
         path: Option<String>,

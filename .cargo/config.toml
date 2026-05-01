@@ -18,20 +18,27 @@
 # with no sibling DLL or redist requirements beyond the WebView2
 # Runtime itself (which ships with Windows 11 and recent Windows 10).
 #
-# `/defaultlib:libucrt.lib` — explicit Universal CRT static archive
-# link. On a native Windows MSVC build, link.exe auto-imports
-# libucrt.lib via the #pragma directives baked into libcmt.lib's
-# metadata. lld-link (which cargo-xwin uses on macOS for cross-
-# builds) doesn't honor those pragmas, so math symbols (log, pow,
-# roundf, etc.) come up undefined the moment any pulled-in crate
-# references them — sqlite, tao, tokio, image scaling code in
-# Tauri's custom-protocol path, and so on. Adding the lib
-# explicitly is harmless on native MSVC (link.exe deduplicates
-# default-libs) and required on lld-link.
+# Pass `libucrt.lib` as a direct linker input (not via /DEFAULTLIB).
+# Rustc's std for windows-msvc emits `/NODEFAULTLIB:libucrt.lib`
+# unconditionally on this target — that excludes the Universal CRT
+# static archive even when `+crt-static` is set. cargo-xwin compounds
+# the issue by adding `-nodefaultlib:ucrt` to suppress the dynamic
+# variant, leaving neither linked: every basic C symbol (log, pow,
+# roundf, strlen, strcmp, etc.) ends up undefined the moment any
+# pulled-in crate references one (rusqlite, tao, tokio, libgit2,
+# Tauri's custom-protocol path).
+#
+# `/NODEFAULTLIB` always wins over `/DEFAULTLIB` for the same library
+# name, so adding `/defaultlib:libucrt.lib` doesn't help — the
+# nodefaultlib from rustc cancels it. Specifying the lib as a direct
+# input bypasses the defaultlib mechanism entirely; the linker has to
+# process it. Native MSVC `link.exe` is happy to see the lib included
+# via either route, so this works for both CI's windows-latest job and
+# local cargo-xwin cross-builds without divergence.
 #
 # Only applies to the windows-msvc target triple, so macOS / Linux
 # builds and the host-target proc-macro compiles are unaffected.
 rustflags = [
     "-C", "target-feature=+crt-static",
-    "-C", "link-arg=/defaultlib:libucrt.lib",
+    "-C", "link-arg=libucrt.lib",
 ]

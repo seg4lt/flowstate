@@ -38,6 +38,7 @@ import type {
 import {
   ALL_PROVIDER_KINDS,
   DEFAULT_PROVIDER,
+  readAllProviderEnabled,
   readDefaultModel,
   readDefaultProvider,
 } from "@/lib/defaults-settings";
@@ -1434,23 +1435,40 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       (message) => {
       if (!active) return;
       dispatchRef.current({ type: "server_message", message });
-      // After the daemon signals readiness, ensure all providers are
-      // enabled at the SDK level so health checks run for every one.
-      // The app-level toggle (ProviderEnabledProvider) controls what
-      // the user sees — the daemon should always track everything.
+      // After the daemon signals readiness, sync the user's app-level
+      // enable/disable preferences to the SDK so the daemon's
+      // `provider_enablement` table matches what the user toggled in
+      // settings. This drives `is_provider_enabled` in runtime-core,
+      // which `dispatch_list_providers` and the spawn dispatchers
+      // consult — without this sync, MCP clients calling
+      // `list_providers` would see providers the user disabled.
       if (message.type === "welcome") {
-        for (const kind of ALL_PROVIDER_KINDS) {
-          sendMessage({
-            type: "set_provider_enabled",
-            provider: kind,
-            enabled: true,
-          }).catch((err) => {
-            // Best effort — the SDK may already have this provider
-            // enabled, or the daemon may be racing shutdown. Log at
-            // debug level so the failure isn't fully silent.
-            console.debug("[app-store] set_provider_enabled burst failed", err);
+        readAllProviderEnabled()
+          .then((enabledByKind) => {
+            for (const kind of ALL_PROVIDER_KINDS) {
+              const enabled = enabledByKind.get(kind) ?? false;
+              sendMessage({
+                type: "set_provider_enabled",
+                provider: kind,
+                enabled,
+              }).catch((err) => {
+                // Best effort — the SDK may already have this
+                // provider in the requested state, or the daemon may
+                // be racing shutdown. Log at debug level so the
+                // failure isn't fully silent.
+                console.debug(
+                  "[app-store] set_provider_enabled burst failed",
+                  err,
+                );
+              });
+            }
+          })
+          .catch((err) => {
+            console.debug(
+              "[app-store] readAllProviderEnabled failed during welcome sync",
+              err,
+            );
           });
-        }
       }
       // Side-effect cleanup: when the SDK reports a session or
       // project as permanently deleted, drop its app-side display

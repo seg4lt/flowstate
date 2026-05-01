@@ -80,6 +80,8 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
                 models,
                 enabled: true,
                 features,
+                update_available: false,
+                latest_version: None,
             };
         }
     };
@@ -120,6 +122,8 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
                 models,
                 enabled: true,
                 features,
+                update_available: false,
+                latest_version: None,
             }
         }
         Err(error) => {
@@ -137,6 +141,8 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
                     models,
                     enabled: true,
                     features,
+                    update_available: false,
+                    latest_version: None,
                 }
             } else {
                 ProviderStatus {
@@ -152,8 +158,44 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
                     models,
                     enabled: true,
                     features,
+                    update_available: false,
+                    latest_version: None,
                 }
             }
         }
     }
+}
+
+/// Result of running a CLI's own update-check command.
+///
+/// Adapters call [`probe_update_check`] (or roll their own equivalent)
+/// after the main `probe_cli` and overwrite `update_available` /
+/// `latest_version` on the returned [`ProviderStatus`] when the probe
+/// signals a newer release exists. Adapters whose CLI has no update
+/// probe leave the defaults (`false` / `None`).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateCheckOutcome {
+    pub update_available: bool,
+    pub latest_version: Option<String>,
+}
+
+/// Lightweight wrapper for the "run a CLI subcommand and look at the
+/// output for an update marker" pattern. Returns whatever bytes the
+/// command produced on stdout/stderr; the caller decides how to parse
+/// them since each CLI's update line format is different.
+///
+/// Returns `None` when the command can't be launched at all (binary
+/// missing, permission denied) — adapters treat that as "no update
+/// info" rather than "no update available", since the failure mode
+/// is the same as a CLI without an update probe.
+pub async fn probe_update_check(
+    binary: &str,
+    args: &[&str],
+) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    Command::new(binary)
+        .args(args)
+        .output()
+        .await
+        .ok()
+        .map(|out| (out.status, out.stdout, out.stderr))
 }

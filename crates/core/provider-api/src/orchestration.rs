@@ -235,19 +235,21 @@ pub enum RuntimeCall {
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
-    /// Introspection: enumerate every provider the runtime knows
-    /// about along with its available models, per-model reasoning
-    /// effort levels, and the permission modes / efforts the wire
-    /// type supports. Agents call this before a `spawn` when they're
+    /// Introspection: enumerate every provider the user has enabled
+    /// along with its available models, per-model reasoning effort
+    /// levels, and the permission modes / efforts the wire type
+    /// supports. Agents call this before a `spawn` when they're
     /// uncertain about the right provider/model string — especially
     /// useful for opencode where model ids look like
     /// `opencode/kimi-k2.5` and are easy to typo.
     ///
-    /// No arguments — the result is always the full catalog. If an
-    /// agent wants only the enabled ones, filter on `enabled` in the
-    /// response. Flowstate does not paginate; the catalog is a
-    /// handful of providers and typically <200 models total, well
-    /// within a single tool response budget.
+    /// No arguments — the result is the catalog of *enabled*
+    /// providers. Providers the user has disabled in settings are
+    /// omitted entirely (rather than listed with `enabled: false`)
+    /// so agents don't suggest models the user explicitly opted out
+    /// of. Flowstate does not paginate; the catalog is a handful of
+    /// providers and typically <200 models total, well within a
+    /// single tool response budget.
     ListProviders,
 }
 
@@ -329,9 +331,11 @@ pub struct ProviderCatalogEntry {
     /// lines + tool-output narration, not for passing back to the
     /// runtime.
     pub label: String,
-    /// Whether the user has this provider enabled. Disabled providers
-    /// are still listed so agents can suggest "enable X in settings
-    /// to use model Y" rather than silently omitting them.
+    /// Whether the user has this provider enabled. The catalog is
+    /// pre-filtered to only include enabled providers, so this is
+    /// always `true` in `ListProviders` responses — the field
+    /// remains for wire-compat with older clients that still read
+    /// it.
     pub enabled: bool,
     /// Whether the provider is installed + authenticated. Pulled
     /// from [`crate::ProviderStatusLevel`]: `Ready` = good to spawn,

@@ -61,3 +61,10 @@ Desktop.ini
 
 # ── Project-specific ─────────────────────────────────────────
 .zenui/
+
+# ── Cross-compile tooling caches ─────────────────────────────
+# `cargo-xwin` (used by `just build-windows`) caches MSVC SDK
+# downloads under ~/.xwin globally, but it also drops a project-
+# local `.xwin-cache/` for dl + unpack scratch when the workspace
+# becomes its CWD. Build artifact, not source.
+.xwin-cache/

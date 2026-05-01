@@ -1123,6 +1123,8 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 models: Vec::new(),
                 enabled: true,
                 features: features.clone(),
+                update_available: false,
+                latest_version: None,
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -1137,6 +1139,8 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 models: Vec::new(),
                 enabled: true,
                 features: features.clone(),
+                update_available: false,
+                latest_version: None,
             };
         }
 
@@ -1156,6 +1160,8 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             models: Vec::new(),
             enabled: true,
             features,
+            update_available: false,
+            latest_version: None,
         }
     }
 

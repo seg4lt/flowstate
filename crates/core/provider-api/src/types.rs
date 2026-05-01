@@ -3,12 +3,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Codex,
+    #[default]
     Claude,
     #[serde(rename = "github_copilot")]
     GitHubCopilot,
@@ -110,13 +111,14 @@ mod provider_kind_tests {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatusLevel {
     Ready,
     Warning,
+    #[default]
     Error,
 }
 
@@ -713,6 +715,45 @@ pub struct ProviderStatus {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub features: ProviderFeatures,
+    /// Whether the provider's CLI has reported that a newer version is
+    /// available. Populated by each adapter's own update probe (e.g.
+    /// `claude doctor`, `gh extension list`). Drives the small
+    /// "update available" dot in the Settings provider row and the
+    /// gating for the Upgrade button. Defaults to `false` for
+    /// providers without a native update probe; never set by the
+    /// frontend — always reset by `health()` based on the latest
+    /// probe result.
+    #[serde(default)]
+    pub update_available: bool,
+    /// The newer version string the provider's update probe reported,
+    /// when known. Used as a tooltip ("Upgrade to 0.0.42") next to
+    /// the per-provider Upgrade button. `None` when the probe didn't
+    /// surface a specific version (only "an update is available").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+}
+
+impl Default for ProviderStatus {
+    fn default() -> Self {
+        Self {
+            kind: ProviderKind::default(),
+            label: String::new(),
+            installed: false,
+            authenticated: false,
+            version: None,
+            status: ProviderStatusLevel::Error,
+            message: None,
+            models: Vec::new(),
+            // Mirrors the `default_true` serde default: a freshly
+            // constructed status is "enabled" so callers using struct-
+            // update syntax (`..Default::default()`) don't accidentally
+            // disable the provider.
+            enabled: true,
+            features: ProviderFeatures::default(),
+            update_available: false,
+            latest_version: None,
+        }
+    }
 }
 
 fn default_true() -> bool {

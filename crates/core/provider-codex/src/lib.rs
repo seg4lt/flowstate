@@ -328,7 +328,7 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn health(&self) -> ProviderStatus {
-        probe_cli(ProbeCliOptions {
+        let mut status = probe_cli(ProbeCliOptions {
             kind: ProviderKind::Codex,
             binary: &self.binary_path,
             version_args: &["--version"],
@@ -339,7 +339,49 @@ impl ProviderAdapter for CodexAdapter {
             auth_hint: None,
             auth_err_is_ok: false,
         })
-        .await
+        .await;
+        // Best-effort update probe. `codex update --check` is a no-op
+        // on builds that don't expose it; we just look for the
+        // "update available" / "newer version" markers in the
+        // combined output. Probe failures are swallowed silently
+        // (default = no update available).
+        if status.installed {
+            if let Some((_st, stdout, stderr)) = zenui_provider_api::probe_update_check(
+                &self.binary_path,
+                &["update", "--check"],
+            )
+            .await
+            {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )
+                .to_ascii_lowercase();
+                if combined.contains("update available") || combined.contains("newer version") {
+                    status.update_available = true;
+                }
+            }
+        }
+        status
+    }
+
+    async fn upgrade(&self) -> Result<String, String> {
+        // Codex distributes as `@openai/codex` on npm. Reinstall the
+        // latest tag globally — npm overwrites in place.
+        let output = tokio::process::Command::new("npm")
+            .args(["install", "-g", "@openai/codex@latest"])
+            .output()
+            .await
+            .map_err(|err| format!("failed to invoke npm: {err}"))?;
+        if output.status.success() {
+            Ok("Codex upgraded.".to_string())
+        } else {
+            Err(format!(
+                "npm install failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
     }
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {
