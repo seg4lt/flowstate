@@ -133,6 +133,14 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # `.github/workflows/*.yml` for the rationale inline. Local dev is
 # unaffected because shells don't set `CI=true`.
 fff-search = "0.5.2"
+# `dunce::canonicalize` returns a plain `C:\...` path on Windows
+# instead of `std::fs::canonicalize`'s extended-length `\\?\C:\...`
+# form. The fff-search background watcher receives notify events
+# with non-extended paths and calls `strip_prefix` against the
+# registered root; if we register a `\\?\` root, every event errors
+# out with `StripPrefixError`. dunce sidesteps that by handing back
+# the same shape the watcher delivers. No-op on Unix.
+dunce = "1.0"
 # Compile user-supplied include/exclude globs (`*.rs`, `target/*`) for
 # pre-filtering the indexed file list before content search.
 globset = "0.4.18"

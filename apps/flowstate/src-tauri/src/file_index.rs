@@ -224,8 +224,15 @@ impl FileIndexRegistry {
     /// Canonicalises the path so two string forms of the same
     /// worktree collapse into one entry.
     pub fn get_or_init(&self, worktree: &Path) -> Result<Arc<FilePickerHandle>, String> {
-        let canon = worktree
-            .canonicalize()
+        // Use `dunce::canonicalize` rather than `std::fs::canonicalize`
+        // so the registered root stays a plain `C:\...` path on
+        // Windows. The fff-search background watcher delivers notify
+        // events with non-extended paths and calls `strip_prefix`
+        // against this root; a `\\?\C:\...` extended-length path
+        // would prefix-mismatch every event and spam the log with
+        // `StripPrefixError`. Same behaviour as `std::fs::canonicalize`
+        // on Unix.
+        let canon = dunce::canonicalize(worktree)
             .map_err(|e| format!("canonicalize {:?}: {e}", worktree))?;
 
         {
@@ -312,7 +319,9 @@ impl FileIndexRegistry {
     /// no-op is the right behaviour for "reindex" on an unindexed
     /// path; the next `list_project_files` will index it cold.
     pub fn reindex(&self, worktree: &Path) -> Result<(), String> {
-        let canon = match worktree.canonicalize() {
+        // Match `get_or_init`'s canonicalizer so the registry key
+        // we look up here is the same shape we inserted earlier.
+        let canon = match dunce::canonicalize(worktree) {
             Ok(c) => c,
             // If canonicalisation fails the path is gone or unreadable —
             // there's nothing to reindex. Drop the un-canonicalised key

@@ -65,6 +65,7 @@ import { useProvidersUpdateAvailable } from "@/hooks/use-providers-update-availa
 import { useAttentionTone } from "@/hooks/use-attention-tone";
 import { cn } from "@/lib/utils";
 import { isMacOS } from "@/lib/popout";
+import { basename } from "@/lib/worktree-utils";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
@@ -362,7 +363,10 @@ function AppSidebarBody() {
     if (!selected) return;
     const path = typeof selected === "string" ? selected : selected[0];
     if (!path) return;
-    const name = path.split("/").pop() ?? path;
+    // `basename` from worktree-utils tolerates both `/` and `\`,
+    // so picking `C:\Users\babal\ccc\T` on Windows yields `T`
+    // instead of the full path being shoved into the project name.
+    const name = basename(path) || path;
     await createProject(path, name);
   }
 

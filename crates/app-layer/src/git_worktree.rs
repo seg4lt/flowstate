@@ -72,13 +72,42 @@ pub fn resolve_git_root_sync(path: &str) -> Option<String> {
 /// When git reports a worktree path inside a `.git/` directory
 /// (submodule gitdir), resolve it back to the actual working
 /// directory. For normal paths this is a cheap no-op string check.
+///
+/// Tolerates both `/` and `\` separators because `git worktree
+/// list --porcelain` on Windows emits backslashes — without the
+/// `\.git\` arm this check would never fire on Windows and the
+/// returned path would point inside `.git/` rather than the actual
+/// working tree.
 fn resolve_worktree_path(path: &str) -> String {
-    if path.contains("/.git/") {
+    if path.contains("/.git/") || path.contains("\\.git\\") {
         if let Some(resolved) = resolve_git_root_sync(path) {
             return resolved;
         }
     }
     path.to_string()
+}
+
+/// Strip any trailing `/` or `\` from `p` for path-equality compares.
+/// Mirrors the `normPath` helper in
+/// `apps/flowstate/src/lib/worktree-utils.ts` so both ends of the IPC
+/// boundary normalize the same way.
+fn strip_trailing_separator(p: &str) -> &str {
+    p.trim_end_matches(|c: char| c == '/' || c == '\\')
+}
+
+/// Compare two filesystem paths for equality, tolerating:
+///   - trailing separator (`/foo` vs `/foo/`)
+///   - mixed `/` vs `\` separators (Windows file picker / IPC vs git
+///     porcelain output)
+///   - case (Windows file systems are case-insensitive by default).
+fn paths_equal(a: &str, b: &str) -> bool {
+    let a = strip_trailing_separator(a).replace('\\', "/");
+    let b = strip_trailing_separator(b).replace('\\', "/");
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
 }
 
 /// Parse `git worktree list --porcelain` output into `Vec<GitWorktree>`.
@@ -230,7 +259,7 @@ pub fn create_git_worktree_internal(
         resolve_git_root_sync(project_path).unwrap_or_else(|| project_path.to_string());
     let all = list_git_worktrees_sync(effective_path)?;
     all.into_iter()
-        .find(|w| w.path.trim_end_matches('/') == worktree_path.trim_end_matches('/'))
+        .find(|w| paths_equal(&w.path, worktree_path))
         .ok_or_else(|| {
             format!("worktree add succeeded but {worktree_path} not found in subsequent list")
         })
