@@ -107,16 +107,41 @@ fn main() {
         // CLI flag (which beats env var precedence in pnpm) and
         // clear every env var pnpm/npm checks for production
         // signaling.
-        let install = Command::new(pnpm_program())
-            .args(install_args)
-            .arg("--prod=false")
-            .env("NODE_ENV", "development")
-            .env("npm_config_production", "false")
-            .env("npm_config_prod", "false")
-            .env("PNPM_PROD", "false")
-            .env_remove("npm_config_only")
-            .current_dir(&bridge_dir)
-            .status();
+        // Cargo's build-script subprocess inherits parent env, plus
+        // adds dozens of `CARGO_*` vars and (depending on the
+        // Cargo.toml) sometimes forwards `npm_config_*` /
+        // `NODE_ENV=production`. Any non-empty value of those is
+        // treated as truthy by pnpm's legacy flag-style env
+        // handling. `env_remove` doesn't help when the shell
+        // already exported them in production mode upstream.
+        //
+        // The robust fix: clear the env entirely, then re-add only
+        // what pnpm strictly needs. PATH (so pnpm finds node/git),
+        // HOME (npm's config lookup), and a couple of TMP / locale
+        // vars so node doesn't crash on missing locale settings.
+        let install_path =
+            env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+        let install_home = env::var("HOME").unwrap_or_default();
+        let install = {
+            let mut cmd = Command::new(pnpm_program());
+            cmd.env_clear()
+                .env("PATH", &install_path)
+                .env("HOME", &install_home)
+                .env("NODE_ENV", "development")
+                // mise/asdf/nvm etc. pnpm respects these to find the
+                // right node binary; preserving them keeps the
+                // install pinned to the same toolchain the dev shell
+                // uses.
+                .env(
+                    "MISE_DATA_DIR",
+                    env::var("MISE_DATA_DIR").unwrap_or_default(),
+                )
+                .env("LANG", env::var("LANG").unwrap_or_default());
+            cmd.args(install_args)
+                .arg("--prod=false")
+                .current_dir(&bridge_dir)
+                .status()
+        };
         match install {
             Ok(s) if s.success() => {
                 touch_stamp(&pnpm_install_stamp);

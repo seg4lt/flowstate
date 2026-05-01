@@ -84,16 +84,27 @@ fn main() {
         // See provider-claude-sdk/build.rs for rationale — force
         // dev install so devDependencies (typescript) actually land
         // in node_modules/.bin/.
-        let install = Command::new(pnpm_program())
-            .args(install_args)
-            .arg("--prod=false")
-            .env("NODE_ENV", "development")
-            .env("npm_config_production", "false")
-            .env("npm_config_prod", "false")
-            .env("PNPM_PROD", "false")
-            .env_remove("npm_config_only")
-            .current_dir(&bridge_dir)
-            .status();
+        // See provider-claude-sdk/build.rs for the env-clear
+        // rationale.
+        let install_path =
+            env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
+        let install_home = env::var("HOME").unwrap_or_default();
+        let install = {
+            let mut cmd = Command::new(pnpm_program());
+            cmd.env_clear()
+                .env("PATH", &install_path)
+                .env("HOME", &install_home)
+                .env("NODE_ENV", "development")
+                .env(
+                    "MISE_DATA_DIR",
+                    env::var("MISE_DATA_DIR").unwrap_or_default(),
+                )
+                .env("LANG", env::var("LANG").unwrap_or_default());
+            cmd.args(install_args)
+                .arg("--prod=false")
+                .current_dir(&bridge_dir)
+                .status()
+        };
         match install {
             Ok(s) if s.success() => {
                 touch_stamp(&pnpm_install_stamp);
