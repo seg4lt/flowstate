@@ -21,6 +21,7 @@ const CONFIG_KEY_PROVIDER_ENABLED_PREFIX = "provider.enabled.";
 const CONFIG_KEY_DEFAULT_PROVIDER = "defaults.provider";
 const CONFIG_KEY_STRICT_PLAN_MODE = "defaults.strict_plan_mode";
 const CONFIG_KEY_CAFFEINATE = "system.caffeinate";
+const CONFIG_KEY_BINARY_SEARCH_PATHS = "binaries.search_paths";
 
 // --- Provider-enabled defaults ---
 
@@ -240,6 +241,41 @@ export async function readCaffeinate(): Promise<boolean> {
 export async function writeCaffeinate(enabled: boolean): Promise<void> {
   try {
     await setUserConfig(CONFIG_KEY_CAFFEINATE, String(enabled));
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+/** Read the user's configured extra binary search paths.
+ *  Stored as a JSON-encoded array of strings. Returns `[]` on
+ *  missing / unparseable / read-failure so callers can present a
+ *  clean editable list. */
+export async function readBinarySearchPaths(): Promise<string[]> {
+  try {
+    const raw = await getUserConfig(CONFIG_KEY_BINARY_SEARCH_PATHS);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((v): v is string => typeof v === "string");
+  } catch {
+    return [];
+  }
+}
+
+/** Persist the user's extra binary search paths. The Settings UI
+ *  pairs this with `refreshBinarySearchPaths()` from `./api` so the
+ *  in-process resolver picks up the change without a daemon
+ *  restart. Empty / whitespace entries are filtered out before
+ *  storage so the daemon never has to defensively re-clean. */
+export async function writeBinarySearchPaths(paths: string[]): Promise<void> {
+  try {
+    const cleaned = paths
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    await setUserConfig(
+      CONFIG_KEY_BINARY_SEARCH_PATHS,
+      JSON.stringify(cleaned),
+    );
   } catch {
     /* storage may be unavailable */
   }

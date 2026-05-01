@@ -19,9 +19,68 @@
 //! `None` if nothing exists.
 
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
 
-/// Locate a CLI binary by name across PATH and a curated list of
-/// well-known install locations.
+/// Process-wide list of additional search directories the user has
+/// configured under the `binaries.search_paths` user_config key.
+/// Read by [`find_cli_binary`] right after the PATH walk and before
+/// the platform fallbacks, so a user who has `claude` (or any other
+/// provider CLI) in a non-standard location can point flowstate at
+/// it without rebuilding.
+///
+/// `OnceLock<RwLock<...>>` rather than a plain `RwLock<Vec<...>>`
+/// because the inner storage can't be a `const` (PathBuf is heap-
+/// allocated), and `Mutex::new(Vec::new()).const_new()` isn't stable
+/// for our MSRV.
+static EXTRA_SEARCH_PATHS: OnceLock<RwLock<Vec<PathBuf>>> = OnceLock::new();
+
+fn extra_search_paths_lock() -> &'static RwLock<Vec<PathBuf>> {
+    EXTRA_SEARCH_PATHS.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Replace the process-wide list of user-configured extra search
+/// directories. The Tauri shell reads `binaries.search_paths` from
+/// `UserConfigStore` at startup and on every settings-page write,
+/// then calls this with the parsed paths. Empty entries are ignored
+/// (defensive against trim-whitespace mishaps in the UI).
+///
+/// Idempotent and inexpensive — replaces the inner Vec under a
+/// short-lived write lock.
+pub fn set_extra_search_paths(paths: Vec<PathBuf>) {
+    let lock = extra_search_paths_lock();
+    let cleaned: Vec<PathBuf> = paths
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    match lock.write() {
+        Ok(mut guard) => {
+            *guard = cleaned;
+        }
+        Err(poisoned) => {
+            // Rare — only happens if a previous writer panicked
+            // while holding the lock. Recover the inner Vec and
+            // continue; we don't want a transient panic to lock
+            // out future config updates.
+            let mut guard = poisoned.into_inner();
+            *guard = cleaned;
+        }
+    }
+}
+
+/// Read-only snapshot of the configured extra search directories.
+/// Exposed primarily for diagnostic / "verify-config" surfaces;
+/// [`find_cli_binary`] consults the live state directly.
+pub fn extra_search_paths() -> Vec<PathBuf> {
+    let lock = extra_search_paths_lock();
+    match lock.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Locate a CLI binary by name across PATH, user-configured extra
+/// search directories, and a curated list of well-known install
+/// locations.
 ///
 /// # Resolution order
 ///
@@ -29,18 +88,49 @@ use std::path::PathBuf;
 ///    platform path separator and checks each entry. On Windows the
 ///    walk also tries every extension in `%PATHEXT%` (or the standard
 ///    `.COM/.EXE/.BAT/.CMD` set if PATHEXT isn't set).
-/// 2. **Platform fallbacks** — if PATH lookup misses, tries the
-///    locations [`platform_fallbacks`] enumerates (npm globals,
-///    user-local bin dirs, common version-manager shims, system
-///    package-manager shims). Designed to catch the case where a
-///    Tauri / GUI launch inherits a stripped PATH compared to what
-///    the user's shell sees.
+/// 2. **User-configured search paths** — directories the user added
+///    under the `binaries.search_paths` key in `UserConfigStore`.
+///    Pushed to this resolver via [`set_extra_search_paths`] at
+///    daemon startup and on every settings-page write. Acts as the
+///    explicit escape hatch when neither PATH nor the curated
+///    fallbacks find the binary.
+/// 3. **Platform fallbacks** — [`platform_fallbacks`] enumerates npm
+///    globals, user-local bin dirs, common version-manager shims,
+///    and system package-manager shims. Designed to catch the case
+///    where a Tauri / GUI launch inherits a stripped PATH compared
+///    to what the user's shell sees.
 ///
 /// Returns `None` when nothing matches. Callers should surface a
 /// clear "install <name> and ensure it's on PATH" error.
 pub fn find_cli_binary(name: &str) -> Option<PathBuf> {
     if let Some(path) = walk_path_for_binary(name) {
         return Some(path);
+    }
+
+    // User-configured directories — same extension-walk logic as the
+    // PATH branch so a Windows entry like `C:\tools\` resolves
+    // `claude.cmd` as well as bare `claude`. Empty paths are filtered
+    // by `set_extra_search_paths` already, but we re-check `is_dir`
+    // each call so a path the user removed since startup doesn't
+    // crash with `ENOENT`-flavored panics.
+    let extras = extra_search_paths();
+    let extensions = executable_extensions();
+    for dir in &extras {
+        if dir.as_os_str().is_empty() || !dir.is_dir() {
+            continue;
+        }
+        for ext in &extensions {
+            let candidate = if ext.is_empty() {
+                dir.join(name)
+            } else {
+                let mut name_with_ext = std::ffi::OsString::from(name);
+                name_with_ext.push(ext);
+                dir.join(name_with_ext)
+            };
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
     }
 
     for candidate in platform_fallbacks(name) {

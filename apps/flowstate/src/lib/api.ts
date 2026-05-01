@@ -596,6 +596,30 @@ export function killCaffeinate(): Promise<void> {
   return invoke<void>("caffeinate_kill");
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Binary search paths — user-configured "look here too" override
+// ─────────────────────────────────────────────────────────────────
+//
+// Wraps the `binaries.search_paths` user_config key. Storage is a
+// JSON-encoded array of strings; the Settings UI calls
+// `setUserConfig(...)` to persist and then `refreshBinarySearchPaths`
+// so the in-process resolver picks up the change without a daemon
+// restart.
+
+/** Tell the daemon to re-read `binaries.search_paths` from
+ *  user_config and update the in-process resolver. Call right after
+ *  writing the key via `setUserConfig`. */
+export function refreshBinarySearchPaths(): Promise<void> {
+  return invoke<void>("refresh_binary_search_paths");
+}
+
+/** Snapshot of the directories the resolver is currently consulting
+ *  beyond PATH + the curated platform fallbacks. Useful for the
+ *  Settings UI to confirm the daemon is seeing what was configured. */
+export function listBinarySearchPaths(): Promise<string[]> {
+  return invoke<string[]>("list_binary_search_paths");
+}
+
 // Per-session and per-project display metadata: titles, names,
 // previews, ordering. Persisted in the same `user_config.sqlite`
 // file as the kv store above, in dedicated tables. The agent SDK

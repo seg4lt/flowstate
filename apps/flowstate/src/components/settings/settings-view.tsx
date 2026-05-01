@@ -8,6 +8,7 @@ import {
   Loader2,
   Monitor,
   Moon,
+  Plus,
   RefreshCw,
   Sun,
 } from "lucide-react";
@@ -27,6 +28,8 @@ import {
   installCli,
   installCliStatus,
   killCaffeinate,
+  listBinarySearchPaths,
+  refreshBinarySearchPaths,
   refreshCaffeinate,
   retryProvisionPhase,
   type CaffeinateStatus,
@@ -68,6 +71,8 @@ import {
   writeStrictPlanMode,
   readCaffeinate,
   writeCaffeinate,
+  readBinarySearchPaths,
+  writeBinarySearchPaths,
   DEFAULT_PROVIDER,
 } from "@/lib/defaults-settings";
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
@@ -490,6 +495,189 @@ function CaffeinateRow() {
         onCheckedChange={(v) => void handleToggle(v)}
         aria-label="Prevent display sleep while a request is in flight"
       />
+    </div>
+  );
+}
+
+/**
+ * Editable list of extra directories the binary resolver should search
+ * when locating provider CLIs (`claude`, `codex`, `copilot`, ...).
+ * The resolver consults these right after the PATH walk and before
+ * the curated platform fallbacks, so it's the explicit escape hatch
+ * for "I have it installed but Flowstate can't find it" — common on
+ * Windows where Tauri GUI launches inherit a much narrower PATH than
+ * the user's PowerShell.
+ *
+ * Storage: `binaries.search_paths` user_config key, JSON-encoded
+ * array of strings. Writes go through `writeBinarySearchPaths` then
+ * `refreshBinarySearchPaths` so the in-process resolver picks up
+ * the change immediately, no daemon restart.
+ */
+function BinarySearchPathsRow() {
+  const [paths, setPaths] = React.useState<string[]>([]);
+  const [draft, setDraft] = React.useState("");
+  const [active, setActive] = React.useState<string[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [saving, setSaving] = React.useState(false);
+
+  // Initial load: pull both the persisted list (source of truth) and
+  // the daemon's currently-applied snapshot. They should match —
+  // showing both lets the user spot a stale config (e.g. config
+  // edited externally while the daemon was running).
+  React.useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [persisted, applied] = await Promise.all([
+          readBinarySearchPaths(),
+          listBinarySearchPaths().catch(() => [] as string[]),
+        ]);
+        if (cancelled) return;
+        setPaths(persisted);
+        setActive(applied);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Single helper — every mutation goes through here so we never
+  // forget to `refreshBinarySearchPaths` after `writeBinarySearchPaths`.
+  // Keeps persisted + applied in sync.
+  async function commit(next: string[]) {
+    setSaving(true);
+    setPaths(next);
+    try {
+      await writeBinarySearchPaths(next);
+      await refreshBinarySearchPaths();
+      try {
+        setActive(await listBinarySearchPaths());
+      } catch {
+        /* leave previous active list */
+      }
+    } catch (err) {
+      toast({
+        description: `Failed to save search paths: ${String(err)}`,
+        duration: 3000,
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function handleAdd() {
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    if (paths.includes(trimmed)) {
+      // Don't dedupe silently — visible feedback prevents the user
+      // wondering why the click "did nothing". 1.5s is enough to
+      // read without lingering.
+      toast({ description: "Already in the list", duration: 1500 });
+      setDraft("");
+      return;
+    }
+    setDraft("");
+    void commit([...paths, trimmed]);
+  }
+
+  function handleRemove(idx: number) {
+    void commit(paths.filter((_, i) => i !== idx));
+  }
+
+  // Lightweight drift indicator — when the user edits the file
+  // externally OR a previous write half-applied, this calls it out
+  // so they aren't debugging silent mismatches.
+  const drifted =
+    !loading &&
+    (active.length !== paths.length ||
+      active.some((p, i) => p !== paths[i]));
+
+  return (
+    <div className="border-b border-border px-4 py-3 last:border-b-0">
+      <div className="text-sm font-medium">Extra binary search paths</div>
+      <div className="mt-0.5 text-xs text-muted-foreground">
+        Directories the resolver checks after PATH and before the built-in
+        fallbacks. Useful when a provider CLI is installed somewhere
+        Flowstate can't find on its own — particularly on Windows where
+        GUI launches inherit a stripped PATH compared to your shell.
+      </div>
+
+      {/* Existing entries. Each row shows the path + a small Remove
+          button. We deliberately don't allow inline editing — every
+          path here is a directory on disk, and re-typing it is
+          cheaper than a buggy edit-in-place. */}
+      {paths.length > 0 && (
+        <ul className="mt-3 space-y-1.5">
+          {paths.map((p, idx) => (
+            <li
+              key={`${idx}-${p}`}
+              className="flex items-center gap-2 rounded-md border border-border bg-muted/30 px-2 py-1"
+            >
+              <code className="flex-1 truncate font-mono text-[12px]">{p}</code>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => handleRemove(idx)}
+                disabled={saving}
+                aria-label={`Remove ${p}`}
+                title="Remove"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {/* Add control. Enter on the input is equivalent to clicking
+          the +Add button — fastest path for users adding several
+          dirs in a row. */}
+      <div className="mt-3 flex gap-2">
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              handleAdd();
+            }
+          }}
+          placeholder={
+            // Different placeholder per OS so the example feels
+            // like an actual path the user might paste in. We
+            // detect Windows via the same navigator.platform sniff
+            // the rest of the settings page uses.
+            navigator.platform.toLowerCase().includes("win")
+              ? "C:\\Users\\you\\.local\\bin"
+              : "/Users/you/.local/bin"
+          }
+          className="min-w-0 flex-1 rounded-md border border-border bg-background px-2 py-1 text-sm font-mono"
+          aria-label="Directory to add to binary search paths"
+          disabled={saving}
+        />
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleAdd}
+          disabled={saving || !draft.trim()}
+        >
+          <Plus className="h-3.5 w-3.5" /> Add
+        </Button>
+      </div>
+
+      {/* Drift indicator. Hidden on the happy path so the row stays
+          unobtrusive; only surfaces when the daemon's view doesn't
+          match the persisted list. */}
+      {drifted && (
+        <div className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+          Daemon has a different list applied. It should sync on the
+          next change — try adding or removing an entry to refresh.
+        </div>
+      )}
     </div>
   );
 }
@@ -1734,6 +1922,12 @@ export function SettingsView() {
             description="Run `flow .` (or `flow <dir>`) from any terminal to open a new thread on a project, using your saved default provider, model, and permission mode."
           >
             <CliInstallRow />
+          </SettingsGroup>
+          <SettingsGroup
+            title="Provider CLI discovery"
+            description="Where Flowstate looks for provider CLIs (claude, codex, copilot, opencode). The resolver always checks PATH and a curated list of common install locations first — these extra directories are an escape hatch for installs the auto-detection misses, especially on Windows where GUI-launched processes inherit a narrower PATH than your shell."
+          >
+            <BinarySearchPathsRow />
           </SettingsGroup>
           <SettingsGroup
             title="Diagnostics"

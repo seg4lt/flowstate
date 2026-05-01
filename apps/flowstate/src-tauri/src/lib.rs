@@ -1841,6 +1841,83 @@ fn caffeinate_kill(state: State<'_, CaffeinateState>) {
     state.0.force_kill();
 }
 
+// ─────────────────────────────────────────────────────────────────
+// User-configured binary search paths
+// ─────────────────────────────────────────────────────────────────
+//
+// `binaries.search_paths` is a JSON-encoded array of directories
+// the user has added as the explicit "look here too" escape hatch
+// for `find_cli_binary`. Used when their `claude` / `codex` /
+// `copilot` is installed somewhere our PATH walk + curated
+// fallbacks don't cover — particularly common on Windows GUI
+// launches where the inherited PATH is much narrower than the
+// user's shell.
+
+/// Read `binaries.search_paths` from the store, parse the JSON, and
+/// push the resulting directories into the process-wide resolver.
+/// Called once at daemon startup and again from `refresh_binary_
+/// search_paths` after the settings UI writes a new value. Quiet on
+/// failure — a malformed entry shouldn't crash the daemon, just log
+/// and leave the previous list in place.
+fn apply_binary_search_paths_from_config(store: &UserConfigStore) {
+    const KEY: &str = "binaries.search_paths";
+    let raw = match store.get(KEY) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // No user override yet — clear so a previously-applied
+            // value from this session doesn't linger after the user
+            // emptied the setting.
+            zenui_provider_api::set_extra_search_paths(Vec::new());
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "failed to read binaries.search_paths from user config; leaving previous list applied");
+            return;
+        }
+    };
+    let parsed: Vec<String> = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                value = %raw,
+                "binaries.search_paths is not a JSON array of strings; ignoring"
+            );
+            return;
+        }
+    };
+    let paths: Vec<std::path::PathBuf> = parsed
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect();
+    tracing::debug!(count = paths.len(), "applying user-configured binary search paths");
+    zenui_provider_api::set_extra_search_paths(paths);
+}
+
+/// Settings UI calls this after writing the `binaries.search_paths`
+/// key so the in-process resolver picks up the change immediately —
+/// otherwise providers would only see the new list after a daemon
+/// restart. Idempotent.
+#[tauri::command]
+fn refresh_binary_search_paths(state: State<'_, UserConfigStore>) {
+    apply_binary_search_paths_from_config(&state);
+}
+
+/// Snapshot the current resolver state — primarily for the settings
+/// UI to render a "currently active" badge alongside the editable
+/// list, so users can verify the daemon is seeing what they
+/// configured. Returned as plain strings for trivial JSON
+/// serialization across the Tauri boundary.
+#[tauri::command]
+fn list_binary_search_paths() -> Vec<String> {
+    zenui_provider_api::extra_search_paths()
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
 // Per-session and per-project display metadata: titles, names,
 // previews, ordering. Lives in the same `user_config.sqlite`
 // file as the kv table above, in dedicated tables. The agent
@@ -2551,6 +2628,17 @@ pub fn run() {
             // belongs in the daemon's schema.
             let user_config_store =
                 UserConfigStore::open(&flowstate_root).expect("failed to open user_config store");
+            // Push the user's configured extra binary search paths
+            // into the process-wide resolver before any provider
+            // adapter spawns. The resolver consults this list right
+            // after PATH walk and before the curated platform
+            // fallbacks, giving users an explicit escape hatch for
+            // CLIs installed to non-standard locations (a frequent
+            // need on Windows where Tauri's GUI-launch PATH is much
+            // narrower than the user's shell PATH). The Tauri
+            // command `refresh_binary_search_paths` re-runs this
+            // helper after the settings UI writes a new value.
+            apply_binary_search_paths_from_config(&user_config_store);
             // Keep a clone for the orchestration adapters below —
             // `app.manage` takes ownership but UserConfigStore is
             // cheap to clone (Arc<Mutex<Connection>> inside).
@@ -3338,6 +3426,8 @@ pub fn run() {
                         retry_provision_phase,
                         install_cli::install_cli,
                         install_cli::install_cli_status,
+                        refresh_binary_search_paths,
+                        list_binary_search_paths,
                         quit_app,
                         $($extra,)*
                     ]

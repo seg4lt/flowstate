@@ -46,7 +46,7 @@ mod types;
 pub mod user_mcp;
 
 pub use adapter::*;
-pub use binary_resolver::find_cli_binary;
+pub use binary_resolver::{extra_search_paths, find_cli_binary, set_extra_search_paths};
 pub use capabilities::{
     AgentCapabilityTool, ToolCatalogEntry, capability_tools, capability_tools_wire,
     encode_runtime_error, encode_runtime_result, parse_runtime_call,
