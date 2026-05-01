@@ -18,27 +18,17 @@
 # with no sibling DLL or redist requirements beyond the WebView2
 # Runtime itself (which ships with Windows 11 and recent Windows 10).
 #
-# Pass `libucrt.lib` as a direct linker input (not via /DEFAULTLIB).
-# Rustc's std for windows-msvc emits `/NODEFAULTLIB:libucrt.lib`
-# unconditionally on this target — that excludes the Universal CRT
-# static archive even when `+crt-static` is set. cargo-xwin compounds
-# the issue by adding `-nodefaultlib:ucrt` to suppress the dynamic
-# variant, leaving neither linked: every basic C symbol (log, pow,
-# roundf, strlen, strcmp, etc.) ends up undefined the moment any
-# pulled-in crate references one (rusqlite, tao, tokio, libgit2,
-# Tauri's custom-protocol path).
-#
-# `/NODEFAULTLIB` always wins over `/DEFAULTLIB` for the same library
-# name, so adding `/defaultlib:libucrt.lib` doesn't help — the
-# nodefaultlib from rustc cancels it. Specifying the lib as a direct
-# input bypasses the defaultlib mechanism entirely; the linker has to
-# process it. Native MSVC `link.exe` is happy to see the lib included
-# via either route, so this works for both CI's windows-latest job and
-# local cargo-xwin cross-builds without divergence.
+# Native MSVC `link.exe` (used on CI's windows-latest runner)
+# resolves the Universal CRT static archive (libucrt.lib) via the
+# #pragma directives baked into libcmt.lib. lld-link (used by
+# cargo-xwin for local cross-builds on macOS) doesn't honor those
+# pragmas, so a local cross-build of the full binary will fail to
+# resolve symbols like log/pow/roundf/strlen unless the lld-link
+# command line is patched separately. That's a local-only concern;
+# `just build-windows` is intended for `cargo check` style
+# compile-error catching, and the actual single-file release exe is
+# produced by CI's native MSVC build where this just works.
 #
 # Only applies to the windows-msvc target triple, so macOS / Linux
 # builds and the host-target proc-macro compiles are unaffected.
-rustflags = [
-    "-C", "target-feature=+crt-static",
-    "-C", "link-arg=libucrt.lib",
-]
+rustflags = ["-C", "target-feature=+crt-static"]
