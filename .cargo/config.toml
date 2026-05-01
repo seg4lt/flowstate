@@ -1,0 +1,23 @@
+# Workspace-level cargo config. Discovered upward from any package's
+# manifest dir, so settings here apply to every cargo invocation in
+# the repo — including the GitHub Actions matrix's `pnpm tauri build`
+# step (which descends into apps/flowstate/src-tauri) and the local
+# `just build-windows` cross-build (which runs cargo from the repo
+# root via cargo-xwin).
+
+[target.x86_64-pc-windows-msvc]
+# Statically link the Microsoft C/C++ runtime so the produced exe
+# doesn't depend on `vcruntime140.dll` / `vcruntime140_1.dll` /
+# `msvcp140.dll` being installed on the user's machine. Without
+# this, a fresh Windows install (no VC++ Redistributable) hits
+# "VCRUNTIME140_1.dll was not found" the moment they double-click
+# flowstate.exe.
+#
+# Pairs with WEBVIEW2_STATIC=1 (set in build.yml + the justfile) —
+# together they make flowstate.exe a fully self-contained binary
+# with no sibling DLL or redist requirements beyond the WebView2
+# Runtime itself (which ships with Windows 11 and recent Windows 10).
+#
+# Only applies to the windows-msvc target triple, so macOS / Linux
+# builds and the host-target proc-macro compiles are unaffected.
+rustflags = ["-C", "target-feature=+crt-static"]
