@@ -22,21 +22,24 @@ local-build:
 
 # Cross-compile the full Rust workspace + frontend for Windows from
 # macOS/Linux. Produces a single-file `flowstate.exe` that doesn't
-# depend on any sibling DLL (WebView2Loader is statically linked) and
-# a sibling `flow.exe` (the CLI sidecar that Tauri's externalBin
-# system places next to the main exe at install time).
+# depend on any sibling DLL (WebView2Loader + the C runtime are both
+# statically linked) and a sibling `flow.exe` (the CLI sidecar that
+# Tauri's externalBin system places next to the main exe at install
+# time).
 #
-# Targets `x86_64-pc-windows-msvc` so the cfg_attr in
-# `webview2-com-sys` activates the static-link path. The gnu ABI
-# would force a dynamic dependency on `WebView2Loader.dll` — the
-# crate's link declaration is `#[cfg_attr(target_env = "msvc",
-# link(name = "WebView2LoaderStatic", kind = "static"))]`, gated to
-# msvc-only.
+# Drives `pnpm tauri build` exactly the way CI does — same flags,
+# same env, same code paths through the Tauri CLI — so any divergence
+# from the windows-x64 matrix row is a bug. The only difference is
+# the runner: locally we point Tauri at `cargo-xwin` (which provides
+# the MSVC SDK headers + libs that aren't on macOS), and we pass
+# `--no-bundle` because Tauri's NSIS/MSI bundlers don't cross-compile
+# from macOS hosts. CI runs natively on `windows-latest` so it skips
+# both of those workarounds.
 #
-# Cross-compiling MSVC from a non-Windows host requires the Microsoft
-# C++ runtime and Windows SDK headers/libs; `xwin` downloads them
-# from Microsoft's NuGet feed (one-time, ~600 MB under ~/.xwin) and
-# `cargo-xwin` wires them into rustc's link path automatically.
+# Targets `x86_64-pc-windows-msvc` so webview2-com-sys's static-link
+# branch activates (it's gated `cfg_attr(target_env = "msvc", ...)`).
+# The MSVC SDK is downloaded from Microsoft's NuGet feed via `xwin`
+# (one-time, ~600 MB under ~/.xwin) and reused across builds.
 #
 # Recipe is idempotent and tolerant of fresh checkouts: every step
 # is a no-op when its outputs already exist. Re-running after a code
@@ -56,12 +59,11 @@ build-windows:
     # we don't redo it on every build).
     test -d ~/.xwin/crt && test -d ~/.xwin/sdk || \
         xwin --accept-license splat --output ~/.xwin
-    # 3. Frontend bundle. `pnpm tauri build` would normally drive
-    # this via `beforeBuildCommand`, but we're invoking cargo
-    # directly because Tauri's bundler can't cross-compile the
-    # NSIS / MSI installers from macOS. Tauri's build.rs reads
-    # apps/flowstate/dist to embed the assets into flowstate.exe.
-    cd {{tauri_dir}} && pnpm install --frozen-lockfile && pnpm build
+    # 3. Frontend deps. `pnpm tauri build` runs the Vite bundle
+    # itself via `beforeBuildCommand` (configured in
+    # tauri.conf.json), so we don't need a separate `pnpm build`
+    # step here — but pnpm install IS a prerequisite.
+    cd {{tauri_dir}} && pnpm install --frozen-lockfile
     # 4. flow CLI for Windows-MSVC. Built first so step 5's
     # externalBin check finds the staged sidecar at the path Tauri
     # expects.
@@ -69,15 +71,32 @@ build-windows:
     mkdir -p apps/flowstate/src-tauri/binaries
     cp target/x86_64-pc-windows-msvc/release/flow.exe \
        apps/flowstate/src-tauri/binaries/flow-x86_64-pc-windows-msvc.exe
-    # 5. flowstate.exe.
+    # 5. Tauri's native build pipeline.
     #
-    # WEBVIEW2_STATIC=1: webview2-com-sys's link declaration uses
-    # the `WebView2LoaderStatic.lib` static archive instead of
-    # `WebView2Loader.dll`, so the loader is embedded directly into
-    # the exe. End-users still need the Microsoft Edge WebView2
-    # Runtime installed (ships with Windows 11 + recent Windows 10) —
-    # that's the *runtime component*, separate from the loader DLL.
-    WEBVIEW2_STATIC=1 cargo xwin build --release --target x86_64-pc-windows-msvc -p flowstate
+    # `--runner cargo-xwin`: instead of invoking plain `cargo build`,
+    # Tauri runs `cargo-xwin build` — picks up the MSVC SDK paths
+    # automatically. The Tauri CLI still adds `--features
+    # tauri/custom-protocol`, the right `--profile`, the right
+    # target triple flags, etc., the same way it does for CI's
+    # native MSVC build.
+    #
+    # `--no-bundle`: skips the NSIS / MSI / updater bundling steps.
+    # Tauri's bundler tooling for those formats doesn't cross-
+    # compile from macOS, and the produced exe is what we actually
+    # want for local smoke-testing anyway. CI's `windows-latest`
+    # runner runs the bundler natively and produces the installers.
+    #
+    # `WEBVIEW2_STATIC=1`: webview2-com-sys's link declaration uses
+    # `WebView2LoaderStatic.lib` instead of dynamically linking
+    # `WebView2Loader.dll`. Combined with `+crt-static` from
+    # `.cargo/config.toml`, the resulting exe has no
+    # `vcruntime140.dll` / `WebView2Loader.dll` dependencies. CI
+    # gets the same flag from `.github/workflows/build.yml`'s env
+    # block; this line keeps local + CI in sync.
+    cd {{tauri_dir}} && WEBVIEW2_STATIC=1 pnpm tauri build \
+        --runner cargo-xwin \
+        --target x86_64-pc-windows-msvc \
+        --no-bundle
     @echo ""
     @echo "  ✓ Windows build ready — single-file exe, no sibling DLLs needed"
     @echo "    target/x86_64-pc-windows-msvc/release/flowstate.exe"
