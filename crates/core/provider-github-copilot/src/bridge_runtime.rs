@@ -310,14 +310,79 @@ fn extract_embedded_assets(staging: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Hydrate `cache_root/node_modules` for the Copilot bridge. See the
+/// equivalent function in `provider-claude-sdk/src/bridge_runtime.rs`
+/// for the full design rationale — short version: pnpm via corepack
+/// for speed, transparent fallback to npm if anything goes wrong, the
+/// produced node_modules layout is npm-compatible (hoisted) so the
+/// bridge's `require()` calls don't care which path was taken.
 fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
     let node = zenui_embedded_node::ensure_available()
-        .context("embedded Node is unavailable — cannot run npm")?;
+        .context("embedded Node is unavailable — cannot install bridge dependencies")?;
 
-    let npm_path = locate_npm(&node.bin_dir).ok_or_else(|| {
+    if let Some(corepack_path) = locate_corepack(&node.bin_dir) {
+        match hydrate_via_pnpm(&corepack_path, cache_root, &node.bin_dir) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "pnpm hydration failed for Copilot bridge; falling back to npm"
+                );
+            }
+        }
+    }
+
+    hydrate_via_npm(cache_root, &node.bin_dir)
+}
+
+fn hydrate_via_pnpm(corepack_path: &Path, cache_root: &Path, bin_dir: &Path) -> Result<()> {
+    tracing::info!(
+        cwd = %cache_root.display(),
+        corepack = %corepack_path.display(),
+        "hydrating Copilot bridge node_modules via corepack pnpm install --prod"
+    );
+    let started = std::time::Instant::now();
+
+    let mut cmd = Command::new(corepack_path);
+    zenui_provider_api::hide_console_window_std(&mut cmd);
+    cmd.arg("pnpm")
+        .arg("install")
+        .arg("--prod")
+        .arg("--reporter=append-only")
+        .arg("--config.strict-peer-dependencies=false")
+        .arg("--config.auto-install-peers=true")
+        // Hoisted layout = npm-compatible flat node_modules; trades
+        // some pnpm speed for compatibility with packages that walk
+        // the tree expecting flat shape.
+        .arg("--config.node-linker=hoisted")
+        .arg("--config.store-dir")
+        .arg(pnpm_store_dir()?)
+        .current_dir(cache_root)
+        // Suppress corepack's interactive download prompt — we have
+        // no TTY in a GUI launch, so the prompt would deadlock.
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        .env("PATH", prepend_path(bin_dir));
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("spawn {}", corepack_path.display()))?;
+
+    if !status.success() {
+        anyhow::bail!("corepack pnpm install exited with {status}");
+    }
+
+    tracing::info!(
+        duration_ms = started.elapsed().as_millis() as u64,
+        "Copilot bridge node_modules hydrated via pnpm"
+    );
+    Ok(())
+}
+
+fn hydrate_via_npm(cache_root: &Path, bin_dir: &Path) -> Result<()> {
+    let npm_path = locate_npm(bin_dir).ok_or_else(|| {
         anyhow!(
             "npm not found alongside embedded node at {}",
-            node.bin_dir.display()
+            bin_dir.display()
         )
     })?;
 
@@ -332,7 +397,7 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
         cwd = %cache_root.display(),
         npm = %npm_path.display(),
         mode = install_subcommand,
-        "hydrating Copilot bridge node_modules via npm {install_subcommand} --omit=dev"
+        "hydrating Copilot bridge node_modules via npm {install_subcommand} --omit=dev (fallback)"
     );
     let started = std::time::Instant::now();
 
@@ -350,7 +415,7 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
         .arg("--cache")
         .arg(npm_cache_dir()?)
         .current_dir(cache_root)
-        .env("PATH", prepend_path(&node.bin_dir));
+        .env("PATH", prepend_path(bin_dir));
 
     let status = cmd
         .status()
@@ -367,9 +432,36 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
 
     tracing::info!(
         duration_ms = started.elapsed().as_millis() as u64,
-        "Copilot bridge node_modules hydrated"
+        "Copilot bridge node_modules hydrated via npm"
     );
     Ok(())
+}
+
+/// Locate `corepack` next to `node`. Same Windows/Unix shim
+/// situation as npm. Returns `None` for the very rare Node build
+/// that strips corepack — caller falls back to npm.
+fn locate_corepack(bin_dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = ["corepack.cmd", "corepack.exe", "corepack"];
+    #[cfg(not(windows))]
+    let candidates = ["corepack"];
+    for name in candidates {
+        let p = bin_dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Per-flowstate pnpm store. Shared across every bridge install in
+/// this app so the Copilot bridge's first hydration can hardlink
+/// any deps the Claude SDK bridge already pulled, and vice versa.
+fn pnpm_store_dir() -> Result<PathBuf> {
+    Ok(dirs::cache_dir()
+        .context("failed to resolve per-user cache directory")?
+        .join("zenui")
+        .join("pnpm-store"))
 }
 
 fn locate_npm(bin_dir: &Path) -> Option<PathBuf> {

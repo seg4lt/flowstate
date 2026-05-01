@@ -362,22 +362,121 @@ fn extract_embedded_assets(staging: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run `<embedded-node>/bin/npm ci --omit=dev` (or `install` as a
-/// fallback when the lockfile is absent) in `cache_root` to fetch
-/// `@anthropic-ai/claude-agent-sdk` and its per-platform optional-deps
-/// from npmjs.org into `cache_root/node_modules`. Blocks until the
-/// install finishes (caller is already on a spawn_blocking thread via
-/// the daemon's `provision_runtimes`).
+/// Hydrate `cache_root/node_modules` so the bridge can `require()`
+/// `@anthropic-ai/claude-agent-sdk` and its per-platform optional-deps.
+/// Blocks until the install finishes (caller is already on a
+/// `spawn_blocking` thread via the daemon's `provision_runtimes`).
+///
+/// Tries pnpm via corepack first. Corepack ships inside Node ≥ 16.10
+/// (the embedded Node is 20.11.1 so it's always present), and pnpm's
+/// content-addressable global store + parallel fetcher is dramatically
+/// faster than npm on cold installs — the difference users actually
+/// notice on Windows where I/O is the bottleneck. We use pnpm with
+/// `node-linker=hoisted` so the produced layout is npm-compatible
+/// (flat `node_modules/`); the bridge's `require()` calls don't know
+/// or care which package manager populated it.
+///
+/// On any pnpm failure (corepack download blocked, transient pnpm
+/// bug, network glitch mid-install) we silently fall back to the
+/// original npm path. Users only see "first launch is fast" or "first
+/// launch is the speed it always was" — never a tooling failure.
 fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
     let node = zenui_embedded_node::ensure_available()
-        .context("embedded Node is unavailable — cannot run npm install")?;
+        .context("embedded Node is unavailable — cannot install bridge dependencies")?;
 
-    // `npm` on Unix is a shim script that shebangs to node. On Windows
-    // the shim is `npm.cmd`. Both live alongside `node` in bin_dir.
-    let npm_path = locate_npm(&node.bin_dir).ok_or_else(|| {
+    // Corepack ships alongside `node` and `npm` in the embedded
+    // Node's bin dir. `corepack` on Unix, `corepack.cmd` /
+    // `corepack.exe` on Windows.
+    if let Some(corepack_path) = locate_corepack(&node.bin_dir) {
+        match hydrate_via_pnpm(&corepack_path, cache_root, &node.bin_dir) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // Don't surface to the user — fall back transparently.
+                // Logged at warn so it shows up in the daemon log if
+                // we ever need to diagnose why a particular install
+                // never benefits from the fast path.
+                tracing::warn!(
+                    %err,
+                    "pnpm hydration failed; falling back to npm"
+                );
+            }
+        }
+    }
+
+    hydrate_via_npm(cache_root, &node.bin_dir)
+}
+
+/// Run `corepack pnpm install --prod` in `cache_root`. pnpm's
+/// content-addressable store lives under `pnpm_store_dir()` (a
+/// flowstate-namespaced location so we don't scribble in the user's
+/// personal `~/.local/share/pnpm`); subsequent installs hardlink
+/// from there which is what makes pnpm fast on warm caches.
+fn hydrate_via_pnpm(corepack_path: &Path, cache_root: &Path, bin_dir: &Path) -> Result<()> {
+    tracing::info!(
+        cwd = %cache_root.display(),
+        corepack = %corepack_path.display(),
+        "hydrating bridge node_modules via corepack pnpm install --prod"
+    );
+    let started = std::time::Instant::now();
+
+    let mut cmd = Command::new(corepack_path);
+    zenui_provider_api::hide_console_window_std(&mut cmd);
+    cmd.arg("pnpm")
+        .arg("install")
+        .arg("--prod")
+        // `--reporter=append-only` disables the live spinner so logs
+        // captured by tracing (or CI) stay readable; fewer terminal
+        // escapes, deterministic line-by-line output.
+        .arg("--reporter=append-only")
+        // Mimic npm's `--legacy-peer-deps` so a peer-dep mismatch in
+        // a transitive dep doesn't brick first-launch. Bridge's
+        // `package.json` already pins the concrete versions we need.
+        .arg("--config.strict-peer-dependencies=false")
+        .arg("--config.auto-install-peers=true")
+        // Hoisted linker = flat node_modules just like npm produces.
+        // pnpm's default symlink layout breaks packages that walk
+        // node_modules expecting a specific shape (some optional
+        // deps in the Agent SDK do this). Hoisted trades some pnpm
+        // speed for maximum compatibility with arbitrary deps.
+        .arg("--config.node-linker=hoisted")
+        // Per-flowstate store so we don't depend on the user's pnpm
+        // setup and don't pollute it either.
+        .arg("--config.store-dir")
+        .arg(pnpm_store_dir()?)
+        .current_dir(cache_root)
+        // Suppress corepack's interactive "do you want to download
+        // pnpm?" prompt — we're a GUI process with no TTY, so the
+        // prompt would deadlock. Newer corepack versions added this
+        // env knob specifically for non-interactive callers.
+        .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+        // pnpm + corepack both expect `node` on PATH; pin PATH to
+        // the embedded bin_dir so they can't pick up a stray system
+        // node of a different major version.
+        .env("PATH", prepend_path(bin_dir));
+
+    let status = cmd
+        .status()
+        .with_context(|| format!("spawn {}", corepack_path.display()))?;
+
+    if !status.success() {
+        anyhow::bail!("corepack pnpm install exited with {status}");
+    }
+
+    tracing::info!(
+        duration_ms = started.elapsed().as_millis() as u64,
+        "Claude SDK bridge node_modules hydrated via pnpm"
+    );
+    Ok(())
+}
+
+/// Original npm-based hydration path. Used as the silent fallback
+/// when pnpm via corepack fails for any reason. Matches the
+/// previous behavior 1:1 so no users regress on the slow path.
+fn hydrate_via_npm(cache_root: &Path, bin_dir: &Path) -> Result<()> {
+    let npm_path = locate_npm(bin_dir).ok_or_else(|| {
         anyhow!(
             "npm not found alongside embedded node at {}",
-            node.bin_dir.display()
+            bin_dir.display()
         )
     })?;
 
@@ -394,7 +493,7 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
         cwd = %cache_root.display(),
         npm = %npm_path.display(),
         mode = install_subcommand,
-        "hydrating bridge node_modules via npm {install_subcommand} --omit=dev"
+        "hydrating bridge node_modules via npm {install_subcommand} --omit=dev (fallback)"
     );
     let started = std::time::Instant::now();
 
@@ -421,7 +520,7 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
         // npm expects `node` on PATH; pin PATH to the embedded bin_dir
         // so it can't pick up a stray system node that might be a
         // different major version.
-        .env("PATH", prepend_path(&node.bin_dir));
+        .env("PATH", prepend_path(bin_dir));
 
     let status = cmd
         .status()
@@ -438,7 +537,7 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
 
     tracing::info!(
         duration_ms = started.elapsed().as_millis() as u64,
-        "Claude SDK bridge node_modules hydrated"
+        "Claude SDK bridge node_modules hydrated via npm"
     );
     Ok(())
 }
@@ -457,11 +556,41 @@ fn locate_npm(bin_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Locate `corepack` next to `node`. Same Windows/Unix shim
+/// situation as npm. Returns `None` on the (extremely rare) case
+/// of a Node distribution that strips corepack — caller falls
+/// back to npm.
+fn locate_corepack(bin_dir: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = ["corepack.cmd", "corepack.exe", "corepack"];
+    #[cfg(not(windows))]
+    let candidates = ["corepack"];
+    for name in candidates {
+        let p = bin_dir.join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn npm_cache_dir() -> Result<PathBuf> {
     Ok(dirs::cache_dir()
         .context("failed to resolve per-user cache directory")?
         .join("zenui")
         .join("npm-cache"))
+}
+
+/// Per-flowstate pnpm store. pnpm hardlinks into this dir from every
+/// bridge install, so a content-shared store across all our bridges
+/// (claude-sdk, copilot, future ones) means each new bridge's first
+/// install only fetches what's genuinely new — the rest of the deps
+/// already exist on disk and get hardlinked in for free.
+fn pnpm_store_dir() -> Result<PathBuf> {
+    Ok(dirs::cache_dir()
+        .context("failed to resolve per-user cache directory")?
+        .join("zenui")
+        .join("pnpm-store"))
 }
 
 fn prepend_path(extra: &Path) -> String {
