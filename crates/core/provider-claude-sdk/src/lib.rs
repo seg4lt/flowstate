@@ -1144,12 +1144,71 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             };
         }
 
+        // Probe the locally-installed `claude` binary for both its
+        // version string and an "update available" signal, mirroring
+        // what `provider-claude-cli` does. The SDK bridge resolves
+        // the same binary via `resolveLocalClaudeBinary` (PATH +
+        // user's `binaries.search_paths` extras + platform
+        // fallbacks), and `find_cli_binary("claude")` here uses the
+        // identical resolver — so whichever binary the bridge ends
+        // up running is exactly the one we just probed.
+        //
+        // When no local `claude` exists (the bridge falls back to
+        // the SDK's bundled binary), we leave `update_available =
+        // false` and `version = None`. We don't probe the bundle's
+        // freshness — its version is a function of the flowstate
+        // build itself, so a separate "Flowstate update available"
+        // banner already covers that lane.
+        let (update_available, version) =
+            match zenui_provider_api::find_cli_binary("claude") {
+                Some(path) => {
+                    let claude_path = path.to_string_lossy().into_owned();
+                    let mut update_available = false;
+                    if let Some((_st, stdout, stderr)) =
+                        zenui_provider_api::probe_update_check(&claude_path, &["doctor"]).await
+                    {
+                        let combined = format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&stdout),
+                            String::from_utf8_lossy(&stderr)
+                        )
+                        .to_ascii_lowercase();
+                        if combined.contains("out of date")
+                            || combined.contains("newer version")
+                            || combined.contains("update available")
+                        {
+                            update_available = true;
+                        }
+                    }
+                    // Capture the installed version while we have
+                    // the binary in hand, so the Settings row's
+                    // monospace `vX.Y.Z` chip populates for SDK
+                    // users too.
+                    let mut version_cmd = tokio::process::Command::new(&path);
+                    zenui_provider_api::hide_console_window_tokio(&mut version_cmd);
+                    version_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+                    let version_string = version_cmd
+                        .arg("--version")
+                        .output()
+                        .await
+                        .ok()
+                        .and_then(|out| {
+                            zenui_provider_api::helpers::first_non_empty_line(&out.stdout)
+                                .or_else(|| {
+                                    zenui_provider_api::helpers::first_non_empty_line(&out.stderr)
+                                })
+                        });
+                    (update_available, version_string)
+                }
+                None => (false, None),
+            };
+
         ProviderStatus {
             kind,
             label: label.to_string(),
             installed: true,
             authenticated: true,
-            version: None,
+            version,
             status: ProviderStatusLevel::Ready,
             message: Some("Claude Agent SDK bridge ready".to_string()),
             // Left empty on purpose: the runtime triggers `fetch_models()`
@@ -1160,8 +1219,52 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             models: Vec::new(),
             enabled: true,
             features,
-            update_available: false,
+            update_available,
             latest_version: None,
+        }
+    }
+
+    /// Upgrade the locally-installed `claude` binary the SDK bridge
+    /// resolves to. We use the CLI's own `claude update` self-update
+    /// command rather than shelling out to `npm install -g`, so
+    /// users without `npm` on PATH (e.g. installed via the
+    /// standalone installer) can still upgrade. The CLI knows how
+    /// to refresh itself in-place regardless of how it was
+    /// originally installed.
+    ///
+    /// Returns an error if no local `claude` is on PATH / extras /
+    /// platform fallbacks — the SDK bundle ships with each
+    /// flowstate release and follows the app's own update channel,
+    /// so there's no in-app upgrade for the bundled-only case.
+    async fn upgrade(&self) -> Result<String, String> {
+        let claude_path = zenui_provider_api::find_cli_binary("claude").ok_or_else(|| {
+            "Claude CLI is not installed locally; nothing to upgrade. \
+             The SDK's bundled binary updates with each flowstate release."
+                .to_string()
+        })?;
+        let mut cmd = tokio::process::Command::new(&claude_path);
+        zenui_provider_api::hide_console_window_tokio(&mut cmd);
+        cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+        let output = cmd
+            .arg("update")
+            .output()
+            .await
+            .map_err(|err| format!("failed to invoke claude update: {err}"))?;
+        if output.status.success() {
+            Ok("Claude upgraded.".to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Err(if !stderr.is_empty() {
+                format!("claude update failed: {stderr}")
+            } else if !stdout.is_empty() {
+                format!("claude update failed: {stdout}")
+            } else {
+                format!(
+                    "claude update exited with status {:?}",
+                    output.status.code()
+                )
+            })
         }
     }
 

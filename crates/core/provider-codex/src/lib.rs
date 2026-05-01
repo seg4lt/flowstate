@@ -371,27 +371,34 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn upgrade(&self) -> Result<String, String> {
-        // Codex distributes as `@openai/codex` on npm. Reinstall the
-        // latest tag globally — npm overwrites in place. Resolve npm
-        // to an absolute path so OS-level binary lookup uses the
-        // user's extras (Windows CreateProcessW ignores the env PATH
-        // we set on the child for binary resolution).
-        let mut npm_cmd =
-            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
-        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
-        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
-        let output = npm_cmd
-            .args(["install", "-g", "@openai/codex@latest"])
+        // Use the CLI's own `codex update` self-update command —
+        // matches the `codex update --check` probe shape and means
+        // we don't depend on `npm` being on PATH (codex can also be
+        // installed via the standalone installer / homebrew). The
+        // CLI knows how it was installed and refreshes in-place.
+        let mut cmd = tokio::process::Command::new(&self.binary_path);
+        zenui_provider_api::hide_console_window_tokio(&mut cmd);
+        cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+        let output = cmd
+            .arg("update")
             .output()
             .await
-            .map_err(|err| format!("failed to invoke npm: {err}"))?;
+            .map_err(|err| format!("failed to invoke codex update: {err}"))?;
         if output.status.success() {
             Ok("Codex upgraded.".to_string())
         } else {
-            Err(format!(
-                "npm install failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Err(if !stderr.is_empty() {
+                format!("codex update failed: {stderr}")
+            } else if !stdout.is_empty() {
+                format!("codex update failed: {stdout}")
+            } else {
+                format!(
+                    "codex update exited with status {:?}",
+                    output.status.code()
+                )
+            })
         }
     }
 

@@ -1166,26 +1166,38 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     async fn upgrade(&self) -> Result<String, String> {
-        // opencode is published as `opencode-ai` on npm; that's the
-        // single distribution channel that works on every platform
-        // (`brew` only covers macOS, the curl installer doesn't
-        // self-update). Reinstall the latest tag globally.
-        let mut npm_cmd =
-            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
-        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
-        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
-        let output = npm_cmd
-            .args(["install", "-g", "opencode-ai@latest"])
+        // Use opencode's own `opencode upgrade` self-update — matches
+        // the `opencode upgrade --check` probe shape and works
+        // regardless of how opencode was installed (npm, brew, the
+        // curl installer). The CLI knows its own install method.
+        let binary = Self::find_opencode_binary().ok_or_else(|| {
+            "opencode CLI not found. Install it first: \
+             https://opencode.ai/docs/install"
+                .to_string()
+        })?;
+        let mut cmd = tokio::process::Command::new(&binary);
+        zenui_provider_api::hide_console_window_tokio(&mut cmd);
+        cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+        let output = cmd
+            .arg("upgrade")
             .output()
             .await
-            .map_err(|err| format!("failed to invoke npm: {err}"))?;
+            .map_err(|err| format!("failed to invoke opencode upgrade: {err}"))?;
         if output.status.success() {
             Ok("opencode upgraded.".to_string())
         } else {
-            Err(format!(
-                "npm install failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Err(if !stderr.is_empty() {
+                format!("opencode upgrade failed: {stderr}")
+            } else if !stdout.is_empty() {
+                format!("opencode upgrade failed: {stdout}")
+            } else {
+                format!(
+                    "opencode upgrade exited with status {:?}",
+                    output.status.code()
+                )
+            })
         }
     }
 

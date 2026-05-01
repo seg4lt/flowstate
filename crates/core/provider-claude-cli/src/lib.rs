@@ -1063,36 +1063,41 @@ impl ProviderAdapter for ClaudeCliAdapter {
     }
 
     async fn upgrade(&self) -> Result<String, String> {
-        // Claude CLI is published as `@anthropic-ai/claude-code` on
-        // npm. Run a synchronous global install of the latest tag —
-        // npm overwrites the existing global binary in place.
-        // Resolve `npm` to an absolute path through the workspace
-        // resolver — required because `cmd.env("PATH", ...)` only
-        // affects the child's view, not the OS-level resolution that
-        // launches npm itself (Windows `CreateProcessW` uses the
-        // parent's PATH for module lookup).
-        let mut npm_cmd =
-            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
-        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
-        // Augment PATH for the child so anything npm forks — git,
-        // node-gyp, postinstall hooks — finds the same tools.
-        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
-        let output = npm_cmd
-            .args([
-                "install",
-                "-g",
-                "@anthropic-ai/claude-code@latest",
-            ])
+        // Use the CLI's own `claude update` self-update command
+        // rather than shelling out to `npm install -g …`. Reasons:
+        //   - Doesn't depend on `npm` being on PATH (claude can be
+        //     installed via the standalone installer or homebrew).
+        //   - The CLI itself knows how it was installed and refreshes
+        //     in-place via the same channel.
+        //   - Symmetric with the Claude SDK adapter's upgrade path.
+        let claude_path = zenui_provider_api::find_cli_binary("claude").ok_or_else(|| {
+            "Claude CLI not found. Install it first: \
+             https://docs.anthropic.com/claude-code"
+                .to_string()
+        })?;
+        let mut cmd = tokio::process::Command::new(&claude_path);
+        zenui_provider_api::hide_console_window_tokio(&mut cmd);
+        cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+        let output = cmd
+            .arg("update")
             .output()
             .await
-            .map_err(|err| format!("failed to invoke npm: {err}"))?;
+            .map_err(|err| format!("failed to invoke claude update: {err}"))?;
         if output.status.success() {
             Ok("Claude CLI upgraded.".to_string())
         } else {
-            Err(format!(
-                "npm install failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ))
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Err(if !stderr.is_empty() {
+                format!("claude update failed: {stderr}")
+            } else if !stdout.is_empty() {
+                format!("claude update failed: {stdout}")
+            } else {
+                format!(
+                    "claude update exited with status {:?}",
+                    output.status.code()
+                )
+            })
         }
     }
 
