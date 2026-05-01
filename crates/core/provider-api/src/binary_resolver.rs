@@ -292,6 +292,68 @@ fn platform_fallbacks(name: &str) -> Vec<PathBuf> {
             }
         }
 
+        // pnpm — its global binary dir defaults to
+        // `%LOCALAPPDATA%\pnpm` on Windows but the user can move it
+        // via `%PNPM_HOME%` (the new convention) or via `pnpm config
+        // set global-bin-dir`. We check both the env-overridable path
+        // first (if set) and the default location.
+        if let Some(pnpm_home) = std::env::var_os("PNPM_HOME") {
+            for ext in ["exe", "cmd"] {
+                paths.push(
+                    PathBuf::from(&pnpm_home).join(format!("{name}.{ext}")),
+                );
+            }
+        }
+        if let Some(ref localappdata) = local_app_data {
+            for ext in ["exe", "cmd"] {
+                paths.push(
+                    PathBuf::from(localappdata)
+                        .join("pnpm")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
+        }
+
+        // yarn (Berry / v2+) — global bin dir on Windows.
+        if let Some(ref localappdata) = local_app_data {
+            paths.push(
+                PathBuf::from(localappdata)
+                    .join("Yarn")
+                    .join("bin")
+                    .join(format!("{name}.cmd")),
+            );
+        }
+        // yarn (classic / v1) — older global install layout under
+        // `%LOCALAPPDATA%\Yarn\config\global\node_modules\.bin`.
+        if let Some(ref localappdata) = local_app_data {
+            paths.push(
+                PathBuf::from(localappdata)
+                    .join("Yarn")
+                    .join("config")
+                    .join("global")
+                    .join("node_modules")
+                    .join(".bin")
+                    .join(format!("{name}.cmd")),
+            );
+        }
+
+        // winget — Microsoft's package manager creates user-mode
+        // shims at `%LOCALAPPDATA%\Microsoft\WinGet\Links` (added
+        // ~v1.6, late 2023). Many users install dev tooling via
+        // `winget install ...` and never realize the shim dir isn't
+        // on the GUI-launch PATH by default.
+        if let Some(ref localappdata) = local_app_data {
+            for ext in ["exe", "cmd"] {
+                paths.push(
+                    PathBuf::from(localappdata)
+                        .join("Microsoft")
+                        .join("WinGet")
+                        .join("Links")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
+        }
+
         // Standard Program Files installations.
         paths.push(PathBuf::from(format!(
             "C:\\Program Files\\{name}\\{name}.exe"
@@ -330,6 +392,33 @@ fn platform_fallbacks(name: &str) -> Vec<PathBuf> {
                     .join("bin")
                     .join(name),
             );
+            // pnpm global bin dir. POSIX default is the XDG data
+            // dir (`~/.local/share/pnpm`); the env-var override
+            // takes precedence below.
+            paths.push(
+                PathBuf::from(&home)
+                    .join(".local")
+                    .join("share")
+                    .join("pnpm")
+                    .join(name),
+            );
+            // yarn (classic / v1) global bin.
+            paths.push(PathBuf::from(&home).join(".yarn").join("bin").join(name));
+            // yarn (classic) — alternate `--global-folder` default.
+            paths.push(
+                PathBuf::from(&home)
+                    .join(".config")
+                    .join("yarn")
+                    .join("global")
+                    .join("node_modules")
+                    .join(".bin")
+                    .join(name),
+            );
+        }
+        // Honor `$PNPM_HOME` if the user moved their pnpm global
+        // bin elsewhere (the recommended pnpm config nowadays).
+        if let Some(pnpm_home) = std::env::var_os("PNPM_HOME") {
+            paths.push(PathBuf::from(&pnpm_home).join(name));
         }
         paths.push(PathBuf::from(format!("/opt/homebrew/bin/{name}")));
         paths.push(PathBuf::from(format!("/usr/local/bin/{name}")));
@@ -410,11 +499,11 @@ mod tests {
             .join("\n");
 
         if cfg!(windows) {
-            // The Windows-specific gaps the v0.2.19 / v0.2.20
-            // expansion was meant to close — Volta, Scoop,
-            // Chocolatey, user-local bin, Bun. If a refactor drops
-            // any of these, GUI-launched flowstate will start
-            // failing to find provider CLIs again.
+            // Windows GUI-launched processes inherit a stripped PATH
+            // compared to the user's shell, so the resolver must
+            // know about every common per-user install location.
+            // If a refactor drops any of these, flowstate.exe will
+            // silently fail to find provider CLIs again.
             for needle in [
                 "Volta",
                 "scoop",
@@ -422,6 +511,9 @@ mod tests {
                 ".local",
                 ".bun",
                 "npm",
+                "pnpm",
+                "Yarn",
+                "WinGet",
             ] {
                 assert!(
                     combined.contains(needle),
@@ -429,7 +521,15 @@ mod tests {
                 );
             }
         } else {
-            for needle in [".local", ".bun", ".volta", ".npm-global", "homebrew"] {
+            for needle in [
+                ".local",
+                ".bun",
+                ".volta",
+                ".npm-global",
+                "homebrew",
+                "pnpm",
+                ".yarn",
+            ] {
                 assert!(
                     combined.contains(needle),
                     "expected POSIX fallbacks to include `{needle}`; got:\n{combined}"
