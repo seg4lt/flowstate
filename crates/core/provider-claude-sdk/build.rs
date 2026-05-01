@@ -137,6 +137,34 @@ fn main() {
                     env::var("MISE_DATA_DIR").unwrap_or_default(),
                 )
                 .env("LANG", env::var("LANG").unwrap_or_default());
+            // Windows-essential env vars stripped by `env_clear` —
+            // re-add them or pnpm dies on first call into Node.
+            // `os.tmpdir()` reads `TEMP`/`TMP`; without it pnpm's
+            // `temp-dir@2.0.0` dep crashes calling
+            // `realpathSync(undefined)`. `APPDATA`/`USERPROFILE` are
+            // where pnpm/npm look up `.npmrc` and the global store.
+            // `LOCALAPPDATA` is where corepack caches package-manager
+            // shims. `SYSTEMROOT` is required by some Win32 APIs
+            // (`GetSystemDirectory`, DNS lookups) that node calls
+            // during startup. Missing any of these used to surface as
+            // `ENOENT: no such file or directory, lstat '…\bridge\undefined'`
+            // on Windows CI runners (where launching shells don't
+            // export these into a stripped env). Unconditional copy
+            // here is a no-op on Unix where these vars don't exist.
+            for var in [
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "SYSTEMROOT",
+                "PATHEXT",
+                "COMSPEC",
+            ] {
+                if let Ok(val) = env::var(var) {
+                    cmd.env(var, val);
+                }
+            }
             cmd.args(install_args)
                 .arg("--prod=false")
                 .current_dir(&bridge_dir)

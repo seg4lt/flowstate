@@ -100,6 +100,26 @@ fn main() {
                     env::var("MISE_DATA_DIR").unwrap_or_default(),
                 )
                 .env("LANG", env::var("LANG").unwrap_or_default());
+            // Windows-essential env vars stripped by `env_clear` —
+            // see provider-claude-sdk/build.rs for full rationale.
+            // Without TEMP/TMP, node's `os.tmpdir()` returns
+            // `undefined`, and pnpm's `temp-dir@2.0.0` dep crashes
+            // calling `realpathSync(undefined)` on Windows CI runners.
+            // Unconditional copy is a no-op on Unix.
+            for var in [
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "SYSTEMROOT",
+                "PATHEXT",
+                "COMSPEC",
+            ] {
+                if let Ok(val) = env::var(var) {
+                    cmd.env(var, val);
+                }
+            }
             cmd.args(install_args)
                 .arg("--prod=false")
                 .current_dir(&bridge_dir)
