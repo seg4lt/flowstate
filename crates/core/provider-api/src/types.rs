@@ -715,22 +715,6 @@ pub struct ProviderStatus {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub features: ProviderFeatures,
-    /// Whether the provider's CLI has reported that a newer version is
-    /// available. Populated by each adapter's own update probe (e.g.
-    /// `claude doctor`, `gh extension list`). Drives the small
-    /// "update available" dot in the Settings provider row and the
-    /// gating for the Upgrade button. Defaults to `false` for
-    /// providers without a native update probe; never set by the
-    /// frontend — always reset by `health()` based on the latest
-    /// probe result.
-    #[serde(default)]
-    pub update_available: bool,
-    /// The newer version string the provider's update probe reported,
-    /// when known. Used as a tooltip ("Upgrade to 0.0.42") next to
-    /// the per-provider Upgrade button. `None` when the probe didn't
-    /// surface a specific version (only "an update is available").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_version: Option<String>,
 }
 
 impl Default for ProviderStatus {
@@ -750,8 +734,6 @@ impl Default for ProviderStatus {
             // disable the provider.
             enabled: true,
             features: ProviderFeatures::default(),
-            update_available: false,
-            latest_version: None,
         }
     }
 }

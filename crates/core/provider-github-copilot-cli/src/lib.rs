@@ -813,8 +813,6 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 models: copilot_cli_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
             };
         }
 
@@ -842,8 +840,6 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     models: copilot_cli_models(),
                     enabled: true,
                     features: zenui_provider_api::ProviderFeatures::default(),
-                    update_available: false,
-                    latest_version: None,
                 };
             }
             Err(_) => {
@@ -858,8 +854,6 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                     models: copilot_cli_models(),
                     enabled: true,
                     features: zenui_provider_api::ProviderFeatures::default(),
-                    update_available: false,
-                    latest_version: None,
                 };
             }
         };
@@ -911,8 +905,6 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 models: copilot_cli_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
             };
         }
 
@@ -930,31 +922,9 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             )
         };
 
-        // Best-effort update probe via `gh extension list`. The
-        // command lists installed extensions and marks each one with
-        // an `update available` tag when the local copy is behind the
-        // upstream release. We grep for the `gh-copilot` row to
-        // decide. Skipped silently when `gh` is missing or `gh
-        // extension list` errors.
-        let mut update_available = false;
-        if let Some((_st, stdout, stderr)) =
-            zenui_provider_api::probe_update_check("gh", &["extension", "list"]).await
-        {
-            let combined = format!(
-                "{}{}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr)
-            );
-            for line in combined.lines() {
-                let lower = line.to_ascii_lowercase();
-                if lower.contains("copilot")
-                    && (lower.contains("update available") || lower.contains("upgrade available"))
-                {
-                    update_available = true;
-                    break;
-                }
-            }
-        }
+        // No update-available probe: keeps health() fast. The
+        // Upgrade button in Settings runs `gh extension upgrade
+        // github/gh-copilot` unconditionally when clicked.
 
         ProviderStatus {
             kind,
@@ -967,8 +937,6 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
             models: copilot_cli_models(),
             enabled: true,
             features: zenui_provider_api::ProviderFeatures::default(),
-            update_available,
-            latest_version: None,
         }
     }
 

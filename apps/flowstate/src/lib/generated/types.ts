@@ -343,25 +343,7 @@ enabled: boolean,
  * deserialize cleanly because both the field and the struct are
  * `#[serde(default)]`.
  */
-features: ProviderFeatures, 
-/**
- * Whether the provider's CLI has reported that a newer version is
- * available. Populated by each adapter's own update probe (e.g.
- * `claude doctor`, `gh extension list`). Drives the small
- * "update available" dot in the Settings provider row and the
- * gating for the Upgrade button. Defaults to `false` for
- * providers without a native update probe; never set by the
- * frontend — always reset by `health()` based on the latest
- * probe result.
- */
-updateAvailable: boolean, 
-/**
- * The newer version string the provider's update probe reported,
- * when known. Used as a tooltip ("Upgrade to 0.0.42") next to
- * the per-provider Upgrade button. `None` when the probe didn't
- * surface a specific version (only "an update is available").
- */
-latestVersion?: string, };
+features: ProviderFeatures, };
 
 export type CommandKind = { "kind": "builtin" } | { "kind": "user_skill", source: SkillSource, };
 

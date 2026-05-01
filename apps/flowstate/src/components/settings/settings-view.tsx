@@ -939,16 +939,21 @@ function ProviderRow({
   const { isProviderEnabled } = useProviderEnabled();
   const label = PROVIDER_LABELS[kind];
   const modelCount = provider?.models.length ?? 0;
-  const isReady = provider?.status === "ready";
   const enabled = isProviderEnabled(kind);
-  const updateAvailable = enabled && (provider?.updateAvailable ?? false);
+  // Prefer the model count whenever we have any — that's what the
+  // user actually cares about, and it's what the model picker
+  // shows. Fall back to the daemon's status message only when
+  // there are zero cached models (truly fresh provider, never
+  // probed). This way a transient `status: "warning"` (e.g. while
+  // the daemon's background re-probe is in flight after a Refresh
+  // click) doesn't blank out the count.
   const statusText = !enabled
     ? "Disabled"
     : provider
-      ? provider.status === "ready"
+      ? modelCount > 0
         ? `${modelCount} model${modelCount === 1 ? "" : "s"}`
         : (provider.message ?? provider.status)
-      : "checking...";
+      : "Checking…";
   // Trim the leading "v" so "v0.0.41" / "0.0.41" both render as
   // `v0.0.41` consistently. Sentinel strings the daemon may return
   // (e.g. "bundled" for the Claude SDK adapter falling back to its
@@ -971,28 +976,22 @@ function ProviderRow({
       }`}
     >
       <span
+        // Colored when the provider is actually usable — enabled
+        // and has at least one model in the catalog. We deliberately
+        // don't gate on `provider.status === "ready"` because that's
+        // a snapshot of the *last* health probe, which may be
+        // transiently "warning" while a re-probe is in flight after
+        // a Refresh click or a fresh-from-cache-bust startup. A
+        // gray dot next to "4 models" is just confusing — the
+        // provider is plainly working.
         className={`inline-block h-2 w-2 shrink-0 rounded-full ${
-          isReady && enabled ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"
+          enabled && modelCount > 0
+            ? PROVIDER_COLORS[kind]
+            : "bg-muted-foreground/30"
         }`}
       />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 truncate text-sm font-medium">
-          <span className="truncate">{label}</span>
-          {updateAvailable ? (
-            // Soft amber dot — no toast, no banner. The Upgrade
-            // button next to the row is the actionable affordance;
-            // this is just the "you have a notification" indicator.
-            <span
-              className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500"
-              aria-label="Update available"
-              title={
-                provider?.latestVersion
-                  ? `Update available (v${provider.latestVersion})`
-                  : "Update available"
-              }
-            />
-          ) : null}
-        </div>
+        <div className="truncate text-sm font-medium">{label}</div>
         <div className="truncate text-xs text-muted-foreground">
           {statusText}
           {versionLabel ? (
@@ -1009,29 +1008,24 @@ function ProviderRow({
           ) : null}
         </div>
       </div>
-      {/* Always render the Upgrade button so the affordance has a
-          stable place in the row. Disabled when no update is
-          available (or the provider is off / not ready / already
-          upgrading), enabled only when the daemon's update probe
-          flagged this provider as outdated. The amber dot next to
-          the label remains the passive notification — the button
-          itself stays present whether or not there's something to
-          upgrade. */}
+      {/* Upgrade always runs the CLI's own self-update command
+          (`claude update`, `codex update`, `opencode upgrade`,
+          `gh extension upgrade …`). We don't pre-probe to decide
+          whether an upgrade is "needed" — those probes were either
+          interactive (claude doctor) or unreliable across CLI
+          versions. Just let the user click; the CLI tells them
+          "already up to date" if there's nothing to do. */}
       <Button
         variant="outline"
         size="sm"
-        disabled={!updateAvailable || upgrading || !enabled}
+        disabled={!enabled || upgrading}
         onClick={onUpgrade}
         title={
           !enabled
             ? `${label} is disabled`
-            : updateAvailable
-              ? provider?.latestVersion
-                ? `Upgrade to v${provider.latestVersion}`
-                : "Upgrade to the latest version"
-              : isBundled
-                ? "Bundled with Flowstate — updates ship with the app itself"
-                : "Up to date"
+            : isBundled
+              ? "Bundled with Flowstate — updates ship with the app itself"
+              : `Run the ${label} CLI's self-update`
         }
       >
         {upgrading ? <Loader2 className="animate-spin" /> : <ArrowUpCircle />}
@@ -1040,7 +1034,14 @@ function ProviderRow({
       <Button
         variant="outline"
         size="sm"
-        disabled={!isReady || refreshing || !enabled}
+        // Allowed even when status === "error". Refresh now busts
+        // both the models cache AND the health cache (see
+        // `ClientMessage::RefreshModels` in runtime-core), so it's
+        // the user's escape hatch for a stuck stale-error row —
+        // disabling it precisely when there's something to retry
+        // would defeat the whole point. Only gated by `!enabled`
+        // (no provider to refresh) and `refreshing` (in flight).
+        disabled={!enabled || refreshing}
         onClick={onRefresh}
       >
         {refreshing ? <Loader2 className="animate-spin" /> : <RefreshCw />}

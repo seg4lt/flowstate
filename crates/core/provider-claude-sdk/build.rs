@@ -14,7 +14,7 @@ fn main() {
     println!("cargo:rerun-if-changed=bridge/src/index.ts");
     println!("cargo:rerun-if-changed=bridge/package.json");
     println!("cargo:rerun-if-changed=bridge/package-lock.json");
-    println!("cargo:rerun-if-changed=bridge/bun.lock");
+    println!("cargo:rerun-if-changed=bridge/pnpm-lock.yaml");
     println!("cargo:rerun-if-changed=bridge/tsconfig.json");
     // Embedded Node version is part of DEPS_FP (a node major bump can
     // invalidate native modules in `node_modules/`), so re-run when
@@ -38,56 +38,127 @@ fn main() {
     // we catch drift at build time before it ships.
     validate_lockfile_consistency(&bridge_dir, "Claude SDK");
 
-    // --- bun install (only needed when embed=ON so `node_modules/` gets
-    //     staged; skip entirely in download mode — npm hydrates at
-    //     runtime using the lockfile we bake in) ---------------------
-    let bun_install_stamp = out_dir.join(".bun-install-stamp");
-    let pkg_json = bridge_dir.join("package.json");
-    let bun_lock = bridge_dir.join("bun.lock");
+    // pnpm preflight: confirm the binary is reachable from the
+    // build-script's child-process PATH BEFORE we get into stamp
+    // logic. Cargo's child env is inherited from the parent, but
+    // shell-only PATH modifications (e.g. mise's PATH shims that
+    // only fire from interactive shells) won't propagate to a build
+    // run from a stripped-PATH context. A failure here used to
+    // surface as a runtime "bridge assets are empty" error far
+    // removed from the cause; now it's a clear build-time panic.
+    preflight_pnpm("Claude SDK");
 
-    if embed && !is_stamp_fresh(&bun_install_stamp, &[&pkg_json, &bun_lock]) {
-        let install_args: &[&str] = if bun_lock.exists() {
+    // --- pnpm install ----------------------------------------------
+    //
+    // pnpm is the source of truth for dev tooling (corepack ships
+    // with node, every contributor has it). bun is intentionally not
+    // used: it's an extra cross-platform install with no
+    // distinguishing benefit here, and not having it on PATH used
+    // to silently brick the bridge build.
+    //
+    // Install runs unconditionally (gated by the staleness stamp).
+    // It used to be gated on `embed` because only the offline-bundle
+    // build path needed `node_modules/` staged into the embed dir —
+    // but the *build step below* also needs `node_modules/.bin/tsc`,
+    // so non-embed builds were failing with "tsc: command not found"
+    // unless install had been run by some other path. The stamp
+    // already de-dupes redundant runs.
+    let pnpm_install_stamp = out_dir.join(".pnpm-install-stamp");
+    let pkg_json = bridge_dir.join("package.json");
+    let pnpm_lock = bridge_dir.join("pnpm-lock.yaml");
+    let npm_lock = bridge_dir.join("package-lock.json");
+
+    if !is_stamp_fresh(
+        &pnpm_install_stamp,
+        &[&pkg_json, &pnpm_lock, &npm_lock],
+    ) {
+        let install_args: &[&str] = if pnpm_lock.exists() {
             &["install", "--frozen-lockfile"]
         } else {
             &["install"]
         };
-        let install = Command::new("bun")
+        // Pin a development-friendly environment: cargo's build-
+        // script subprocess can inherit `NODE_ENV=production` /
+        // `PNPM_PROD=true` / `npm_config_*` flags from the
+        // launching shell or a parent tooling layer (cargo test
+        // sets some of these). Any one of them makes `pnpm
+        // install` silently drop `devDependencies` (typescript /
+        // @types/*). Without typescript the next `pnpm run build`
+        // step dies with "tsc: command not found" and dist stays
+        // empty. Force include-dev with the explicit `--prod=false`
+        // CLI flag (which beats env var precedence in pnpm) and
+        // clear every env var pnpm/npm checks for production
+        // signaling.
+        let install = Command::new("pnpm")
             .args(install_args)
+            .arg("--prod=false")
+            .env("NODE_ENV", "development")
+            .env("npm_config_production", "false")
+            .env("npm_config_prod", "false")
+            .env("PNPM_PROD", "false")
+            .env_remove("npm_config_only")
             .current_dir(&bridge_dir)
             .status();
         match install {
             Ok(s) if s.success() => {
-                touch_stamp(&bun_install_stamp);
+                touch_stamp(&pnpm_install_stamp);
             }
-            Ok(s) => println!(
-                "cargo:warning=Claude SDK bridge `bun install` exited with {s}; build may fail"
+            Ok(s) => panic!(
+                "Claude SDK bridge `pnpm install` exited with {s}. \
+                The bridge can't compile without `node_modules/`. \
+                Run `pnpm install` in `crates/core/provider-claude-sdk/bridge/` \
+                manually to see the full error.",
             ),
-            Err(e) => println!(
-                "cargo:warning=Failed to invoke `bun install` for claude bridge ({e}); \
-                build may fail"
+            Err(e) => panic!(
+                "Failed to invoke `pnpm install` for claude bridge ({e}). \
+                Cargo's build-script PATH does not contain `pnpm`. \
+                Install pnpm via `corepack enable` or `npm i -g pnpm`, \
+                then retry. Current PATH: {}",
+                env::var("PATH").unwrap_or_else(|_| "<unset>".to_string()),
             ),
         }
     }
 
     // --- tsc (always — the dist output is what we actually ship) -----
-    let tsc_status = Command::new("bun")
+    //
+    // Run via `pnpm run build` so pnpm-managed dev binaries (tsc) are
+    // resolvable from PATH. The package.json's `build` script is just
+    // `tsc`, so any package manager would do — but using pnpm here
+    // keeps a single source of truth across dev-time and runtime
+    // hydration (which also uses pnpm via corepack).
+    // Belt-and-braces: confirm tsc is actually installed before we
+    // ask pnpm to run it. If pnpm install above was a no-op (stamp
+    // said fresh) but a prior install had skipped devDeps, the
+    // next `pnpm run build` would fail with the cryptic "tsc:
+    // command not found". Catch it here with a pointed message.
+    let tsc_bin = bridge_dir.join("node_modules").join(".bin").join("tsc");
+    if !tsc_bin.exists() {
+        panic!(
+            "Claude SDK bridge: `node_modules/.bin/tsc` is missing — \
+            `pnpm install` was either skipped or ran in production mode \
+            (devDependencies dropped). Delete \
+            `crates/core/provider-claude-sdk/bridge/node_modules` and the \
+            stamp file in `OUT_DIR/.pnpm-install-stamp`, then rebuild.",
+        );
+    }
+    let tsc_status = Command::new("pnpm")
         .args(["run", "build"])
+        .env("NODE_ENV", "development")
         .current_dir(&bridge_dir)
         .status();
     match tsc_status {
         Ok(s) if s.success() => {}
-        Ok(s) => {
-            println!(
-                "cargo:warning=Claude SDK bridge `bun run build` exited with {s}; \
-                using existing dist/index.js if present"
-            );
-        }
-        Err(e) => {
-            println!(
-                "cargo:warning=Failed to invoke `bun run build` for claude bridge ({e}); \
-                using existing dist/index.js if present"
-            );
-        }
+        Ok(s) => panic!(
+            "Claude SDK bridge `pnpm run build` (tsc) exited with {s}. \
+            The compile cannot embed an empty bridge — fix the TypeScript \
+            error and re-run `cargo build`. Run `pnpm run build` in \
+            `crates/core/provider-claude-sdk/bridge/` to reproduce.",
+        ),
+        Err(e) => panic!(
+            "Failed to invoke `pnpm run build` for claude bridge ({e}). \
+            pnpm went missing between the preflight check and now — that \
+            should be impossible. Inspect the build-script PATH.",
+        ),
     }
 
     // --- Stage assets for rust-embed ---------------------------------
@@ -102,31 +173,38 @@ fn main() {
 
     let bridge_src = PathBuf::from("bridge/dist/index.js");
     if !bridge_src.exists() {
-        println!(
-            "cargo:warning=bridge/dist/index.js missing; Claude SDK bridge will not be embedded"
+        // Reachable only if `pnpm run build` succeeded (above) but
+        // somehow didn't produce dist/index.js — e.g. tsconfig
+        // misconfigured, the build script does something custom that
+        // skips emit. Fail loud rather than ship an empty embed: the
+        // alternative is the runtime "bridge assets are empty" error
+        // that bricks every Claude session.
+        panic!(
+            "bridge/dist/index.js missing after a successful `pnpm run build`. \
+            Check `bridge/tsconfig.json`'s outDir + `bridge/package.json`'s \
+            build script. This should never happen.",
         );
-        write_fingerprints(&out_dir, "0000000000000000", "0000000000000000");
-        return;
     }
 
     // Always include the small files: the bridge entry point, its
-    // package.json (npm uses it to resolve deps at runtime), and the
-    // lockfile (for `npm ci --omit=dev` reproducibility).
+    // package.json (the runtime uses it to resolve deps), and any
+    // lockfiles (for reproducible runtime hydration via
+    // `pnpm install --frozen-lockfile` and the `npm ci` fallback).
     fs::copy(&bridge_src, assets_dir.join("index.js")).expect("failed to copy bridge");
     if pkg_json.exists() {
         fs::copy(&pkg_json, assets_dir.join("package.json"))
             .expect("failed to copy bridge package.json");
     }
-    if bun_lock.exists() {
-        // Bun's `bun.lock` is bun's own lockfile format. npm doesn't
-        // read it, but we ship it so a `bun install` fallback at
-        // runtime (future work) stays reproducible. npm uses the
-        // separate `package-lock.json` if present — stage it too when
-        // the bridge project committed one.
-        fs::copy(&bun_lock, assets_dir.join("bun.lock")).expect("failed to copy bun.lock");
+    if pnpm_lock.exists() {
+        // Preferred lockfile: corepack-pnpm at runtime uses this for
+        // `pnpm install --frozen-lockfile`.
+        fs::copy(&pnpm_lock, assets_dir.join("pnpm-lock.yaml"))
+            .expect("failed to copy pnpm-lock.yaml");
     }
-    let npm_lock = bridge_dir.join("package-lock.json");
     if npm_lock.exists() {
+        // Fallback lockfile for the runtime's `npm ci --omit=dev`
+        // path. Both can ship; pnpm picks pnpm-lock.yaml when both
+        // are present.
         fs::copy(&npm_lock, assets_dir.join("package-lock.json"))
             .expect("failed to copy package-lock.json");
     }
@@ -300,8 +378,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// launch, so a silent lockfile drift bricks the provider for everyone.
 ///
 /// Best-effort: if either file is missing, or `npm` is not on PATH
-/// (rare — the bridge build also requires `bun`, so devs reaching this
-/// step have a JS toolchain installed), the check skips with a
+/// (rare — the bridge build also requires `pnpm`, so devs reaching
+/// this step have a JS toolchain installed), the check skips with a
 /// warning rather than failing the build.
 fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
     let pkg_path = bridge_dir.join("package.json");
@@ -369,4 +447,44 @@ fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
         "{provider} bridge package-lock.json drift detected by `npm ci --dry-run`; \
          see cargo warnings above for the fix"
     );
+}
+
+/// Verify `pnpm` is reachable from the build script's child-process
+/// PATH before the install / build steps run. Cargo inherits PATH
+/// from its launching shell, but shell-only modifications (mise
+/// shims, sourced rc-file additions) sometimes don't propagate to
+/// non-interactive subprocesses.
+///
+/// This is a guard against the silent failure mode that produced
+/// the original "Claude SDK bridge assets are empty" runtime error:
+/// pnpm wasn't on the build-script PATH, both `pnpm install` and
+/// `pnpm run build` exited with errors that were logged as
+/// `cargo:warning=…`, the rust-embed proc-macro saw an empty
+/// bridge-assets dir, and the binary shipped with no embedded
+/// bridge. Failing the build here turns that mystery into a
+/// pointed actionable error.
+fn preflight_pnpm(provider: &str) {
+    let probe = Command::new("pnpm").arg("--version").output();
+    match probe {
+        Ok(out) if out.status.success() => {
+            // pnpm exists on PATH — nothing to do. We deliberately
+            // don't enforce a specific version; the bridges' tooling
+            // works on any recent pnpm major.
+        }
+        Ok(out) => panic!(
+            "{provider} bridge preflight: `pnpm --version` exited with {} \
+            (stderr: {}). pnpm is on PATH but appears broken.",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+        Err(e) => panic!(
+            "{provider} bridge preflight: `pnpm` not found on PATH ({e}). \
+            Cargo's build-script subprocess inherits PATH from its launching \
+            shell — if you installed pnpm via mise, ensure mise's shims dir \
+            is on PATH for non-interactive shells too. Quick fixes: \
+            `corepack enable`, `npm i -g pnpm`, or add mise shims to \
+            your login PATH (~/.zprofile, ~/.profile). Current PATH: {}",
+            env::var("PATH").unwrap_or_else(|_| "<unset>".to_string()),
+        ),
+    }
 }

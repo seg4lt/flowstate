@@ -70,7 +70,7 @@ pub use orchestration::{
     RuntimeCallOrigin, RuntimeCallResult, SessionCreator, SessionDigest, WorktreeSummary,
 };
 pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
-pub use probe::{ProbeCliOptions, UpdateCheckOutcome, probe_cli, probe_update_check};
+pub use probe::{ProbeCliOptions, probe_cli};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
 pub use process_group::ProcessGroup;
 pub use windows_console::{hide_console_window_std, hide_console_window_tokio};

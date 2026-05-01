@@ -1013,7 +1013,11 @@ impl ProviderAdapter for ClaudeCliAdapter {
 
     async fn health(&self) -> ProviderStatus {
         let binary = Self::find_claude_binary();
-        let mut status = probe_cli(ProbeCliOptions {
+        // No update-available probe: `claude doctor` is interactive
+        // (waits on stdin) and would hang health(). The Upgrade
+        // button in Settings runs `claude update` unconditionally
+        // when the user explicitly clicks it.
+        probe_cli(ProbeCliOptions {
             kind: ProviderKind::ClaudeCli,
             binary: &binary,
             version_args: &["--version"],
@@ -1031,31 +1035,7 @@ impl ProviderAdapter for ClaudeCliAdapter {
             // capability that doesn't exist.
             auth_err_is_ok: true,
         })
-        .await;
-        // Best-effort update probe via `claude doctor`. The CLI prints
-        // a "Your version is out of date" / "newer version available"
-        // line on stderr when an update exists. We don't surface a
-        // "latest version" string because the doctor output isn't
-        // structured — just the boolean is enough to drive the UI dot.
-        if status.installed {
-            if let Some((_status, stdout, stderr)) =
-                zenui_provider_api::probe_update_check(&binary, &["doctor"]).await
-            {
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                )
-                .to_ascii_lowercase();
-                if combined.contains("out of date")
-                    || combined.contains("newer version")
-                    || combined.contains("update available")
-                {
-                    status.update_available = true;
-                }
-            }
-        }
-        status
+        .await
     }
 
     async fn fetch_models(&self) -> Result<Vec<ProviderModel>, String> {

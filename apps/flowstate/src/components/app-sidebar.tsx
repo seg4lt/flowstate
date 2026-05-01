@@ -61,7 +61,6 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar";
 import { useApp, useProvisionFailures } from "@/stores/app-store";
-import { useProvidersUpdateAvailable } from "@/hooks/use-providers-update-available";
 import { useAttentionTone } from "@/hooks/use-attention-tone";
 import { cn } from "@/lib/utils";
 import { isMacOS } from "@/lib/popout";
@@ -162,13 +161,6 @@ function AppSidebarBody() {
   // banner + Retry buttons.
   const provisionFailures = useProvisionFailures();
   const hasProvisionFailures = provisionFailures.length > 0;
-  // Amber dot on the sidebar Settings icon when any enabled provider
-  // has a CLI update waiting. Independent of the red provisioning
-  // dot — both can stack visually, but in practice users either
-  // have a fresh install (provisioning issues only) or a steady
-  // state (update notifications only). No toast — the dot is the
-  // entire affordance per the requirement.
-  const hasUpdateAvailable = useProvidersUpdateAvailable();
   // Aggregate "wants attention" tone across all non-active threads.
   // Drives the dot rendered next to the "flowstate" wordmark below
   // so a long thread list still has a persistent cue when the
@@ -776,9 +768,7 @@ function AppSidebarBody() {
               tooltip={
                 hasProvisionFailures
                   ? `Settings (${provisionFailures.length} provisioning issue${provisionFailures.length === 1 ? "" : "s"})`
-                  : hasUpdateAvailable
-                    ? "Settings (provider update available)"
-                    : "Settings"
+                  : "Settings"
               }
               onClick={() => {
                 navigate({ to: "/settings" });
@@ -786,23 +776,15 @@ function AppSidebarBody() {
               }}
             >
               {/* Wrap the icon in a relative span so the absolute
-                  dot is positioned to the icon's top-right rather
-                  than the SidebarMenuButton's. The provisioning dot
-                  (red) takes precedence; the update-available dot
-                  (amber) only renders when there's nothing more
-                  urgent. Purely decorative — Settings itself shows
-                  the actionable rows. */}
+                  red dot is positioned to the icon's top-right rather
+                  than the SidebarMenuButton's. Purely decorative —
+                  Settings itself shows the actionable banner. */}
               <span className="relative inline-flex">
                 <Settings />
                 {hasProvisionFailures ? (
                   <span
                     aria-hidden="true"
                     className="absolute -right-0.5 -top-0.5 inline-block h-2 w-2 rounded-full bg-red-500 ring-1 ring-background"
-                  />
-                ) : hasUpdateAvailable ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute -right-0.5 -top-0.5 inline-block h-2 w-2 rounded-full bg-amber-500 ring-1 ring-background"
                   />
                 ) : null}
               </span>

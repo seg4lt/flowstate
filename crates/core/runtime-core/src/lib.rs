@@ -716,20 +716,34 @@ impl RuntimeCore {
                 status.enabled = enabled;
                 status
             }
-            None => ProviderStatus {
-                kind,
-                label: kind.label().to_string(),
-                installed: false,
-                authenticated: false,
-                version: None,
-                status: zenui_provider_api::ProviderStatusLevel::Warning,
-                message: Some("No health check yet".to_string()),
-                models: Vec::new(),
-                enabled,
-                features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
-            },
+            None => {
+                // Health cache is empty (first launch, or someone
+                // hand-deleted the row). Don't broadcast an empty
+                // placeholder — the user already has cached models
+                // from a prior successful run, and dropping them
+                // here makes the Settings row show "No health check
+                // yet" with no count even though the model picker
+                // works. Pull the cached models in so the row keeps
+                // the count it had.
+                let cached_models = self
+                    .persistence
+                    .get_cached_models(kind)
+                    .await
+                    .map(|(_, m)| m)
+                    .unwrap_or_default();
+                ProviderStatus {
+                    kind,
+                    label: kind.label().to_string(),
+                    installed: false,
+                    authenticated: false,
+                    version: None,
+                    status: zenui_provider_api::ProviderStatusLevel::Warning,
+                    message: Some("Checking…".to_string()),
+                    models: cached_models,
+                    enabled,
+                    features: zenui_provider_api::ProviderFeatures::default(),
+                }
+            }
         };
         self.publish(RuntimeEvent::ProviderHealthUpdated { status });
 
@@ -4097,8 +4111,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -4143,8 +4155,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -4242,8 +4252,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -4571,8 +4579,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -4690,8 +4696,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -4771,8 +4775,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -4928,8 +4930,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
 
@@ -5422,8 +5422,6 @@ mod tests {
             models,
             enabled: true,
             features: Default::default(),
-            update_available: false,
-            latest_version: None,
         }
     }
 
@@ -5806,8 +5804,6 @@ mod tests {
                 models: vec![],
                 enabled: true,
                 features: Default::default(),
-                update_available: false,
-                latest_version: None,
             }
         }
         async fn execute_turn(
@@ -5937,8 +5933,6 @@ mod tests {
                     models: vec![],
                     enabled: true,
                     features: Default::default(),
-                    update_available: false,
-                    latest_version: None,
                 }
             }
             async fn execute_turn(

@@ -332,7 +332,11 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn health(&self) -> ProviderStatus {
-        let mut status = probe_cli(ProbeCliOptions {
+        // No update-available probe: keeps health() fast and
+        // immune to subcommands that may block on stdin. The
+        // Upgrade button in Settings runs `codex update`
+        // unconditionally when the user explicitly clicks it.
+        probe_cli(ProbeCliOptions {
             kind: ProviderKind::Codex,
             binary: &self.binary_path,
             version_args: &["--version"],
@@ -343,31 +347,7 @@ impl ProviderAdapter for CodexAdapter {
             auth_hint: None,
             auth_err_is_ok: false,
         })
-        .await;
-        // Best-effort update probe. `codex update --check` is a no-op
-        // on builds that don't expose it; we just look for the
-        // "update available" / "newer version" markers in the
-        // combined output. Probe failures are swallowed silently
-        // (default = no update available).
-        if status.installed {
-            if let Some((_st, stdout, stderr)) = zenui_provider_api::probe_update_check(
-                &self.binary_path,
-                &["update", "--check"],
-            )
-            .await
-            {
-                let combined = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&stdout),
-                    String::from_utf8_lossy(&stderr)
-                )
-                .to_ascii_lowercase();
-                if combined.contains("update available") || combined.contains("newer version") {
-                    status.update_available = true;
-                }
-            }
-        }
-        status
+        .await
     }
 
     async fn upgrade(&self) -> Result<String, String> {

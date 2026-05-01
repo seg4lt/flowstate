@@ -647,8 +647,6 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 models: copilot_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -663,8 +661,6 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 models: copilot_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
             };
         }
 
@@ -690,8 +686,6 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 models: copilot_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
             },
             None => ProviderStatus {
                 kind,
@@ -707,8 +701,6 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 models: copilot_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
-                update_available: false,
-                latest_version: None,
             },
         }
     }

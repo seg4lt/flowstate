@@ -13,7 +13,7 @@ fn main() {
     println!("cargo:rerun-if-changed=bridge/src/index.ts");
     println!("cargo:rerun-if-changed=bridge/package.json");
     println!("cargo:rerun-if-changed=bridge/package-lock.json");
-    println!("cargo:rerun-if-changed=bridge/bun.lock");
+    println!("cargo:rerun-if-changed=bridge/pnpm-lock.yaml");
     println!("cargo:rerun-if-changed=bridge/tsconfig.json");
     // Embedded Node version is part of DEPS_FP (a node major bump can
     // invalidate native modules in `node_modules/`), so re-run when
@@ -39,51 +39,96 @@ fn main() {
     // every user who lazy-hydrates the bridge.
     validate_lockfile_consistency(&bridge_dir, "Copilot");
 
-    let bun_install_stamp = out_dir.join(".bun-install-stamp");
-    let pkg_json = bridge_dir.join("package.json");
-    let bun_lock = bridge_dir.join("bun.lock");
+    // pnpm preflight — see provider-claude-sdk/build.rs::preflight_pnpm
+    // for the full rationale. Failing the build now turns the
+    // "bridge assets are empty" runtime mystery into a pointed
+    // build-time error.
+    preflight_pnpm("Copilot");
 
-    if embed && !is_stamp_fresh(&bun_install_stamp, &[&pkg_json, &bun_lock]) {
-        let install_args: &[&str] = if bun_lock.exists() {
+    // pnpm via mise / corepack is the dev-time package manager. bun
+    // intentionally not used: extra cross-platform install with no
+    // distinguishing benefit, and not having it on PATH used to
+    // silently brick the bridge build. See provider-claude-sdk's
+    // build.rs for the matching rationale, including the reason this
+    // install runs unconditionally (the build step below needs
+    // `node_modules/.bin/tsc`, so non-embed builds were broken when
+    // the install was gated on `embed`).
+    let pnpm_install_stamp = out_dir.join(".pnpm-install-stamp");
+    let pkg_json = bridge_dir.join("package.json");
+    let pnpm_lock = bridge_dir.join("pnpm-lock.yaml");
+    let npm_lock = bridge_dir.join("package-lock.json");
+
+    if !is_stamp_fresh(
+        &pnpm_install_stamp,
+        &[&pkg_json, &pnpm_lock, &npm_lock],
+    ) {
+        let install_args: &[&str] = if pnpm_lock.exists() {
             &["install", "--frozen-lockfile"]
         } else {
             &["install"]
         };
-        let install = Command::new("bun")
+        // See provider-claude-sdk/build.rs for rationale — force
+        // dev install so devDependencies (typescript) actually land
+        // in node_modules/.bin/.
+        let install = Command::new("pnpm")
             .args(install_args)
+            .arg("--prod=false")
+            .env("NODE_ENV", "development")
+            .env("npm_config_production", "false")
+            .env("npm_config_prod", "false")
+            .env("PNPM_PROD", "false")
+            .env_remove("npm_config_only")
             .current_dir(&bridge_dir)
             .status();
         match install {
             Ok(s) if s.success() => {
-                touch_stamp(&bun_install_stamp);
+                touch_stamp(&pnpm_install_stamp);
             }
-            Ok(s) => println!(
-                "cargo:warning=Copilot bridge `bun install` exited with {s}; build may fail"
+            Ok(s) => panic!(
+                "Copilot bridge `pnpm install` exited with {s}. \
+                The bridge can't compile without `node_modules/`. \
+                Run `pnpm install` in `crates/core/provider-github-copilot/bridge/` \
+                manually to see the full error.",
             ),
-            Err(e) => println!(
-                "cargo:warning=Failed to invoke `bun install` for copilot bridge ({e}); build may fail"
+            Err(e) => panic!(
+                "Failed to invoke `pnpm install` for copilot bridge ({e}). \
+                Cargo's build-script PATH does not contain `pnpm`. \
+                Install pnpm via `corepack enable` or `npm i -g pnpm`, \
+                then retry. Current PATH: {}",
+                env::var("PATH").unwrap_or_else(|_| "<unset>".to_string()),
             ),
         }
     }
 
-    let tsc_status = Command::new("bun")
+    // See provider-claude-sdk/build.rs for rationale.
+    let tsc_bin = bridge_dir.join("node_modules").join(".bin").join("tsc");
+    if !tsc_bin.exists() {
+        panic!(
+            "Copilot bridge: `node_modules/.bin/tsc` is missing — \
+            `pnpm install` was either skipped or ran in production mode \
+            (devDependencies dropped). Delete \
+            `crates/core/provider-github-copilot/bridge/node_modules` and \
+            the stamp file in `OUT_DIR/.pnpm-install-stamp`, then rebuild.",
+        );
+    }
+    let tsc_status = Command::new("pnpm")
         .args(["run", "build"])
+        .env("NODE_ENV", "development")
         .current_dir(&bridge_dir)
         .status();
     match tsc_status {
         Ok(s) if s.success() => {}
-        Ok(s) => {
-            println!(
-                "cargo:warning=Copilot bridge `bun run build` exited with {s}; \
-                using existing dist/index.js if present"
-            );
-        }
-        Err(e) => {
-            println!(
-                "cargo:warning=Failed to invoke `bun run build` for copilot bridge ({e}); \
-                using existing dist/index.js if present"
-            );
-        }
+        Ok(s) => panic!(
+            "Copilot bridge `pnpm run build` (tsc) exited with {s}. \
+            The compile cannot embed an empty bridge — fix the TypeScript \
+            error and re-run `cargo build`. Run `pnpm run build` in \
+            `crates/core/provider-github-copilot/bridge/` to reproduce.",
+        ),
+        Err(e) => panic!(
+            "Failed to invoke `pnpm run build` for copilot bridge ({e}). \
+            pnpm went missing between the preflight check and now — that \
+            should be impossible. Inspect the build-script PATH.",
+        ),
     }
 
     let assets_dir = out_dir.join("bridge-assets");
@@ -94,9 +139,14 @@ fn main() {
 
     let bridge_src = PathBuf::from("bridge/dist/index.js");
     if !bridge_src.exists() {
-        println!("cargo:warning=bridge/dist/index.js missing; Copilot bridge will not be embedded");
-        write_fingerprints(&out_dir, "0000000000000000", "0000000000000000");
-        return;
+        // See provider-claude-sdk/build.rs for rationale. Reachable
+        // only if `pnpm run build` succeeded above but didn't emit
+        // dist/index.js — fail loud rather than ship an empty embed.
+        panic!(
+            "bridge/dist/index.js missing after a successful `pnpm run build`. \
+            Check `bridge/tsconfig.json`'s outDir + `bridge/package.json`'s \
+            build script. This should never happen.",
+        );
     }
 
     fs::copy(&bridge_src, assets_dir.join("index.js")).expect("failed to copy bridge");
@@ -104,10 +154,10 @@ fn main() {
         fs::copy(&pkg_json, assets_dir.join("package.json"))
             .expect("failed to copy bridge package.json");
     }
-    if bun_lock.exists() {
-        fs::copy(&bun_lock, assets_dir.join("bun.lock")).expect("failed to copy bun.lock");
+    if pnpm_lock.exists() {
+        fs::copy(&pnpm_lock, assets_dir.join("pnpm-lock.yaml"))
+            .expect("failed to copy pnpm-lock.yaml");
     }
-    let npm_lock = bridge_dir.join("package-lock.json");
     if npm_lock.exists() {
         fs::copy(&npm_lock, assets_dir.join("package-lock.json"))
             .expect("failed to copy package-lock.json");
@@ -286,8 +336,8 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// silent lockfile drift bricks the provider for everyone.
 ///
 /// Best-effort: if either file is missing, or `npm` is not on PATH
-/// (rare — the bridge build also requires `bun`, so devs reaching this
-/// step have a JS toolchain installed), the check skips with a
+/// (rare — the bridge build also requires `pnpm`, so devs reaching
+/// this step have a JS toolchain installed), the check skips with a
 /// warning rather than failing the build.
 fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
     let pkg_path = bridge_dir.join("package.json");
@@ -362,4 +412,30 @@ fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
         "{provider} bridge package-lock.json drift detected by `npm ci --dry-run`; \
          see cargo warnings above for the fix"
     );
+}
+
+/// Mirror of `provider-claude-sdk/build.rs::preflight_pnpm`. Verify
+/// `pnpm` is reachable from cargo's build-script subprocess before
+/// any install / build step. See that file's doc-comment for the
+/// full rationale.
+fn preflight_pnpm(provider: &str) {
+    let probe = Command::new("pnpm").arg("--version").output();
+    match probe {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => panic!(
+            "{provider} bridge preflight: `pnpm --version` exited with {} \
+            (stderr: {}). pnpm is on PATH but appears broken.",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+        Err(e) => panic!(
+            "{provider} bridge preflight: `pnpm` not found on PATH ({e}). \
+            Cargo's build-script subprocess inherits PATH from its launching \
+            shell — if you installed pnpm via mise, ensure mise's shims dir \
+            is on PATH for non-interactive shells too. Quick fixes: \
+            `corepack enable`, `npm i -g pnpm`, or add mise shims to \
+            your login PATH (~/.zprofile, ~/.profile). Current PATH: {}",
+            env::var("PATH").unwrap_or_else(|_| "<unset>".to_string()),
+        ),
+    }
 }

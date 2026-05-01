@@ -1123,8 +1123,6 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 models: Vec::new(),
                 enabled: true,
                 features: features.clone(),
-                update_available: false,
-                latest_version: None,
             };
         }
         if let Err(err) = bridge_runtime::ensure_extracted() {
@@ -1139,78 +1137,46 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 models: Vec::new(),
                 enabled: true,
                 features: features.clone(),
-                update_available: false,
-                latest_version: None,
             };
         }
 
-        // Probe the locally-installed `claude` binary for both its
-        // version string and an "update available" signal, mirroring
-        // what `provider-claude-cli` does. The SDK bridge resolves
-        // the same binary via `resolveLocalClaudeBinary` (PATH +
-        // user's `binaries.search_paths` extras + platform
-        // fallbacks), and `find_cli_binary("claude")` here uses the
-        // identical resolver — so whichever binary the bridge ends
-        // up running is exactly the one we just probed.
+        // Probe the locally-installed `claude` binary for its version
+        // string only. The SDK bridge resolves the same binary via
+        // `resolveLocalClaudeBinary` (PATH + user's
+        // `binaries.search_paths` extras + platform fallbacks), and
+        // `find_cli_binary("claude")` here uses the identical
+        // resolver — so the version we report is the version the
+        // bridge will actually use.
+        //
+        // We deliberately do NOT probe `claude doctor` for an
+        // "update available" signal here: that command is
+        // interactive (waits on stdin) and would hang the health
+        // check indefinitely. The Upgrade button in Settings runs
+        // `claude update` unconditionally — users who want to
+        // refresh just click it.
         //
         // When no local `claude` exists (the bridge falls back to
-        // the SDK's bundled binary), we leave `update_available =
-        // false` and `version = None`. We don't probe the bundle's
-        // freshness — its version is a function of the flowstate
-        // build itself, so a separate "Flowstate update available"
-        // banner already covers that lane.
-        let (update_available, version) =
-            match zenui_provider_api::find_cli_binary("claude") {
-                Some(path) => {
-                    let claude_path = path.to_string_lossy().into_owned();
-                    let mut update_available = false;
-                    if let Some((_st, stdout, stderr)) =
-                        zenui_provider_api::probe_update_check(&claude_path, &["doctor"]).await
-                    {
-                        let combined = format!(
-                            "{}{}",
-                            String::from_utf8_lossy(&stdout),
-                            String::from_utf8_lossy(&stderr)
+        // the SDK's vendored binary), surface "bundled" in the
+        // version chip so the user can tell at a glance which
+        // install is in play.
+        let version = match zenui_provider_api::find_cli_binary("claude") {
+            Some(path) => {
+                let mut version_cmd = tokio::process::Command::new(&path);
+                zenui_provider_api::hide_console_window_tokio(&mut version_cmd);
+                version_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+                version_cmd
+                    .arg("--version")
+                    .output()
+                    .await
+                    .ok()
+                    .and_then(|out| {
+                        zenui_provider_api::helpers::first_non_empty_line(&out.stdout).or_else(
+                            || zenui_provider_api::helpers::first_non_empty_line(&out.stderr),
                         )
-                        .to_ascii_lowercase();
-                        if combined.contains("out of date")
-                            || combined.contains("newer version")
-                            || combined.contains("update available")
-                        {
-                            update_available = true;
-                        }
-                    }
-                    // Capture the installed version while we have
-                    // the binary in hand, so the Settings row's
-                    // monospace `vX.Y.Z` chip populates for SDK
-                    // users too.
-                    let mut version_cmd = tokio::process::Command::new(&path);
-                    zenui_provider_api::hide_console_window_tokio(&mut version_cmd);
-                    version_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
-                    let version_string = version_cmd
-                        .arg("--version")
-                        .output()
-                        .await
-                        .ok()
-                        .and_then(|out| {
-                            zenui_provider_api::helpers::first_non_empty_line(&out.stdout)
-                                .or_else(|| {
-                                    zenui_provider_api::helpers::first_non_empty_line(&out.stderr)
-                                })
-                        });
-                    (update_available, version_string)
-                }
-                // No local claude on PATH / extras / fallbacks. The
-                // bridge will use the SDK's vendored `claude-code`
-                // binary; we surface "bundled" in the version chip
-                // so the user can tell at a glance which install is
-                // in play. Bundle freshness is governed by the
-                // flowstate update channel itself, so there's no
-                // upgrade affordance for this case (the Upgrade
-                // button stays disabled because update_available is
-                // false).
-                None => (false, Some("bundled".to_string())),
-            };
+                    })
+            }
+            None => Some("bundled".to_string()),
+        };
 
         ProviderStatus {
             kind,
@@ -1228,8 +1194,6 @@ impl ProviderAdapter for ClaudeSdkAdapter {
             models: Vec::new(),
             enabled: true,
             features,
-            update_available,
-            latest_version: None,
         }
     }
 
