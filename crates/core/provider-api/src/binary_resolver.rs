@@ -29,12 +29,12 @@ use std::path::PathBuf;
 ///    platform path separator and checks each entry. On Windows the
 ///    walk also tries every extension in `%PATHEXT%` (or the standard
 ///    `.COM/.EXE/.BAT/.CMD` set if PATHEXT isn't set).
-/// 2. **Platform fallbacks** — if PATH lookup misses, tries:
-///    - **Linux/macOS**: `~/.local/bin/<name>`, `/opt/homebrew/bin/<name>`,
-///      `/usr/local/bin/<name>`, `/home/linuxbrew/.linuxbrew/bin/<name>`,
-///      `/usr/bin/<name>`
-///    - **Windows**: `%LOCALAPPDATA%\Programs\<name>\<name>.exe`,
-///      `%APPDATA%\npm\<name>.cmd`, `C:\Program Files\<name>\<name>.exe`
+/// 2. **Platform fallbacks** — if PATH lookup misses, tries the
+///    locations [`platform_fallbacks`] enumerates (npm globals,
+///    user-local bin dirs, common version-manager shims, system
+///    package-manager shims). Designed to catch the case where a
+///    Tauri / GUI launch inherits a stripped PATH compared to what
+///    the user's shell sees.
 ///
 /// Returns `None` when nothing matches. Callers should surface a
 /// clear "install <name> and ensure it's on PATH" error.
@@ -101,35 +101,145 @@ fn platform_fallbacks(name: &str) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
     if cfg!(windows) {
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        // Tauri / GUI-launched processes on Windows inherit PATH from
+        // the launcher (explorer.exe, the Start menu), NOT from the
+        // user's shell rc. So directories like `~/.local/bin` and
+        // `%LOCALAPPDATA%\Volta\bin` that PowerShell would normally
+        // see are typically absent from a Tauri app's PATH. Most of
+        // the entries below cover that gap.
+        let userprofile = std::env::var_os("USERPROFILE");
+        let local_app_data = std::env::var_os("LOCALAPPDATA");
+        let app_data = std::env::var_os("APPDATA");
+        let program_data = std::env::var_os("PROGRAMDATA");
+
+        // npm global installs — the most common path for `claude`,
+        // `codex`, etc. Both the default location and a few common
+        // overrides are covered.
+        if let Some(ref appdata) = app_data {
+            for ext in ["cmd", "exe", "ps1"] {
+                paths.push(
+                    PathBuf::from(appdata)
+                        .join("npm")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
+        }
+        if let Some(ref localappdata) = local_app_data {
+            for ext in ["cmd", "exe"] {
+                paths.push(
+                    PathBuf::from(localappdata)
+                        .join("npm")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
+        }
+
+        // User-local bin dir — pip installs, cargo install, manual
+        // drops. Mirrors `~/.local/bin` on Unix.
+        if let Some(ref home) = userprofile {
+            for ext in ["exe", "cmd", "bat", ""] {
+                let leaf = if ext.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name}.{ext}")
+                };
+                paths.push(
+                    PathBuf::from(home)
+                        .join(".local")
+                        .join("bin")
+                        .join(leaf),
+                );
+            }
+        }
+
+        // Volta — Node.js + tool version manager. Uses fixed shim
+        // exes under `%LOCALAPPDATA%\Volta\bin`.
+        if let Some(ref localappdata) = local_app_data {
             paths.push(
-                PathBuf::from(&local_app_data)
-                    .join("Programs")
-                    .join(name)
+                PathBuf::from(localappdata)
+                    .join("Volta")
+                    .join("bin")
                     .join(format!("{name}.exe")),
             );
         }
-        if let Some(app_data) = std::env::var_os("APPDATA") {
-            paths.push(
-                PathBuf::from(&app_data)
-                    .join("npm")
-                    .join(format!("{name}.cmd")),
-            );
-            paths.push(
-                PathBuf::from(&app_data)
-                    .join("npm")
-                    .join(format!("{name}.exe")),
-            );
+
+        // Scoop — popular user-mode package manager. Shims live
+        // under `~\scoop\shims`.
+        if let Some(ref home) = userprofile {
+            for ext in ["cmd", "exe"] {
+                paths.push(
+                    PathBuf::from(home)
+                        .join("scoop")
+                        .join("shims")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
         }
+
+        // Chocolatey — system-wide package manager. Shims live in
+        // `%PROGRAMDATA%\chocolatey\bin`.
+        if let Some(ref pd) = program_data {
+            for ext in ["exe", "cmd"] {
+                paths.push(
+                    PathBuf::from(pd)
+                        .join("chocolatey")
+                        .join("bin")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
+        }
+
+        // bun — Bun's global bin dir. Some npm-installed tools end
+        // up here when the user's `npm` is bun-shimmed.
+        if let Some(ref home) = userprofile {
+            for ext in ["exe", "cmd"] {
+                paths.push(
+                    PathBuf::from(home)
+                        .join(".bun")
+                        .join("bin")
+                        .join(format!("{name}.{ext}")),
+                );
+            }
+        }
+
+        // Standard Program Files installations.
         paths.push(PathBuf::from(format!(
             "C:\\Program Files\\{name}\\{name}.exe"
         )));
         paths.push(PathBuf::from(format!(
             "C:\\Program Files (x86)\\{name}\\{name}.exe"
         )));
+
+        // Per-user Programs install dir (Tauri / Electron / npm
+        // user-mode apps).
+        if let Some(ref localappdata) = local_app_data {
+            paths.push(
+                PathBuf::from(localappdata)
+                    .join("Programs")
+                    .join(name)
+                    .join(format!("{name}.exe")),
+            );
+        }
     } else {
+        // POSIX hosts. Most version managers (nvm, fnm, mise, asdf)
+        // shim via PATH rather than fixed install paths, so the PATH
+        // walk above usually catches them. The entries below cover
+        // tools that DO drop a fixed file:
         if let Some(home) = std::env::var_os("HOME") {
+            // ~/.local/bin — pip user-installs, cargo install, npm
+            // with `--prefix=$HOME/.local`.
             paths.push(PathBuf::from(&home).join(".local").join("bin").join(name));
+            // ~/.bun/bin — Bun's global bin dir.
+            paths.push(PathBuf::from(&home).join(".bun").join("bin").join(name));
+            // ~/.volta/bin — Volta on POSIX.
+            paths.push(PathBuf::from(&home).join(".volta").join("bin").join(name));
+            // Custom npm prefix some setups use to avoid `sudo npm`.
+            paths.push(
+                PathBuf::from(&home)
+                    .join(".npm-global")
+                    .join("bin")
+                    .join(name),
+            );
         }
         paths.push(PathBuf::from(format!("/opt/homebrew/bin/{name}")));
         paths.push(PathBuf::from(format!("/usr/local/bin/{name}")));
@@ -193,5 +303,48 @@ mod tests {
             any_contains_copilot,
             "expected platform fallbacks to mention the binary name"
         );
+    }
+
+    /// Smoke test that each platform's fallback list mentions the
+    /// directories we actually care about — so a careless edit that
+    /// drops one of them gets caught at PR time. Done with substring
+    /// matches because the actual paths get joined with platform-
+    /// specific separators we don't want to recompute here.
+    #[test]
+    fn platform_fallbacks_cover_known_dirs() {
+        let fallbacks = platform_fallbacks("claude");
+        let combined: String = fallbacks
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if cfg!(windows) {
+            // The Windows-specific gaps the v0.2.19 / v0.2.20
+            // expansion was meant to close — Volta, Scoop,
+            // Chocolatey, user-local bin, Bun. If a refactor drops
+            // any of these, GUI-launched flowstate will start
+            // failing to find provider CLIs again.
+            for needle in [
+                "Volta",
+                "scoop",
+                "chocolatey",
+                ".local",
+                ".bun",
+                "npm",
+            ] {
+                assert!(
+                    combined.contains(needle),
+                    "expected Windows fallbacks to include `{needle}`; got:\n{combined}"
+                );
+            }
+        } else {
+            for needle in [".local", ".bun", ".volta", ".npm-global", "homebrew"] {
+                assert!(
+                    combined.contains(needle),
+                    "expected POSIX fallbacks to include `{needle}`; got:\n{combined}"
+                );
+            }
+        }
     }
 }
