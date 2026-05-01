@@ -3,6 +3,24 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Cross-platform program name for pnpm. On Windows the
+/// `pnpm/action-setup` (and most installers) place pnpm as
+/// `pnpm.cmd` in `node_modules/.bin/`. Rust's `Command::new` on
+/// Windows does NOT reliably resolve bare names through PATHEXT for
+/// `.cmd`/`.bat` shims (CreateProcessW only auto-appends `.exe`),
+/// so spawning bare "pnpm" fails with a "program not found" error
+/// even when pnpm is on PATH. Spelling the extension explicitly
+/// sidesteps the lookup ambiguity.
+fn pnpm_program() -> &'static str {
+    if cfg!(windows) { "pnpm.cmd" } else { "pnpm" }
+}
+
+/// Same Windows-shim caveat as `pnpm_program` — `npm` ships as
+/// `npm.cmd` on Windows runners.
+fn npm_program() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bridge_dir = PathBuf::from("bridge");
@@ -89,7 +107,7 @@ fn main() {
         // CLI flag (which beats env var precedence in pnpm) and
         // clear every env var pnpm/npm checks for production
         // signaling.
-        let install = Command::new("pnpm")
+        let install = Command::new(pnpm_program())
             .args(install_args)
             .arg("--prod=false")
             .env("NODE_ENV", "development")
@@ -141,7 +159,7 @@ fn main() {
             stamp file in `OUT_DIR/.pnpm-install-stamp`, then rebuild.",
         );
     }
-    let tsc_status = Command::new("pnpm")
+    let tsc_status = Command::new(pnpm_program())
         .args(["run", "build"])
         .env("NODE_ENV", "development")
         .current_dir(&bridge_dir)
@@ -388,7 +406,7 @@ fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
         return;
     }
 
-    let output = Command::new("npm")
+    let output = Command::new(npm_program())
         .args([
             "ci",
             "--omit=dev",
@@ -464,7 +482,7 @@ fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
 /// bridge. Failing the build here turns that mystery into a
 /// pointed actionable error.
 fn preflight_pnpm(provider: &str) {
-    let probe = Command::new("pnpm").arg("--version").output();
+    let probe = Command::new(pnpm_program()).arg("--version").output();
     match probe {
         Ok(out) if out.status.success() => {
             // pnpm exists on PATH — nothing to do. We deliberately

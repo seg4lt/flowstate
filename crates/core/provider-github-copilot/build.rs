@@ -6,6 +6,20 @@ use std::process::Command;
 // Copilot bridge build — mirror of provider-claude-sdk/build.rs.
 // Keep them in sync when changing staging semantics.
 
+/// Cross-platform program name for pnpm. Mirrors the helper in
+/// provider-claude-sdk/build.rs — keep in sync. On Windows pnpm is
+/// installed as `pnpm.cmd`, and Rust's `Command::new` doesn't
+/// auto-resolve `.cmd` shims through PATHEXT, so a bare "pnpm" panics
+/// with "program not found" even when pnpm is on PATH.
+fn pnpm_program() -> &'static str {
+    if cfg!(windows) { "pnpm.cmd" } else { "pnpm" }
+}
+
+/// Same Windows-shim caveat as `pnpm_program`.
+fn npm_program() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let bridge_dir = PathBuf::from("bridge");
@@ -70,7 +84,7 @@ fn main() {
         // See provider-claude-sdk/build.rs for rationale — force
         // dev install so devDependencies (typescript) actually land
         // in node_modules/.bin/.
-        let install = Command::new("pnpm")
+        let install = Command::new(pnpm_program())
             .args(install_args)
             .arg("--prod=false")
             .env("NODE_ENV", "development")
@@ -111,7 +125,7 @@ fn main() {
             the stamp file in `OUT_DIR/.pnpm-install-stamp`, then rebuild.",
         );
     }
-    let tsc_status = Command::new("pnpm")
+    let tsc_status = Command::new(pnpm_program())
         .args(["run", "build"])
         .env("NODE_ENV", "development")
         .current_dir(&bridge_dir)
@@ -350,7 +364,7 @@ fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
     // pre-flight matches what end-user `npm ci` will see — no
     // false-negatives from a different flag combination resolving
     // peer-deps differently.
-    let output = Command::new("npm")
+    let output = Command::new(npm_program())
         .args([
             "ci",
             "--omit=dev",
@@ -419,7 +433,7 @@ fn validate_lockfile_consistency(bridge_dir: &Path, provider: &str) {
 /// any install / build step. See that file's doc-comment for the
 /// full rationale.
 fn preflight_pnpm(provider: &str) {
-    let probe = Command::new("pnpm").arg("--version").output();
+    let probe = Command::new(pnpm_program()).arg("--version").output();
     match probe {
         Ok(out) if out.status.success() => {}
         Ok(out) => panic!(
