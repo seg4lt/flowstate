@@ -1010,7 +1010,7 @@ function ProviderRow({
       </div>
       {/* Upgrade always runs the CLI's own self-update command
           (`claude update`, `codex update`, `opencode upgrade`,
-          `gh extension upgrade …`). We don't pre-probe to decide
+          `npm i -g @github/copilot@latest`). We don't pre-probe to decide
           whether an upgrade is "needed" — those probes were either
           interactive (claude doctor) or unreliable across CLI
           versions. Just let the user click; the CLI tells them

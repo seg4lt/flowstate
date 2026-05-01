@@ -806,10 +806,7 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
                 authenticated: false,
                 version: None,
                 status: ProviderStatusLevel::Error,
-                message: Some(
-                    "Copilot CLI not found. Run: gh extension install github/gh-copilot"
-                        .to_string(),
-                ),
+                message: Some("Copilot CLI not found on PATH".to_string()),
                 models: copilot_cli_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
@@ -916,15 +913,13 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
         } else {
             (
                 ProviderStatusLevel::Warning,
-                Some(format!(
-                    "{label} is installed but not authenticated. Run: gh auth login"
-                )),
+                Some(format!("{label} is installed but not authenticated")),
             )
         };
 
         // No update-available probe: keeps health() fast. The
-        // Upgrade button in Settings runs `gh extension upgrade
-        // github/gh-copilot` unconditionally when clicked.
+        // Upgrade button in Settings runs `npm install -g
+        // @github/copilot@latest` unconditionally when clicked.
 
         ProviderStatus {
             kind,
@@ -941,22 +936,28 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     }
 
     async fn upgrade(&self) -> Result<String, String> {
-        // The copilot CLI ships as a `gh` extension; the canonical
-        // upgrade path is `gh extension upgrade github/gh-copilot`.
-        let mut gh_cmd =
-            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("gh"));
-        zenui_provider_api::hide_console_window_tokio(&mut gh_cmd);
-        gh_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
-        let output = gh_cmd
-            .args(["extension", "upgrade", "github/gh-copilot"])
+        // The standalone `copilot` CLI ships as the npm package
+        // `@github/copilot`. Re-running the global install with
+        // `@latest` picks up the newest published version (npm
+        // resolves the dist-tag and replaces the symlink shim in
+        // `~/.npm-global` / `%APPDATA%\npm`). `resolve_cli_command`
+        // handles Windows `.cmd` shim resolution; without it, bare
+        // `npm` fails to spawn on Windows runners (same root cause
+        // as the build.rs fix in v0.2.29).
+        let mut npm_cmd =
+            tokio::process::Command::new(zenui_provider_api::resolve_cli_command("npm"));
+        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        npm_cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+        let output = npm_cmd
+            .args(["install", "-g", "@github/copilot@latest"])
             .output()
             .await
-            .map_err(|err| format!("failed to invoke gh: {err}"))?;
+            .map_err(|err| format!("failed to invoke npm: {err}"))?;
         if output.status.success() {
             Ok("GitHub Copilot CLI upgraded.".to_string())
         } else {
             Err(format!(
-                "gh extension upgrade failed: {}",
+                "npm install -g @github/copilot@latest failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ))
         }

@@ -26,7 +26,7 @@ transport, or daemon crate.
 - **[`provider-github-copilot/`](./provider-github-copilot/README.md)** —
   GitHub Copilot via the SDK (TypeScript bridge).
 - **[`provider-github-copilot-cli/`](./provider-github-copilot-cli/README.md)**
-  — GitHub Copilot via the `gh copilot` CLI.
+  — GitHub Copilot via the standalone `copilot` CLI.
 
 ## Why providers live in `core` and not `middleman`
 

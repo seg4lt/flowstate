@@ -342,10 +342,10 @@ pub trait ProviderAdapter: Send + Sync {
     async fn shutdown(&self) {}
 
     /// Run the per-provider CLI upgrade flow (e.g. `npm install -g
-    /// @anthropic-ai/claude-code@latest` for the Claude CLI; `gh
-    /// extension upgrade github/gh-copilot` for Copilot CLI). Called
-    /// in response to the user clicking "Upgrade" in the Settings
-    /// provider row.
+    /// @anthropic-ai/claude-code@latest` for the Claude CLI;
+    /// `npm install -g @github/copilot@latest` for the Copilot CLI).
+    /// Called in response to the user clicking "Upgrade" in the
+    /// Settings provider row.
     ///
     /// The default impl returns a friendly "no upgrade flow" message
     /// so adapters that have no native upgrade path (the embedded

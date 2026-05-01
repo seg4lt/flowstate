@@ -664,17 +664,15 @@ impl ProviderAdapter for GitHubCopilotAdapter {
             };
         }
 
-        let copilot_paths = [
-            "/opt/homebrew/bin/copilot",
-            "/usr/local/bin/copilot",
-            "/home/linuxbrew/.linuxbrew/bin/copilot",
-        ];
-
-        let copilot_found = copilot_paths
-            .iter()
-            .find(|p| std::path::Path::new(p).exists());
-
-        match copilot_found {
+        // The Copilot SDK bridge spawns `@github/copilot-sdk` which
+        // in turn drives the standalone `copilot` CLI as a subprocess
+        // (see bridge/src/index.ts:362 — `useStdio: true, cliPath`).
+        // So health depends on locating that binary. Reuse the
+        // shared cross-platform resolver — it walks `$PATH` (with
+        // `PATHEXT` on Windows) and falls back through npm globals,
+        // `%APPDATA%\npm`, `~/.local/bin`, Homebrew dirs, etc. The
+        // sibling `-cli` crate already uses the same helper.
+        match zenui_provider_api::find_cli_binary("copilot") {
             Some(path) => ProviderStatus {
                 kind,
                 label: label.to_string(),
@@ -682,7 +680,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 authenticated: true,
                 version: None,
                 status: ProviderStatusLevel::Ready,
-                message: Some(format!("Copilot SDK ready (found at {})", path)),
+                message: Some(format!("Copilot SDK ready (found at {})", path.display())),
                 models: copilot_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
@@ -694,10 +692,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
                 authenticated: false,
                 version: None,
                 status: ProviderStatusLevel::Warning,
-                message: Some(
-                    "Copilot CLI not found. Run: gh extension install github/gh-copilot"
-                        .to_string(),
-                ),
+                message: Some("Copilot CLI not found on PATH".to_string()),
                 models: copilot_models(),
                 enabled: true,
                 features: zenui_provider_api::ProviderFeatures::default(),
