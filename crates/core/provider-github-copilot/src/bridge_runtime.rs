@@ -337,6 +337,7 @@ fn hydrate_node_modules(cache_root: &Path) -> Result<()> {
     let started = std::time::Instant::now();
 
     let mut cmd = Command::new(&npm_path);
+    zenui_provider_api::hide_console_window_std(&mut cmd);
     cmd.arg(install_subcommand)
         .arg("--omit=dev")
         .arg("--no-audit")

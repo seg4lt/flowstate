@@ -19,6 +19,7 @@ mod adapter;
 mod binary_resolver;
 pub mod capabilities;
 pub mod process_group;
+pub mod windows_console;
 
 /// Current wire schema version.
 ///
@@ -69,6 +70,7 @@ pub use orchestration_ipc::{OrchestrationIpcHandle, OrchestrationIpcInfo};
 pub use probe::{ProbeCliOptions, UpdateCheckOutcome, probe_cli, probe_update_check};
 pub use process_cache::{ActivityGuard, CachedProcess, ProcessCache};
 pub use process_group::ProcessGroup;
+pub use windows_console::{hide_console_window_std, hide_console_window_tokio};
 pub use types::*;
 pub use user_mcp::{McpSnapshot, RESERVED_FLOWSTATE_KEY, UserMcpRegistry};
 

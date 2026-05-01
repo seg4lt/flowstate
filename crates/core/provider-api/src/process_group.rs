@@ -125,7 +125,19 @@ impl ProcessGroup {
     /// Configure `cmd` so the spawned child enters its own process
     /// group / Job Object. Call **before** `cmd.spawn()`. After spawn,
     /// call [`Self::attach`] with the resulting [`Child`].
+    ///
+    /// On Windows the helper also sets `CREATE_NO_WINDOW` on the
+    /// child's creation flags via
+    /// [`crate::hide_console_window_tokio`], so every provider-
+    /// adapter spawn (the only callers of `ProcessGroup`) doesn't
+    /// flash a cmd window on launch. Inherited by descendants the
+    /// child itself spawns (npm forks, MCP proxies, etc.), which
+    /// silences the whole subtree without per-grandchild fixes.
     pub fn before_spawn(cmd: &mut Command) -> Self {
+        // Apply on every platform so the call site has uniform
+        // behavior; the helper is a no-op on non-Windows.
+        crate::windows_console::hide_console_window_tokio(cmd);
+
         #[cfg(unix)]
         {
             // SAFETY: `setpgid(0, 0)` is async-signal-safe per

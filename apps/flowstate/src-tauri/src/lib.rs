@@ -282,8 +282,20 @@ async fn get_git_branch(path: String) -> Option<String> {
         .flatten()
 }
 
+/// `Command::new("git")` with `CREATE_NO_WINDOW` already applied so
+/// the synchronous git probes scattered through the Tauri command
+/// surface (branch detection, worktree listing, diff, etc.) don't
+/// flash a cmd window on Windows GUI launches. No-op on non-Windows.
+/// Tiny helper because every git spawn in this file would otherwise
+/// need the same two-line dance.
+fn git_cmd() -> Command {
+    let mut c = Command::new("git");
+    zenui_provider_api::hide_console_window_std(&mut c);
+    c
+}
+
 fn get_git_branch_sync(path: String) -> Option<String> {
-    let output = Command::new("git")
+    let output = git_cmd()
         .args(["-C", &path, "rev-parse", "--abbrev-ref", "HEAD"])
         .output()
         .ok()?;
@@ -323,7 +335,7 @@ async fn list_git_branches(path: String) -> Result<GitBranchList, String> {
 }
 
 fn list_git_branches_sync(path: String) -> Result<GitBranchList, String> {
-    let output = Command::new("git")
+    let output = git_cmd()
         .args([
             "-C",
             &path,
@@ -416,7 +428,7 @@ fn git_create_branch(path: String, branch: String) -> Result<(), String> {
     if branch.trim().is_empty() {
         return Err("empty branch name".into());
     }
-    let output = Command::new("git")
+    let output = git_cmd()
         .args(["-C", &path, "checkout", "-b", &branch])
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
@@ -445,7 +457,7 @@ fn git_delete_branch(path: String, branch: String) -> Result<(), String> {
     if branch.trim().is_empty() {
         return Err("empty branch name".into());
     }
-    let output = Command::new("git")
+    let output = git_cmd()
         .args(["-C", &path, "branch", "-D", &branch])
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
@@ -521,6 +533,7 @@ fn remove_git_worktree(
         return Err("empty worktree path".into());
     }
     let mut cmd = Command::new("git");
+    zenui_provider_api::hide_console_window_std(&mut cmd);
     cmd.args(["-C", &project_path, "worktree", "remove"]);
     if force {
         cmd.arg("--force");
@@ -559,6 +572,7 @@ fn git_checkout(path: String, branch: String, create_track: Option<String>) -> R
         return Err("empty branch name".into());
     }
     let mut cmd = Command::new("git");
+    zenui_provider_api::hide_console_window_std(&mut cmd);
     cmd.args(["-C", &path, "checkout"]);
     match &create_track {
         Some(remote_ref) => {
@@ -624,7 +638,7 @@ fn read_file_capped(abs: &Path) -> String {
 }
 
 fn git_show_head(repo: &str, file: &str) -> String {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = git_cmd()
         .args(["-C", repo, "show", &format!("HEAD:{file}")])
         .output()
     else {
@@ -684,7 +698,7 @@ fn get_git_diff_summary_sync(path: String) -> Vec<GitFileSummary> {
 /// Binary files report `-` for both counts; we treat as 0/0.
 fn run_git_diff_numstat(path: &str) -> Vec<GitFileSummary> {
     let mut entries: Vec<GitFileSummary> = Vec::new();
-    let Ok(output) = Command::new("git")
+    let Ok(output) = git_cmd()
         .args(["-C", path, "diff", "HEAD", "--numstat", "-z"])
         .output()
     else {
@@ -743,7 +757,7 @@ fn run_git_diff_numstat(path: &str) -> Vec<GitFileSummary> {
 /// lines ourselves.
 fn run_git_ls_files_others(project_path: &Path, path: &str) -> Vec<GitFileSummary> {
     let mut entries: Vec<GitFileSummary> = Vec::new();
-    let Ok(output) = Command::new("git")
+    let Ok(output) = git_cmd()
         .args([
             "-C",
             path,
@@ -910,7 +924,7 @@ fn count_file_lines_bounded(abs: &Path) -> u32 {
 /// in v1 porcelain: `<XY> <new>\0<old>\0` — we use the new path and
 /// skip the old one.
 fn collect_git_status_files(project_path: &Path, path: &str) -> Vec<GitFileSummary> {
-    let Ok(output) = Command::new("git")
+    let Ok(output) = git_cmd()
         .args([
             "-C",
             path,
@@ -999,7 +1013,7 @@ fn run_watch_diff(
     // Phase 2: stream numstat. Piped stdout + read_until(b'\0') so
     // each record surfaces as soon as git's buffer flushes, rather
     // than at the end of the whole run.
-    let child = Command::new("git")
+    let child = git_cmd()
         .args(["-C", path, "diff", "HEAD", "--numstat", "-z"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1439,7 +1453,9 @@ fn open_in_editor(editor: String, path: String) -> Result<(), String> {
     if !project_path.is_dir() {
         return Err(format!("not a directory: {path}"));
     }
-    let mut child = Command::new(trimmed)
+    let mut editor_cmd = Command::new(trimmed);
+    zenui_provider_api::hide_console_window_std(&mut editor_cmd);
+    let mut child = editor_cmd
         .arg(".")
         .current_dir(project_path)
         .spawn()

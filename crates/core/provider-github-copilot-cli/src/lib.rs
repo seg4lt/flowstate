@@ -971,7 +971,9 @@ impl ProviderAdapter for GitHubCopilotCliAdapter {
     async fn upgrade(&self) -> Result<String, String> {
         // The copilot CLI ships as a `gh` extension; the canonical
         // upgrade path is `gh extension upgrade github/gh-copilot`.
-        let output = tokio::process::Command::new("gh")
+        let mut gh_cmd = tokio::process::Command::new("gh");
+        zenui_provider_api::hide_console_window_tokio(&mut gh_cmd);
+        let output = gh_cmd
             .args(["extension", "upgrade", "github/gh-copilot"])
             .output()
             .await

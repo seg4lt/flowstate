@@ -369,7 +369,9 @@ impl ProviderAdapter for CodexAdapter {
     async fn upgrade(&self) -> Result<String, String> {
         // Codex distributes as `@openai/codex` on npm. Reinstall the
         // latest tag globally — npm overwrites in place.
-        let output = tokio::process::Command::new("npm")
+        let mut npm_cmd = tokio::process::Command::new("npm");
+        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        let output = npm_cmd
             .args(["install", "-g", "@openai/codex@latest"])
             .output()
             .await

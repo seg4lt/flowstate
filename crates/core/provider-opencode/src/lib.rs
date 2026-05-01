@@ -979,7 +979,9 @@ impl ProviderAdapter for OpenCodeAdapter {
         // configured per-workspace via `opencode auth login`, not
         // globally). The server itself is the real authentication
         // proof, so we try to start it next.
-        let version = match tokio::process::Command::new(&binary)
+        let mut version_cmd = tokio::process::Command::new(&binary);
+        zenui_provider_api::hide_console_window_tokio(&mut version_cmd);
+        let version = match version_cmd
             .arg("--version")
             .output()
             .await
@@ -1167,7 +1169,9 @@ impl ProviderAdapter for OpenCodeAdapter {
         // single distribution channel that works on every platform
         // (`brew` only covers macOS, the curl installer doesn't
         // self-update). Reinstall the latest tag globally.
-        let output = tokio::process::Command::new("npm")
+        let mut npm_cmd = tokio::process::Command::new("npm");
+        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        let output = npm_cmd
             .args(["install", "-g", "opencode-ai@latest"])
             .output()
             .await

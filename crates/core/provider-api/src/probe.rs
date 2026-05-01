@@ -61,7 +61,9 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
     } = options;
     let label = kind.label().to_string();
 
-    let version_output = Command::new(binary).args(version_args).output().await;
+    let mut version_cmd = Command::new(binary);
+    crate::hide_console_window_tokio(&mut version_cmd);
+    let version_output = version_cmd.args(version_args).output().await;
     let version_output = match version_output {
         Ok(out) => out,
         Err(error) => {
@@ -89,7 +91,9 @@ pub async fn probe_cli(options: ProbeCliOptions<'_>) -> ProviderStatus {
     let version = first_non_empty_line(&version_output.stdout)
         .or_else(|| first_non_empty_line(&version_output.stderr));
 
-    match Command::new(binary).args(auth_args).output().await {
+    let mut auth_cmd = Command::new(binary);
+    crate::hide_console_window_tokio(&mut auth_cmd);
+    match auth_cmd.args(auth_args).output().await {
         Ok(auth_output) => {
             let authenticated = auth_output.status.success();
             let message = if authenticated {
@@ -192,8 +196,9 @@ pub async fn probe_update_check(
     binary: &str,
     args: &[&str],
 ) -> Option<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
-    Command::new(binary)
-        .args(args)
+    let mut cmd = Command::new(binary);
+    crate::hide_console_window_tokio(&mut cmd);
+    cmd.args(args)
         .output()
         .await
         .ok()

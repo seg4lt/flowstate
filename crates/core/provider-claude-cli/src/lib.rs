@@ -1060,7 +1060,9 @@ impl ProviderAdapter for ClaudeCliAdapter {
         // Claude CLI is published as `@anthropic-ai/claude-code` on
         // npm. Run a synchronous global install of the latest tag —
         // npm overwrites the existing global binary in place.
-        let output = tokio::process::Command::new("npm")
+        let mut npm_cmd = tokio::process::Command::new("npm");
+        zenui_provider_api::hide_console_window_tokio(&mut npm_cmd);
+        let output = npm_cmd
             .args([
                 "install",
                 "-g",

@@ -18,6 +18,8 @@
 
 use std::process::Command;
 
+use zenui_provider_api::hide_console_window_std;
+
 use serde::{Deserialize, Serialize};
 
 /// One entry in `git worktree list --porcelain`. Serialised to the
@@ -37,7 +39,9 @@ pub struct GitWorktree {
 /// Used by the worktree list to canonicalize paths reported under a
 /// `.git/` dir (submodule gitdirs) back to the actual working tree.
 pub fn resolve_git_root_sync(path: &str) -> Option<String> {
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    hide_console_window_std(&mut cmd);
+    let output = cmd
         .args(["-C", path, "rev-parse", "--show-toplevel"])
         .output()
         .ok()?;
@@ -64,7 +68,9 @@ fn resolve_worktree_path(path: &str) -> String {
 /// Ignores `bare` records (no working tree to show) and strips
 /// `refs/heads/` so the UI can render branch names directly.
 pub fn list_git_worktrees_sync(path: String) -> Result<Vec<GitWorktree>, String> {
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    hide_console_window_std(&mut cmd);
+    let output = cmd
         .args(["-C", &path, "worktree", "list", "--porcelain"])
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
@@ -172,13 +178,15 @@ pub fn create_git_worktree_internal(
         return Err("empty worktree path".into());
     }
     let output = if checkout_existing {
-        Command::new("git")
-            .args(["-C", project_path, "worktree", "add", worktree_path, branch])
+        let mut cmd = Command::new("git");
+        hide_console_window_std(&mut cmd);
+        cmd.args(["-C", project_path, "worktree", "add", worktree_path, branch])
             .output()
             .map_err(|e| format!("failed to run git: {e}"))?
     } else {
-        Command::new("git")
-            .args([
+        let mut cmd = Command::new("git");
+        hide_console_window_std(&mut cmd);
+        cmd.args([
                 "-C",
                 project_path,
                 "worktree",
