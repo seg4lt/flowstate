@@ -186,6 +186,16 @@ pub enum RuntimeEvent {
         mode: MemoryRecallMode,
         memories: Vec<MemoryRecallItem>,
     },
+    /// Provider auto-generated a ~30-char label for a recent batch
+    /// of tool calls (Claude Code's `tool_use_summary` SDK message).
+    /// Frontend uses `call_ids` to fold the referenced `ToolCall`
+    /// blocks under a single collapsible labeled header.
+    ToolUseSummary {
+        session_id: String,
+        turn_id: String,
+        summary: String,
+        call_ids: Vec<String>,
+    },
     /// Turn-phase transition. Drives the working-indicator's
     /// secondary label. Runtime-core forwards these verbatim from
     /// the provider; it does not synthesize phases on its own, so

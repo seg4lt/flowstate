@@ -2649,6 +2649,22 @@ impl RuntimeCore {
                         memories,
                     });
                 }
+                ProviderTurnEvent::ToolUseSummary { summary, call_ids } => {
+                    // Append the label to the turn's block stream.
+                    // The frontend walks the blocks looking for the
+                    // matching ToolCall blocks via `call_ids` and
+                    // collapses them under a labeled header.
+                    blocks.push(ContentBlock::ToolUseSummary {
+                        summary: summary.clone(),
+                        call_ids: call_ids.clone(),
+                    });
+                    self.publish(RuntimeEvent::ToolUseSummary {
+                        session_id: sid.clone(),
+                        turn_id: tid.clone(),
+                        summary,
+                        call_ids,
+                    });
+                }
                 ProviderTurnEvent::StatusChanged { phase } => {
                     // Pass-through. Working-indicator reads the
                     // latest phase from chat-view's local state;

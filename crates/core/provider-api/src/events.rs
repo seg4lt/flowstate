@@ -144,6 +144,22 @@ pub enum ProviderTurnEvent {
         mode: MemoryRecallMode,
         memories: Vec<MemoryRecallItem>,
     },
+    /// Auto-generated short label (~30 chars, "git-commit-subject"
+    /// style) the provider produced for a recent batch of tool
+    /// calls. Designed for compact / mobile views that collapse a
+    /// stretch of tool rows under one labeled header. The provider
+    /// runs its own internal LLM call to produce this — no consumer
+    /// action is required.
+    ///
+    /// Currently emitted by Claude Code's SDK as
+    /// `SDKToolUseSummaryMessage`. Runtime-core appends a
+    /// `ContentBlock::ToolUseSummary` to the current turn's block
+    /// stream so the frontend can group the matching tool-call
+    /// rows under the label.
+    ToolUseSummary {
+        summary: String,
+        call_ids: Vec<String>,
+    },
     /// Coarse-grained turn-phase signal. Providers emit this when
     /// they enter / exit a non-streaming phase (waiting on the API
     /// to start responding, compressing history). Drives the

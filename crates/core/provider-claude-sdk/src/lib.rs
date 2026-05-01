@@ -715,6 +715,7 @@ impl ClaudeSdkAdapter {
                     model,
                     elapsed_time_seconds: _elapsed_time_seconds,
                     occurred_at,
+                    call_ids,
                 } => {
                     // Log every non-delta stream event so "stuck"
                     // bugs are diagnosable from the log alone: if the
@@ -821,6 +822,25 @@ impl ClaudeSdkAdapter {
                                         .send(ProviderTurnEvent::ModelResolved { model: m })
                                         .await;
                                 }
+                            }
+                        }
+                        "tool_use_summary" => {
+                            // Auto-generated ~30-char label from
+                            // claude-code's internal LLM call. Forward
+                            // as a turn event; runtime-core converts
+                            // to a ContentBlock::ToolUseSummary
+                            // attached to the current turn so the
+                            // frontend can collapse the referenced
+                            // tool calls under one labeled header.
+                            let label = summary.clone().unwrap_or_default();
+                            let ids = call_ids.clone().unwrap_or_default();
+                            if !label.is_empty() && !ids.is_empty() {
+                                events
+                                    .send(ProviderTurnEvent::ToolUseSummary {
+                                        summary: label,
+                                        call_ids: ids,
+                                    })
+                                    .await;
                             }
                         }
                         "compact_boundary" => {

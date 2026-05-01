@@ -1647,6 +1647,40 @@ class ClaudeBridge {
         }
         return null;
       }
+      case 'tool_use_summary': {
+        // Auto-generated, ~30-character "git-commit-subject" label
+        // claude-code itself produces (via an internal LLM call with
+        // `querySource: tool_use_summary_generation`) for a recent
+        // batch of tool calls. Designed for mobile / compact views
+        // that collapse a stretch of tool rows under one labeled
+        // header. We forward both the label and the list of
+        // referenced tool_use_ids so the runtime can attach the
+        // summary to the matching ToolCall blocks.
+        //
+        // Shape (sdk.d.ts:3473):
+        //   { type, summary, preceding_tool_use_ids, uuid, session_id }
+        const tus = msg as {
+          summary?: string;
+          preceding_tool_use_ids?: string[];
+        };
+        const summary = (tus.summary ?? '').trim();
+        const callIds = Array.isArray(tus.preceding_tool_use_ids)
+          ? tus.preceding_tool_use_ids.filter(
+              (id) => typeof id === 'string' && id.length > 0,
+            )
+          : [];
+        // Drop entirely if the model produced an empty label or no
+        // tool_use_ids — both fields are load-bearing on the consumer
+        // side and an empty summary would render as a blank chip.
+        if (summary.length > 0 && callIds.length > 0) {
+          writeStream({
+            event: 'tool_use_summary',
+            summary,
+            call_ids: callIds,
+          });
+        }
+        return null;
+      }
       case 'tool_progress': {
         // Heartbeat for an in-flight tool call. The SDK emits these
         // periodically while a tool is running (Bash watching stdout,

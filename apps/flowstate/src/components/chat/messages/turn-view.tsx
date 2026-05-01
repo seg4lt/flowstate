@@ -31,6 +31,16 @@ type RenderBlock =
       callIds: string[];
       parentCallId: string | undefined;
       key: string;
+      /** Optional auto-generated label (~30 chars, "git-commit-
+       *  subject" style) the provider produced for this batch of
+       *  tool calls. When present the group renders collapsed-by-
+       *  default with the label as the clickable header — mobile-
+       *  density gain on long tool-heavy turns. Set during a
+       *  second pass after the walking grouping logic, by matching
+       *  any of a `ContentBlock::ToolUseSummary` block's
+       *  `callIds` against the group's. Null = no auto-summary,
+       *  group renders as before with overflow-only collapse. */
+      summary?: string;
     }
   | {
       kind: "compact";
@@ -202,7 +212,32 @@ function groupBlocks(
         key: `memrecall-${idx}`,
       });
     }
+    // tool_use_summary blocks are NOT emitted as their own visual
+    // item — they get consumed in the second pass below and
+    // attached to the matching tool_call_group as its summary
+    // header. Falling through silently here is intentional.
   });
+
+  // Second pass: walk the original block list once more and
+  // attach each `tool_use_summary`'s text to the tool_call_group
+  // whose callIds intersect. Most calls land in exactly one
+  // group; if a summary's callIds span groups (rare — would mean
+  // the provider summarized across a text/reasoning gap), we
+  // attach to the first match to avoid duplicating the label.
+  for (const block of blocks) {
+    if (block.kind !== "tool_use_summary") continue;
+    const targetIds = new Set(block.callIds);
+    if (targetIds.size === 0 || !block.summary) continue;
+    for (const item of result) {
+      if (item.kind !== "tool_call_group") continue;
+      if (item.summary) continue; // already labeled — first wins
+      if (item.callIds.some((id) => targetIds.has(id))) {
+        item.summary = block.summary;
+        break;
+      }
+    }
+  }
+
   return result;
 }
 
@@ -211,6 +246,7 @@ function ToolCallGroup({
   parentCallId,
   callsById,
   subagentsByParent,
+  summary,
 }: {
   callIds: string[];
   parentCallId: string | undefined;
@@ -219,8 +255,17 @@ function ToolCallGroup({
    *  dispatcher's call id (== `parentCallId`). Used to surface the
    *  per-subagent model in the box header. */
   subagentsByParent: Map<string, SubagentRecord>;
+  /** Auto-generated ~30-char label for the batch (Claude SDK's
+   *  `tool_use_summary`). When present, the group renders
+   *  collapsed-by-default with this string as the clickable
+   *  header — mobile-density gain on tool-heavy turns. */
+  summary?: string;
 }) {
-  const [expanded, setExpanded] = React.useState(false);
+  // When the provider supplied a batch label, default-collapse;
+  // user can click the label to expand. Without a label, we keep
+  // the existing behavior (visible by default, overflow-only
+  // collapse for very long batches).
+  const [expanded, setExpanded] = React.useState(summary == null);
 
   const calls = React.useMemo(() => {
     const out: ToolCall[] = [];
@@ -367,13 +412,30 @@ function ToolCallGroup({
     );
   }
 
+  // When the provider supplied an auto-summary, default the
+  // group to collapsed so the label is the dominant visual — the
+  // whole point of `tool_use_summary` is mobile-density on tool-
+  // heavy turns. Without a summary, keep the historical
+  // behavior (open by default).
   return (
     <details
-      open
+      open={summary == null ? true : undefined}
       className="rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-xs"
     >
       <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
-        Tools <span className="text-muted-foreground/60">· {calls.length}</span>
+        {summary ? (
+          <span className="flex items-center gap-1.5">
+            <span className="font-medium text-foreground">{summary}</span>
+            <span className="text-muted-foreground/60">
+              · {calls.length} {calls.length === 1 ? "tool" : "tools"}
+            </span>
+          </span>
+        ) : (
+          <>
+            Tools{" "}
+            <span className="text-muted-foreground/60">· {calls.length}</span>
+          </>
+        )}
       </summary>
       <div className="mt-1.5">{body}</div>
     </details>
@@ -525,6 +587,7 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
                 parentCallId={block.parentCallId}
                 callsById={callsById}
                 subagentsByParent={subagentsByParent}
+                summary={block.summary}
               />
             );
           case "compact":

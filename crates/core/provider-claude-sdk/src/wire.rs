@@ -456,6 +456,13 @@ pub(crate) enum BridgeResponse {
         /// can compare against wall time.
         #[serde(default)]
         occurred_at: Option<String>,
+        /// Populated on `tool_use_summary` events. The list of
+        /// `tool_use_id`s the auto-generated label covers — used by
+        /// the runtime to attach the summary to the matching
+        /// ToolCall blocks. The summary text itself rides on the
+        /// existing `summary` field above.
+        #[serde(default)]
+        call_ids: Option<Vec<String>>,
     },
 }
 

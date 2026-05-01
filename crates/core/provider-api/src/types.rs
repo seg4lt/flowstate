@@ -546,6 +546,20 @@ pub enum ContentBlock {
         mode: MemoryRecallMode,
         memories: Vec<MemoryRecallItem>,
     },
+    /// Auto-generated short label (~30 chars, "git-commit-subject"
+    /// style) the provider produced for a recent batch of tool
+    /// calls. The frontend uses this to collapse the referenced
+    /// `ToolCall` blocks under one labeled header — mobile-style
+    /// density on tool-heavy turns.
+    ///
+    /// `call_ids` references the `ToolCall.call_id`s the label
+    /// covers (in order). Currently emitted by Claude Code's SDK
+    /// only.
+    ToolUseSummary {
+        summary: String,
+        #[serde(rename = "callIds")]
+        call_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
