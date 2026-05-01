@@ -78,6 +78,7 @@ import {
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
 import { ShortcutsDialog } from "@/lib/keyboard";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
+import { useEditorPrefs } from "@/hooks/use-editor-prefs";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useCheckpointSettings } from "@/hooks/useCheckpointSettings";
 import { visibleEffortOptions } from "@/components/chat/effort-selector";
@@ -154,6 +155,34 @@ function ContextDisplayRow() {
         checked={showContextDisplay}
         onCheckedChange={setShowContextDisplay}
         aria-label="Show context size display"
+      />
+    </div>
+  );
+}
+
+// Vim mode is an app-wide preference (one boolean per user, persisted
+// in localStorage and broadcast through `useEditorPrefs`'s module
+// singleton). It used to live as a toolbar button in the code view,
+// but since flipping it always affected every editor anyway, the
+// toggle now lives here in Settings — one source of truth, no
+// per-pane chrome to maintain. `useEditorPrefs()` with no sessionId
+// is correct: the optional argument is only used for the per-session
+// gitMode flag, which we don't read in this row.
+function VimModeRow() {
+  const { vimEnabled, setVimEnabled } = useEditorPrefs();
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Vim mode</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Enable vim keybindings in the code viewer.
+        </div>
+      </div>
+      <Switch
+        checked={vimEnabled}
+        onCheckedChange={setVimEnabled}
+        aria-label="Toggle vim mode"
       />
     </div>
   );
@@ -1851,6 +1880,7 @@ export function SettingsView() {
           >
             <ThemeRow />
             <ContextDisplayRow />
+            <VimModeRow />
           </SettingsGroup>
           <SettingsGroup
             title="Keyboard shortcuts"

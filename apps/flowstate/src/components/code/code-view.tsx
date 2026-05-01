@@ -397,7 +397,6 @@ export function CodeView(props: CodeViewProps) {
   // CodeEditor.
   const {
     vimEnabled,
-    setVimEnabled,
     gitModeEnabled,
     setGitModeEnabled,
   } = useEditorPrefs(sessionId);
@@ -1222,21 +1221,6 @@ export function CodeView(props: CodeViewProps) {
           >
             <span className="font-mono text-[10px] uppercase tracking-wide">
               git {gitModeEnabled ? "on" : "off"}
-            </span>
-          </Button>
-          <Button
-            variant={vimEnabled ? "secondary" : "ghost"}
-            size="xs"
-            onClick={() => setVimEnabled(!vimEnabled)}
-            title={
-              vimEnabled
-                ? "Vim mode is ON — click to disable"
-                : "Vim mode is OFF — click to enable"
-            }
-            aria-pressed={vimEnabled}
-          >
-            <span className="font-mono text-[10px] uppercase tracking-wide">
-              vim {vimEnabled ? "on" : "off"}
             </span>
           </Button>
           {/* Embedded-only: panel-level fullscreen + close. Mirrors

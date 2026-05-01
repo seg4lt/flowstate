@@ -35,9 +35,16 @@ import { sessionTransient } from "@/stores/session-transient-store";
 //                     Default: false. Per-session — flipping it on one
 //                     thread does NOT affect any other thread.
 //
-// We deliberately don't use the existing settings store yet — the
-// editor only owns these booleans and there's no value in roundtripping
-// through SQLite for a localStorage-class concern. If the editor grows
+// `vimEnabled` is surfaced to the user in the Settings page
+// (Appearance group) — see `VimModeRow` in
+// `components/settings/settings-view.tsx`. It used to also live as a
+// per-editor toolbar button, but since flipping it always affected
+// every editor through the singleton below, the toolbar copy was
+// removed in favour of one source of truth in Settings.
+//
+// We deliberately keep this on localStorage rather than the SQLite
+// settings store — it's a UI-only client preference, no value in
+// roundtripping through Tauri IPC for a boolean. If the editor grows
 // more prefs (font size, indent width, ...), fold them into a proper
 // store at that point.
 
