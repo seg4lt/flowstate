@@ -42,6 +42,7 @@ import {
   readDefaultModel,
   readDefaultProvider,
 } from "@/lib/defaults-settings";
+import { deriveAutoTitle } from "@/lib/auto-title";
 import { useNavigate } from "@tanstack/react-router";
 
 /** Single permission prompt awaiting the user's answer. */
@@ -1489,6 +1490,51 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
             projectId: message.event.project_id,
             display: null,
           });
+        } else if (message.event.type === "turn_started") {
+          // Auto-title the very first turn of a session, mirroring
+          // `chat-view.tsx::handleSend`'s pre-send title set. The
+          // human-driven path already titled the session in the
+          // composer (sub-frame, no daemon round-trip), so this
+          // branch is a no-op for those — the `!display?.title`
+          // guard short-circuits. Where this branch actually pulls
+          // its weight is MCP-spawned threads: `spawn_peer_turn` in
+          // runtime-core calls `send_turn` directly without ever
+          // touching the composer, so without this hook the new
+          // thread's sidebar row would render empty until manually
+          // renamed.
+          //
+          // Reading turnCount via `stateRef.current.sessions` is
+          // safe: `turn_started`'s reducer arm doesn't mutate
+          // turnCount (the daemon broadcasts the incremented value
+          // later via `turn_completed`), so the pre-turn count is
+          // still 0 here on the very first turn.
+          const sid = message.event.session_id;
+          const session = stateRef.current.sessions.get(sid);
+          const display = stateRef.current.sessionDisplay.get(sid);
+          if (session && session.turnCount === 0 && !display?.title) {
+            const auto = deriveAutoTitle(message.event.turn.input ?? "");
+            if (auto.length > 0) {
+              const newDisplay: SessionDisplay = {
+                title: auto,
+                lastTurnPreview: display?.lastTurnPreview ?? null,
+              };
+              setSessionDisplay(sid, newDisplay)
+                .then(() => {
+                  dispatchRef.current({
+                    type: "set_session_display",
+                    sessionId: sid,
+                    display: newDisplay,
+                  });
+                })
+                .catch((err) => {
+                  console.debug(
+                    "[app-store] auto-title failed for spawned session",
+                    sid,
+                    err,
+                  );
+                });
+            }
+          }
         } else if (message.event.type === "project_created") {
           // Backend-initiated creates (e.g. an agent used a worktree
           // tool — see WorktreeProvisionerImpl in src-tauri) don't go

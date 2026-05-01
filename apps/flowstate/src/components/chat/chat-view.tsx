@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { cn } from "@/lib/utils";
 import { isMacOS, isPopoutWindow } from "@/lib/popout";
+import { deriveAutoTitle } from "@/lib/auto-title";
 import {
   TOGGLE_CONTEXT_EVENT,
   TOGGLE_DIFF_EVENT,
@@ -1387,17 +1388,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // First-turn auto-title. Mirrors what the SDK's orchestration layer
     // used to do before display metadata moved app-side; see the zenui
     // reference in rs-agent-sdk/apps/zenui/frontend/src/state/appStore.ts.
+    // Truncation rule lives in `@/lib/auto-title` so MCP-spawned
+    // threads (which never reach this handler) can use the same rule
+    // from the app-store's `turn_started` side-effect handler.
     const existingDisplay = state.sessionDisplay.get(sessionId);
     if (
       session &&
       session.turnCount === 0 &&
       !existingDisplay?.title
     ) {
-      const autoTitle = input
-        .split(/\s+/)
-        .filter(Boolean)
-        .slice(0, 10)
-        .join(" ");
+      const autoTitle = deriveAutoTitle(input);
       if (autoTitle.length > 0) {
         void renameSession(sessionId, autoTitle);
       }
