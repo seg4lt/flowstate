@@ -5,6 +5,12 @@
 // basename hits beat directory-prefix hits, consecutive matches beat
 // scattered ones, and word-boundary anchors beat mid-word hits.
 //
+// On top of the subsequence scorer we run an **acronym pre-pass**
+// (IntelliJ / Zed style): if the query is a prefix of the word-initials
+// of the basename — `fnsc` → `FooNameStrategyController.ts` — we short-
+// circuit with a score that dominates any subsequence hit. The
+// fall-through preserves all the old "tbsv → tabs-view.tsx" behavior.
+//
 // We deliberately don't pull in `fuzzysort` or `fuse.js`: the whole
 // matcher is ~80 lines, runs in <2 ms over 100k paths in dev tests,
 // and avoids ~12 KB gzipped of dependency. Score weights tuned so
@@ -39,6 +45,18 @@ interface FuzzyConfig {
   /** Penalty per gap character between matches. Keeps long
    *  spread-out matches (`abc` → `aXXXbXXXc`) below tight ones. */
   gapPenalty: number;
+  /** Per-query-char score when the query is a prefix of the basename's
+   *  word-initials (e.g. `fnsc` → `FooNameStrategyController.ts`).
+   *  Multiplied by query length so longer acronym matches beat shorter
+   *  ones AND so even a 2-char acronym (`fb` → `FooBar.ts` ⇒ 4000) sits
+   *  comfortably above the densest realistic subsequence hit (~250 for
+   *  a 4-char fully-consecutive basename-prefix match). */
+  acronymBasenameBonus: number;
+  /** Same idea, but for the full-path initials when the basename's
+   *  initials don't cover the query (e.g. `cclf` →
+   *  `components/code/lib/fuzzy-utils.ts`). Half the basename weight
+   *  so a basename acronym hit always outranks a path acronym hit. */
+  acronymPathBonus: number;
 }
 
 const DEFAULT_CONFIG: FuzzyConfig = {
@@ -47,6 +65,8 @@ const DEFAULT_CONFIG: FuzzyConfig = {
   basenameBonus: 8,
   basenamePrefixBonus: 40,
   gapPenalty: 1,
+  acronymBasenameBonus: 2000,
+  acronymPathBonus: 1000,
 };
 
 /** Word-boundary detector. A position `i` is a boundary when the
@@ -62,6 +82,42 @@ function isBoundary(path: string, i: number): boolean {
   const cur = path.charCodeAt(i);
   if (prev >= 97 && prev <= 122 && cur >= 65 && cur <= 90) return true;
   return false;
+}
+
+/** Concatenate the lowercase first character of every word in
+ *  `path[start..end)`, where "word start" is exactly what `isBoundary`
+ *  recognises. Used by the acronym pre-pass — keeping this in lockstep
+ *  with `isBoundary` is intentional so the docs ("typing FNSC matches
+ *  FooNameStrategyController") stay honest as the boundary rules
+ *  evolve. ASCII fast path mirrors the main scoring loop; non-ASCII
+ *  falls back to `String#toLowerCase()` for that one char only. */
+function acronymInitials(path: string, start: number, end: number): string {
+  let out = "";
+  for (let i = start; i < end; i++) {
+    if (!isBoundary(path, i)) continue;
+    const pc = path.charCodeAt(i);
+    let pcLower: number;
+    if (pc < 128) {
+      pcLower = pc >= 65 && pc <= 90 ? pc + 32 : pc;
+    } else {
+      pcLower = path[i]!.toLowerCase().charCodeAt(0);
+    }
+    // Skip pure separators that only appear because the *previous*
+    // char was a separator — `isBoundary` says position 0 is a
+    // boundary, but if path starts with `/` we don't want `/` itself
+    // in the initials. Same for any other non-letter/digit boundary.
+    if (
+      pcLower === 47 ||
+      pcLower === 95 ||
+      pcLower === 45 ||
+      pcLower === 46 ||
+      pcLower === 32
+    ) {
+      continue;
+    }
+    out += String.fromCharCode(pcLower);
+  }
+  return out;
 }
 
 /** Compute a fuzzy score for `query` against `path` (case-insensitive
@@ -83,6 +139,29 @@ export function fuzzyScore(
 
   const slash = path.lastIndexOf("/");
   const basenameStart = slash >= 0 ? slash + 1 : 0;
+
+  // Acronym pre-pass (IntelliJ / Zed style). Only kicks in for queries
+  // long enough to be informative — single-char "acronyms" would tie
+  // together every file whose basename starts with that letter. The
+  // returned score scales with `qlen` so longer acronym matches beat
+  // shorter ones, and the constants are large enough that any acronym
+  // hit dominates the densest realistic subsequence hit on the same
+  // path (see `acronymBasenameBonus` doc above for the math).
+  if (qlen >= FUZZY_MIN_QUERY_LEN) {
+    const basenameInitials = acronymInitials(path, basenameStart, plen);
+    if (basenameInitials.startsWith(queryLower)) {
+      return config.acronymBasenameBonus * qlen;
+    }
+    // Path-level initials only when there's a directory prefix to
+    // contribute extra letters; otherwise we'd be repeating the
+    // basename check we just did.
+    if (basenameStart > 0) {
+      const pathInitials = acronymInitials(path, 0, plen);
+      if (pathInitials.startsWith(queryLower)) {
+        return config.acronymPathBonus * qlen;
+      }
+    }
+  }
 
   let score = 0;
   let qi = 0;

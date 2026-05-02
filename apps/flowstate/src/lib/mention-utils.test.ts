@@ -96,6 +96,20 @@ describe("rankFileMatches", () => {
   it("drops non-matches", () => {
     expect(rankFileMatches(files, "zzzzzz")).toEqual([]);
   });
+
+  it("ranks a CamelCase acronym hit first in fuzzy mode", () => {
+    // Regression guard for the IntelliJ/Zed-style acronym pre-pass in
+    // `lib/fuzzy.ts`. Without it the `fnsc-` literal file scores higher
+    // than the camel-cased file because `fnsc` appears as a contiguous
+    // substring there.
+    const input = [
+      "src/fnsc-config.ts",
+      "src/foo/FooNameStrategyController.ts",
+      "src/unrelated.ts",
+    ];
+    const result = rankFileMatches(input, "fnsc", 5, "fuzzy");
+    expect(result[0]).toBe("src/foo/FooNameStrategyController.ts");
+  });
 });
 
 describe("applyMentionPick", () => {
