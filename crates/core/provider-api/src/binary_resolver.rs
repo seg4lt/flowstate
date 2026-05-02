@@ -265,7 +265,15 @@ fn executable_extensions() -> Vec<String> {
             .collect();
         // Always include the bare name so `copilot` itself is checked
         // even on Windows (e.g. for shim scripts without an extension).
-        exts.insert(0, String::new());
+        //
+        // CRITICAL: push at the END, never insert at position 0. npm
+        // installs `copilot` (a bare POSIX `#!/bin/sh` script — not
+        // spawnable on Windows; CreateProcess fails with os error 193)
+        // alongside `copilot.cmd` and `copilot.ps1` in %APPDATA%\npm.
+        // If '' wins the race, the SDK's JSON-RPC pipe collapses with
+        // "Cannot call write after a stream was destroyed" and flowstate
+        // falls back to its hardcoded default model list.
+        exts.push(String::new());
         exts
     } else {
         vec![String::new()]
@@ -555,6 +563,38 @@ mod tests {
         // be missed.
         let exts = executable_extensions();
         assert!(exts.contains(&String::new()));
+    }
+
+    #[test]
+    fn windows_extensions_try_pathext_before_bare_name() {
+        // Regression guard for the npm-shim trap. `npm i -g
+        // @github/copilot` drops three sibling files in
+        // %APPDATA%\npm: a bare-name `copilot` that's actually a
+        // POSIX `#!/bin/sh` script (CreateProcess on Windows fails
+        // with os error 193 — "not a valid Win32 application"), plus
+        // `copilot.cmd` (the real Windows shim) and `copilot.ps1`.
+        // If the resolver tries the empty extension before PATHEXT
+        // entries, the bare POSIX script wins, the spawned bridge
+        // dies immediately, the SDK's JSON-RPC pipe collapses with
+        // "Cannot call write after a stream was destroyed", and
+        // flowstate silently falls back to its hardcoded default
+        // model list. Keep '' at the END of the list.
+        let exts = executable_extensions();
+        if cfg!(windows) {
+            assert!(
+                exts.first().map(|s| !s.is_empty()).unwrap_or(false),
+                "expected a real PATHEXT entry first, got {exts:?}"
+            );
+            assert_eq!(
+                exts.last(),
+                Some(&String::new()),
+                "bare-name fallback must be tried last on Windows, got {exts:?}"
+            );
+        } else {
+            // POSIX has no PATHEXT — the only entry is the empty
+            // string, so the ordering question is vacuous.
+            assert_eq!(exts, vec![String::new()]);
+        }
     }
 
     #[test]

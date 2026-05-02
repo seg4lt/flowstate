@@ -145,8 +145,17 @@ function resolveBinaryOnPath(
     : [''];
   // Always include the bare name on every platform, in case the user
   // installed a shim script without an extension on Windows.
+  //
+  // CRITICAL: append, do NOT prepend. npm installs three sibling files
+  // for `copilot` in %APPDATA%\npm: a bare-name POSIX `#!/bin/sh` script
+  // (unspawnable on Windows — CreateProcess fails with os error 193),
+  // plus `copilot.cmd` (the Windows shim we want) and `copilot.ps1`.
+  // Prepending '' makes the bare POSIX script win on Windows; the SDK's
+  // JSON-RPC stream then dies with "Cannot call write after a stream was
+  // destroyed" and flowstate falls back to its hardcoded model list.
+  // PATHEXT entries must be tried first so `.cmd` resolves before ''.
   if (!exeExtensions.includes('')) {
-    exeExtensions.unshift('');
+    exeExtensions.push('');
   }
 
   const pathEntries = (process.env.PATH ?? '')
