@@ -20,12 +20,21 @@ jobs:
             target: aarch64-apple-darwin
             tauri-args: --target aarch64-apple-darwin
             bundle-subpath: aarch64-apple-darwin/release/bundle
+            # Default cargo behavior on darwin (no static CRT — that's
+            # a Windows-MSVC concept). Empty string preserves whatever
+            # toolchain default would apply.
+            rustflags: ""
 
           - name: windows-x64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
             tauri-args: ""
             bundle-subpath: release/bundle
+            # Static MSVC C/C++ runtime — see the Build step's
+            # RUSTFLAGS comment for the full rationale (no
+            # `vcruntime140.dll`, `msvcp140.dll`, or UCRT shim
+            # dependency on the user's machine).
+            rustflags: "-C target-feature=+crt-static"
 
           # - name: linux-x64
           #   runner: ubuntu-22.04
@@ -101,6 +110,14 @@ jobs:
       # step by OS.
       - name: Build flow CLI
         shell: bash
+        env:
+          # Same static-CRT treatment as the main app build below —
+          # otherwise on Windows `flow.exe` would dynamically link
+          # `vcruntime140.dll` / `msvcp140.dll` while `flowstate.exe`
+          # statically links them, producing an inconsistent bundle
+          # where the sidecar fails to launch on a fresh Windows
+          # install. Empty / unset on non-Windows.
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --target ${{ matrix.target }} -p flow
 
       # Stage flow.exe as a Tauri externalBin sidecar so the NSIS /
@@ -147,6 +164,24 @@ jobs:
           # `cfg(target_os = "windows")`), so this env var is a
           # harmless no-op on non-Windows runners.
           WEBVIEW2_STATIC: "1"
+          # Statically link the MSVC C/C++ runtime on Windows so
+          # `flowstate.exe` does not depend on `vcruntime140.dll`,
+          # `msvcp140.dll`, or any of the `api-ms-win-crt-*` /
+          # `ucrtbase.dll` UCRT shims at load time. By default, Rust's
+          # x86_64-pc-windows-msvc target dynamic-links the CRT, which
+          # works on machines that already have the Visual C++
+          # Redistributable installed (typically pre-installed on
+          # modern Windows via Windows Update or a previously-installed
+          # MSVC-linked app) but breaks with `The code execution cannot
+          # proceed because vcruntime140.dll was not found` on a fresh
+          # / older Windows install. `+crt-static` flips Rust's link
+          # line to use `libcmt.lib` instead of `msvcrt.lib`, embedding
+          # the runtime into the binary — slightly larger exe, no
+          # external CRT dependency. Empty / unset on non-Windows
+          # runners (matrix.rustflags below); RUSTFLAGS replaces (not
+          # appends to) any default, so leaving it unset preserves
+          # cargo's default behavior elsewhere.
+          RUSTFLAGS: ${{ matrix.rustflags }}
         # `env -u CI`: fff-search 0.5.2's build.rs hard-panics
         # whenever the `CI` env var is set (gate is
         # `env::var("CI").is_ok()`, so "false" / "" all trip it)
