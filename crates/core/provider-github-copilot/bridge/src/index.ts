@@ -13,8 +13,8 @@ import {
 } from '@github/copilot-sdk';
 import { createInterface } from 'readline';
 import { randomUUID } from 'crypto';
-import { existsSync } from 'fs';
-import { delimiter as pathDelimiter, join as joinPath } from 'path';
+import { existsSync, readFileSync } from 'fs';
+import { delimiter as pathDelimiter, dirname, join as joinPath } from 'path';
 import { homedir } from 'os';
 
 /**
@@ -75,6 +75,71 @@ function resolveBinaryOnPath(
   return null;
 }
 
+/**
+ * Windows-only escape hatch around CVE-2024-27980.
+ *
+ * `npm install -g @github/copilot` lays down `copilot.cmd` as the
+ * Windows shim alongside `node_modules/@github/copilot/`. Since
+ * Node 16.17 / 20+, `child_process.spawn` refuses to launch
+ * `.bat`/`.cmd` files unless `shell: true` is passed. The Copilot
+ * SDK's stdio path calls bare `spawn(cliPath, args, { ... })` (see
+ * @github/copilot-sdk/dist/client.js around its `isJsFile` check),
+ * so handing it a `.cmd` produces an immediate `spawn EINVAL` and
+ * the bridge dies before sending its `ready` signal — which
+ * surfaces in the host as the cryptic "Bridge process closed
+ * stdout" error.
+ *
+ * The SDK *does* have a working path: when `cliPath.endsWith('.js')`
+ * it spawns `node <cliPath>` directly. So instead of handing it the
+ * `.cmd` shim, we resolve through the npm-global layout to the
+ * package's `bin` JS entry and pass that. The SDK's JS branch then
+ * runs the same bytes the `.cmd` would have run, just via the Node
+ * we're already inside of.
+ *
+ * Returns the resolved JS path or null if any step fails (missing
+ * package, malformed package.json, bin entry doesn't exist on disk).
+ * The caller falls back to the original shim path on null and the
+ * spawn will surface its own error — better than silently doing
+ * the wrong thing.
+ */
+function resolveJsEntryUnderWindowsShim(shimPath: string): string | null {
+  if (process.platform !== 'win32') return null;
+  const lower = shimPath.toLowerCase();
+  if (!lower.endsWith('.cmd') && !lower.endsWith('.bat')) return null;
+
+  // npm global layout: `<dir>/copilot.cmd` lives next to
+  // `<dir>/node_modules/@github/copilot/`. Read the package's
+  // package.json `bin` field to find the JS entry — works for
+  // any future package layout the upstream might ship.
+  const dir = dirname(shimPath);
+  const pkgRoot = joinPath(dir, 'node_modules', '@github', 'copilot');
+  const pkgJsonPath = joinPath(pkgRoot, 'package.json');
+  let pkg: { bin?: string | Record<string, string>; main?: string };
+  try {
+    if (!existsSync(pkgJsonPath)) return null;
+    pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf8'));
+  } catch {
+    return null;
+  }
+
+  // `bin` can be either a string (single entry; key is the package
+  // name) or a map. We only care about the `copilot` mapping; if
+  // that's missing, fall back to `main` since some packages ship a
+  // single executable as `main`.
+  let rel: string | undefined;
+  if (typeof pkg.bin === 'string') {
+    rel = pkg.bin;
+  } else if (pkg.bin && typeof pkg.bin === 'object') {
+    rel = pkg.bin.copilot ?? Object.values(pkg.bin)[0];
+  }
+  rel = rel ?? pkg.main;
+  if (!rel) return null;
+
+  const jsPath = joinPath(pkgRoot, rel);
+  if (!existsSync(jsPath)) return null;
+  return jsPath;
+}
+
 function resolveCopilotBinary(): string | null {
   const home = homedir();
   const fallbackPaths: string[] =
@@ -91,7 +156,21 @@ function resolveCopilotBinary(): string | null {
           '/home/linuxbrew/.linuxbrew/bin/copilot',
           '/usr/bin/copilot',
         ];
-  return resolveBinaryOnPath('copilot', fallbackPaths);
+  const found = resolveBinaryOnPath('copilot', fallbackPaths);
+  if (!found) return null;
+
+  // Windows-only: rewrite `.cmd` shims to the underlying JS so the
+  // SDK takes its `isJsFile` spawn branch (CVE-2024-27980 prevents
+  // `child_process.spawn` from launching `.cmd` directly). See
+  // `resolveJsEntryUnderWindowsShim` for the full rationale.
+  const jsAlt = resolveJsEntryUnderWindowsShim(found);
+  if (jsAlt) {
+    console.error(
+      `[bridge] Resolved Windows .cmd shim to JS entry to bypass spawn-EINVAL: ${jsAlt}`,
+    );
+    return jsAlt;
+  }
+  return found;
 }
 
 // ZenUI protocol types

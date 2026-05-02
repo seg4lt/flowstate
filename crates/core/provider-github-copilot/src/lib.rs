@@ -115,6 +115,24 @@ impl GitHubCopilotAdapter {
         info!("Using bridge at: {}", bridge.script.display());
         info!("Using embedded node at: {}", node.node_bin.display());
 
+        // Surface the resolved standalone `copilot` CLI path so the
+        // logs answer the recurring "is it the bundled bridge or my
+        // local install?" question. The bundled bit is the bridge
+        // script + embedded Node above; the bridge then drives a
+        // SEPARATE local `copilot` CLI as a subprocess (the SDK
+        // construct `new CopilotClient({ useStdio: true, cliPath })`
+        // — see bridge/src/index.ts:362). Auth state lives in that
+        // CLI's own user-config dir, NOT in the bundled bridge, so
+        // signing in once via `copilot` propagates to flowstate but
+        // not vice-versa.
+        match zenui_provider_api::find_cli_binary("copilot") {
+            Some(path) => info!("Using local copilot CLI at: {}", path.display()),
+            None => info!(
+                "No local copilot CLI found on PATH — bridge will fail on start. \
+                Install `@github/copilot` (`npm i -g @github/copilot`) and authenticate via `/login`."
+            ),
+        }
+
         // Put the embedded node on PATH so the Copilot SDK's internal
         // `node` subprocess calls resolve to the same runtime; also
         // weave in the user's configured extra search dirs so any
@@ -166,13 +184,34 @@ impl GitHubCopilotAdapter {
             .take()
             .ok_or_else(|| "Bridge stdout unavailable".to_string())?;
 
+        // Buffer the last N stderr lines so a fatal-on-startup bridge
+        // (e.g. `[bridge] Fatal error: ...` from `main().catch`) can
+        // attach context to the "Bridge process closed stdout" error
+        // we'd otherwise raise blind. Also stream every line through
+        // tracing so they show up in the user's log file in real time.
+        // No `target:` override — earlier code used a dashed target
+        // (`provider-github-copilot`) which the default `EnvFilter`
+        // (which keys on the underscored crate name) silently dropped,
+        // so fatal bridge errors were invisible. Logging under the
+        // module path makes them obey the same filter as everything
+        // else in this crate.
+        let stderr_buf: Arc<Mutex<std::collections::VecDeque<String>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(32)));
         if let Some(stderr) = child.stderr.take() {
+            let buf = Arc::clone(&stderr_buf);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if !line.trim().is_empty() {
-                        info!(target: "provider-github-copilot", "{}", line);
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
                     }
+                    info!("bridge stderr: {trimmed}");
+                    let mut guard = buf.lock().await;
+                    if guard.len() == 32 {
+                        guard.pop_front();
+                    }
+                    guard.push_back(trimmed.to_string());
                 }
             });
         }
@@ -196,7 +235,37 @@ impl GitHubCopilotAdapter {
                 return Err(format!("Expected ready signal, got: {:?}", other));
             }
             Ok(Err(e)) => {
-                return Err(format!("Failed to read ready signal: {e}"));
+                // Bridge died (or otherwise hosed stdout) before
+                // emitting `ready`. Reap the child to get an exit code
+                // and drain the buffered stderr; both make the failure
+                // diagnosable instead of just "stdout closed".
+                let exit_status = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    process.child.wait(),
+                )
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "still running".to_string());
+                let tail = {
+                    let guard = stderr_buf.lock().await;
+                    guard
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                if tail.is_empty() {
+                    return Err(format!(
+                        "Failed to read ready signal: {e} (bridge exit: {exit_status}). \
+                        No stderr captured — try `npm i -g @github/copilot` and `copilot` → `/login` if not yet installed/authenticated."
+                    ));
+                }
+                return Err(format!(
+                    "Failed to read ready signal: {e} (bridge exit: {exit_status}; \
+                    last stderr: {tail})"
+                ));
             }
             Err(_) => {
                 return Err("Timeout waiting for bridge ready signal".to_string());
