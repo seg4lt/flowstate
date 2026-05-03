@@ -1,4 +1,5 @@
 import type { UsageAgentGroupRow } from "@/lib/api";
+import { CACHE_TOKEN_TOOLTIP } from "@/components/chat/context-display";
 
 // Main-vs-Subagents rollup table. Two rows: one for the parent
 // agent ("Main"), one aggregating every Task/Agent subagent
@@ -113,13 +114,13 @@ export function UsageAgentRoleTable({
                 </th>
                 <th
                   className="px-3 py-2 text-right font-medium"
-                  title="Tokens served from the prompt cache (~0.1× input rate)."
+                  title={`Tokens served from the prompt cache (~0.1× input rate). ${CACHE_TOKEN_TOOLTIP}`}
                 >
                   Cache R
                 </th>
                 <th
                   className="px-3 py-2 text-right font-medium"
-                  title="Tokens written to the prompt cache (~1.25× input rate)."
+                  title={`Tokens written to the prompt cache (~1.25× input rate). ${CACHE_TOKEN_TOOLTIP}`}
                 >
                   Cache W
                 </th>

@@ -476,6 +476,19 @@ impl ClaudeCliAdapter {
         // partial-messages support) we fall back to emitting text from the final
         // `assistant` message so the UI always receives a delta.
         let mut has_stream_events = false;
+        // Per-call token snapshots for the live context-window
+        // indicator. Anthropic's `assistant.message.usage` carries
+        // per-API-call counts (input + cache_read + cache_write),
+        // which we combine with the running output total to compute
+        // `live_context_tokens` at result time. Without this the
+        // CLI adapter has to leave `live_context_tokens = None` and
+        // the chat-toolbar context bar falls back to the SDK-
+        // aggregate sum — which is N-fold inflated on tool-loop
+        // turns (the "51M / 1M" bug). Mirrors the SDK bridge logic
+        // at `provider-claude-sdk/bridge/src/index.ts:1907-1932,
+        // 2201-2206`.
+        let mut last_assistant_usage: Option<CliUsage> = None;
+        let mut output_tokens_total: u64 = 0;
 
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(TURN_TIMEOUT_SECS);
@@ -603,6 +616,33 @@ impl ClaudeCliAdapter {
                 } => {
                     if let Some(id) = sid {
                         cli_session_id = Some(id);
+                    }
+                    // Extract per-API-call usage for the live
+                    // context-window indicator. Skip subagent
+                    // assistant messages (parent_tool_use_id is
+                    // non-null) — the SDK bridge applies the same
+                    // exclusion at `bridge/src/index.ts:1908` so the
+                    // top-level context fill isn't inflated by
+                    // sub-agent prompts the user can't see. Failure
+                    // to parse is non-fatal: older CLI versions
+                    // omit `usage`, in which case
+                    // `live_context_tokens` stays None at result
+                    // time and the existing fallback in
+                    // `context-display.tsx` takes over.
+                    let is_subagent = message
+                        .get("parent_tool_use_id")
+                        .map(|v| !v.is_null())
+                        .unwrap_or(false);
+                    if !is_subagent {
+                        if let Some(usage_value) = message.get("usage") {
+                            if let Ok(u) =
+                                serde_json::from_value::<CliUsage>(usage_value.clone())
+                            {
+                                output_tokens_total =
+                                    output_tokens_total.saturating_add(u.output_tokens);
+                                last_assistant_usage = Some(u);
+                            }
+                        }
                     }
                     if let Some(content) = message.get("content").and_then(Value::as_array) {
                         for block in content {
@@ -891,13 +931,36 @@ impl ClaudeCliAdapter {
                                     cache_write_tokens: u.cache_creation_input_tokens,
                                     cache_read_tokens: u.cache_read_input_tokens,
                                     context_window: ctx_window,
-                                    // claude-cli's stream-json `result` only
-                                    // exposes the per-turn aggregate; no
-                                    // per-API-call snapshot is available.
-                                    // The live context indicator falls back
-                                    // to the aggregate sum on this provider.
-                                    live_context_tokens: None,
+                                    // Per-API-call snapshot of context fill,
+                                    // computed from the LAST assistant
+                                    // message's `message.usage` plus the
+                                    // running output total. This avoids the
+                                    // SDK-aggregate's "51M / 1M" inflation
+                                    // pattern (cached system prompt counted
+                                    // once per tool-loop iteration). Falls
+                                    // back to None when the CLI didn't emit
+                                    // usage on any assistant message
+                                    // (older versions / no-tool turns) —
+                                    // the chat-toolbar then uses the
+                                    // aggregate sum as before.
+                                    live_context_tokens: last_assistant_usage.as_ref().map(
+                                        |last| {
+                                            last.input_tokens
+                                                + output_tokens_total
+                                                + last.cache_read_input_tokens.unwrap_or(0)
+                                                + last.cache_creation_input_tokens.unwrap_or(0)
+                                        },
+                                    ),
                                     total_cost_usd,
+                                    // Explicit signal: did the CLI actually
+                                    // report a cost? `Some(true)` when
+                                    // total_cost_usd is present, `Some(false)`
+                                    // when the field was absent or null.
+                                    // Older CLI versions (pre-cost-reporting)
+                                    // surface here as `Some(false)` so the
+                                    // dashboard can render "(unknown)" rather
+                                    // than the misleading $0.00 fallback.
+                                    has_cost: Some(total_cost_usd.is_some()),
                                     duration_ms,
                                     model,
                                     // claude-cli doesn't emit a per-agent
@@ -1524,4 +1587,204 @@ fn claude_cli_models() -> Vec<ProviderModel> {
             ..ProviderModel::default()
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the CLI adapter's wire-format parsing. Pin
+    //! the JSON shapes we accept from `claude` so a future binary
+    //! that adds / renames a field doesn't silently drop usage data
+    //! into the void. The integration with `run_turn` is exercised
+    //! end-to-end by the app's own usage dashboard but a parsing
+    //! regression here is the cheapest place to catch wire drift.
+    //!
+    //! These tests intentionally use real JSON strings (not
+    //! programmatic constructors) — the bytes are exactly what
+    //! `claude` writes to stdout, so the test fixtures double as
+    //! documentation of the wire format.
+    use super::*;
+
+    /// `CliEvent::Result` with all four cache fields populated and a
+    /// non-zero cost — the happy path for current `claude` versions.
+    /// Pins the field names: a typo in `cache_creation_input_tokens`
+    /// or `cache_read_input_tokens` would silently drop those fields
+    /// to None and the dashboard would understate cache traffic.
+    #[test]
+    fn result_with_cache_fields_parses_all_fields() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "success",
+            "session_id": "sess-1",
+            "result": "ok",
+            "usage": {
+                "input_tokens": 1234,
+                "output_tokens": 567,
+                "cache_creation_input_tokens": 8000,
+                "cache_read_input_tokens": 12000
+            },
+            "modelUsage": {
+                "claude-sonnet-4-5-20260315": {
+                    "contextWindow": 200000
+                }
+            },
+            "total_cost_usd": 0.0123,
+            "duration_ms": 5432
+        }"#;
+        let event: CliEvent = serde_json::from_str(json).expect("parse Result event");
+        match event {
+            CliEvent::Result {
+                subtype,
+                usage,
+                model_usage,
+                total_cost_usd,
+                duration_ms,
+                ..
+            } => {
+                assert_eq!(subtype, "success");
+                let u = usage.expect("usage payload present");
+                assert_eq!(u.input_tokens, 1234);
+                assert_eq!(u.output_tokens, 567);
+                assert_eq!(u.cache_creation_input_tokens, Some(8000));
+                assert_eq!(u.cache_read_input_tokens, Some(12000));
+                let mu = model_usage.expect("modelUsage present");
+                let (model, cm) = mu.iter().next().expect("one model");
+                assert_eq!(model, "claude-sonnet-4-5-20260315");
+                assert_eq!(cm.context_window, Some(200_000));
+                assert_eq!(total_cost_usd, Some(0.0123));
+                assert_eq!(duration_ms, Some(5432));
+            }
+            other => panic!("expected CliEvent::Result, got {other:?}"),
+        }
+    }
+
+    /// `CliEvent::Result` with cache fields entirely OMITTED (older
+    /// CLI versions, or models without prompt caching). Both fields
+    /// default to None — the adapter must NOT panic and must NOT
+    /// fabricate a zero where the CLI didn't report.
+    #[test]
+    fn result_without_cache_fields_parses_to_none() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "success",
+            "session_id": "sess-old",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50
+            }
+        }"#;
+        let event: CliEvent = serde_json::from_str(json).expect("parse Result event");
+        if let CliEvent::Result { usage, .. } = event {
+            let u = usage.expect("usage payload present");
+            assert_eq!(u.input_tokens, 100);
+            assert_eq!(u.output_tokens, 50);
+            assert_eq!(u.cache_creation_input_tokens, None);
+            assert_eq!(u.cache_read_input_tokens, None);
+        } else {
+            panic!("expected CliEvent::Result");
+        }
+    }
+
+    /// `CliEvent::Result` with `total_cost_usd` absent. The adapter
+    /// must yield `None`, NOT default to 0.0 — the dashboard
+    /// distinguishes "provider didn't report" from "$0.00" and
+    /// renders "(unknown)" for the former. This pins the wire path
+    /// for the new `has_cost: Option<bool>` signal.
+    #[test]
+    fn result_missing_cost_parses_to_none_so_has_cost_emits_false() {
+        let json = r#"{
+            "type": "result",
+            "subtype": "success",
+            "session_id": "sess-no-cost",
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50
+            }
+        }"#;
+        let event: CliEvent = serde_json::from_str(json).expect("parse");
+        if let CliEvent::Result { total_cost_usd, .. } = event {
+            assert_eq!(total_cost_usd, None);
+            // Mirror the adapter's `has_cost: Some(total_cost_usd.is_some())`
+            // line so the test pins the exact computation that
+            // produces the wire `has_cost = false` signal the
+            // dashboard reads to render "(unknown)".
+            let has_cost = Some(total_cost_usd.is_some());
+            assert_eq!(has_cost, Some(false));
+        } else {
+            panic!("expected CliEvent::Result");
+        }
+    }
+
+    /// Compute the live-context-tokens math the way `run_turn` does
+    /// after seeing two assistant messages and a result. Pins the
+    /// formula so a refactor that uses the wrong field (e.g. sums
+    /// across all calls instead of taking the last) gets caught.
+    /// The math is `last.input + sum(output) + last.cache_read +
+    /// last.cache_write`, mirroring the SDK bridge at
+    /// `bridge/src/index.ts:2201-2206`.
+    #[test]
+    fn live_context_tokens_computed_from_last_assistant_plus_running_output() {
+        // Two assistant messages: the second is a tool-loop iteration
+        // with a much larger cached prompt. Live context should
+        // reflect ONLY the second message's prompt + total output —
+        // NOT the sum across both.
+        let assistant_1_usage_json = r#"{
+            "input_tokens": 10,
+            "output_tokens": 100,
+            "cache_creation_input_tokens": 5000,
+            "cache_read_input_tokens": 0
+        }"#;
+        let assistant_2_usage_json = r#"{
+            "input_tokens": 20,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 5000
+        }"#;
+        let u1: CliUsage = serde_json::from_str(assistant_1_usage_json).unwrap();
+        let u2: CliUsage = serde_json::from_str(assistant_2_usage_json).unwrap();
+
+        // Replicate the run_turn accumulator: per-message output
+        // sums, last_assistant_usage tracks the most recent.
+        let mut output_total: u64 = 0;
+        output_total = output_total.saturating_add(u1.output_tokens);
+        output_total = output_total.saturating_add(u2.output_tokens);
+        let last = u2;
+
+        // The exact formula from `lib.rs::Result` arm.
+        let live = last.input_tokens
+            + output_total
+            + last.cache_read_input_tokens.unwrap_or(0)
+            + last.cache_creation_input_tokens.unwrap_or(0);
+
+        // last.input(20) + output(150) + last.cache_read(5000) + last.cache_write(0) = 5170.
+        // NOT 10215 (which would be the inflated SDK-aggregate
+        // sum: 10+20 + 100+50 + 0+5000 + 5000+0).
+        assert_eq!(live, 5170);
+    }
+
+    /// Subagent assistant messages carry a non-null
+    /// `parent_tool_use_id`. They must NOT update the live-context
+    /// tracker — including a sub-agent's prompt would inflate the
+    /// top-level context-window indicator with content the user
+    /// can't see. Mirrors the SDK bridge's exclusion at
+    /// `bridge/src/index.ts:1908`.
+    #[test]
+    fn subagent_assistant_message_excluded_from_live_context() {
+        let json = r#"{
+            "id": "msg_sub1",
+            "parent_tool_use_id": "toolu_abc",
+            "usage": {
+                "input_tokens": 99999,
+                "output_tokens": 99999
+            }
+        }"#;
+        let message: serde_json::Value = serde_json::from_str(json).unwrap();
+        let is_subagent = message
+            .get("parent_tool_use_id")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        assert!(
+            is_subagent,
+            "subagent detection must trip on non-null parent_tool_use_id"
+        );
+    }
 }

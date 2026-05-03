@@ -290,7 +290,10 @@ export function UsageKpiCards({ totals, modelGroups }: UsageKpiCardsProps) {
 
       <Card
         title="Cache read"
-        titleHint="Tokens served from the prompt cache, billed at ~0.1× the input rate. This is where steady-state agent traffic lives — the bigger this is, the less you pay per turn."
+        titleHint={
+          "Tokens served from the prompt cache, billed at ~0.1× the input rate. This is where steady-state agent traffic lives — the bigger this is, the less you pay per turn.\n\n" +
+          "Honesty note: on multi-step tool loops this number is summed across every API call in the turn — the same cached prompt is counted once per iteration. It reconciles with cost (matches total_cost_usd's scope) but reads as inflated if interpreted as 'unique tokens served from cache.' For the per-call snapshot of context fill, see the chat-toolbar context-window indicator."
+        }
       >
         <div className="text-2xl font-semibold tabular-nums">
           {formatCompact(totals.cacheReadTokens)}

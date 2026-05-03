@@ -140,6 +140,15 @@ pub struct UsageSummaryPayload {
     pub by_provider: Vec<UsageGroupRow>,
     pub groups: Vec<UsageGroupRow>,
     pub generated_at: String,
+    /// Date the per-token rate table used for per-agent cost
+    /// allocation was last verified against anthropic.com/pricing.
+    /// Surfaced verbatim in the dashboard footer with a "verify
+    /// current rates" link so users can sanity-check that the
+    /// allocations they see haven't drifted from current pricing.
+    /// Always equals `PRICING_TABLE_DATE` — carried in the payload
+    /// rather than read from a frontend constant so the date can't
+    /// drift between the frontend bundle and the backend rate table.
+    pub pricing_table_date: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,7 +291,15 @@ impl UsageEvent {
     /// subscriber in `lib.rs`.
     pub fn from_turn(session: &SessionSummary, turn: &TurnRecord) -> Self {
         let usage: Option<&TokenUsage> = turn.usage.as_ref();
-        let has_cost = usage.map(|u| u.total_cost_usd.is_some()).unwrap_or(false);
+        // Prefer the provider's explicit `has_cost` signal when it
+        // emits one — `Some(false)` lets a provider that tried and
+        // failed to compute cost (older CLI version, future API-key
+        // session) be distinguished from "we didn't try." Fall back to
+        // inferring from `total_cost_usd.is_some()` for providers that
+        // pre-date the explicit signal so historical behavior holds.
+        let has_cost = usage
+            .and_then(|u| u.has_cost)
+            .unwrap_or_else(|| usage.map(|u| u.total_cost_usd.is_some()).unwrap_or(false));
         // Prefer the model the provider actually reported on this
         // turn (usage.model) over the session-level fallback — a
         // session can route multiple turns through different models
@@ -750,6 +767,7 @@ impl UsageStore {
             by_provider,
             groups,
             generated_at: now.to_rfc3339(),
+            pricing_table_date: PRICING_TABLE_DATE.to_string(),
         })
     }
 
@@ -1068,16 +1086,95 @@ fn rate_limit_status_from_str(s: &str) -> RateLimitStatus {
     }
 }
 
+/// Per-token rates in USD per million tokens. Source: Anthropic's
+/// public pricing at <https://www.anthropic.com/pricing#api> as of
+/// `PRICING_TABLE_DATE`.
+///
+/// **Used ONLY to weight per-agent cost allocation** — never to
+/// compute `total_cost_usd`, which is always the provider's own
+/// number passed verbatim through the bridge (see
+/// `provider-claude-sdk/bridge/src/index.ts:2243`) or the CLI
+/// adapter (see `provider-claude-cli/src/lib.rs::Result` arm). If
+/// Anthropic changes pricing, update both this table and
+/// `PRICING_TABLE_DATE` so the Settings → Usage footer can warn
+/// users to verify against the current rate card.
+///
+/// Why per-token weighting (not unweighted token sum): output tokens
+/// cost ~5× input, cache_read costs ~10× cheaper than fresh input,
+/// cache_write is ~1.25× input. An unweighted sum over-allocates
+/// cost to cache-heavy agents and under-allocates to output-heavy
+/// agents — which matters when one sub-agent does heavy file reads
+/// (cache-heavy) while another generates large diffs (output-heavy).
+#[derive(Debug, Clone, Copy)]
+struct ModelRates {
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    cache_read_per_mtok: f64,
+    cache_write_per_mtok: f64,
+}
+
+/// Date the pricing constants below were last verified against
+/// anthropic.com/pricing. Surfaced in `UsageSummaryPayload` so the
+/// dashboard footer can render "Pricing data verified <date>" with
+/// a link for users to cross-check the current rate card.
+pub const PRICING_TABLE_DATE: &str = "2026-05-02";
+
+const RATES_SONNET: ModelRates = ModelRates {
+    input_per_mtok: 3.0,
+    output_per_mtok: 15.0,
+    cache_read_per_mtok: 0.30,
+    cache_write_per_mtok: 3.75,
+};
+const RATES_OPUS: ModelRates = ModelRates {
+    input_per_mtok: 15.0,
+    output_per_mtok: 75.0,
+    cache_read_per_mtok: 1.50,
+    cache_write_per_mtok: 18.75,
+};
+const RATES_HAIKU: ModelRates = ModelRates {
+    input_per_mtok: 1.0,
+    output_per_mtok: 5.0,
+    cache_read_per_mtok: 0.10,
+    cache_write_per_mtok: 1.25,
+};
+
+/// Best-effort model→rates lookup. Substring match on model id
+/// because Anthropic uses date-pinned ids like
+/// `claude-sonnet-4-5-20260315` — matching on substring keeps the
+/// table forward-compatible with patch revisions of the same family
+/// without manual updates.
+///
+/// Unknown models fall back to Sonnet rates (the median of flowstate
+/// traffic). Alternatives considered and rejected:
+///   * `$0` weight: would unfairly pile residual cost onto co-running
+///     agents under the residual-absorption trick.
+///   * Skip allocation entirely (leave at 0): wastes the cost data we
+///     do have for the well-known models in the same turn.
+///   * Panic / log-and-default: would flood logs on any new model
+///     family; substring fallback is silent and roughly right.
+fn rates_for_model(model: Option<&str>) -> &'static ModelRates {
+    match model {
+        Some(m) if m.contains("opus") => &RATES_OPUS,
+        Some(m) if m.contains("haiku") => &RATES_HAIKU,
+        Some(m) if m.contains("sonnet") => &RATES_SONNET,
+        _ => &RATES_SONNET,
+    }
+}
+
 /// Insert per-agent slice rows for a freshly-recorded turn.
 ///
 /// Allocates `event.total_cost_usd` across agents proportionally to
-/// each agent's "billable weight" (input + output + cache_read +
-/// cache_write tokens). The weight choice matches how the SDK itself
-/// bills — every token type has a per-model rate that's > 0, so
-/// using the sum is a close proxy for the cost share without needing
-/// a per-model pricing table on the Rust side. When the total weight
-/// is zero (no tokens at all) we skip the allocation and leave every
-/// row at cost 0, which still satisfies `SUM(cost_usd) == 0`.
+/// each agent's "billable weight" — `input × $input + output ×
+/// $output + cache_read × $cache_read + cache_write × $cache_write`,
+/// using the per-model rates from `rates_for_model`. This matches
+/// how Anthropic actually bills, so cache-heavy agents get
+/// proportionally less cost (cache reads are ~10× cheaper than fresh
+/// inputs) and output-heavy agents get proportionally more (output
+/// tokens cost ~5× more than inputs).
+///
+/// When the total weight is zero (no tokens at all) we skip the
+/// allocation and leave every row at cost 0, which still satisfies
+/// `SUM(cost_usd) == 0`.
 ///
 /// When the provider didn't supply an `agents` breakdown
 /// (`event.agents.is_empty()`) we synthesize a single "main" row
@@ -1110,38 +1207,53 @@ fn insert_agent_rows(
         event.agents.clone()
     };
 
-    // Proportional cost allocation. Compute weights and the cumulative
-    // running remainder so the final agent absorbs any floating-point
-    // drift — the invariant SUM(cost_usd) == event.total_cost_usd must
-    // hold exactly for the rollup math to stay consistent with
-    // `usage_events.total_cost_usd`.
-    let weights: Vec<u64> = slices
+    // Proportional cost allocation. Compute price-aware weights and
+    // the cumulative running remainder so the final agent absorbs any
+    // floating-point drift — the invariant
+    //   SUM(usage_event_agents.cost_usd WHERE turn_id = X)
+    //     == usage_events.total_cost_usd WHERE turn_id = X
+    // must hold exactly for the dashboard's per-agent SUM to match
+    // the per-turn total it derives from `usage_events`. Switching
+    // the WEIGHT formula does NOT change this invariant — only the
+    // share each agent gets.
+    let weights: Vec<f64> = slices
         .iter()
-        .map(|s| s.input_tokens + s.output_tokens + s.cache_read_tokens + s.cache_write_tokens)
+        .map(|s| {
+            let r = rates_for_model(s.model.as_deref());
+            (s.input_tokens as f64) * r.input_per_mtok
+                + (s.output_tokens as f64) * r.output_per_mtok
+                + (s.cache_read_tokens as f64) * r.cache_read_per_mtok
+                + (s.cache_write_tokens as f64) * r.cache_write_per_mtok
+        })
         .collect();
-    let total_weight: u64 = weights.iter().sum();
-    let costs: Vec<f64> = if total_weight == 0 {
-        // No tokens reported at all: the turn's cost is likely 0 too
-        // (or unknown), and any nonzero total_cost_usd can't be
-        // attributed. Give it all to the first (main) agent so the
-        // sum still matches; this path is exceedingly rare in
-        // practice.
+    let total_weight: f64 = weights.iter().sum();
+    // Use a small epsilon rather than == 0.0 — float weights with
+    // tiny token counts (e.g. 1 cache_read on Haiku = 1e-7) round to
+    // a value indistinguishable from 0 for allocation purposes; the
+    // residual-absorption branch handles it cleanly.
+    let costs: Vec<f64> = if total_weight < 1e-12 {
+        // No tokens reported at all (or every weight rounded to ~0):
+        // the turn's cost is likely 0 too (or unknown), and any
+        // nonzero total_cost_usd can't be attributed. Give it all to
+        // the first (main) agent so the sum still matches; this path
+        // is exceedingly rare in practice.
         let mut c = vec![0.0_f64; slices.len()];
         if let Some(first) = c.first_mut() {
             *first = event.total_cost_usd;
         }
         c
     } else {
-        // All but the last row get `floor(share * total_cost)`; the
-        // last row absorbs the residual. This mirrors how we'd hand
-        // out a fixed-point bill and guarantees the SUM invariant.
+        // All but the last row get `share * total_cost`; the last
+        // row absorbs the residual so SUM(c) == total_cost_usd
+        // holds exactly even in the presence of floating-point
+        // drift. This mirrors how we'd hand out a fixed-point bill.
         let mut c = Vec::with_capacity(slices.len());
         let mut running = 0.0_f64;
         for (i, w) in weights.iter().enumerate() {
             if i + 1 == weights.len() {
                 c.push(event.total_cost_usd - running);
             } else {
-                let share = (*w as f64 / total_weight as f64) * event.total_cost_usd;
+                let share = (*w / total_weight) * event.total_cost_usd;
                 running += share;
                 c.push(share);
             }
@@ -1975,17 +2087,27 @@ mod tests {
 
     /// Turn with a full provider-supplied breakdown: one main bucket
     /// plus two Explore subagents. Verifies that (a) cost is
-    /// allocated proportionally to the billable-weight sum and (b)
-    /// summing per-agent cost over the turn reconciles exactly with
-    /// the turn-level total.
+    /// allocated proportionally to the price-aware billable weight
+    /// (input × $input + output × $output + cache_read × $cache_read
+    /// + cache_write × $cache_write) and (b) summing per-agent cost
+    /// over the turn reconciles exactly with the turn-level total.
+    ///
+    /// Pricing here is Sonnet's: $3/$15/$0.30/$3.75 per MTok for
+    /// input/output/cache_read/cache_write respectively. The tokens
+    /// are deliberately mixed so cache_read-heavy and cache_write-
+    /// heavy agents get materially different shares than they would
+    /// under the old unweighted-token-sum formula — that's the point
+    /// of the price-aware change. See `rates_for_model`.
     #[test]
     fn by_agent_allocates_cost_proportionally_to_weight() {
         let store = UsageStore::in_memory().unwrap();
         let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
-        // Main agent: 100 + 200 + 0 + 0 = 300 weight
-        // Explore #1: 50 + 100 + 50 + 0 = 200 weight
-        // Explore #2: 50 + 100 + 0 + 50 = 200 weight
-        // Total weight = 700; main should get 300/700 * $0.70 = $0.30
+        // Sonnet rates: input $3, output $15, cache_read $0.30,
+        // cache_write $3.75 (per MTok). All three agents are Sonnet.
+        //   Main:      100i + 200o → weight = 100*3 + 200*15      = 3300
+        //   Explore#1:  50i + 100o + 50cr → weight = 1500 + 150 + 15      = 1665
+        //   Explore#2:  50i + 100o + 50cw → weight = 1500 + 150 + 187.5   = 1837.5
+        // Total weight = 6802.5; main share = 3300/6802.5 ≈ 48.5%.
         let event = UsageEvent {
             turn_id: "t1".into(),
             session_id: "s1".into(),
@@ -2033,24 +2155,37 @@ mod tests {
         };
         store.record_turn(&event).unwrap();
 
+        // Compute expected shares from the same formula the
+        // implementation uses, so the test keeps pinning the
+        // allocation invariants without becoming brittle if pricing
+        // changes (only the absolute numbers shift; the relative
+        // ordering and SUM invariant are pricing-independent).
+        let w_main = 100.0 * 3.0 + 200.0 * 15.0;
+        let w_e1 = 50.0 * 3.0 + 100.0 * 15.0 + 50.0 * 0.30;
+        let w_e2 = 50.0 * 3.0 + 100.0 * 15.0 + 50.0 * 3.75;
+        let total_w = w_main + w_e1 + w_e2;
+        let exp_main = w_main / total_w * 0.70;
+        let exp_e1 = w_e1 / total_w * 0.70;
+        // E2 absorbs the residual (last bucket); compute it as the
+        // implementation does so the test stays exactly aligned.
+        let exp_e2 = 0.70 - exp_main - exp_e1;
+        let exp_explore_total = exp_e1 + exp_e2;
+
         let payload = store.summary_by_agent(UsageRange::Last7Days).unwrap();
         assert_eq!(payload.groups.len(), 2);
-        // Explore shows up first because its total cost ($0.40)
-        // exceeds main ($0.30).
         let explore = payload.groups.iter().find(|r| r.key == "Explore").unwrap();
         let main = payload.groups.iter().find(|r| r.key == "main").unwrap();
         assert_eq!(explore.invocation_count, 2);
         assert_eq!(explore.turn_count, 1);
-        assert!((explore.total_cost_usd - 0.40).abs() < 1e-9);
-        assert!((main.total_cost_usd - 0.30).abs() < 1e-9);
+        assert!((explore.total_cost_usd - exp_explore_total).abs() < 1e-9);
+        assert!((main.total_cost_usd - exp_main).abs() < 1e-9);
         // SUM invariant holds exactly (last-bucket absorbs rounding).
         let sum: f64 = payload.groups.iter().map(|r| r.total_cost_usd).sum();
         assert!((sum - 0.70).abs() < 1e-9);
 
-        // Same turn, rolled up by role: exactly two rows, and the
-        // subagent bucket folds both Explore invocations together
-        // ($0.20 each → $0.40 total) while main's $0.30 is preserved.
-        // Counts: main = 1 invocation / 1 turn; subagent = 2 invocations / 1 turn.
+        // Same turn, rolled up by role: exactly two rows. Subagent
+        // folds both Explore invocations into one bucket; main keeps
+        // its share unchanged. SUM invariant must still hold.
         let roles = store.summary_by_agent_role(UsageRange::Last7Days).unwrap();
         assert_eq!(roles.groups.len(), 2);
         let role_sub = roles.groups.iter().find(|r| r.key == "subagent").unwrap();
@@ -2061,10 +2196,287 @@ mod tests {
         assert_eq!(role_sub.turn_count, 1);
         assert_eq!(role_main.invocation_count, 1);
         assert_eq!(role_main.turn_count, 1);
-        assert!((role_sub.total_cost_usd - 0.40).abs() < 1e-9);
-        assert!((role_main.total_cost_usd - 0.30).abs() < 1e-9);
+        assert!((role_sub.total_cost_usd - exp_explore_total).abs() < 1e-9);
+        assert!((role_main.total_cost_usd - exp_main).abs() < 1e-9);
         let role_sum: f64 = roles.groups.iter().map(|r| r.total_cost_usd).sum();
         assert!((role_sum - 0.70).abs() < 1e-9);
+    }
+
+    /// **Critical no-double-count regression.** With price-aware
+    /// weights now active, a 3-agent turn with mixed token shapes
+    /// must still satisfy SUM(per-agent cost) == turn cost down to
+    /// 1e-9, with the residual-absorption trick handling float
+    /// drift. If a future refactor drops the residual-absorption
+    /// loop or messes up the weight calculation, this test catches
+    /// it before silently-wrong allocations land in users' dashboards.
+    #[test]
+    fn agent_cost_allocation_sum_invariant_under_price_weights() {
+        let store = UsageStore::in_memory().unwrap();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
+        // A deliberately ugly cost number so float-drift bugs in the
+        // share-then-residual loop become visible — round numbers
+        // hide rounding errors in test deltas.
+        let total_cost = 1.234567_f64;
+        let event = UsageEvent {
+            turn_id: "sum-invariant".into(),
+            session_id: "s1".into(),
+            provider: ProviderKind::Claude,
+            model: Some("sonnet".into()),
+            project_id: None,
+            status: TurnStatus::Completed,
+            occurred_at: now_ish,
+            input_tokens: 600,
+            output_tokens: 400,
+            cache_read_tokens: 1200,
+            cache_write_tokens: 200,
+            total_cost_usd: total_cost,
+            has_cost: true,
+            duration_ms: 5_000,
+            agents: vec![
+                // Cache-heavy agent — under unweighted-sum allocation
+                // would have gotten a disproportionately large share.
+                UsageAgentSlice {
+                    agent_id: Some("call_cache_heavy".into()),
+                    agent_type: Some("Explore".into()),
+                    model: Some("sonnet".into()),
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cache_read_tokens: 1000,
+                    cache_write_tokens: 0,
+                },
+                // Output-heavy agent — under unweighted-sum would
+                // have been short-changed; price-aware fixes that.
+                UsageAgentSlice {
+                    agent_id: Some("call_output_heavy".into()),
+                    agent_type: Some("general-purpose".into()),
+                    model: Some("sonnet".into()),
+                    input_tokens: 100,
+                    output_tokens: 300,
+                    cache_read_tokens: 50,
+                    cache_write_tokens: 0,
+                },
+                // Balanced main agent.
+                UsageAgentSlice {
+                    agent_id: None,
+                    agent_type: None,
+                    model: Some("sonnet".into()),
+                    input_tokens: 400,
+                    output_tokens: 50,
+                    cache_read_tokens: 150,
+                    cache_write_tokens: 200,
+                },
+            ],
+        };
+        store.record_turn(&event).unwrap();
+
+        // Read raw per-agent rows; the SUM must reconcile to the
+        // parent turn's total_cost_usd EXACTLY.
+        let conn_guard = store.connection.lock().unwrap();
+        let sum_per_agent: f64 = conn_guard
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0)
+                 FROM usage_event_agents WHERE turn_id = ?1",
+                params!["sum-invariant"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn_guard);
+        assert!(
+            (sum_per_agent - total_cost).abs() < 1e-9,
+            "per-agent cost SUM ({sum_per_agent}) != turn cost ({total_cost}) — \
+             residual-absorption invariant broken"
+        );
+    }
+
+    /// Pins the price-aware allocation: under Sonnet rates an
+    /// output-heavy agent should get materially MORE cost than a
+    /// cache-read-heavy agent with the same total token count,
+    /// because output costs ~50× cache_read per token. Under the
+    /// old unweighted-sum formula they'd have gotten equal shares;
+    /// this test fails if anyone reverts to that.
+    #[test]
+    fn agent_allocation_shifts_toward_output_under_price_weights() {
+        let store = UsageStore::in_memory().unwrap();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
+        let event = UsageEvent {
+            turn_id: "weight-shift".into(),
+            session_id: "s1".into(),
+            provider: ProviderKind::Claude,
+            // Force Sonnet rates so the test's expected ratio
+            // (output:cache_read = $15:$0.30 = 50:1) is stable.
+            model: Some("sonnet".into()),
+            project_id: None,
+            status: TurnStatus::Completed,
+            occurred_at: now_ish,
+            input_tokens: 0,
+            output_tokens: 1000,
+            cache_read_tokens: 1000,
+            cache_write_tokens: 0,
+            total_cost_usd: 1.00,
+            has_cost: true,
+            duration_ms: 1_000,
+            agents: vec![
+                // Output-only agent: 1000 output tokens, 0 cache_read.
+                UsageAgentSlice {
+                    agent_id: None,
+                    agent_type: None,
+                    model: Some("sonnet".into()),
+                    input_tokens: 0,
+                    output_tokens: 1000,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                // Cache-read-only agent: identical token TOTAL
+                // (1000) but all cache reads.
+                UsageAgentSlice {
+                    agent_id: Some("call_cache".into()),
+                    agent_type: Some("Explore".into()),
+                    model: Some("sonnet".into()),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 1000,
+                    cache_write_tokens: 0,
+                },
+            ],
+        };
+        store.record_turn(&event).unwrap();
+
+        // Output weight = 1000 * $15 = 15000.
+        // Cache_read weight = 1000 * $0.30 = 300.
+        // Total = 15300; output share = 15000/15300 ≈ 98.04%.
+        let conn = store.connection.lock().unwrap();
+        let output_cost: f64 = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_event_agents
+                 WHERE turn_id = ?1 AND agent_type IS NULL",
+                params!["weight-shift"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cache_cost: f64 = conn
+            .query_row(
+                "SELECT cost_usd FROM usage_event_agents
+                 WHERE turn_id = ?1 AND agent_type = 'Explore'",
+                params!["weight-shift"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        // The output-heavy agent must get MUCH more cost than the
+        // cache-heavy one — pin the ratio to ≥ 40 (slack against the
+        // exact 50:1 to allow for last-bucket residual on the cache
+        // side). Under the old unweighted formula this ratio would
+        // have been exactly 1.0.
+        let ratio = output_cost / cache_cost;
+        assert!(
+            ratio > 40.0,
+            "output:cache_read cost ratio = {ratio:.2}, expected > 40 \
+             (under Sonnet's $15:$0.30 pricing); \
+             output_cost={output_cost}, cache_cost={cache_cost} — \
+             this regression suggests the price-aware weight formula \
+             was reverted to the old unweighted token sum"
+        );
+
+        // SUM invariant still holds (no double-count, no leakage).
+        assert!((output_cost + cache_cost - 1.00).abs() < 1e-9);
+    }
+
+    /// **Cost-specific double-count regression.** Formalizes the
+    /// existing `duplicate_turn_ids_are_no_ops` invariant for the
+    /// cost field: replaying the same `turn_id` 3× must leave both
+    /// `usage_events.total_cost_usd` and `SUM(usage_event_agents.cost_usd)`
+    /// at their first-recorded value, not 3× it. Insurance against
+    /// a future refactor that accidentally drops the `if inserted > 0`
+    /// gate on the agent-rows or rollup branches.
+    #[test]
+    fn record_turn_double_invocation_does_not_double_count_cost() {
+        let store = UsageStore::in_memory().unwrap();
+        let now_ish = Utc::now().format("%Y-%m-%dT12:00:00Z").to_string();
+        let event = UsageEvent {
+            turn_id: "no-double".into(),
+            session_id: "s1".into(),
+            provider: ProviderKind::Claude,
+            model: Some("sonnet".into()),
+            project_id: None,
+            status: TurnStatus::Completed,
+            occurred_at: now_ish,
+            input_tokens: 100,
+            output_tokens: 200,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_cost_usd: 5.0,
+            has_cost: true,
+            duration_ms: 1_000,
+            agents: vec![UsageAgentSlice {
+                agent_id: None,
+                agent_type: None,
+                model: Some("sonnet".into()),
+                input_tokens: 100,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }],
+        };
+        store.record_turn(&event).unwrap();
+        store.record_turn(&event).unwrap();
+        store.record_turn(&event).unwrap();
+
+        let conn = store.connection.lock().unwrap();
+        let events_cost: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_cost_usd), 0.0)
+                 FROM usage_events WHERE turn_id = ?1",
+                params!["no-double"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let agents_cost: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(cost_usd), 0.0)
+                 FROM usage_event_agents WHERE turn_id = ?1",
+                params!["no-double"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Daily rollup must also see exactly one turn's worth.
+        let rollup_cost: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_cost_usd), 0.0)
+                 FROM usage_daily_rollups",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let rollup_turns: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(turn_count), 0)
+                 FROM usage_daily_rollups",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            (events_cost - 5.0).abs() < 1e-9,
+            "usage_events cost = {events_cost}, expected 5.0 \
+             (replay must not double-insert)"
+        );
+        assert!(
+            (agents_cost - 5.0).abs() < 1e-9,
+            "usage_event_agents SUM = {agents_cost}, expected 5.0 \
+             (replay must not double-allocate per-agent rows)"
+        );
+        assert!(
+            (rollup_cost - 5.0).abs() < 1e-9,
+            "usage_daily_rollups cost = {rollup_cost}, expected 5.0 \
+             (rollup increment must be gated on inserted > 0)"
+        );
+        assert_eq!(
+            rollup_turns, 1,
+            "usage_daily_rollups turn_count = {rollup_turns}, expected 1"
+        );
     }
 
     /// Replay of the same turn_id must not double-insert agent rows.

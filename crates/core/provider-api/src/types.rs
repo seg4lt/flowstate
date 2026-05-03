@@ -1152,6 +1152,17 @@ pub struct TokenUsage {
     pub live_context_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
+    /// Whether the provider actually attempted to compute a cost for
+    /// this turn. `Some(true)` means `total_cost_usd` is the
+    /// provider's own number; `Some(false)` means the provider
+    /// explicitly did not return a cost (older CLI versions, API-key
+    /// sessions on plans where cost isn't surfaced, future quirks);
+    /// `None` means the provider gave us no signal either way and
+    /// consumers should treat it as unknown. The dashboard renders
+    /// "(unknown)" when this is `Some(false)` instead of silently
+    /// showing $0.00 from the `unwrap_or(0.0)` fallback in the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_cost: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

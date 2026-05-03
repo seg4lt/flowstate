@@ -1945,6 +1945,11 @@ class ClaudeBridge {
               liveContextTokens,
               // Cost and duration are only authoritative at turn end.
               totalCostUsd: null,
+              // hasCost left null mid-turn — we genuinely don't know
+              // yet whether the SDK will report a cost at result time.
+              // Setting `false` here would lie to the dashboard until
+              // the result event lands and corrected the value.
+              hasCost: null,
               durationMs: null,
               model: observedMainModel ?? null,
             },
@@ -2241,6 +2246,13 @@ class ClaudeBridge {
               contextWindow: resolvedContextWindow,
               liveContextTokens,
               totalCostUsd: r.total_cost_usd ?? null,
+              // Explicit signal: did the SDK actually report a cost for
+              // this turn? `true` when total_cost_usd is present, `false`
+              // when omitted. Lets the dashboard render "(unknown)"
+              // instead of a misleading $0.00 fallback when the SDK
+              // didn't compute a cost (rare today, but defensive against
+              // future SDK behavior changes / API-key sessions).
+              hasCost: r.total_cost_usd != null,
               durationMs: r.duration_ms ?? null,
               // Parent model. On Task-heavy turns subagents may have
               // run different models; the `agents` field carries the

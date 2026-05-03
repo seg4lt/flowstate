@@ -22,6 +22,22 @@ interface ContextDisplayProps {
   sessionId: string;
 }
 
+/**
+ * Single-source-of-truth tooltip explaining the "cache read /
+ * cache write" tokens shown in the context-window popover and the
+ * Usage dashboard. The numbers are summed across every API call in
+ * the turn — Anthropic counts the cached system prompt once per
+ * tool-loop iteration in `usage.cache_read_input_tokens`, so a
+ * 10-call tool loop with a 50k cached prompt reports ~500k. The
+ * value is correct for cost reconciliation (it matches the scope
+ * of `total_cost_usd`) but reads as inflated if a user expects
+ * "tokens served from cache this turn." Direct them to the
+ * context-window indicator (which uses the per-call snapshot via
+ * `liveContextTokens`) when they want the dedup'd figure.
+ */
+export const CACHE_TOKEN_TOOLTIP =
+  "On multi-step tool loops these numbers are summed across every API call in the turn — the same cached prompt is counted once per iteration. They reconcile with total_cost_usd. For the single-call snapshot of context fill, see the context-window bar above.";
+
 function formatTokens(n: number | undefined | null): string {
   if (n == null) return "--";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
@@ -379,7 +395,21 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
 
   const usedLabel = formatTokens(used);
   const totalLabel = formatTokens(total);
-  const costLabel = formatCost(usage?.totalCostUsd);
+  // Distinguish "provider didn't report cost" from "$0.00":
+  //   - hasCost === false  → provider explicitly skipped (older CLI,
+  //                          API-key session) → render "(unknown)"
+  //   - hasCost === true   → cost is the provider's number → render it
+  //   - hasCost == null    → no signal either way → fall back to the
+  //                          legacy behavior (render formatCost which
+  //                          itself returns null when totalCostUsd is
+  //                          null). Never silently shows $0.00 from
+  //                          the store's `unwrap_or(0.0)` fallback.
+  const costLabel: string | null = !usage
+    ? null
+    : usage.hasCost === false
+      ? "(unknown)"
+      : formatCost(usage.totalCostUsd);
+  const costIsUnknown = usage?.hasCost === false;
   const durationLabel = formatDuration(usage?.durationMs);
   const cacheRead = usage?.cacheReadTokens ?? 0;
   const cacheWrite = usage?.cacheWriteTokens ?? 0;
@@ -458,7 +488,10 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
           </div>
         )}
         {usage && hasCache && (
-          <div className="mt-2 text-[11px] text-muted-foreground/80">
+          <div
+            className="mt-2 text-[11px] text-muted-foreground/80"
+            title={CACHE_TOKEN_TOOLTIP}
+          >
             cache read:{" "}
             <span className="tabular-nums">{formatTokens(cacheRead)}</span>
             {" · "}cache write:{" "}
@@ -467,7 +500,22 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
         )}
         {usage && (costLabel || durationLabel) && (
           <div className="mt-1 text-[11px] text-muted-foreground/80">
-            {costLabel && <span className="tabular-nums">{costLabel}</span>}
+            {costLabel && (
+              <span
+                className={
+                  costIsUnknown
+                    ? "italic text-muted-foreground/60"
+                    : "tabular-nums"
+                }
+                title={
+                  costIsUnknown
+                    ? "Provider didn't return a cost for this turn (older CLI version, API-key session, or plan that doesn't surface cost). The dashboard shows '(unknown)' rather than $0.00 to avoid implying free."
+                    : undefined
+                }
+              >
+                {costLabel}
+              </span>
+            )}
             {costLabel && durationLabel && " · "}
             {durationLabel && (
               <span className="tabular-nums">{durationLabel}</span>

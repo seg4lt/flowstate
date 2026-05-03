@@ -151,6 +151,33 @@ export function UsageView() {
               {topSessionsQuery.data ? (
                 <UsageTopSessionsTable rows={topSessionsQuery.data} />
               ) : null}
+
+              {/* Pricing-data freshness disclosure. The per-agent
+                  cost split in the tables above relies on a
+                  hardcoded Anthropic rate table on the Rust side
+                  (see crates/app-layer/src/usage.rs::RATES_*). When
+                  Anthropic changes pricing the absolute totals stay
+                  correct (they're the provider's own numbers), but
+                  the per-agent SHARE drifts until the table is
+                  updated. Surfacing the verification date lets
+                  attentive users cross-check rather than assume. */}
+              <div className="pt-2 text-center text-[11px] text-muted-foreground/70">
+                Per-agent cost allocation uses Anthropic public rates
+                verified{" "}
+                <span className="tabular-nums">
+                  {summary.pricingTableDate}
+                </span>
+                .{" "}
+                <a
+                  href="https://www.anthropic.com/pricing"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline hover:text-foreground"
+                >
+                  Verify current rates
+                </a>
+                .
+              </div>
             </>
           ) : null}
         </div>

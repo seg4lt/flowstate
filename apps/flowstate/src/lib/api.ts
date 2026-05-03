@@ -992,6 +992,15 @@ export interface UsageSummaryPayload {
   byProvider: UsageGroupRow[];
   groups: UsageGroupRow[];
   generatedAt: string;
+  /**
+   * Date the per-token rate table used for per-agent cost
+   * allocation was last verified against anthropic.com/pricing.
+   * Always equals the Rust `PRICING_TABLE_DATE` constant — carried
+   * in the payload so the dashboard footer can render
+   * "Pricing data verified <date>" without the frontend ever
+   * holding a stale copy of the date.
+   */
+  pricingTableDate: string;
 }
 
 export interface UsageTimeseriesPoint {

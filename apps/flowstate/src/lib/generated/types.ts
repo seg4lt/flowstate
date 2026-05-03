@@ -146,7 +146,19 @@ contextWindow?: number,
  * inflation bug). Absent on providers that don't expose per-call
  * usage; consumers fall back to the aggregate sum in that case.
  */
-liveContextTokens?: number, totalCostUsd?: number, durationMs?: number, model?: string, 
+liveContextTokens?: number, totalCostUsd?: number, 
+/**
+ * Whether the provider actually attempted to compute a cost for
+ * this turn. `Some(true)` means `total_cost_usd` is the
+ * provider's own number; `Some(false)` means the provider
+ * explicitly did not return a cost (older CLI versions, API-key
+ * sessions on plans where cost isn't surfaced, future quirks);
+ * `None` means the provider gave us no signal either way and
+ * consumers should treat it as unknown. The dashboard renders
+ * "(unknown)" when this is `Some(false)` instead of silently
+ * showing $0.00 from the `unwrap_or(0.0)` fallback in the store.
+ */
+hasCost?: boolean, durationMs?: number, model?: string, 
 /**
  * Per-agent token breakdown within this turn. When present, the
  * sum of every entry's token fields equals the turn-level

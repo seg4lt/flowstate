@@ -1,4 +1,5 @@
 import type { UsageGroupRow } from "@/lib/api";
+import { CACHE_TOKEN_TOOLTIP } from "@/components/chat/context-display";
 
 // Per-provider / per-model breakdown table. Mirrors the KPI cards
 // column-for-column so the grand totals at the top reconcile to the
@@ -114,13 +115,13 @@ export function UsageBreakdownTable({
                 </th>
                 <th
                   className="px-3 py-2 text-right font-medium"
-                  title="Tokens served from the prompt cache (~0.1× input rate)."
+                  title={`Tokens served from the prompt cache (~0.1× input rate). ${CACHE_TOKEN_TOOLTIP}`}
                 >
                   Cache R
                 </th>
                 <th
                   className="px-3 py-2 text-right font-medium"
-                  title="Tokens written to the prompt cache (~1.25× input rate). The real 'new content per turn' signal."
+                  title={`Tokens written to the prompt cache (~1.25× input rate). The real 'new content per turn' signal. ${CACHE_TOKEN_TOOLTIP}`}
                 >
                   Cache W
                 </th>
