@@ -5,6 +5,7 @@ import {
   deleteProjectWorktree,
   deleteSessionDisplay,
   getProjectWorktree,
+  getRateLimitCache,
   listProjectDisplay,
   listProjectWorktree,
   listSessionDisplay,
@@ -256,7 +257,16 @@ type AppAction =
    *  `connectStream` lifecycle callbacks in AppProvider. The splash
    *  reads this to decide between "Finishing up…" and the
    *  "couldn't reach daemon" error card. */
-  | { type: "set_daemon_connect_status"; status: "connecting" | "connected" | "failed" };
+  | { type: "set_daemon_connect_status"; status: "connecting" | "connected" | "failed" }
+  /** Bulk-seed `state.rateLimits` from the persisted snapshot in
+   *  `usage.sqlite` (via `getRateLimitCache`). Dispatched once on
+   *  app boot in the welcome handler so the chat-toolbar's 5h /
+   *  weekly chips render their last-known values immediately
+   *  instead of staying blank until the user sends their first
+   *  message. Live `rate_limit_updated` runtime events overwrite
+   *  individual buckets via the existing reducer arm — this seed
+   *  is just the initial paint. */
+  | { type: "seed_rate_limits"; rateLimits: RateLimitInfo[] };
 
 /** Recompute whether a session still has any pending input after a
  *  consume action. If both the permissions queue and the question
@@ -357,6 +367,24 @@ function appReducer(state: AppState, action: AppAction): AppState {
       const permissionModeBySession = new Map(state.permissionModeBySession);
       permissionModeBySession.set(action.sessionId, action.mode);
       return { ...state, permissionModeBySession };
+    }
+    case "seed_rate_limits": {
+      // Boot-time merge: don't blow away a live `rate_limit_updated`
+      // event that beat the seed home (rare, but possible if the
+      // daemon's first turn finishes before the welcome handler's
+      // `getRateLimitCache()` round-trip resolves). The live value
+      // is fresher than the cached one by definition, so existing
+      // bucket entries win over the seed.
+      if (action.rateLimits.length === 0) return state;
+      const merged: Record<string, RateLimitInfo> = {};
+      for (const info of action.rateLimits) {
+        merged[info.bucket] = info;
+      }
+      // Live entries (already in state.rateLimits) override the seed.
+      for (const [bucket, info] of Object.entries(state.rateLimits)) {
+        merged[bucket] = info;
+      }
+      return { ...state, rateLimits: merged };
     }
     case "consume_pending_permission": {
       const list = state.pendingPermissionsBySession.get(action.sessionId);
@@ -1467,6 +1495,27 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           .catch((err) => {
             console.debug(
               "[app-store] readAllProviderEnabled failed during welcome sync",
+              err,
+            );
+          });
+        // Hydrate the chat-toolbar's 5h / weekly limit chips with
+        // the last-known values from `usage.sqlite`. Anthropic's
+        // plan limits only land as a side-effect of inference
+        // responses, so without this seed the chips stay blank
+        // until the user sends their first message of the session.
+        // Failure is non-fatal: the store falls back to the live
+        // event path (chips appear after the first turn).
+        getRateLimitCache()
+          .then((rateLimits) => {
+            if (rateLimits.length === 0) return;
+            dispatchRef.current({
+              type: "seed_rate_limits",
+              rateLimits,
+            });
+          })
+          .catch((err) => {
+            console.debug(
+              "[app-store] getRateLimitCache failed during welcome sync",
               err,
             );
           });

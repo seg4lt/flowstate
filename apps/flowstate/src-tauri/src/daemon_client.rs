@@ -34,6 +34,7 @@ use flowstate_app_layer::usage::{
     UsageTimeseriesPayload,
 };
 use flowstate_app_layer::user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay};
+use zenui_provider_api::RateLimitInfo;
 use std::collections::HashMap;
 
 /// Shared client. Holds a `reqwest::Client` + a `watch::Receiver`
@@ -326,6 +327,14 @@ impl DaemonClient {
             &serde_json::json!({ "range": range }),
         )
         .await
+    }
+
+    /// Last-seen snapshot of every rate-limit bucket. Called once
+    /// on app boot to seed `state.rateLimits` so the chat-toolbar
+    /// chips render their persisted values immediately instead of
+    /// staying blank until the user sends their first message.
+    pub async fn get_rate_limit_cache(&self) -> Result<Vec<RateLimitInfo>, String> {
+        self.get("/api/usage/rate_limit_cache").await
     }
 }
 

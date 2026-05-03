@@ -41,7 +41,8 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use zenui_provider_api::{
-    AgentUsage, ProviderKind, SessionSummary, TokenUsage, TurnRecord, TurnStatus,
+    AgentUsage, ProviderKind, RateLimitInfo, RateLimitStatus, SessionSummary, TokenUsage,
+    TurnRecord, TurnStatus,
 };
 
 /// Requested time range for dashboard queries. Resolved to an
@@ -471,9 +472,130 @@ impl UsageStore {
                 CREATE INDEX IF NOT EXISTS idx_usage_event_agents_day
                     ON usage_event_agents(occurred_day_utc);
                 CREATE INDEX IF NOT EXISTS idx_usage_event_agents_type
-                    ON usage_event_agents(agent_type, occurred_day_utc);",
+                    ON usage_event_agents(agent_type, occurred_day_utc);
+
+                -- Last-seen snapshot of every rate-limit bucket the
+                -- providers have reported for this user. One row per
+                -- bucket id; UPSERT-replaced on every
+                -- `RuntimeEvent::RateLimitUpdated`.
+                --
+                -- The Anthropic plan limits (5-hour window, weekly,
+                -- weekly-by-model, overage) only arrive as a side-
+                -- effect of inference responses — there's no API to
+                -- poll for them. Persisting the most recent value
+                -- means the chat-toolbar chips are populated from
+                -- launch instead of blank until the user sends their
+                -- first message of the session. Live events overwrite
+                -- the cached row so the snapshot stays fresh.
+                CREATE TABLE IF NOT EXISTS rate_limit_cache (
+                    bucket            TEXT PRIMARY KEY,
+                    label             TEXT NOT NULL,
+                    status            TEXT NOT NULL,
+                    utilization       REAL NOT NULL,
+                    -- Unix milliseconds; nullable because some
+                    -- buckets (e.g. hard caps) don't reset on a
+                    -- schedule.
+                    resets_at_ms      INTEGER,
+                    is_using_overage  INTEGER NOT NULL DEFAULT 0,
+                    -- Unix milliseconds when this row was last
+                    -- written. Diagnostic only — not surfaced in
+                    -- the UI but useful when debugging stale data.
+                    updated_at_ms     INTEGER NOT NULL
+                );",
             )
             .map_err(|e| format!("create usage schema: {e}"))
+    }
+
+    /// Persist the latest snapshot of a rate-limit bucket. Called
+    /// from the runtime-event subscriber on every
+    /// `RuntimeEvent::RateLimitUpdated` so the next app boot can
+    /// rehydrate `state.rateLimits` immediately, instead of waiting
+    /// for the user to send a message before the bars populate.
+    ///
+    /// Idempotent on `bucket` — the row is replaced wholesale, so a
+    /// re-emitted event after a transient runtime broadcast lag is
+    /// harmless. The `RateLimitInfo` struct is the canonical wire
+    /// shape produced by both Claude adapters via `claude_bucket_label`
+    /// in `provider-api/helpers.rs`, so the persisted `label` carries
+    /// the provider's display copy and the frontend doesn't need a
+    /// fallback table.
+    pub fn upsert_rate_limit(&self, info: &RateLimitInfo) -> Result<(), String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        let status = rate_limit_status_to_str(info.status);
+        let overage = if info.is_using_overage { 1i64 } else { 0i64 };
+        connection
+            .execute(
+                "INSERT INTO rate_limit_cache (
+                    bucket, label, status, utilization,
+                    resets_at_ms, is_using_overage, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(bucket) DO UPDATE SET
+                    label            = excluded.label,
+                    status           = excluded.status,
+                    utilization      = excluded.utilization,
+                    resets_at_ms     = excluded.resets_at_ms,
+                    is_using_overage = excluded.is_using_overage,
+                    updated_at_ms    = excluded.updated_at_ms",
+                params![
+                    info.bucket,
+                    info.label,
+                    status,
+                    info.utilization,
+                    info.resets_at,
+                    overage,
+                    now_ms,
+                ],
+            )
+            .map_err(|e| format!("upsert rate_limit_cache: {e}"))?;
+        Ok(())
+    }
+
+    /// Return every persisted rate-limit bucket. Called once on app
+    /// boot to seed `state.rateLimits` so the chat-toolbar chips
+    /// render their last-known values immediately. Live events from
+    /// the next turn overwrite the seed via the existing
+    /// `rate_limit_updated` reducer arm.
+    ///
+    /// Rows with an unrecognised `status` string fall back to
+    /// `Allowed` — better to show a stale chip than to drop the row
+    /// entirely if a future provider adds a new status variant we
+    /// haven't deserialised yet.
+    pub fn load_rate_limit_cache(&self) -> Result<Vec<RateLimitInfo>, String> {
+        let connection = match self.connection.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut stmt = connection
+            .prepare(
+                "SELECT bucket, label, status, utilization,
+                        resets_at_ms, is_using_overage
+                 FROM rate_limit_cache
+                 ORDER BY bucket",
+            )
+            .map_err(|e| format!("prepare load_rate_limit_cache: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let status_str: String = row.get(2)?;
+                let overage_int: i64 = row.get(5)?;
+                Ok(RateLimitInfo {
+                    bucket: row.get(0)?,
+                    label: row.get(1)?,
+                    status: rate_limit_status_from_str(&status_str),
+                    utilization: row.get(3)?,
+                    resets_at: row.get::<_, Option<i64>>(4)?,
+                    is_using_overage: overage_int != 0,
+                })
+            })
+            .map_err(|e| format!("query rate_limit_cache: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("row rate_limit_cache: {e}"))?);
+        }
+        Ok(out)
     }
 
     /// Record a finalized turn. Idempotent on `turn_id`: a double
@@ -918,6 +1040,31 @@ fn turn_status_to_str(status: TurnStatus) -> &'static str {
         TurnStatus::Completed => "completed",
         TurnStatus::Interrupted => "interrupted",
         TurnStatus::Failed => "failed",
+    }
+}
+
+/// Stable string encoding of a `RateLimitStatus` for SQLite. Values
+/// match the JSON tag (`#[serde(rename_all = "snake_case")]`) so a
+/// future tooling pass that exports the cache as JSON sees the same
+/// strings as a live wire payload.
+fn rate_limit_status_to_str(status: RateLimitStatus) -> &'static str {
+    match status {
+        RateLimitStatus::Allowed => "allowed",
+        RateLimitStatus::AllowedWarning => "allowed_warning",
+        RateLimitStatus::Rejected => "rejected",
+    }
+}
+
+/// Inverse of `rate_limit_status_to_str`. Unknown strings (which can
+/// only happen if a future provider invents a new status the running
+/// build doesn't know about) fall back to `Allowed` so the row still
+/// loads — rendering a stale chip is preferable to dropping the row
+/// and leaving the user with no visibility at all.
+fn rate_limit_status_from_str(s: &str) -> RateLimitStatus {
+    match s {
+        "rejected" => RateLimitStatus::Rejected,
+        "allowed_warning" => RateLimitStatus::AllowedWarning,
+        _ => RateLimitStatus::Allowed,
     }
 }
 
@@ -1959,5 +2106,75 @@ mod tests {
         assert_eq!(payload.groups[0].invocation_count, 1);
         assert_eq!(payload.groups[0].turn_count, 1);
         assert!((payload.groups[0].total_cost_usd - 0.10).abs() < 1e-9);
+    }
+
+    /// Round-trip: writing a `RateLimitInfo` and reading it back must
+    /// preserve every field, and a second write to the same bucket must
+    /// replace (not duplicate) the row. This is the contract the chat-
+    /// toolbar widget relies on for "show last-known values from app
+    /// boot, then overwrite as live events land."
+    #[test]
+    fn rate_limit_cache_upsert_replaces_and_load_returns_latest() {
+        let store = UsageStore::in_memory().unwrap();
+
+        let initial = RateLimitInfo {
+            bucket: "five_hour".into(),
+            label: "5-hour limit".into(),
+            status: RateLimitStatus::Allowed,
+            utilization: 0.42,
+            resets_at: Some(1_700_000_000_000),
+            is_using_overage: false,
+        };
+        store.upsert_rate_limit(&initial).unwrap();
+
+        // Distinct bucket — should coexist, not replace.
+        let weekly = RateLimitInfo {
+            bucket: "seven_day".into(),
+            label: "Weekly · all models".into(),
+            status: RateLimitStatus::AllowedWarning,
+            utilization: 0.81,
+            resets_at: Some(1_700_500_000_000),
+            is_using_overage: true,
+        };
+        store.upsert_rate_limit(&weekly).unwrap();
+
+        // Second write to the SAME bucket — must overwrite the first.
+        let updated = RateLimitInfo {
+            bucket: "five_hour".into(),
+            label: "5-hour limit".into(),
+            status: RateLimitStatus::Rejected,
+            utilization: 0.99,
+            resets_at: None,
+            is_using_overage: true,
+        };
+        store.upsert_rate_limit(&updated).unwrap();
+
+        let mut rows = store.load_rate_limit_cache().unwrap();
+        rows.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+        assert_eq!(rows.len(), 2, "exactly two distinct buckets persisted");
+
+        let five = rows.iter().find(|r| r.bucket == "five_hour").unwrap();
+        assert_eq!(five.label, "5-hour limit");
+        assert!(matches!(five.status, RateLimitStatus::Rejected));
+        assert!((five.utilization - 0.99).abs() < 1e-9);
+        assert_eq!(five.resets_at, None);
+        assert!(five.is_using_overage);
+
+        let week = rows.iter().find(|r| r.bucket == "seven_day").unwrap();
+        assert!(matches!(week.status, RateLimitStatus::AllowedWarning));
+        assert!((week.utilization - 0.81).abs() < 1e-9);
+        assert_eq!(week.resets_at, Some(1_700_500_000_000));
+        assert!(week.is_using_overage);
+    }
+
+    /// Empty store must return an empty Vec — important because the
+    /// frontend boot path dispatches one seed action per row and an
+    /// `Err` here would make the welcome handler log a confusing error
+    /// on every fresh install.
+    #[test]
+    fn rate_limit_cache_load_returns_empty_on_fresh_store() {
+        let store = UsageStore::in_memory().unwrap();
+        let rows = store.load_rate_limit_cache().unwrap();
+        assert!(rows.is_empty());
     }
 }

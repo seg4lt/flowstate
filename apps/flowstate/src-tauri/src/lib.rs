@@ -2134,6 +2134,21 @@ async fn get_usage_by_agent_role(
     base_url.client().get_usage_by_agent_role(range).await
 }
 
+/// Last-seen snapshot of every rate-limit bucket the providers have
+/// reported. The Anthropic 5-hour and weekly limits only land as a
+/// side-effect of inference responses — there is no API to poll for
+/// them — so we persist the latest value to `usage.sqlite` and seed
+/// `state.rateLimits` from this on app boot. The frontend dispatches
+/// one `seed_rate_limits` action with the returned vec; live
+/// `RuntimeEvent::RateLimitUpdated` events overwrite individual
+/// buckets via the existing `rate_limit_updated` reducer arm.
+#[tauri::command]
+async fn get_rate_limit_cache(
+    base_url: State<'_, DaemonBaseUrl>,
+) -> Result<Vec<zenui_provider_api::RateLimitInfo>, String> {
+    base_url.client().get_rate_limit_cache().await
+}
+
 /// Resolved cross-platform app data dir for Flowstate — the same
 /// directory the daemon and user_config sqlite live under. Surfaced
 /// to the Settings UI as a read-only row so users can copy the
@@ -3072,6 +3087,23 @@ pub fn run() {
                                         tracing::warn!("record turn usage failed: {e}");
                                     }
                                 }
+                                // Persist the latest snapshot of every
+                                // rate-limit bucket so the chat-toolbar
+                                // chips render their last-known values
+                                // on next app boot. The Anthropic 5h /
+                                // weekly windows only arrive as a
+                                // side-effect of inference responses —
+                                // there's no API to poll — so without
+                                // this the chips stay blank until the
+                                // user sends a message after every
+                                // restart.
+                                Ok(RuntimeEvent::RateLimitUpdated { info }) => {
+                                    if let Err(e) = writer.upsert_rate_limit(&info) {
+                                        tracing::warn!(
+                                            "persist rate_limit_cache failed: {e}"
+                                        );
+                                    }
+                                }
                                 Ok(_) => {}
                                 Err(RecvError::Lagged(n)) => {
                                     tracing::warn!(
@@ -3452,6 +3484,7 @@ pub fn run() {
                         get_top_sessions,
                         get_usage_by_agent,
                         get_usage_by_agent_role,
+                        get_rate_limit_cache,
                         get_app_data_dir,
                         get_log_dir,
                         get_cache_dir,

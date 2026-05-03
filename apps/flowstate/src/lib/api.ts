@@ -4,6 +4,7 @@ import type {
   CheckpointSettings,
   ClientMessage,
   ContextBreakdown,
+  RateLimitInfo,
   RewindOutcomeWire,
   ServerMessage,
 } from "./types";
@@ -1089,6 +1090,19 @@ export function getUsageByAgentRole(
   range: UsageRange,
 ): Promise<UsageAgentPayload> {
   return invoke<UsageAgentPayload>("get_usage_by_agent_role", { range });
+}
+
+// Last-seen snapshot of every rate-limit bucket the providers have
+// reported, persisted in `usage.sqlite`. Called once on app boot so
+// the chat-toolbar's 5h / Wk chips render last-known values
+// immediately instead of staying blank until the user sends their
+// first message — the Anthropic plan limits only arrive as a side-
+// effect of inference responses, so without this rehydration the
+// chips look broken on every relaunch. Live `rate_limit_updated`
+// runtime events overwrite individual buckets via the existing
+// reducer arm in app-store.
+export function getRateLimitCache(): Promise<RateLimitInfo[]> {
+  return invoke<RateLimitInfo[]>("get_rate_limit_cache");
 }
 
 // Read a single project file as a UTF-8 string. Rejects on:

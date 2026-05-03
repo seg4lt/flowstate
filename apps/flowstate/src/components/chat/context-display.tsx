@@ -100,6 +100,90 @@ function RateLimitRow({ info }: { info: RateLimitInfo }) {
 }
 
 /**
+ * Compact inline rate-limit indicator shown next to the context-window
+ * chip in the chat toolbar — the user-facing answer to "am I about to
+ * hit my 5-hour or weekly limit?" without forcing a popover open.
+ *
+ * Renders only the single highest-utilization bucket within the given
+ * label prefix; the popover ("Plan usage" section) remains the place
+ * to inspect every bucket. Hidden entirely when no bucket has been
+ * reported yet (fresh install, API-key user, non-Claude provider) so
+ * the toolbar doesn't show a misleading "0%" placeholder.
+ *
+ * Reuses `barClassForStatus` and `formatResetIn` so the inline chip
+ * and the popover row stay color- and copy-aligned.
+ */
+function InlineRateLimitChip({
+  info,
+  shortLabel,
+}: {
+  info: RateLimitInfo;
+  shortLabel: string;
+}) {
+  const pct = Math.min(100, Math.round(info.utilization * 100));
+  const resetIn = formatResetIn(info.resetsAt);
+  const barClass = barClassForStatus(info.status, pct);
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground"
+      title={`${info.label} — ${pct}% used${
+        resetIn ? `, resets ${resetIn}` : ""
+      }`}
+    >
+      <span className="text-[11px] uppercase tracking-wide text-muted-foreground/70">
+        {shortLabel}
+      </span>
+      <span className="h-0.5 w-10 overflow-hidden rounded-full bg-muted/40">
+        <span
+          className={`block h-full ${barClass}`}
+          style={{ width: `${pct}%` }}
+        />
+      </span>
+      <span className="tabular-nums">{pct}%</span>
+      {resetIn && (
+        <span className="tabular-nums text-muted-foreground/70">
+          · {resetIn}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Pick the bucket to surface for a given short label. Strategy:
+ *
+ *  - "5h"  → the `five_hour` bucket exactly. There's only one.
+ *  - "Wk"  → highest-utilization of the weekly buckets
+ *           (`seven_day` / `seven_day_opus` / `seven_day_sonnet`).
+ *           A user with high Opus utilization still wants to see
+ *           that bar before they hit a hard cap, even if the
+ *           "all models" bucket is comfortably below.
+ *
+ * Returns `null` when none of the candidate buckets has been
+ * reported yet — the inline chip then renders nothing rather than
+ * a bogus 0% indicator.
+ */
+function pickFiveHourBucket(
+  rateLimits: Record<string, RateLimitInfo>,
+): RateLimitInfo | null {
+  return rateLimits["five_hour"] ?? null;
+}
+
+function pickWeeklyBucket(
+  rateLimits: Record<string, RateLimitInfo>,
+): RateLimitInfo | null {
+  const candidates = [
+    rateLimits["seven_day"],
+    rateLimits["seven_day_opus"],
+    rateLimits["seven_day_sonnet"],
+  ].filter((b): b is RateLimitInfo => !!b);
+  if (candidates.length === 0) return null;
+  return candidates.reduce((max, cur) =>
+    cur.utilization > max.utilization ? cur : max,
+  );
+}
+
+/**
  * Per-category context breakdown lazily loaded from the provider's
  * live SDK Query via the mid-turn RPC plumbing in
  * `CachedBridge.pending_rpcs`. Fetch fires on popover open; the
@@ -232,6 +316,22 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
     (r) => r.status === "allowed_warning" || r.status === "rejected",
   );
 
+  // Surface the 5-hour and weekly buckets inline next to the
+  // context-window chip so users can glance at "am I about to hit a
+  // limit?" without opening the popover. The popover stays as the
+  // detailed-breakdown affordance for every bucket. Both can be null
+  // (fresh install / API-key user / non-Claude provider) — the chips
+  // hide entirely in that case so the toolbar doesn't show a stale
+  // 0% placeholder.
+  const fiveHour = React.useMemo(
+    () => pickFiveHourBucket(state.rateLimits),
+    [state.rateLimits],
+  );
+  const weekly = React.useMemo(
+    () => pickWeeklyBucket(state.rateLimits),
+    [state.rateLimits],
+  );
+
   // Current context-window occupancy. We prefer the bridge-supplied
   // `liveContextTokens` snapshot — it's computed from the LAST API
   // call's prompt + the running output, which is the right
@@ -295,22 +395,23 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
           : "bg-foreground/60";
 
   return (
-    <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:text-foreground"
-          title="Context window & plan usage"
-        >
-          <Info className="h-3 w-3" />
-          <span className="tabular-nums">
-            {usedLabel} / {totalLabel}
-          </span>
-          {hasWarning && (
-            <span className="ml-0.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-          )}
-        </button>
-      </PopoverTrigger>
+    <div className="inline-flex items-center gap-1">
+      <Popover open={popoverOpen} onOpenChange={setPopoverOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:text-foreground"
+            title="Context window & plan usage"
+          >
+            <Info className="h-3 w-3" />
+            <span className="tabular-nums">
+              {usedLabel} / {totalLabel}
+            </span>
+            {hasWarning && (
+              <span className="ml-0.5 inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+            )}
+          </button>
+        </PopoverTrigger>
       <PopoverContent side="top" align="end" className="w-80 p-3">
         <div className="flex items-center gap-2">
           <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -401,6 +502,9 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
           )}
         </div>
       </PopoverContent>
-    </Popover>
+      </Popover>
+      {fiveHour && <InlineRateLimitChip info={fiveHour} shortLabel="5h" />}
+      {weekly && <InlineRateLimitChip info={weekly} shortLabel="Wk" />}
+    </div>
   );
 }

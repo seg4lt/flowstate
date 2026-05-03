@@ -45,6 +45,7 @@ use crate::usage::{
     TopSessionRow, UsageAgentPayload, UsageBucket, UsageGroupBy, UsageRange, UsageStore,
     UsageSummaryPayload, UsageTimeseriesPayload,
 };
+use zenui_provider_api::RateLimitInfo;
 use crate::user_config::{ProjectDisplay, ProjectWorktree, SessionDisplay, UserConfigStore};
 
 /// Sender side of the open-project signal. The HTTP route
@@ -114,6 +115,11 @@ pub fn router(state: AppLayerApiState) -> Router<()> {
         .route("/api/usage/top_sessions", post(usage_top_sessions_h))
         .route("/api/usage/by_agent", post(usage_by_agent_h))
         .route("/api/usage/by_agent_role", post(usage_by_agent_role_h))
+        // Persisted snapshot of every rate-limit bucket (Anthropic
+        // 5h / weekly / overage). Read once on app boot to seed the
+        // chat-toolbar chips before the first turn lands the live
+        // event. GET (no body) — the response is the full small map.
+        .route("/api/usage/rate_limit_cache", get(usage_rate_limit_cache_h))
         // CLI bridge — the `flow` binary POSTs the user's project
         // path here. The Tauri shell drains the channel and emits
         // an `open-project` event the webview consumes to spawn
@@ -382,6 +388,20 @@ async fn usage_by_agent_role_h(
         Err(r) => return r,
     };
     let r: Result<UsageAgentPayload, String> = store.summary_by_agent_role(body.range);
+    into_response(r)
+}
+
+/// Every persisted rate-limit bucket. Called once on app boot to
+/// seed `state.rateLimits` before the first turn fires; the live
+/// `RuntimeEvent::RateLimitUpdated` stream takes over from there.
+/// GET-only because the request carries no parameters and we want
+/// the route to be inspectable from a browser when debugging.
+async fn usage_rate_limit_cache_h(State(state): State<AppLayerApiState>) -> Response {
+    let store = match usage_store(&state) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let r: Result<Vec<RateLimitInfo>, String> = store.load_rate_limit_cache();
     into_response(r)
 }
 
