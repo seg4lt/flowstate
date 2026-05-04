@@ -407,12 +407,21 @@ jobs:
             | Windows (x64) MSI | `Flowstate-${{ github.ref_name }}-windows-x64.msi` |
             | Windows (x64) Setup | `Flowstate-${{ github.ref_name }}-windows-x64-setup.exe` |
 
-            ### macOS Installation
+            ### Quick install (any platform)
+            ```
+            npx @seg4lt/flowstate                              # latest
+            npx @seg4lt/flowstate install --version ${{ github.ref_name }}   # pin to this release
+            ```
+            Downloads the right artifact for your OS, installs, and
+            launches the app. Bypasses Gatekeeper on macOS without you
+            having to mount the DMG.
+
+            ### macOS Installation (manual)
             1. Download the `.dmg` file
             2. Open it and double-click "Install Flowstate.command"
             3. This installs to /Applications and clears the quarantine flag
 
-            ### Windows Installation
+            ### Windows Installation (manual)
             Download either the `.msi` (standard Windows Installer) or the `-setup.exe` (NSIS installer).
 
             ### Auto-updates

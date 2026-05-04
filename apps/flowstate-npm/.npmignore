@@ -1,0 +1,12 @@
+# `files` in package.json is the source of truth for what ships, but
+# .npmignore catches stray dotfiles and editor cruft just in case.
+.DS_Store
+*.log
+node_modules/
+*.tgz
+.editorconfig
+.eslintrc*
+.prettierrc*
+tsconfig*.json
+*.test.js
+__tests__/

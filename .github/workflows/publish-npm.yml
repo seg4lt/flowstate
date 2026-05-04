@@ -1,0 +1,73 @@
+name: Publish npm wrapper
+
+# Manual-only trigger by design. The npm wrapper (@seg4lt/flowstate) is
+# decoupled from the app's release cadence — wrapper code in
+# apps/flowstate-npm/ changes ~never, while the app ships frequently.
+# Publishing on every `v*` tag would just churn the npm registry. When
+# you DO change the wrapper, bump apps/flowstate-npm/package.json's
+# `version` in the same commit, then run this workflow from the
+# Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Run npm publish --dry-run (no actual publish)"
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for `npm publish --provenance`. The OIDC token scopes
+      # the publication to this workflow run so consumers can verify
+      # provenance from npm's UI.
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Compare local vs published version
+        id: check
+        working-directory: apps/flowstate-npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCAL=$(node -p "require('./package.json').version")
+          # `npm view` exits non-zero on a missing package; tolerate it
+          # for the very first publish.
+          PUBLISHED=$(npm view @seg4lt/flowstate version 2>/dev/null || echo "none")
+          echo "local=$LOCAL"     >> "$GITHUB_OUTPUT"
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+          echo "Local: $LOCAL"
+          echo "Published: $PUBLISHED"
+          if [ "$LOCAL" = "$PUBLISHED" ]; then
+            echo "skip=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::Local version matches published — bump apps/flowstate-npm/package.json before publishing."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.check.outputs.skip != 'true'
+        working-directory: apps/flowstate-npm
+        # `--access public` is required the first time a scoped package
+        # is published; harmless on subsequent publishes. `--provenance`
+        # attaches the GitHub Actions OIDC attestation.
+        run: |
+          if [ "${{ inputs.dry-run }}" = "true" ]; then
+            npm publish --access public --provenance --dry-run
+          else
+            npm publish --access public --provenance
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

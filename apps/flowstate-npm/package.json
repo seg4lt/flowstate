@@ -1,0 +1,45 @@
+{
+  "name": "@seg4lt/flowstate",
+  "version": "1.0.0",
+  "description": "One-line installer for the Flowstate desktop app. Downloads the official release and bypasses macOS Gatekeeper quarantine on unsigned builds. This version tracks the installer wrapper, not the app — `npx @seg4lt/flowstate` always pulls the latest Flowstate release.",
+  "keywords": [
+    "flowstate",
+    "installer",
+    "tauri",
+    "desktop"
+  ],
+  "homepage": "https://github.com/seg4lt/flowstate",
+  "bugs": {
+    "url": "https://github.com/seg4lt/flowstate/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seg4lt/flowstate.git",
+    "directory": "apps/flowstate-npm"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "flowstate": "bin/flowstate.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "win32",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
