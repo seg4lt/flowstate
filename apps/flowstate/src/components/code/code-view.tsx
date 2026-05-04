@@ -1989,8 +1989,19 @@ function TabPaneView({
         onFocus={onFocus}
         onDropTab={onDropTab}
       />
+      {/*
+        `relative` + `z-0` creates an isolated stacking context for the
+        editor pane. CM6 renders its bottom panels (e.g. the vim status
+        line) as `position: absolute` children of the editor root with
+        no z-index of their own. Without isolation here, those panels
+        escape to the nearest positioned ancestor (SidebarInset) and
+        paint over the TerminalDock (z-20) sitting in that same
+        stacking context. Pinning a stacking context at the pane
+        boundary keeps CM panels stacked inside the editor, below the
+        dock.
+      */}
       <div
-        className="min-h-0 flex-1 overflow-hidden"
+        className="relative z-0 min-h-0 flex-1 overflow-hidden"
         onMouseDown={onFocus}
       >
         <CodeViewBody
