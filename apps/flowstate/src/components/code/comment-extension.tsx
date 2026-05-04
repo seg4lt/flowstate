@@ -362,9 +362,15 @@ export function commentExtension(cfg: CommentExtensionConfig): Extension {
     // outer height past the content line height by 2px each, and
     // the cumulative drift across many lines was a ~one-line
     // misalignment that broke hover line attribution.
+    //
+    // `alignItems: flex-start` (not center) so that on wrapped
+    // lines the "+" sits next to the first visual row (where the
+    // line number is) instead of floating in the middle of the
+    // wrapped block — otherwise users have to chase a button that
+    // drifts out of the hover zone on long lines.
     ".cm-comment-gutter .cm-gutterElement": {
       display: "flex",
-      alignItems: "center",
+      alignItems: "flex-start",
       justifyContent: "center",
       cursor: "pointer",
     },
