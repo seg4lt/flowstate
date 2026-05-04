@@ -15,7 +15,7 @@ use zenui_runtime_core::{
 };
 
 use crate::git_worktree::create_git_worktree_internal;
-use crate::user_config::UserConfigStore;
+use crate::user_config::{SessionDisplay, UserConfigStore};
 
 /// Reads user-set titles / project names from the app-owned
 /// `session_display` / `project_display` tables. No writes — the
@@ -66,6 +66,32 @@ impl AppMetadataProvider for AppMetadataProviderImpl {
         .await
         .ok()
         .flatten()
+    }
+
+    async fn set_session_title(&self, session_id: &str, title: &str) -> Result<(), String> {
+        // Preserve any existing `last_turn_preview` if the row was
+        // already touched (e.g. a previous turn ran). For a fresh
+        // spawn this is None on first read, which matches the
+        // frontend's `setSessionDisplay` shape exactly.
+        let store = self.store.clone();
+        let id = session_id.to_string();
+        let title = title.to_string();
+        tokio::task::spawn_blocking(move || {
+            let existing_preview = store
+                .get_session_display(&id)
+                .ok()
+                .flatten()
+                .and_then(|d| d.last_turn_preview);
+            store.set_session_display(
+                &id,
+                &SessionDisplay {
+                    title: Some(title),
+                    last_turn_preview: existing_preview,
+                },
+            )
+        })
+        .await
+        .map_err(|e| format!("spawn_blocking join: {e}"))?
     }
 }
 

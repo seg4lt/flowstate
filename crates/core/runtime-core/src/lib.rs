@@ -90,6 +90,19 @@ pub trait ConnectionObserver: Send + Sync {
 pub trait AppMetadataProvider: Send + Sync {
     async fn session_title(&self, session_id: &str) -> Option<String>;
     async fn project_name(&self, project_id: &str) -> Option<String>;
+    /// Persist a session's display title. Used by the spawn
+    /// dispatchers so MCP-spawned threads land in the host's
+    /// session-display store with a real title (derived from the
+    /// `initial_message`) BEFORE the spawn event fans out — the host
+    /// then surfaces the same title in its sidebar with no async
+    /// race against later `TurnStarted` events. Errors are
+    /// non-fatal: the spawn still succeeds; the host just falls
+    /// back to "New thread" until something else titles the row.
+    /// Default impl is a graceful no-op for hosts that don't
+    /// expose a session-display store yet.
+    async fn set_session_title(&self, _session_id: &str, _title: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Host-provided git worktree creator. Runtime-core has no git
@@ -3206,6 +3219,47 @@ impl RuntimeCore {
         }
     }
 
+    /// Synchronously persist a sidebar title for a freshly-spawned
+    /// session, derived from the spawning agent's `initial_message`.
+    /// The whole point is determinism: by the time the spawn
+    /// dispatcher publishes `SessionLinked` and schedules the peer
+    /// turn, the title is already on disk in the host's session-display
+    /// store. The host's `listSessionDisplay()` boot-time hydration
+    /// path picks it up unconditionally, no matter when the frontend
+    /// connects or whether `TurnStarted` is missed by a stream
+    /// reconnect.
+    ///
+    /// Title rule mirrors the frontend (`apps/flowstate/src/lib/auto-title.ts`):
+    /// first 10 whitespace-delimited non-empty words of the input,
+    /// joined by single spaces. Empty input → no write (the host
+    /// will fall back to its default placeholder).
+    ///
+    /// No-op when no `AppMetadataProvider` is installed. Errors are
+    /// logged but NEVER propagate — a flaky write must not block a
+    /// spawn the user explicitly asked for.
+    async fn persist_spawn_title(&self, session_id: &str, initial_message: &str) {
+        let Some(metadata) = self.metadata_provider() else {
+            return;
+        };
+        let title = initial_message
+            .split_whitespace()
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if title.is_empty() {
+            return;
+        }
+        if let Err(err) = metadata.set_session_title(session_id, &title).await {
+            tracing::warn!(
+                session_id,
+                error = %err,
+                "Failed to persist auto-derived spawn title; the host will \
+                 fall back to its default placeholder until something else \
+                 titles the row.",
+            );
+        }
+    }
+
     /// Inherit provider / model from the caller's session if the
     /// RuntimeCall didn't specify one. Keeps the agent from having to
     /// remember what it is just to spawn a like-for-like peer.
@@ -3256,6 +3310,12 @@ impl RuntimeCore {
             .await
             .map_err(|e| RuntimeCallError::Internal { message: e })?;
         let new_sid = new_session.summary.session_id.clone();
+        // Persist the sidebar title BEFORE fanning the SessionLinked
+        // event out to the host. The host's link handler refreshes its
+        // session-display cache for spawn-reason links, so by the time
+        // its sidebar paints the new row the auto-title is already
+        // there — no race against TurnStarted, no "New thread" flash.
+        self.persist_spawn_title(&new_sid, &initial_message).await;
         self.publish(RuntimeEvent::SessionLinked {
             from_session_id: origin.session_id.clone(),
             to_session_id: new_sid.clone(),
@@ -3332,6 +3392,9 @@ impl RuntimeCore {
             .await
             .map_err(|e| RuntimeCallError::Internal { message: e })?;
         let new_sid = new_session.summary.session_id.clone();
+        // See `persist_spawn_title` doc and dispatch_spawn_and_await
+        // for why this happens before publishing SessionLinked.
+        self.persist_spawn_title(&new_sid, &initial_message).await;
         self.publish(RuntimeEvent::SessionLinked {
             from_session_id: origin.session_id.clone(),
             to_session_id: new_sid.clone(),
@@ -3827,6 +3890,9 @@ impl RuntimeCore {
             .await
             .map_err(|e| RuntimeCallError::Internal { message: e })?;
         let new_sid = new_session.summary.session_id.clone();
+        // See `persist_spawn_title` doc and dispatch_spawn_and_await
+        // for why this happens before publishing SessionLinked.
+        self.persist_spawn_title(&new_sid, &initial_message).await;
         self.publish(RuntimeEvent::SessionLinked {
             from_session_id: origin.session_id.clone(),
             to_session_id: new_sid.clone(),

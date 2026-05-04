@@ -6,6 +6,7 @@ import {
   deleteSessionDisplay,
   getProjectWorktree,
   getRateLimitCache,
+  getSessionDisplay,
   listProjectDisplay,
   listProjectWorktree,
   listSessionDisplay,
@@ -1584,6 +1585,46 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
                 });
             }
           }
+        } else if (
+          message.event.type === "session_linked" &&
+          message.event.reason === "spawn"
+        ) {
+          // MCP-spawn determinism. Runtime-core writes the new
+          // session's auto-title to disk BEFORE publishing this
+          // event (see `persist_spawn_title` in runtime-core/src/lib.rs).
+          // The disk write is the source of truth — boot-time
+          // `listSessionDisplay()` already picks it up unconditionally,
+          // so the only remaining job for the live stream is to
+          // refresh the in-memory cache so the sidebar paints the
+          // title without waiting for the next app restart.
+          //
+          // We deliberately do NOT gate on `turnCount === 0` or any
+          // other timing condition: the Rust write is unconditional
+          // for spawn dispatches with a non-empty initial_message,
+          // and `getSessionDisplay` returns whatever is currently on
+          // disk — so even on a stream reconnect that missed
+          // `TurnStarted`, this fetch still hydrates the title. The
+          // `turn_started` handler above stays as a belt-and-braces
+          // fallback for any legacy session created before this code
+          // shipped (idempotent — re-writing the same string is a
+          // no-op visually).
+          const sid = message.event.to_session_id;
+          void getSessionDisplay(sid)
+            .then((display) => {
+              if (!active || !display) return;
+              dispatchRef.current({
+                type: "set_session_display",
+                sessionId: sid,
+                display,
+              });
+            })
+            .catch((err) => {
+              console.debug(
+                "[app-store] getSessionDisplay failed for spawn-linked session",
+                sid,
+                err,
+              );
+            });
         } else if (message.event.type === "project_created") {
           // Backend-initiated creates (e.g. an agent used a worktree
           // tool — see WorktreeProvisionerImpl in src-tauri) don't go
