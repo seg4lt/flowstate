@@ -1,0 +1,32 @@
+# Tauri dev watcher exclusions.
+#
+# Why this file exists:
+# `tauri dev` walks every workspace crate that the app transitively
+# depends on and watches each crate dir for changes. Two of those
+# crates — provider-claude-sdk and provider-github-copilot — have a
+# `bridge/` subdir with its own JS toolchain (pnpm + tsc). Their
+# `build.rs` runs `pnpm install` and `pnpm run build` on (re)build, and
+# pnpm rewrites `bridge/node_modules/.package-lock.json` as part of its
+# internal bookkeeping — even on a no-op install.
+#
+# Without this ignore file, the sequence is:
+#   1. cargo build → build.rs → pnpm touches node_modules/.package-lock.json
+#   2. tauri watcher sees the write → triggers rebuild
+#   3. goto 1 (infinite loop, the build never settles)
+#
+# Patterns are gitignore-style, matched against paths inside every
+# watched crate dir.
+
+# JS bridge artifacts in the provider crates. Patterns are gitignore-
+# style and matched relative to each watched crate root, so both rooted
+# and globbed forms are listed for safety across tauri-cli versions.
+node_modules
+node_modules/
+**/node_modules
+**/node_modules/**
+bridge/node_modules
+bridge/node_modules/**
+bridge/dist
+bridge/dist/**
+**/.package-lock.json
+**/.pnpm-install-stamp

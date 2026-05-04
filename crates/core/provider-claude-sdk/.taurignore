@@ -1,0 +1,8 @@
+# Bridge artifacts that this crate's build.rs writes during cargo
+# build. Without this, tauri dev's file watcher fires on every tsc
+# output and triggers a rebuild loop. Patterns are matched relative
+# to this directory.
+bridge/dist
+bridge/dist/**
+bridge/node_modules
+bridge/node_modules/**

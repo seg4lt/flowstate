@@ -43,6 +43,46 @@ fn main() {
         return;
     }
 
+    // -----------------------------------------------------------------
+    // Fast-path: skip the entire pnpm/tsc pipeline when nothing has
+    // changed. Mirror of provider-claude-sdk/build.rs — see that file
+    // for the full rationale. Short version: invoking pnpm rewrites
+    // `bridge/node_modules/.package-lock.json`, which under
+    // `tauri dev` triggers a watcher rebuild, which reruns this build
+    // script, which reinvokes pnpm, ad infinitum. Skipping pnpm
+    // entirely when the staged assets are already fresh breaks the
+    // loop.
+    let assets_dir = out_dir.join("bridge-assets");
+    let staged_index = assets_dir.join("index.js");
+    let staged_pkg = assets_dir.join("package.json");
+    let glue_fp_path = out_dir.join("bridge-glue-fingerprint.txt");
+    let deps_fp_path = out_dir.join("bridge-deps-fingerprint.txt");
+
+    let inputs: Vec<PathBuf> = vec![
+        bridge_dir.join("src/index.ts"),
+        bridge_dir.join("tsconfig.json"),
+        bridge_dir.join("package.json"),
+        bridge_dir.join("package-lock.json"),
+        bridge_dir.join("pnpm-lock.yaml"),
+        PathBuf::from("../embedded-node/src/lib.rs"),
+    ];
+    let outputs: Vec<&Path> = vec![
+        staged_index.as_path(),
+        staged_pkg.as_path(),
+        glue_fp_path.as_path(),
+        deps_fp_path.as_path(),
+    ];
+
+    if assets_fresh(&inputs, &outputs) {
+        let glue_fp = fs::read_to_string(&glue_fp_path).unwrap_or_default();
+        let deps_fp = fs::read_to_string(&deps_fp_path).unwrap_or_default();
+        println!("cargo:rustc-env=BRIDGE_GLUE_FINGERPRINT={glue_fp}");
+        println!("cargo:rustc-env=BRIDGE_DEPS_FINGERPRINT={deps_fp}");
+        println!("cargo:rerun-if-changed={}", glue_fp_path.display());
+        println!("cargo:rerun-if-changed={}", deps_fp_path.display());
+        return;
+    }
+
     // Fail-fast guard: bridge/package-lock.json MUST satisfy
     // bridge/package.json's declared deps. Drift between the two
     // makes `npm ci` refuse to install at end-user first launch — the
@@ -51,7 +91,23 @@ fn main() {
     // forgets to regenerate the lockfile gets a build-time error
     // pointing at the fix, not a shipped binary that explodes for
     // every user who lazy-hydrates the bridge.
-    validate_lockfile_consistency(&bridge_dir, "Copilot");
+    //
+    // Gated by a stamp — see provider-claude-sdk/build.rs for the
+    // full rationale. Short version: `npm ci --dry-run` re-syncs
+    // `bridge/node_modules/.package-lock.json` as a side effect, which
+    // under `tauri dev` triggers an infinite watcher rebuild loop.
+    // Skipping the check when lockfiles haven't changed avoids the
+    // rewrite without weakening the guarantee.
+    let validation_stamp = out_dir.join(".lockfile-validation-stamp");
+    let pkg_json_for_stamp = bridge_dir.join("package.json");
+    let pkg_lock_for_stamp = bridge_dir.join("package-lock.json");
+    if !is_stamp_fresh(
+        &validation_stamp,
+        &[&pkg_json_for_stamp, &pkg_lock_for_stamp],
+    ) {
+        validate_lockfile_consistency(&bridge_dir, "Copilot");
+        touch_stamp(&validation_stamp);
+    }
 
     // pnpm preflight — see provider-claude-sdk/build.rs::preflight_pnpm
     // for the full rationale. Failing the build now turns the
@@ -145,35 +201,60 @@ fn main() {
         }
     }
 
-    // See provider-claude-sdk/build.rs for rationale.
-    let tsc_bin = bridge_dir.join("node_modules").join(".bin").join("tsc");
-    if !tsc_bin.exists() {
-        panic!(
-            "Copilot bridge: `node_modules/.bin/tsc` is missing — \
-            `pnpm install` was either skipped or ran in production mode \
-            (devDependencies dropped). Delete \
-            `crates/core/provider-github-copilot/bridge/node_modules` and \
-            the stamp file in `OUT_DIR/.pnpm-install-stamp`, then rebuild.",
-        );
-    }
-    let tsc_status = Command::new(pnpm_program())
-        .args(["run", "build"])
-        .env("NODE_ENV", "development")
-        .current_dir(&bridge_dir)
-        .status();
-    match tsc_status {
-        Ok(s) if s.success() => {}
-        Ok(s) => panic!(
-            "Copilot bridge `pnpm run build` (tsc) exited with {s}. \
-            The compile cannot embed an empty bridge — fix the TypeScript \
-            error and re-run `cargo build`. Run `pnpm run build` in \
-            `crates/core/provider-github-copilot/bridge/` to reproduce.",
-        ),
-        Err(e) => panic!(
-            "Failed to invoke `pnpm run build` for copilot bridge ({e}). \
-            pnpm went missing between the preflight check and now — that \
-            should be impossible. Inspect the build-script PATH.",
-        ),
+    // Direct tsc call (NOT via `pnpm run build`) — see
+    // provider-claude-sdk/build.rs for the full rationale. Short
+    // version: pnpm rewrites `node_modules/.package-lock.json` even on
+    // no-op script invocations, which under `tauri dev` triggers an
+    // infinite watcher rebuild loop. Calling tsc by path skips pnpm
+    // entirely, leaving node_modules untouched.
+    //
+    // Skip tsc when dist is already fresh, AND don't even require tsc
+    // to be installed in that case — the bridge artifact is what
+    // matters, not the build tooling. Locating tsc itself is delegated
+    // to `locate_tsc` which copes with missing .bin shims on Windows
+    // by falling back to the pnpm virtual store and `node`.
+    let dist_index = bridge_dir.join("dist/index.js");
+    let tsconfig = bridge_dir.join("tsconfig.json");
+    let src_index = bridge_dir.join("src/index.ts");
+    let dist_fresh = match (
+        fs::metadata(&dist_index).and_then(|m| m.modified()),
+        fs::metadata(&src_index).and_then(|m| m.modified()),
+        fs::metadata(&tsconfig).and_then(|m| m.modified()),
+    ) {
+        (Ok(d), Ok(s), Ok(c)) => d >= s && d >= c,
+        _ => false,
+    };
+
+    if !dist_fresh {
+        let mut tsc_cmd = locate_tsc(&bridge_dir).unwrap_or_else(|| {
+            panic!(
+                "Copilot bridge: cannot find a runnable tsc anywhere \
+                under `node_modules/` (.bin shim, flat layout, or pnpm \
+                virtual store). The node_modules tree appears corrupted — \
+                most likely from interrupted pnpm installs during `tauri \
+                dev` rebuild loops. Repair with: \
+                `cd crates/core/provider-github-copilot/bridge && \
+                rm -rf node_modules && pnpm install --prod=false`",
+            )
+        });
+        let tsc_status = tsc_cmd
+            .env("NODE_ENV", "development")
+            .current_dir(&bridge_dir)
+            .status();
+        match tsc_status {
+            Ok(s) if s.success() => {}
+            Ok(s) => panic!(
+                "Copilot bridge `tsc` exited with {s}. \
+                The compile cannot embed an empty bridge — fix the TypeScript \
+                error and re-run `cargo build`. Run `pnpm run build` in \
+                `crates/core/provider-github-copilot/bridge/` to reproduce.",
+            ),
+            Err(e) => panic!(
+                "Failed to invoke direct tsc for copilot bridge ({e}). \
+                Reinstall the bridge dev deps: \
+                `cd crates/core/provider-github-copilot/bridge && pnpm install --prod=false`",
+            ),
+        }
     }
 
     let assets_dir = out_dir.join("bridge-assets");
@@ -333,6 +414,108 @@ fn write_fingerprints(out_dir: &Path, glue_fp: &str, deps_fp: &str) {
     println!("cargo:rustc-env=BRIDGE_DEPS_FINGERPRINT={deps_fp}");
     println!("cargo:rerun-if-changed={}", glue_path.display());
     println!("cargo:rerun-if-changed={}", deps_path.display());
+}
+
+/// Mirror of provider-claude-sdk/build.rs::locate_tsc — keep in sync.
+/// See that copy for the full rationale (Windows symlink failures in
+/// pnpm produce node_modules trees with no `.bin/tsc.cmd`; we walk
+/// alternative locations and fall back to `node <script>` on Windows).
+fn locate_tsc(bridge_dir: &Path) -> Option<Command> {
+    let bin_dir = bridge_dir.join("node_modules").join(".bin");
+    let shim_name = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
+    let shim = bin_dir.join(shim_name);
+    if shim.exists() {
+        return Some(Command::new(shim));
+    }
+
+    let mut script: Option<PathBuf> = None;
+    let flat = bridge_dir
+        .join("node_modules")
+        .join("typescript")
+        .join("bin")
+        .join("tsc");
+    if flat.exists() {
+        script = Some(flat);
+    } else {
+        let pnpm_store = bridge_dir.join("node_modules").join(".pnpm");
+        if let Ok(entries) = fs::read_dir(&pnpm_store) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with("typescript@") {
+                    let candidate = entry
+                        .path()
+                        .join("node_modules")
+                        .join("typescript")
+                        .join("bin")
+                        .join("tsc");
+                    if candidate.exists() {
+                        script = Some(candidate);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let script = script?;
+
+    // Canonicalize before invoking — see provider-claude-sdk/build.rs
+    // for rationale (the caller sets `current_dir(bridge_dir)` which
+    // would otherwise cause a relative `script` to resolve under
+    // `bridge/bridge/...`). Then strip the `\\?\` UNC prefix that
+    // `fs::canonicalize` adds on Windows (node's CJS resolver chokes
+    // on verbatim paths with "EISDIR: lstat 'C:'").
+    let script = fs::canonicalize(&script).unwrap_or(script);
+    let script = strip_unc_prefix(&script);
+
+    if cfg!(windows) {
+        let mut cmd = Command::new("node");
+        cmd.arg(script);
+        Some(cmd)
+    } else {
+        Some(Command::new(script))
+    }
+}
+
+/// Mirror of provider-claude-sdk/build.rs::strip_unc_prefix — keep in sync.
+fn strip_unc_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        if !stripped.starts_with("UNC\\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    p.to_path_buf()
+}
+
+/// Mirror of provider-claude-sdk/build.rs::assets_fresh. Returns true
+/// when every staged output exists and is newer than every existing
+/// input — used by the build-script fast-path to skip pnpm/tsc when
+/// nothing has changed. Missing inputs are skipped; missing outputs
+/// always count as stale. Keep in sync with the claude-sdk copy.
+fn assets_fresh(inputs: &[PathBuf], outputs: &[&Path]) -> bool {
+    use std::time::SystemTime;
+
+    let mut newest_input: Option<SystemTime> = None;
+    for src in inputs {
+        let Ok(meta) = fs::metadata(src) else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        newest_input = Some(match newest_input {
+            Some(prev) if prev >= mtime => prev,
+            _ => mtime,
+        });
+    }
+    let Some(newest_input) = newest_input else {
+        return false;
+    };
+
+    for out in outputs {
+        let Ok(meta) = fs::metadata(out) else { return false };
+        let Ok(mtime) = meta.modified() else { return false };
+        if mtime < newest_input {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_stamp_fresh(stamp: &Path, sources: &[&Path]) -> bool {
