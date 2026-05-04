@@ -17,6 +17,7 @@ import { SidebarTrigger } from "@/components/ui/sidebar";
 import { AppProvider, useApp } from "@/stores/app-store";
 import { ThemeProvider } from "@/hooks/use-theme";
 import { ContextDisplaySettingProvider } from "@/hooks/use-context-display-setting";
+import { EditStandaloneSettingProvider } from "@/hooks/use-edit-standalone-setting";
 import { ProviderEnabledProvider } from "@/hooks/use-provider-enabled";
 import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
 import { TerminalDock } from "@/components/terminal/TerminalDock";
@@ -457,13 +458,15 @@ function AppLayout() {
   return (
     <ThemeProvider>
       <ContextDisplaySettingProvider>
-        <ProviderEnabledProvider>
-          <AppProvider>
-            <TerminalProvider>
-              {popout ? <PopoutShell /> : <AppShell />}
-            </TerminalProvider>
-          </AppProvider>
-        </ProviderEnabledProvider>
+        <EditStandaloneSettingProvider>
+          <ProviderEnabledProvider>
+            <AppProvider>
+              <TerminalProvider>
+                {popout ? <PopoutShell /> : <AppShell />}
+              </TerminalProvider>
+            </AppProvider>
+          </ProviderEnabledProvider>
+        </EditStandaloneSettingProvider>
       </ContextDisplaySettingProvider>
     </ThemeProvider>
   );

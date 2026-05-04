@@ -15,6 +15,7 @@ import { AgentMessage } from "./agent-message";
 import { CompactBlock } from "./compact-block";
 import { MemoryRecallBlock } from "./memory-recall-block";
 import { RewindDivider } from "./rewind-divider";
+import { useEditStandaloneSetting } from "@/hooks/use-edit-standalone-setting";
 
 const GROUP_DEFAULT_VISIBLE = 5;
 
@@ -41,6 +42,12 @@ type RenderBlock =
        *  `callIds` against the group's. Null = no auto-summary,
        *  group renders as before with overflow-only collapse. */
       summary?: string;
+      /** When true, every `ToolCallCard` inside the group renders
+       *  pre-expanded. Set by the edit-standalone code path so
+       *  broken-out Edit calls show their diff inline without an
+       *  extra click. Off everywhere else — default collapsed cards
+       *  remain the baseline. */
+      cardsDefaultOpen?: boolean;
     }
   | {
       kind: "compact";
@@ -61,7 +68,9 @@ type RenderBlock =
 function groupBlocks(
   blocks: ContentBlock[],
   callsById: Map<string, ToolCall>,
+  options: { editStandalone?: boolean } = {},
 ): RenderBlock[] {
+  const { editStandalone = false } = options;
   const result: RenderBlock[] = [];
 
   // Main-agent grouping: sequential, breaks on any non-tool block or
@@ -145,6 +154,28 @@ function groupBlocks(
 
       if (parent === undefined) {
         // Main agent — sequential grouping.
+        //
+        // Edit-standalone opt-in: every Edit / MultiEdit call breaks
+        // the current main-agent streak and lands in its own
+        // single-call group. Subsequent main-agent tool calls start a
+        // FRESH group on the other side — never merging through an
+        // Edit. Sub-agent boxes are unaffected (their identity is the
+        // parentCallId, not stream contiguity), so Edits inside a
+        // Task's sub-agent still fold into that sub-agent's box.
+        const isStandaloneEdit =
+          editStandalone &&
+          (tc?.name === "Edit" || tc?.name === "MultiEdit");
+        if (isStandaloneEdit) {
+          currentMainGroup = null;
+          result.push({
+            kind: "tool_call_group",
+            callIds: [block.callId],
+            parentCallId: undefined,
+            key: `tg-edit-${block.callId}`,
+            cardsDefaultOpen: true,
+          });
+          return;
+        }
         if (currentMainGroup) {
           currentMainGroup.callIds.push(block.callId);
           return;
@@ -247,6 +278,7 @@ function ToolCallGroup({
   callsById,
   subagentsByParent,
   summary,
+  cardsDefaultOpen = false,
 }: {
   callIds: string[];
   parentCallId: string | undefined;
@@ -260,6 +292,10 @@ function ToolCallGroup({
    *  collapsed-by-default with this string as the clickable
    *  header — mobile-density gain on tool-heavy turns. */
   summary?: string;
+  /** When true, every `ToolCallCard` inside this group renders
+   *  pre-expanded. The edit-standalone code path sets this so
+   *  broken-out Edits show their diff without an extra click. */
+  cardsDefaultOpen?: boolean;
 }) {
   // When the provider supplied a batch label, default-collapse;
   // user can click the label to expand. Without a label, we keep
@@ -308,7 +344,11 @@ function ToolCallGroup({
     <>
       <div className="divide-y divide-border/30">
         {visible.map((tc) => (
-          <ToolCallCard key={tc.callId} toolCall={tc} />
+          <ToolCallCard
+            key={tc.callId}
+            toolCall={tc}
+            defaultOpen={cardsDefaultOpen}
+          />
         ))}
       </div>
       {hasOverflow && (
@@ -493,6 +533,7 @@ interface TurnViewProps {
 }
 
 function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
+  const { editStandalone } = useEditStandaloneSetting();
   const callsById = React.useMemo(() => {
     const map = new Map<string, ToolCall>();
     for (const tc of item.toolCalls ?? []) map.set(tc.callId, tc);
@@ -510,8 +551,8 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
   }, [item.subagents]);
 
   const renderBlocks = React.useMemo(
-    () => groupBlocks(item.blocks, callsById),
-    [item.blocks, callsById],
+    () => groupBlocks(item.blocks, callsById, { editStandalone }),
+    [item.blocks, callsById, editStandalone],
   );
 
   // Index of the trailing text block in the grouped stream so the
@@ -588,6 +629,7 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
                 callsById={callsById}
                 subagentsByParent={subagentsByParent}
                 summary={block.summary}
+                cardsDefaultOpen={block.cardsDefaultOpen}
               />
             );
           case "compact":

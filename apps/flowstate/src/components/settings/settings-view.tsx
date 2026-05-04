@@ -78,6 +78,7 @@ import {
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
 import { ShortcutsDialog } from "@/lib/keyboard";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
+import { useEditStandaloneSetting } from "@/hooks/use-edit-standalone-setting";
 import { useEditorPrefs } from "@/hooks/use-editor-prefs";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useCheckpointSettings } from "@/hooks/useCheckpointSettings";
@@ -135,6 +136,28 @@ function ThemeRow() {
           </Button>
         ))}
       </div>
+    </div>
+  );
+}
+
+function EditStandaloneRow() {
+  const { editStandalone, setEditStandalone } = useEditStandaloneSetting();
+
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Edit calls as standalone</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Break the inline tool-call group around every Edit / MultiEdit call so
+          each diff renders as its own message-style block. Surrounding tool
+          calls regroup into fresh streaks on either side.
+        </div>
+      </div>
+      <Switch
+        checked={editStandalone}
+        onCheckedChange={setEditStandalone}
+        aria-label="Render Edit tool calls as standalone messages"
+      />
     </div>
   );
 }
@@ -1905,6 +1928,7 @@ export function SettingsView() {
           >
             <ThemeRow />
             <ContextDisplayRow />
+            <EditStandaloneRow />
             <VimModeRow />
           </SettingsGroup>
           <SettingsGroup

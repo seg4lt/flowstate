@@ -6,6 +6,11 @@ import { renderToolArgs, ToolOutputContent } from "./tool-renderers";
 
 interface ToolCallCardProps {
   toolCall: ToolCall;
+  /** Initial open state for the collapsible. Used by the
+   *  edit-standalone code path so each broken-out Edit lands
+   *  pre-expanded with its diff visible — the whole point of the
+   *  toggle. Defaults to closed (existing collapsed-card behavior). */
+  defaultOpen?: boolean;
 }
 
 // One-line preview of what a tool call is doing, shown inline next to
@@ -130,8 +135,11 @@ function ToolStalled({ lastProgressAt }: { lastProgressAt: string }) {
   );
 }
 
-export function ToolCallCard({ toolCall }: ToolCallCardProps) {
-  const [open, setOpen] = React.useState(false);
+export function ToolCallCard({
+  toolCall,
+  defaultOpen = false,
+}: ToolCallCardProps) {
+  const [open, setOpen] = React.useState(defaultOpen);
 
   const statusColor =
     toolCall.status === "completed"
