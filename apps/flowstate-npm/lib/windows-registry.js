@@ -117,12 +117,22 @@ function findInstall() {
  * order:
  *   1. DisplayIcon (NSIS often points this directly at the main exe)
  *   2. <InstallLocation>\flowstate.exe
- * Returns null if neither exists or the entry is null.
+ *   3. dirname(UninstallString)\flowstate.exe
+ *      — Tauri's NSIS template doesn't always write InstallLocation,
+ *      but UninstallString is mandatory and the uninstaller lives
+ *      in the install dir.
+ *   4. Scan dirname(UninstallString) for any flowstate*.exe (case-
+ *      insensitive) as a last-ditch fallback for renamed binaries.
+ * Returns null if nothing matches or the entry is null.
  */
-function resolveMainExe(entry, fs = require('node:fs'), path = require('node:path')) {
+function resolveMainExe(
+  entry,
+  fs = require('node:fs'),
+  path = require('node:path'),
+) {
   if (!entry) return null;
 
-  // DisplayIcon may include a `,0` icon-index suffix — strip it.
+  // 1. DisplayIcon may include a `,0` icon-index suffix — strip it.
   if (entry.displayIcon) {
     const cleaned = entry.displayIcon.replace(/,\d+$/, '');
     if (cleaned.toLowerCase().endsWith('.exe') && fs.existsSync(cleaned)) {
@@ -130,12 +140,59 @@ function resolveMainExe(entry, fs = require('node:fs'), path = require('node:pat
     }
   }
 
+  // 2. InstallLocation when present.
   if (entry.installLocation) {
     const guess = path.join(entry.installLocation, 'flowstate.exe');
     if (fs.existsSync(guess)) return guess;
   }
 
+  // 3. & 4. Derive install dir from the uninstaller path.
+  const uninstallerPath = extractUninstallerPath(
+    entry.uninstallString || entry.quietUninstallString,
+  );
+  if (uninstallerPath) {
+    const dir = path.dirname(uninstallerPath);
+
+    const guess = path.join(dir, 'flowstate.exe');
+    if (fs.existsSync(guess)) return guess;
+
+    // Last-ditch: any flowstate*.exe in the install dir, case-insensitive.
+    try {
+      const candidates = fs
+        .readdirSync(dir)
+        .filter(
+          (f) =>
+            f.toLowerCase().startsWith('flowstate') &&
+            f.toLowerCase().endsWith('.exe'),
+        );
+      if (candidates.length > 0) {
+        return path.join(dir, candidates[0]);
+      }
+    } catch {
+      // unreadable dir — fall through to null
+    }
+  }
+
   return null;
+}
+
+/**
+ * Pull the executable path out of an UninstallString. NSIS writes it
+ * either bare (`C:\X\unins.exe`) or quoted (`"C:\X\unins.exe" /S`).
+ * Returns the unquoted path, or null if the string is empty.
+ */
+function extractUninstallerPath(uninstallString) {
+  if (!uninstallString) return null;
+  const s = uninstallString.trim();
+  if (s.startsWith('"')) {
+    const end = s.indexOf('"', 1);
+    if (end === -1) return s.slice(1);
+    return s.slice(1, end);
+  }
+  // Unquoted: take everything up to the first space (NSIS doesn't put
+  // unquoted paths-with-spaces in the registry).
+  const space = s.indexOf(' ');
+  return space === -1 ? s : s.slice(0, space);
 }
 
 /**
@@ -152,4 +209,4 @@ function trimQuotes(s) {
   return t;
 }
 
-module.exports = { findInstall, resolveMainExe };
+module.exports = { findInstall, resolveMainExe, extractUninstallerPath };

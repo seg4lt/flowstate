@@ -75,14 +75,38 @@ async function installWindows({ tag, launch = true, quiet = false } = {}) {
   }
 
   const installedExe = resolveMainExe(entry);
-  log(quiet, `==> Installed to ${entry.installLocation || '(unknown dir)'}`);
+  // Prefer InstallLocation when NSIS wrote it; otherwise show the
+  // uninstaller's directory (always present).
+  const reportedDir =
+    entry.installLocation ||
+    (entry.uninstallString
+      ? require('node:path').dirname(
+          require('./windows-registry').extractUninstallerPath(
+            entry.uninstallString,
+          ) || '',
+        )
+      : '(unknown dir)');
+  log(quiet, `==> Installed to ${reportedDir}`);
 
   if (!installedExe) {
+    // Dump the raw registry entry so the user can paste it back to us
+    // for diagnosis when our resolver heuristics miss the actual exe.
     log(
       quiet,
-      'note: registry has the install entry but flowstate.exe was not found ' +
-        'at the expected location. Launch via the Start Menu shortcut instead.',
+      'note: install registered but no flowstate*.exe was found in the install dir. ' +
+        'Launch via the Start Menu shortcut. Registry entry below for diagnosis:',
     );
+    log(quiet, JSON.stringify(entry, null, 2));
+    // Also list what IS in the install dir, so we can see the actual
+    // binary name without another round-trip.
+    try {
+      const fsMod = require('node:fs');
+      const files = fsMod.readdirSync(reportedDir);
+      log(quiet, `Install dir contents (${reportedDir}):`);
+      for (const f of files) log(quiet, `  ${f}`);
+    } catch (err) {
+      log(quiet, `(could not list ${reportedDir}: ${err.message})`);
+    }
     return { installedAt: null, registryEntry: entry };
   }
 
