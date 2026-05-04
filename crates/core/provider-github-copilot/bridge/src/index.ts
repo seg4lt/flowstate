@@ -149,6 +149,48 @@ function resolveJsEntryUnderWindowsShim(shimPath: string): string | null {
   return jsPath;
 }
 
+/**
+ * Last-resort .cmd → JS rewrite when the npm-layout walk in
+ * `resolveJsEntryUnderWindowsShim` returns null (e.g. user moved their
+ * npm prefix, package.json's `bin` field changed shape upstream, or
+ * `node_modules/@github/copilot/` was relocated by a tool we don't
+ * know about). Every npm-generated `.cmd` shim contains a quoted JS
+ * path embedded in its body — we read the file, regex out the first
+ * `*.js` reference, expand the `%~dp0` token to the shim's directory,
+ * and verify the resulting path exists. Works for npm/pnpm/yarn shims
+ * regardless of where `node_modules/` actually lives.
+ *
+ * Returns null on any failure (read error, no JS reference found,
+ * resolved path doesn't exist) so the caller can fall through to its
+ * raw-shim fallback.
+ */
+function resolveJsEntryFromCmdContents(shimPath: string): string | null {
+  if (process.platform !== 'win32') return null;
+  if (!shimPath.toLowerCase().endsWith('.cmd')) return null;
+  let contents: string;
+  try {
+    contents = readFileSync(shimPath, 'utf8');
+  } catch {
+    return null;
+  }
+  // npm shims contain a line like:
+  //   "%_prog%"  "%dp0%\node_modules\@github\copilot\bin\copilot.js" %*
+  // pnpm/yarn variants differ in the surrounding tokens but always
+  // quote a `*.js` path. Match either single backticks (rare) or
+  // double-quoted strings ending in `.js`.
+  const m = contents.match(/["`]([^"`\n]*\.js)["`]/);
+  if (!m) return null;
+  // Expand npm-shim tokens. `%~dp0` and `%dp0%` both expand to the
+  // shim's directory with a trailing backslash; normalise both forms.
+  const shimDir = dirname(shimPath);
+  let resolved = m[1].replace(/%~?dp0%?\\?/gi, shimDir + '\\');
+  // npm-style shims sometimes use forward slashes inside the quoted
+  // path; Node handles either on Windows but normalising avoids
+  // surprises in the existsSync check.
+  resolved = resolved.replace(/\//g, '\\');
+  return existsSync(resolved) ? resolved : null;
+}
+
 function resolveCopilotBinary(): string | null {
   const home = homedir();
   const fallbackPaths: string[] =
@@ -172,12 +214,33 @@ function resolveCopilotBinary(): string | null {
   // SDK takes its `isJsFile` spawn branch (CVE-2024-27980 prevents
   // `child_process.spawn` from launching `.cmd` directly). See
   // `resolveJsEntryUnderWindowsShim` for the full rationale.
-  const jsAlt = resolveJsEntryUnderWindowsShim(found);
+  //
+  // Two-stage resolution: prefer the npm-layout walk (cheap, structured),
+  // fall back to parsing the shim file's contents for an embedded JS
+  // path (works for any layout that ships a standard cmd shim, including
+  // pnpm-global and relocated npm prefixes).
+  const jsAlt =
+    resolveJsEntryUnderWindowsShim(found) ?? resolveJsEntryFromCmdContents(found);
   if (jsAlt) {
     console.error(
       `[bridge] Resolved Windows .cmd shim to JS entry to bypass spawn-EINVAL: ${jsAlt}`,
     );
     return jsAlt;
+  }
+  // Diagnostic: if we resolved a `.cmd` shim but couldn't rewrite it
+  // to a JS entry, the SDK is about to die with `spawn EINVAL`. Log
+  // loudly so the next investigation doesn't have to reverse-engineer
+  // why the model menu shows the static fallback list.
+  if (
+    process.platform === 'win32' &&
+    found.toLowerCase().endsWith('.cmd')
+  ) {
+    console.error(
+      `[bridge] WARNING: resolved Windows .cmd shim but could not rewrite ` +
+        `to a JS entry — SDK spawn will likely fail with EINVAL. ` +
+        `Resolved path: ${found}. ` +
+        `If this is your install, the bridge needs a wider .cmd-parsing fallback.`,
+    );
   }
   return found;
 }
