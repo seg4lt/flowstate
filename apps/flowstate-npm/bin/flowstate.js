@@ -123,11 +123,26 @@ function runLaunch({ quiet }) {
     return;
   }
   if (process.platform === 'win32') {
-    const { defaultWindowsInstallExe } = require('../lib/paths');
-    const exe = defaultWindowsInstallExe();
-    if (!fs.existsSync(exe)) {
+    const { findInstall, resolveMainExe } = require('../lib/windows-registry');
+    let entry;
+    try {
+      entry = findInstall();
+    } catch (err) {
+      process.stderr.write(`Registry lookup failed: ${err.message}\n`);
+      process.exit(1);
+    }
+    if (!entry) {
       process.stderr.write(
-        `${exe} not found. Run \`flowstate install\` first.\n`,
+        'flowstate is not installed (no entry in the Uninstall registry hives). ' +
+          'Run `flowstate install` first.\n',
+      );
+      process.exit(1);
+    }
+    const exe = resolveMainExe(entry);
+    if (!exe) {
+      process.stderr.write(
+        `Found install at ${entry.installLocation || '(unknown)'} but flowstate.exe ` +
+          'is missing. Try the Start Menu shortcut.\n',
       );
       process.exit(1);
     }

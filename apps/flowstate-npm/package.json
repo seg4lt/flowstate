@@ -1,6 +1,6 @@
 {
   "name": "@seg4lt/flowstate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "One-line installer for the Flowstate desktop app. Downloads the official release and bypasses macOS Gatekeeper quarantine on unsigned builds. This version tracks the installer wrapper, not the app — `npx @seg4lt/flowstate` always pulls the latest Flowstate release.",
   "keywords": [
     "flowstate",

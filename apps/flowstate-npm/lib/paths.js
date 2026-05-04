@@ -35,19 +35,6 @@ function isWritableDir(dir) {
 }
 
 /**
- * Default Tauri NSIS install path. Tauri's default `installMode` is
- * "currentUser", which lands here. If the user customized installMode in
- * tauri.conf.json the path would differ, but Flowstate's config uses the
- * default.
- */
-function defaultWindowsInstallExe() {
-  const localAppData =
-    process.env.LOCALAPPDATA ||
-    path.join(os.homedir(), 'AppData', 'Local');
-  return path.join(localAppData, 'Programs', 'flowstate', 'flowstate.exe');
-}
-
-/**
  * Build a unique-per-tag path under the OS temp dir. Including the tag in
  * the filename lets us keep partial downloads for inspection if a run
  * fails halfway, without overwriting a different version's bytes.
@@ -60,6 +47,5 @@ module.exports = {
   APP_BUNDLE_NAME,
   pickMacInstallDir,
   isWritableDir,
-  defaultWindowsInstallExe,
   tempArtifactPath,
 };

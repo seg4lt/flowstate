@@ -1,46 +1,107 @@
-// Windows uninstall — invoke the NSIS uninstaller silently.
+// Windows uninstall — invoke the registered NSIS uninstaller silently.
 //
-// Tauri's NSIS template drops `uninstall.exe` (the per-app uninstaller)
-// next to the installed binary. NSIS uninstallers also accept `/S` for
-// silent uninstall. If we can't find the uninstaller at the default
-// path, we direct the user to "Add or Remove Programs" rather than
-// trying to clean up by hand and risk leaving registry/Start Menu cruft.
+// Reads UninstallString from the Uninstall hive (whichever one our
+// install registered into) so we don't have to guess where the
+// uninstaller lives. NSIS uninstallers accept `/S` for silent uninstall.
 
 'use strict';
 
 const { spawnSync } = require('node:child_process');
-const fs = require('node:fs');
 const path = require('node:path');
 
-const { defaultWindowsInstallExe } = require('./paths');
+const { findInstall } = require('./windows-registry');
 
 function uninstallWindows({ quiet = false } = {}) {
-  const installedExe = defaultWindowsInstallExe();
-  const uninstaller = path.join(path.dirname(installedExe), 'uninstall.exe');
+  let entry = null;
+  try {
+    entry = findInstall();
+  } catch (err) {
+    if (!quiet) {
+      process.stderr.write(`Registry lookup failed: ${err.message}\n`);
+    }
+    return { removed: false };
+  }
 
-  if (!fs.existsSync(uninstaller)) {
+  if (!entry) {
     if (!quiet) {
       process.stderr.write(
-        `Could not locate ${uninstaller}.\n` +
-          'Open "Settings → Apps → Installed apps" and remove "Flowstate" from there.\n',
+        'No flowstate install found in the registry. Nothing to uninstall.\n',
       );
     }
     return { removed: false };
   }
 
-  if (!quiet) process.stderr.write(`==> Running ${uninstaller} /S\n`);
-  // NSIS requires the uninstaller to be invoked from outside its own
-  // install dir for some _NSIS-internal-copy_ scenarios. Spawning with
-  // `cwd` set to the parent dir avoids "uninstall.exe was unable to
-  // delete itself" weirdness on some Windows builds.
-  const result = spawnSync(uninstaller, ['/S'], {
-    stdio: 'inherit',
-    cwd: path.dirname(path.dirname(uninstaller)),
-  });
+  // Prefer QuietUninstallString when NSIS supplied one — it already
+  // includes the silent flag. Otherwise append `/S` to UninstallString.
+  let cmd = entry.quietUninstallString || entry.uninstallString;
+  if (!cmd) {
+    if (!quiet) {
+      process.stderr.write(
+        `Registry entry "${entry.displayName}" has no UninstallString. ` +
+          'Open "Settings → Apps → Installed apps" and remove "flowstate" from there.\n',
+      );
+    }
+    return { removed: false };
+  }
+
+  // UninstallString is typically `"C:\path\with spaces\uninstall.exe"`.
+  // Splitting on space would break paths with spaces — use a small
+  // helper that respects quoted segments.
+  const argv = parseRegistryCmd(cmd);
+  const exe = argv.shift();
+  const args = argv;
+  if (!entry.quietUninstallString && !args.includes('/S')) {
+    args.push('/S');
+  }
+
+  if (!quiet) {
+    process.stderr.write(`==> Running ${exe} ${args.join(' ')}\n`);
+  }
+
+  // NSIS occasionally has trouble deleting its own uninstaller from
+  // within its own dir; running with cwd one level up avoids that
+  // edge case on some Windows builds.
+  const cwd = exe ? path.dirname(path.dirname(exe)) : undefined;
+  const result = spawnSync(exe, args, { stdio: 'inherit', cwd });
   if (result.status !== 0) {
     throw new Error(`Uninstaller exited with ${result.status}`);
   }
   return { removed: true };
 }
 
-module.exports = { uninstallWindows };
+/**
+ * Split a registry-style command string into argv, respecting double
+ * quotes around the executable path. Handles:
+ *   `"C:\Program Files\app\unins.exe"`              -> ['C:\\…\\unins.exe']
+ *   `"C:\Program Files\app\unins.exe" /MODE=quiet`  -> ['C:\\…\\unins.exe', '/MODE=quiet']
+ *   `C:\App\unins.exe /S`                           -> ['C:\\App\\unins.exe', '/S']
+ */
+function parseRegistryCmd(s) {
+  const out = [];
+  let i = 0;
+  const len = s.length;
+  while (i < len) {
+    while (i < len && s[i] === ' ') i += 1;
+    if (i >= len) break;
+    if (s[i] === '"') {
+      const end = s.indexOf('"', i + 1);
+      if (end === -1) {
+        out.push(s.slice(i + 1));
+        break;
+      }
+      out.push(s.slice(i + 1, end));
+      i = end + 1;
+    } else {
+      const end = s.indexOf(' ', i);
+      if (end === -1) {
+        out.push(s.slice(i));
+        break;
+      }
+      out.push(s.slice(i, end));
+      i = end + 1;
+    }
+  }
+  return out;
+}
+
+module.exports = { uninstallWindows, parseRegistryCmd };
