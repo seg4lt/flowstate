@@ -302,7 +302,18 @@ function PopoutShell() {
   return (
     <TooltipProvider>
       <SidebarProvider>
-        <div className="h-svh w-svw">
+        {/*
+          `overflow-hidden` is load-bearing: AppShell clips overflow via
+          `<SidebarInset>`'s overflow-hidden, but PopoutShell renders
+          `<Outlet />` directly, so without a clip boundary here the
+          editor (and especially its file-picker dropdown) can force the
+          popout window itself to grow when the user shrinks the
+          window — making the editor unusable until the popout is
+          resized big again. `min-w-0` lets descendant flex items
+          actually shrink to fit a narrow window instead of refusing to
+          go below their intrinsic content width.
+        */}
+        <div className="h-svh w-svw min-w-0 overflow-hidden">
           {state.ready ? (
             <Outlet />
           ) : (

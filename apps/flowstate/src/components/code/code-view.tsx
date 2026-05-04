@@ -119,6 +119,9 @@ const CONTENT_SEARCH_DEBOUNCE_MS = 600;
 
 const TREE_WIDTH_KEY = "flowstate:code-tree-width";
 const TREE_COLLAPSED_KEY = "flowstate:code-tree-collapsed";
+// Persists the file-picker fuzzy/acronym mode toggle across reloads.
+// See the `useFuzzyFiles` initializer for default + rationale.
+const FUZZY_FILES_STORAGE_KEY = "flowstate:fuzzy-files";
 const TREE_DEFAULT_WIDTH = 260;
 const TREE_MIN_WIDTH = 160;
 const TREE_MAX_WIDTH = 520;
@@ -338,9 +341,30 @@ export function CodeView(props: CodeViewProps) {
   // the content-search fuzzy flag because the matchers are different:
   // file fuzzy is the JS-side subsequence scorer in `lib/fuzzy.ts`
   // (instant, no IPC), content fuzzy goes through fff-search's
-  // Smith-Waterman grep mode on the Rust side. Persisted in
-  // component state — flipping search modes preserves it.
-  const [useFuzzyFiles, setUseFuzzyFiles] = React.useState(false);
+  // Smith-Waterman grep mode on the Rust side.
+  //
+  // Default = ON. Fuzzy mode is a strict superset: it still scores
+  // contiguous substring matches highest, plus enables IntelliJ /
+  // Zed-style acronym matching ("usc" → "UserServiceController.ts")
+  // and typo-tolerant subsequence matches. Defaulting it OFF made
+  // the acronym feature silently inert because the substring
+  // pre-filter dropped acronym-only candidates before the scorer
+  // ever saw them. Persisted to localStorage so a user who
+  // explicitly turns it off keeps that preference across reloads.
+  const [useFuzzyFiles, setUseFuzzyFiles] = React.useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const raw = window.localStorage.getItem(FUZZY_FILES_STORAGE_KEY);
+    if (raw === "true") return true;
+    if (raw === "false") return false;
+    return true;
+  });
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(
+      FUZZY_FILES_STORAGE_KEY,
+      String(useFuzzyFiles),
+    );
+  }, [useFuzzyFiles]);
 
   // ─── tabs + panes layout ─────────────────────────────────────
   // `useEditorTabs` owns the per-project tab/pane layout and
@@ -1285,17 +1309,20 @@ export function CodeView(props: CodeViewProps) {
             <SearchModeToggle mode={searchMode} onChange={setSearchMode} />
             {searchMode === "files" && (
               // Files-mode fuzzy toggle. Subsequence + word-boundary
-              // ranking via `lib/fuzzy.ts`. Useful when you remember
+              // ranking via `lib/fuzzy.ts`, including IntelliJ /
+              // Zed-style acronym matching ("usc" →
+              // "UserServiceController.ts"). Useful when you remember
               // a few characters but not the exact substring (e.g.
-              // typing `tbsv` to find `tabs-view.tsx`). Off by default
-              // because exact substring is what most "I know the file
-              // name" jumps want.
+              // typing `tbsv` to find `tabs-view.tsx`). On by default
+              // — fuzzy still ranks contiguous substring matches
+              // highest, so plain "I know the file name" jumps still
+              // work. Persisted to localStorage.
               <Button
                 variant="ghost"
                 size="icon-xs"
                 aria-pressed={useFuzzyFiles}
                 onClick={() => setUseFuzzyFiles((v) => !v)}
-                title="Fuzzy file match (typo-tolerant subsequence)"
+                title="Fuzzy file match (subsequence + acronym, e.g. usc → UserServiceController)"
                 aria-label="Toggle fuzzy file matching"
                 className={
                   useFuzzyFiles ? "bg-muted text-foreground" : undefined
@@ -1868,7 +1895,14 @@ const FilePickerResults = React.memo(function FilePickerResults({
             }}
             onMouseEnter={() => onHover(i)}
             className={
-              "flex w-full items-baseline gap-2 px-3 py-1 text-left text-[11px] " +
+              // `min-w-0 overflow-hidden` is load-bearing: without
+              // them the row's intrinsic width is `icon + basename +
+              // dirname` at full text width, which on narrow popout
+              // windows pushes the dropdown — and the popout window
+              // itself — wider than the viewport. With min-w-0 the
+              // row collapses to the parent's width and the truncate
+              // spans below clip cleanly via ellipsis.
+              "flex w-full min-w-0 items-baseline gap-2 overflow-hidden px-3 py-1 text-left text-[11px] " +
               (isHighlighted
                 ? "bg-muted text-foreground"
                 : "text-muted-foreground hover:bg-muted/50")
@@ -1878,7 +1912,11 @@ const FilePickerResults = React.memo(function FilePickerResults({
             <FileText className="h-3 w-3 shrink-0" />
             <span className="truncate font-mono">{basename}</span>
             {dirname && (
-              <span className="ml-auto shrink-0 truncate font-mono text-[10px] text-muted-foreground/70">
+              // `shrink-0` removed: keeping it forced the dirname to
+              // its intrinsic width and made the row impossible to
+              // compress on narrow popouts. `min-w-0` + `truncate`
+              // lets it ellipsify instead.
+              <span className="ml-auto min-w-0 truncate font-mono text-[10px] text-muted-foreground/70">
                 {dirname}
               </span>
             )}
