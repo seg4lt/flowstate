@@ -8,21 +8,22 @@
 //!   * a parked writer behind a mutex for `pty_write`
 //!   * the master handle for `pty_resize`
 //!   * the child handle for `pty_kill`
-//!   * an `AtomicBool` the reader polls for flow-control pause
+//!   * a `PauseGate` (`Mutex<bool>` + `Condvar`) the reader blocks
+//!     on for flow-control pause
 //!
 //! The flow-control model is the xterm.js `write(data, cb)` watermark
 //! pattern: the frontend calls `pty_pause` when its pending-ack count
 //! crosses the high watermark and `pty_resume` when it falls back
-//! below the low watermark. The reader thread checks the flag between
-//! reads and sleeps in a tight loop while paused — simple, and the
-//! pty buffer itself provides the real backpressure to the child
-//! process when the reader stops draining it.
+//! below the low watermark. The reader thread blocks on a `Condvar`
+//! between reads while paused — the pty buffer itself provides the
+//! real backpressure to the child process when the reader stops
+//! draining it, and a stuck-paused terminal stays genuinely 0 Hz
+//! instead of waking the scheduler 100×/s.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
@@ -47,11 +48,57 @@ pub enum PtyEvent {
     Exit { code: Option<i32> },
 }
 
+/// Reader-thread pause gate. `paused` is the flag the reader checks
+/// between blocking reads; `cvar` lets `pty_resume` wake the reader
+/// immediately instead of waiting out the next spin-sleep tick.
+///
+/// Why a `Condvar` instead of the pre-existing 10 ms spin loop: the
+/// old `while paused { sleep(10ms) }` parks the reader thread, so it
+/// doesn't burn CPU directly — but it produces 100 wake-ups/s per
+/// paused terminal, and any frontend that leaves a terminal
+/// `paused = true` (panel hidden without resume, popout torn down
+/// mid-flow-control, resize race) keeps that drum-beat going forever.
+/// The Condvar version blocks the thread until `pty_resume` actually
+/// fires, so a stuck-paused terminal is genuinely 0 Hz instead of
+/// "looks idle but ticking the scheduler."
+struct PauseGate {
+    paused: Mutex<bool>,
+    cvar: Condvar,
+}
+
+impl PauseGate {
+    fn new() -> Self {
+        Self {
+            paused: Mutex::new(false),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn set(&self, value: bool) {
+        let mut guard = self.paused.lock().unwrap();
+        if *guard == value {
+            return;
+        }
+        *guard = value;
+        // Always notify on transition. Resume → reader wakes from
+        // `wait_while`. Pause → no waiter to notify, but the cheap
+        // notify_all keeps the API symmetric.
+        self.cvar.notify_all();
+    }
+
+    /// Block while the gate is held. Returns immediately when the
+    /// gate is open. Spurious wakes are absorbed by the predicate.
+    fn wait_while_paused(&self) {
+        let guard = self.paused.lock().unwrap();
+        let _unused = self.cvar.wait_while(guard, |paused| *paused).unwrap();
+    }
+}
+
 struct PtySession {
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
-    paused: Arc<AtomicBool>,
+    pause_gate: Arc<PauseGate>,
 }
 
 pub struct PtyManager {
@@ -129,22 +176,22 @@ impl PtyManager {
             .map_err(|e| format!("take writer: {e}"))?;
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let paused = Arc::new(AtomicBool::new(false));
+        let pause_gate = Arc::new(PauseGate::new());
 
         let session = Arc::new(PtySession {
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
-            paused: paused.clone(),
+            pause_gate: pause_gate.clone(),
         });
 
         self.sessions.lock().unwrap().insert(id, session);
 
-        let paused_for_thread = paused;
+        let gate_for_thread = pause_gate;
         std::thread::Builder::new()
             .name(format!("pty-reader-{id}"))
             .spawn(move || {
-                reader_loop(reader, on_event, paused_for_thread);
+                reader_loop(reader, on_event, gate_for_thread);
             })
             .map_err(|e| format!("spawn reader thread: {e}"))?;
 
@@ -173,13 +220,13 @@ impl PtyManager {
 
     pub fn pause(&self, id: PtyId) -> Result<(), String> {
         let session = self.get(id)?;
-        session.paused.store(true, Ordering::Relaxed);
+        session.pause_gate.set(true);
         Ok(())
     }
 
     pub fn resume(&self, id: PtyId) -> Result<(), String> {
         let session = self.get(id)?;
-        session.paused.store(false, Ordering::Relaxed);
+        session.pause_gate.set(false);
         Ok(())
     }
 
@@ -247,7 +294,7 @@ fn which_in_path(binary: &str) -> bool {
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     channel: Channel<PtyEvent>,
-    paused: Arc<AtomicBool>,
+    pause_gate: Arc<PauseGate>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     // Track whether we exited via EOF (child died on its own — user
@@ -257,13 +304,13 @@ fn reader_loop(
     // hear us anyway.
     let mut child_gone = false;
     loop {
-        // Lightweight busy-sleep while paused. The pty buffer will
-        // fill and SIGSTOP-equivalent-block the child on its own
-        // write() once we stop draining, which is the actual
-        // backpressure — this sleep just keeps us from burning CPU.
-        while paused.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Block until the gate is open. The pty buffer fills and
+        // SIGSTOP-equivalent-blocks the child on its own write() once
+        // we stop draining, which is the real backpressure; this just
+        // keeps the reader thread genuinely parked while paused
+        // (vs. the prior 10 ms spin that woke the scheduler 100×/s
+        // for as long as the gate stayed closed).
+        pause_gate.wait_while_paused();
 
         match reader.read(&mut buf) {
             Ok(0) => {

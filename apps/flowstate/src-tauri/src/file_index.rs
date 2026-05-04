@@ -328,12 +328,90 @@ impl FileIndexRegistry {
             // too in case it was ever inserted that way (it shouldn't be).
             Err(_) => return Ok(()),
         };
-        let mut guard = self
-            .inner
-            .write()
-            .map_err(|e| format!("registry write: {e}"))?;
-        guard.remove(&canon);
+        let removed = {
+            let mut guard = self
+                .inner
+                .write()
+                .map_err(|e| format!("registry write: {e}"))?;
+            guard.remove(&canon)
+        };
+        if let Some(handle) = removed {
+            shutdown_picker(&handle);
+        }
         Ok(())
+    }
+}
+
+/// Tear down a `FilePicker`'s background threads BEFORE dropping the
+/// last `Arc` to its `SharedPicker`.
+///
+/// Without this, every reindex leaked a notify-rs FSEvents triplet
+/// (debouncer loop + fsevents loop + watcher-owner) plus the
+/// `FilePicker` itself. Root cause: `fff_search::FilePicker::new_with_shared_state`
+/// spawns its background watcher with a CLONE of the `SharedPicker`
+/// (see `fff-search-0.5.2/src/file_picker.rs:421-466`). The watcher
+/// thread holds that Arc for life, so dropping our `FilePickerHandle`
+/// alone — which is what `reindex` used to do — only decremented our
+/// side of the refcount; the watcher's Arc kept the `FilePicker` alive
+/// forever.
+///
+/// On a working session that completes one turn per minute (each
+/// firing `reindex_project_files`), this leaked three threads per
+/// minute. A `sample` of an idle flowstate caught 27 leaked watcher
+/// triplets (81 threads) all subscribed to FSEvents on the same
+/// worktree, and every fs notification — `.git/index.lock` flicker,
+/// flowstate's own sqlite WAL write, an editor save — woke all 27
+/// watchers in parallel. That's the 110% idle-CPU bug.
+///
+/// `cancel()` flips the atomic the watcher's hot loop polls between
+/// notify deliveries (`fff-search/src/file_picker.rs:892-894`).
+/// `stop_background_monitor()` takes the inner notify-rs watcher and
+/// joins it (`file_picker.rs:896-900`). After both fire, the watcher's
+/// remaining Arcs to the `SharedPicker` drop and the `FilePicker`
+/// inside it can finally be reaped.
+///
+/// Idempotent: safe to call from `Drop` for the registry as well as
+/// from `reindex`. A failure to acquire the write lock is logged but
+/// not surfaced — the worst case is one leaked watcher, and the
+/// reindex itself has already removed the registry entry so no future
+/// caller will hand the leaked picker out.
+fn shutdown_picker(handle: &FilePickerHandle) {
+    let mut guard = match handle.picker.write() {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                root = %handle.root.display(),
+                "shutdown_picker: SharedPicker write lock poisoned: {e}; \
+                 watcher threads may leak"
+            );
+            return;
+        }
+    };
+    if let Some(picker) = guard.as_mut() {
+        picker.cancel();
+        picker.stop_background_monitor();
+    }
+    // Drop the FilePicker out of the SharedPicker explicitly so the
+    // watcher's clone of the SharedPicker, which still observes the
+    // RwLock, sees `None` on its next access and exits its loop. Without
+    // this, the watcher keeps spinning on a populated picker even after
+    // we've cancelled it (cancel only flips a poll flag — the watcher
+    // still holds the Arc).
+    *guard = None;
+}
+
+impl Drop for FileIndexRegistry {
+    fn drop(&mut self) {
+        // Best-effort shutdown of every cached picker. App-shutdown
+        // path: the OS will reap threads on process exit, but doing
+        // this explicitly means tests / hot-reloads that drop a
+        // registry mid-process don't accumulate watcher threads.
+        let Ok(mut guard) = self.inner.write() else {
+            return;
+        };
+        for (_, handle) in guard.drain() {
+            shutdown_picker(&handle);
+        }
     }
 }
 
