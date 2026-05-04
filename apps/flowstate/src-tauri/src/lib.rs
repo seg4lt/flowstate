@@ -3546,31 +3546,13 @@ pub fn run() {
                 // alive indefinitely, holding 100s of MB per popout
                 // and keeping its Rust-side `connect` broadcast
                 // subscription open.
-                #[cfg(target_os = "macos")]
-                tauri::WindowEvent::CloseRequested { api, .. } => {
-                    if is_main {
-                        api.prevent_close();
-                        let _ = window.hide();
-                    } else {
-                        // Stop Tauri/Tao's default close path (which on
-                        // macOS only orders the NSWindow out and leaves
-                        // the WKWebView alive) before destroying — the
-                        // two paths can race otherwise.
-                        api.prevent_close();
-                        tracing::info!(
-                            label = %window.label(),
-                            "popout close requested; destroying window"
-                        );
-                        if let Err(e) = window.destroy() {
-                            tracing::warn!(
-                                label = %window.label(),
-                                error = %e,
-                                "popout window.destroy() failed"
-                            );
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
+                // Main window: red traffic light (or any close path)
+                // quits the app, same on every platform. Routes through
+                // `app.exit(0)` so the two-phase shutdown gate at
+                // `RunEvent::ExitRequested` runs the graceful daemon
+                // teardown before the process actually terminates.
+                // Previously on macOS this hid the window instead — bad
+                // DX, made the red button feel broken.
                 tauri::WindowEvent::CloseRequested { .. } if is_main => {
                     if let Some(pty) = window.try_state::<PtyManager>() {
                         pty.kill_all();
@@ -3579,6 +3561,25 @@ pub fn run() {
                         state.lifecycle.request_shutdown();
                     }
                     window.app_handle().exit(0);
+                }
+                #[cfg(target_os = "macos")]
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    // Popouts on macOS need explicit destroy: Tauri/Tao's
+                    // default close path only orders the NSWindow out and
+                    // leaves the WKWebView alive. Stop the default first
+                    // so the two paths can't race.
+                    api.prevent_close();
+                    tracing::info!(
+                        label = %window.label(),
+                        "popout close requested; destroying window"
+                    );
+                    if let Err(e) = window.destroy() {
+                        tracing::warn!(
+                            label = %window.label(),
+                            error = %e,
+                            "popout window.destroy() failed"
+                        );
+                    }
                 }
                 // Still wire the Destroyed path as a belt-and-braces
                 // fallback — any code path that destroys the main
