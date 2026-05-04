@@ -161,6 +161,22 @@ export function ToolCallCard({
   const showStalled =
     isPending && typeof toolCall.lastProgressAt === "string";
 
+  // For Edit / MultiEdit / Write the args renderer already shows the
+  // diff (or full new file body) inline, so the provider's `output`
+  // string is just a redundant confirmation like "The file has been
+  // updated." On a successful call we suppress the Output block to
+  // keep the card tight — the diff IS the result. On failure we
+  // still surface it: when something goes wrong, the output line
+  // tends to be the only place that says WHY (path didn't exist,
+  // string match wasn't unique, etc.). The separate `error` block
+  // below is unaffected and renders normally either way.
+  const isFileWriteTool =
+    toolCall.name === "Edit" ||
+    toolCall.name === "MultiEdit" ||
+    toolCall.name === "Write";
+  const hideOutputForFileWrite =
+    isFileWriteTool && toolCall.status === "completed";
+
   return (
     <div className="text-xs">
       <button
@@ -192,7 +208,7 @@ export function ToolCallCard({
       {open && (
         <div className="space-y-2 px-1 pb-2 pt-1">
           <div>{renderToolArgs(toolCall.name, toolCall.args)}</div>
-          {toolCall.output && (
+          {toolCall.output && !hideOutputForFileWrite && (
             <div>
               <p className="mb-1 font-medium text-muted-foreground">Output</p>
               {toolCall.name === "Task" || toolCall.name === "Agent" ? (

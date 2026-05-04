@@ -148,9 +148,9 @@ function EditStandaloneRow() {
       <div className="min-w-0 flex-1">
         <div className="text-sm font-medium">Edit calls as standalone</div>
         <div className="mt-0.5 text-xs text-muted-foreground">
-          Break the inline tool-call group around every Edit / MultiEdit call so
-          each diff renders as its own message-style block. Surrounding tool
-          calls regroup into fresh streaks on either side.
+          Break the inline tool-call group around every Edit / MultiEdit / Write
+          call so each diff renders as its own message-style block. Surrounding
+          tool calls regroup into fresh streaks on either side.
         </div>
       </div>
       <Switch

@@ -155,16 +155,22 @@ function groupBlocks(
       if (parent === undefined) {
         // Main agent — sequential grouping.
         //
-        // Edit-standalone opt-in: every Edit / MultiEdit call breaks
-        // the current main-agent streak and lands in its own
+        // Edit-standalone opt-in: every Edit / MultiEdit / Write call
+        // breaks the current main-agent streak and lands in its own
         // single-call group. Subsequent main-agent tool calls start a
-        // FRESH group on the other side — never merging through an
-        // Edit. Sub-agent boxes are unaffected (their identity is the
-        // parentCallId, not stream contiguity), so Edits inside a
-        // Task's sub-agent still fold into that sub-agent's box.
+        // FRESH group on the other side — never merging through one
+        // of these. Write piggybacks on the same toggle because a
+        // brand-new file is just as much a "diff worth seeing inline"
+        // as an Edit; users who want one broken out almost always
+        // want the other. Sub-agent boxes are unaffected (their
+        // identity is the parentCallId, not stream contiguity), so
+        // these calls inside a Task's sub-agent still fold into that
+        // sub-agent's box.
         const isStandaloneEdit =
           editStandalone &&
-          (tc?.name === "Edit" || tc?.name === "MultiEdit");
+          (tc?.name === "Edit" ||
+            tc?.name === "MultiEdit" ||
+            tc?.name === "Write");
         if (isStandaloneEdit) {
           currentMainGroup = null;
           result.push({
