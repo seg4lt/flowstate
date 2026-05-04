@@ -16,7 +16,12 @@ const fs = require('node:fs');
 const { download } = require('./download');
 const { tempArtifactPath } = require('./paths');
 const { windowsAssetName, windowsUrl } = require('./release');
-const { findInstall, resolveMainExe } = require('./windows-registry');
+const {
+  findInstall,
+  resolveMainExe,
+  diagnosticDump,
+  extractUninstallerPath,
+} = require('./windows-registry');
 
 async function installWindows({ tag, launch = true, quiet = false } = {}) {
   if (!tag) throw new Error('installWindows: tag is required');
@@ -68,37 +73,38 @@ async function installWindows({ tag, launch = true, quiet = false } = {}) {
   if (!entry) {
     log(
       quiet,
-      'note: install completed but no flowstate registry entry found. ' +
-        'The app may still have installed correctly — check the Start Menu.',
+      'note: install completed but no flowstate-matching registry entry was found. ' +
+        'Dumping diagnostic info from the Uninstall hives so we can see what NSIS actually wrote.',
     );
+    try {
+      const dump = diagnosticDump(20);
+      log(quiet, JSON.stringify(dump, null, 2));
+    } catch (err) {
+      log(quiet, `(diagnostic dump failed: ${err.message})`);
+    }
     return { installedAt: null };
   }
 
   const installedExe = resolveMainExe(entry);
-  // Prefer InstallLocation when NSIS wrote it; otherwise show the
-  // uninstaller's directory (always present).
+  // Prefer InstallLocation when NSIS wrote it; otherwise the
+  // uninstaller's directory (UninstallString is always present in NSIS).
   const reportedDir =
     entry.installLocation ||
     (entry.uninstallString
       ? require('node:path').dirname(
-          require('./windows-registry').extractUninstallerPath(
-            entry.uninstallString,
-          ) || '',
+          extractUninstallerPath(entry.uninstallString) || '',
         )
-      : '(unknown dir)');
+      : null) ||
+    '(unknown dir)';
   log(quiet, `==> Installed to ${reportedDir}`);
 
   if (!installedExe) {
-    // Dump the raw registry entry so the user can paste it back to us
-    // for diagnosis when our resolver heuristics miss the actual exe.
     log(
       quiet,
-      'note: install registered but no flowstate*.exe was found in the install dir. ' +
-        'Launch via the Start Menu shortcut. Registry entry below for diagnosis:',
+      'note: registry entry matched but no flowstate*.exe was found in the install dir. ' +
+        'Launch via the Start Menu shortcut. Registry entry + dir listing below:',
     );
     log(quiet, JSON.stringify(entry, null, 2));
-    // Also list what IS in the install dir, so we can see the actual
-    // binary name without another round-trip.
     try {
       const fsMod = require('node:fs');
       const files = fsMod.readdirSync(reportedDir);

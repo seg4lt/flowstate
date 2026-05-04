@@ -6,18 +6,27 @@
 //   HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\<id>   (perMachine)
 //   HKLM\Software\WOW6432Node\...\Uninstall\<id>                    (32-bit on 64-bit)
 //
-// containing `InstallLocation`, `UninstallString`, `DisplayIcon`,
-// `DisplayName`, etc. We walk all three hives, filter by DisplayName
-// matching /flowstate/i, and return the first hit.
+// containing `InstallLocation`, `UninstallString`, `DisplayIcon`, etc.
+// The registry key name itself is typically the bundleId
+// ("com.seg4lt.flowstate") and DisplayName is sometimes blank, so we
+// CAN'T rely on filtering by DisplayName alone — the smart match is
+// done Node-side, considering key name + DisplayName + Publisher +
+// UninstallString path + DisplayIcon path.
 //
-// PowerShell is the cleanest way to do this from Node — `reg query`'s
-// output is hostile to parse. Every supported Windows ships PowerShell
-// 5.1+ in the box, no install needed.
+// PowerShell is the cleanest way to read the registry from Node.
+// Every supported Windows ships PowerShell 5.1+ in the box.
 
 'use strict';
 
 const { spawnSync } = require('node:child_process');
 
+// Returns ALL entries from the three Uninstall hives. Filtering happens
+// on the Node side so we have full data to fall back on for diagnosis.
+//
+// Critical bit: `ConvertTo-Json -InputObject @($all)` (not pipeline form)
+// avoids the empty-array → `[[]]` serialization quirk that older versions
+// of this code tripped on. With -InputObject + explicit @() coercion,
+// 0 entries → `[]`, 1 entry → `[{...}]`, N entries → `[{...},{...}]`.
 const PS_SCRIPT = `
 $ErrorActionPreference = 'SilentlyContinue'
 $hives = @(
@@ -25,55 +34,49 @@ $hives = @(
   'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
   'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
 )
-$out = @()
+$all = @()
 foreach ($hive in $hives) {
   if (Test-Path $hive) {
     Get-ChildItem $hive | ForEach-Object {
       $p = Get-ItemProperty $_.PSPath
-      if ($p -and $p.DisplayName -and ($p.DisplayName -match 'flowstate')) {
-        $out += [pscustomobject]@{
-          DisplayName     = $p.DisplayName
-          InstallLocation = $p.InstallLocation
-          UninstallString = $p.UninstallString
+      if ($p) {
+        $all += [pscustomobject]@{
+          KeyName              = $_.PSChildName
+          DisplayName          = $p.DisplayName
+          InstallLocation      = $p.InstallLocation
+          UninstallString      = $p.UninstallString
           QuietUninstallString = $p.QuietUninstallString
-          DisplayIcon     = $p.DisplayIcon
-          Publisher       = $p.Publisher
-          Hive            = $hive
+          DisplayIcon          = $p.DisplayIcon
+          Publisher            = $p.Publisher
+          Hive                 = $hive
         }
       }
     }
   }
 }
-# Always emit a JSON array, even for 0 or 1 results, so Node-side parsing
-# is uniform. ConvertTo-Json on a single object yields an object, not an
-# array, hence the explicit @() coercion.
-,@($out) | ConvertTo-Json -Compress -Depth 4
+ConvertTo-Json -InputObject @($all) -Compress -Depth 4
 `;
 
 /**
- * Query the registry for our install entry.
- *
- * Returns the first match (HKCU preferred, since that's Tauri's default
- * install mode), or null if nothing matches. Never throws on "no
- * match" — only on PowerShell invocation failure.
- *
- * Shape:
- *   {
- *     displayName, installLocation, uninstallString,
- *     quietUninstallString, displayIcon, publisher, hive
- *   }
+ * Patterns that count as "this is our install" — case-insensitive.
+ * Any one matching across {KeyName, DisplayName, Publisher,
+ * UninstallString, DisplayIcon, InstallLocation} is enough.
  */
-function findInstall() {
+const FLOWSTATE_PATTERN = /flowstate|seg4lt/i;
+
+/**
+ * Read all Uninstall-hive entries. Returns the raw array (possibly empty,
+ * never null). Throws on PowerShell invocation failure.
+ */
+function readAllEntries() {
   if (process.platform !== 'win32') {
-    throw new Error(`findInstall is win32-only, got ${process.platform}`);
+    throw new Error(`readAllEntries is win32-only, got ${process.platform}`);
   }
 
-  // -NoProfile so user PS profile slowness / errors don't bleed in.
-  // -NonInteractive so any prompt would fail-fast instead of hanging.
   const result = spawnSync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-Command', PS_SCRIPT],
-    { encoding: 'utf8', windowsHide: true },
+    { encoding: 'utf8', windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
   );
 
   if (result.status !== 0) {
@@ -85,30 +88,89 @@ function findInstall() {
   }
 
   const stdout = (result.stdout || '').trim();
-  if (!stdout) return null;
+  if (!stdout) return [];
 
   let parsed;
   try {
     parsed = JSON.parse(stdout);
   } catch (err) {
     throw new Error(
-      `Failed to parse registry query JSON: ${err.message}\nRaw: ${stdout}`,
+      `Failed to parse registry query JSON: ${err.message}\nRaw: ${stdout.slice(0, 500)}`,
     );
   }
 
-  // ConvertTo-Json with `,@($out)` always wraps in an array.
-  const entries = Array.isArray(parsed) ? parsed : [parsed];
-  if (entries.length === 0) return null;
+  if (!Array.isArray(parsed)) parsed = [parsed];
+  return parsed.map(normalizeEntry);
+}
 
-  const first = entries[0];
+/**
+ * Walk all Uninstall entries and find the first one whose KeyName,
+ * DisplayName, Publisher, UninstallString, DisplayIcon, or
+ * InstallLocation matches FLOWSTATE_PATTERN. Returns null on no match.
+ *
+ * Hive order in PS_SCRIPT puts HKCU first (Tauri's default install
+ * mode), so the first match is the right one.
+ */
+function findInstall() {
+  const all = readAllEntries();
+  for (const entry of all) {
+    if (matchesFlowstate(entry)) return entry;
+  }
+  return null;
+}
+
+function matchesFlowstate(entry) {
+  if (!entry) return false;
+  const fields = [
+    entry.keyName,
+    entry.displayName,
+    entry.publisher,
+    entry.uninstallString,
+    entry.quietUninstallString,
+    entry.displayIcon,
+    entry.installLocation,
+  ];
+  return fields.some((f) => typeof f === 'string' && FLOWSTATE_PATTERN.test(f));
+}
+
+function normalizeEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
   return {
-    displayName: first.DisplayName || null,
-    installLocation: trimQuotes(first.InstallLocation),
-    uninstallString: trimQuotes(first.UninstallString),
-    quietUninstallString: trimQuotes(first.QuietUninstallString),
-    displayIcon: trimQuotes(first.DisplayIcon),
-    publisher: first.Publisher || null,
-    hive: first.Hive || null,
+    keyName: nonEmpty(raw.KeyName),
+    displayName: nonEmpty(raw.DisplayName),
+    installLocation: trimQuotes(raw.InstallLocation),
+    uninstallString: trimQuotes(raw.UninstallString),
+    quietUninstallString: trimQuotes(raw.QuietUninstallString),
+    displayIcon: trimQuotes(raw.DisplayIcon),
+    publisher: nonEmpty(raw.Publisher),
+    hive: nonEmpty(raw.Hive),
+  };
+}
+
+/**
+ * For diagnosis when findInstall returns null. Returns up to N entries
+ * whose key name or any string field hints at flowstate. If nothing
+ * looks remotely related, returns the first N entries verbatim so we
+ * can at least see what shape the registry has.
+ */
+function diagnosticDump(limit = 20) {
+  let all;
+  try {
+    all = readAllEntries();
+  } catch (err) {
+    return { error: err.message, candidates: [] };
+  }
+  const candidates = all.filter((e) => matchesFlowstate(e));
+  if (candidates.length > 0) {
+    return { totalEntries: all.length, candidates: candidates.slice(0, limit) };
+  }
+  // Nothing matched. Surface the first N entries unfiltered so we can
+  // see what the registry looks like at all.
+  return {
+    totalEntries: all.length,
+    note:
+      'No entry matched flowstate/seg4lt across any field. First entries shown for shape inspection.',
+    candidates: all.slice(0, limit),
   };
 }
 
@@ -117,12 +179,12 @@ function findInstall() {
  * order:
  *   1. DisplayIcon (NSIS often points this directly at the main exe)
  *   2. <InstallLocation>\flowstate.exe
- *   3. dirname(UninstallString)\flowstate.exe
- *      — Tauri's NSIS template doesn't always write InstallLocation,
- *      but UninstallString is mandatory and the uninstaller lives
- *      in the install dir.
- *   4. Scan dirname(UninstallString) for any flowstate*.exe (case-
- *      insensitive) as a last-ditch fallback for renamed binaries.
+ *   3. dirname(UninstallString)\flowstate.exe — Tauri's NSIS doesn't
+ *      always write InstallLocation, but UninstallString is mandatory
+ *      and the uninstaller lives in the install dir.
+ *   4. Scan dirname(UninstallString) for any *.exe whose name starts
+ *      with "flowstate" (case-insensitive) — last-ditch for renamed
+ *      binaries.
  * Returns null if nothing matches or the entry is null.
  */
 function resolveMainExe(
@@ -132,7 +194,7 @@ function resolveMainExe(
 ) {
   if (!entry) return null;
 
-  // 1. DisplayIcon may include a `,0` icon-index suffix — strip it.
+  // 1. DisplayIcon (strip `,N` icon-index suffix).
   if (entry.displayIcon) {
     const cleaned = entry.displayIcon.replace(/,\d+$/, '');
     if (cleaned.toLowerCase().endsWith('.exe') && fs.existsSync(cleaned)) {
@@ -156,7 +218,6 @@ function resolveMainExe(
     const guess = path.join(dir, 'flowstate.exe');
     if (fs.existsSync(guess)) return guess;
 
-    // Last-ditch: any flowstate*.exe in the install dir, case-insensitive.
     try {
       const candidates = fs
         .readdirSync(dir)
@@ -179,7 +240,6 @@ function resolveMainExe(
 /**
  * Pull the executable path out of an UninstallString. NSIS writes it
  * either bare (`C:\X\unins.exe`) or quoted (`"C:\X\unins.exe" /S`).
- * Returns the unquoted path, or null if the string is empty.
  */
 function extractUninstallerPath(uninstallString) {
   if (!uninstallString) return null;
@@ -189,24 +249,31 @@ function extractUninstallerPath(uninstallString) {
     if (end === -1) return s.slice(1);
     return s.slice(1, end);
   }
-  // Unquoted: take everything up to the first space (NSIS doesn't put
-  // unquoted paths-with-spaces in the registry).
   const space = s.indexOf(' ');
   return space === -1 ? s : s.slice(0, space);
 }
 
-/**
- * Strip surrounding double-quotes from a registry value. NSIS often
- * writes `UninstallString` as `"C:\Path With Spaces\uninstall.exe"`
- * (quoted) but `InstallLocation` typically isn't quoted. Handle both.
- */
-function trimQuotes(s) {
-  if (!s || typeof s !== 'string') return null;
+function nonEmpty(s) {
+  if (typeof s !== 'string') return null;
   const t = s.trim();
+  return t === '' ? null : t;
+}
+
+function trimQuotes(s) {
+  const t = nonEmpty(s);
+  if (!t) return null;
   if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) {
     return t.slice(1, -1);
   }
   return t;
 }
 
-module.exports = { findInstall, resolveMainExe, extractUninstallerPath };
+module.exports = {
+  findInstall,
+  resolveMainExe,
+  extractUninstallerPath,
+  diagnosticDump,
+  // Exposed for tests:
+  matchesFlowstate,
+  normalizeEntry,
+};
