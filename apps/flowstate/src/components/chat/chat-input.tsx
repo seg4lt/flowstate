@@ -431,10 +431,15 @@ export function ChatInput({
   // drain the head of the queue, because after a stop there is no
   // in-flight send_turn to race against.
   //
-  // Steer (the "Send now" button on a queued chip) no longer hooks
-  // this effect — it's an atomic daemon-side RPC (`steer_turn`) that
-  // handles its own interrupt-then-send sequencing. This effect now
-  // only handles the "turn completed → drain head of queue" path.
+  // Steer (the "Send now" button on a queued chip) is an atomic
+  // daemon-side RPC (`steer_turn`) that handles its own
+  // interrupt-then-send sequencing. BUT the daemon's interrupt phase
+  // still flips the session through running -> interrupted before the
+  // steered turn starts, which would re-enter this effect and drain
+  // the head of the *remaining* queue as a regular send_turn, racing
+  // the steer. The `steerInFlightRef` below suppresses exactly that
+  // one transition; the drain resumes naturally when the steered
+  // turn completes (running -> ready).
   const prevStatusRef = React.useRef(
     // If mounting with a non-empty queue and the session already
     // finished, pretend the previous status was "running" so the
@@ -446,11 +451,27 @@ export function ChatInput({
       ? "running"
       : sessionStatus,
   );
+  // Set when a steer (per-chip "Send now") is in flight. The daemon's
+  // steer_turn produces a running -> interrupted transition before the
+  // steered message starts; without this guard the drain effect would
+  // fire on that transition and pop the remaining queue head as a
+  // regular send_turn, racing the steer. We clear the ref the first
+  // time we observe the steer's interrupt/ready transition.
+  const steerInFlightRef = React.useRef(false);
   React.useEffect(() => {
     const wasRunning = prevStatusRef.current === "running";
     const nowReady = sessionStatus === "ready" || sessionStatus === "interrupted";
     prevStatusRef.current = sessionStatus;
     if (!wasRunning || !nowReady) return;
+
+    // A steer is responsible for this transition — don't drain. The
+    // daemon will flip status back to running for the steered turn,
+    // then to ready when it completes; the drain resumes on that
+    // natural completion.
+    if (steerInFlightRef.current) {
+      steerInFlightRef.current = false;
+      return;
+    }
 
     // Normal drain — pop the head of the queue.
     if (queued.length === 0) return;
@@ -511,7 +532,22 @@ export function ChatInput({
     // lost from the queue, which is the same contract as a normal
     // send that returns an error.
     setQueued((q) => q.filter((item) => item.id !== id));
-    onSteer(target.text, target.images);
+    // Mark the steer as in flight so the upcoming
+    // running -> interrupted transition (issued by the daemon as part
+    // of steer_turn's interrupt-then-send sequence) does not trip
+    // the drain effect and ship the rest of the queue alongside the
+    // steered message. The flag is cleared by the drain effect on
+    // that next non-running tick.
+    steerInFlightRef.current = true;
+    try {
+      onSteer(target.text, target.images);
+    } catch (err) {
+      // Synchronous throw: no transition will occur, so clear the
+      // flag now to avoid silently swallowing a future legitimate
+      // drain.
+      steerInFlightRef.current = false;
+      throw err;
+    }
     // Revoke the attached image preview URLs now that we've handed
     // the encoded payload off to the daemon. Mirrors the cleanup
     // the drain effect does for naturally-drained messages.
