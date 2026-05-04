@@ -35,7 +35,7 @@ use tracing::info;
 /// runtime (download mode) — used below to namespace the cache
 /// directory so bumping the version automatically invalidates any
 /// stale extraction.
-pub const NODE_VERSION: &str = "20.11.1";
+pub const NODE_VERSION: &str = "24.15.0";
 
 /// Build-time platform identifiers forwarded from `build.rs` via
 /// `cargo:rustc-env`. Empty strings when the build target is

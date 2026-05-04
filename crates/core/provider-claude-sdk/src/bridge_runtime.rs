@@ -368,7 +368,7 @@ fn extract_embedded_assets(staging: &Path) -> Result<()> {
 /// `spawn_blocking` thread via the daemon's `provision_runtimes`).
 ///
 /// Tries pnpm via corepack first. Corepack ships inside Node ≥ 16.10
-/// (the embedded Node is 20.11.1 so it's always present), and pnpm's
+/// (the embedded Node is 24.15.0 so it's always present), and pnpm's
 /// content-addressable global store + parallel fetcher is dramatically
 /// faster than npm on cold installs — the difference users actually
 /// notice on Windows where I/O is the bottleneck. We use pnpm with

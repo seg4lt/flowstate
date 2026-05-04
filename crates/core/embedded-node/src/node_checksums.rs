@@ -19,36 +19,37 @@
 /// that `detect_platform` in `build.rs` / `src/lib.rs` emits, not
 /// arbitrary strings — they're compared byte-for-byte.
 pub const NODE_CHECKSUMS: &[(&str, &str, &str, &str)] = &[
-    // Node.js v20.11.1 — from https://nodejs.org/dist/v20.11.1/SHASUMS256.txt
+    // Node.js v24.15.0 — from https://nodejs.org/dist/v24.15.0/SHASUMS256.txt
+    // Bumped from v20.11.1 because GitHub Copilot CLI requires Node ≥ v24.
     (
         "darwin",
         "arm64",
         "tar.gz",
-        "e0065c61f340e85106a99c4b54746c5cee09d59b08c5712f67f99e92aa44995d",
+        "372331b969779ab5d15b949884fc6eaf88d5afe87bde8ba881d6400b9100ffc4",
     ),
     (
         "darwin",
         "x64",
         "tar.gz",
-        "c52e7fb0709dbe63a4cbe08ac8af3479188692937a7bd8e776e0eedfa33bb848",
+        "ffd5ee293467927f3ee731a553eb88fd1f48cf74eebc2d74a6babe4af228673b",
     ),
     (
         "linux",
         "arm64",
         "tar.gz",
-        "e34ab2fc2726b4abd896bcbff0250e9b2da737cbd9d24267518a802ed0606f3b",
+        "73afc234d558c24919875f51c2d1ea002a2ada4ea6f83601a383869fefa64eed",
     ),
     (
         "linux",
         "x64",
         "tar.gz",
-        "bf3a779bef19452da90fb88358ec2c57e0d2f882839b20dc6afc297b6aafc0d7",
+        "44836872d9aec49f1e6b52a9a922872db9a2b02d235a616a5681b6a85fec8d89",
     ),
     (
         "win",
         "x64",
         "zip",
-        "bc032628d77d206ffa7f133518a6225a9c5d6d9210ead30d67e294ff37044bda",
+        "cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62",
     ),
 ];
 

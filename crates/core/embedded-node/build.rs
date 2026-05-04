@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 #[path = "src/node_checksums.rs"]
 mod node_checksums;
 
-const NODE_VERSION: &str = "20.11.1";
+const NODE_VERSION: &str = "24.15.0";
 
 fn main() {
     // Only re-run this build script when build.rs itself changes.
