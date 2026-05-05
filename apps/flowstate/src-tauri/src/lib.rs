@@ -89,11 +89,9 @@ use flowstate_app_layer::user_config::{
 };
 use tokio::sync::broadcast::error::RecvError;
 use zenui_provider_api::{OrchestrationIpcHandle, ProviderAdapter, RuntimeEvent};
-use zenui_provider_claude_cli::ClaudeCliAdapter;
 use zenui_provider_claude_sdk::ClaudeSdkAdapter;
 use zenui_provider_codex::CodexAdapter;
 use zenui_provider_github_copilot::GitHubCopilotAdapter;
-use zenui_provider_github_copilot_cli::GitHubCopilotCliAdapter;
 use zenui_provider_opencode::OpenCodeAdapter;
 
 use std::collections::HashMap;
@@ -3004,22 +3002,12 @@ pub fn run() {
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
                     )) as Arc<dyn ProviderAdapter>,
-                    Arc::new(ClaudeCliAdapter::new_with_orchestration(
-                        flowstate_root.clone(),
-                        Some(ipc_handle.clone()),
-                        Some(user_mcp_registry.clone()),
-                    )),
                     Arc::new(CodexAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
                     )),
                     Arc::new(GitHubCopilotAdapter::new_with_orchestration(
-                        flowstate_root.clone(),
-                        Some(ipc_handle.clone()),
-                        Some(user_mcp_registry.clone()),
-                    )),
-                    Arc::new(GitHubCopilotCliAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),

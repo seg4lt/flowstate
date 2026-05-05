@@ -37,19 +37,11 @@ export const PROVIDER_META: Record<ProviderKind, ProviderMeta> = {
     defaultEnabled: true,
     slashPrefix: "/",
   },
-  claude_cli: {
-    label: "Claude 2",
-    color: "bg-purple-500",
-    hex: "#a855f7",
-    order: 1,
-    defaultEnabled: false,
-    slashPrefix: "/",
-  },
   codex: {
     label: "Codex",
     color: "bg-green-500",
     hex: "#10b981",
-    order: 2,
+    order: 1,
     defaultEnabled: false,
     slashPrefix: "$",
   },
@@ -57,23 +49,15 @@ export const PROVIDER_META: Record<ProviderKind, ProviderMeta> = {
     label: "GitHub Copilot",
     color: "bg-blue-500",
     hex: "#3b82f6",
-    order: 3,
+    order: 2,
     defaultEnabled: true,
-    slashPrefix: "/",
-  },
-  github_copilot_cli: {
-    label: "GitHub Copilot 2",
-    color: "bg-cyan-500",
-    hex: "#06b6d4",
-    order: 4,
-    defaultEnabled: false,
     slashPrefix: "/",
   },
   opencode: {
     label: "opencode",
     color: "bg-orange-500",
     hex: "#f97316",
-    order: 5,
+    order: 3,
     // Opt-in — the adapter depends on the external `opencode`
     // binary being on PATH. Showing it enabled by default on a
     // fresh install would produce a warning badge in Settings for

@@ -20,13 +20,9 @@ transport, or daemon crate.
   bundled `rusqlite`, wrapped in an async-safe `PersistenceService`.
 - **[`provider-claude-sdk/`](./provider-claude-sdk/README.md)** — Claude
   via the Agent SDK (TypeScript bridge).
-- **[`provider-claude-cli/`](./provider-claude-cli/README.md)** — Claude
-  via the `claude` CLI binary.
 - **[`provider-codex/`](./provider-codex/README.md)** — OpenAI Codex CLI.
 - **[`provider-github-copilot/`](./provider-github-copilot/README.md)** —
   GitHub Copilot via the SDK (TypeScript bridge).
-- **[`provider-github-copilot-cli/`](./provider-github-copilot-cli/README.md)**
-  — GitHub Copilot via the standalone `copilot` CLI.
 
 ## Why providers live in `core` and not `middleman`
 

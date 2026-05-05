@@ -130,9 +130,9 @@ pub fn claude_file_change_from_tool_call(
 /// Serialize `value` as compact JSON, write it to `writer` followed by a
 /// newline, and flush.
 ///
-/// Three adapters (`provider-claude-sdk`, `provider-claude-cli`,
-/// `provider-codex`) use the same newline-framed JSONL stdio protocol to
-/// talk to their respective child processes. This helper lives here so
+/// Two adapters (`provider-claude-sdk`, `provider-codex`) use the same
+/// newline-framed JSONL stdio protocol to talk to their respective
+/// child processes. This helper lives here so
 /// error wording, flush semantics, and ordering (write body, write '\n',
 /// flush) stay identical across them. `describe` is a short noun for the
 /// target (e.g. `"bridge"`, `"claude CLI"`, `"codex app-server"`) and
@@ -164,10 +164,9 @@ where
 
 /// Human-readable label for an Anthropic rate-limit bucket id.
 ///
-/// Both Claude adapters (`provider-claude-cli` reading the CLI's JSON event
-/// stream and `provider-claude-sdk` forwarding from the SDK bridge) surface
-/// the same set of bucket ids. Keeping the id→label table here ensures the
-/// two Rust adapters — and any future Claude adapter — render identical
+/// The Claude adapter (`provider-claude-sdk` forwarding from the SDK
+/// bridge) surfaces a known set of bucket ids. Keeping the id→label
+/// table here ensures any future Claude adapter renders identical
 /// copy. The TS bridge also carries a fallback copy as its own defensive
 /// measure, but Rust is the canonical source.
 ///

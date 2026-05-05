@@ -1,10 +1,9 @@
 //! Shared CLI health-probe helper used by adapters that wrap a
-//! command-line binary (Codex, Claude CLI, and future CLI-backed
-//! providers).
+//! command-line binary (Codex and future CLI-backed providers).
 //!
-//! Adapters that speak JSON-RPC over stdio (e.g. `provider-github-copilot-cli`)
-//! need a different flow — this helper is only for the classic
-//! `--version` / `auth status` shape.
+//! Adapters that speak JSON-RPC over stdio need a different flow —
+//! this helper is only for the classic `--version` / `auth status`
+//! shape.
 
 use tokio::process::Command;
 

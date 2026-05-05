@@ -2811,7 +2811,7 @@ impl RuntimeCore {
         // clicked stop while the adapter was streaming — finalise the turn
         // as Interrupted regardless of whether the adapter surfaced the
         // interrupt as an Ok with a stub string (claude-sdk) or an Err
-        // from a closed stdout (claude-cli / codex).
+        // from a closed stdout (codex).
         let was_interrupted = self.interrupted_sessions.lock().await.remove(&sid);
 
         let (status, canonical, result) = match (was_interrupted, adapter_result) {
@@ -5267,7 +5267,7 @@ mod tests {
     }
 
     /// User stops the turn; adapter surfaces it as `Err(...)` (the
-    /// claude-cli / codex path). The final turn must keep every streamed
+    /// codex path). The final turn must keep every streamed
     /// block, land in `Interrupted` status, and NOT publish `Error`.
     #[tokio::test]
     async fn interrupt_preserves_blocks_on_err_path() {

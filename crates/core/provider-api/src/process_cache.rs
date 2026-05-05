@@ -1,8 +1,8 @@
 //! Per-session long-lived subprocess cache with an idle-kill watchdog.
 //!
-//! Three provider adapters (`provider-claude-sdk`,
-//! `provider-github-copilot`, `provider-github-copilot-cli`) each cache
-//! a long-running bridge/CLI child per session so the SDK's in-memory
+//! Two provider adapters (`provider-claude-sdk`,
+//! `provider-github-copilot`) each cache a long-running bridge/CLI
+//! child per session so the SDK's in-memory
 //! context is reused across turns instead of paid for on every turn
 //! startup. All three independently grew the same state machine:
 //!

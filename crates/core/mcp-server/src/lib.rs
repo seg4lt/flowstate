@@ -455,7 +455,7 @@ async fn write_response(stdout: &mut tokio::io::Stdout, response: JsonRpcRespons
 ///
 /// 1. **Reparenting to init** (`getppid() == 1`): when a direct parent
 ///    dies, Unix kernels reparent the child to PID 1. Our direct
-///    parent is the *agent* (opencode, claude-cli, …), not flowstate,
+///    parent is the *agent* (opencode, codex, …), not flowstate,
 ///    but in practice when flowstate is SIGKILL'd the agent subprocess
 ///    tree also dies (opencode's `kill_on_drop` usually fires, or the
 ///    agent exits when its MCP stdio connection goes silent), so

@@ -780,10 +780,8 @@ function DefaultModelRow() {
     Record<ProviderKind, string | null>
   >({
     claude: null,
-    claude_cli: null,
     codex: null,
     github_copilot: null,
-    github_copilot_cli: null,
     opencode: null,
   });
   const [loaded, setLoaded] = React.useState(false);

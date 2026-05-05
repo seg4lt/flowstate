@@ -11,7 +11,7 @@
 //!   The child reparents to PID 1 and keeps running, holding its
 //!   port and its basic-auth password.
 //! - `flowstate mcp-server`: spawned by the *agent* (opencode /
-//!   claude-cli / codex / copilot), grandchild of flowstate. When the
+//!   codex / copilot), grandchild of flowstate. When the
 //!   agent dies too it reparents to PID 1. Under `tauri dev` the
 //!   agent and its mcp-server both typically survive because they're
 //!   detached from the flowstate process group.

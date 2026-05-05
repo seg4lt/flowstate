@@ -1438,11 +1438,9 @@ dependencies = [
  "winreg 0.52.0",
  "zenui-daemon-core",
  "zenui-provider-api",
- "zenui-provider-claude-cli",
  "zenui-provider-claude-sdk",
  "zenui-provider-codex",
  "zenui-provider-github-copilot",
- "zenui-provider-github-copilot-cli",
  "zenui-provider-opencode",
  "zenui-runtime-core",
  "zenui-transport-http",
@@ -7512,18 +7510,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zenui-provider-claude-cli"
-version = "0.2.32"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "zenui-provider-api",
-]
-
-[[package]]
 name = "zenui-provider-claude-sdk"
 version = "0.2.32"
 dependencies = [
@@ -7563,19 +7549,6 @@ dependencies = [
  "tokio",
  "tracing",
  "zenui-embedded-node",
- "zenui-provider-api",
-]
-
-[[package]]
-name = "zenui-provider-github-copilot-cli"
-version = "0.2.32"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
  "zenui-provider-api",
 ]
 

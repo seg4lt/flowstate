@@ -13,10 +13,6 @@ pub enum ProviderKind {
     Claude,
     #[serde(rename = "github_copilot")]
     GitHubCopilot,
-    #[serde(rename = "claude_cli")]
-    ClaudeCli,
-    #[serde(rename = "github_copilot_cli")]
-    GitHubCopilotCli,
     /// The `opencode` CLI (https://opencode.ai) — driven via its
     /// headless HTTP server (`opencode serve`) with an SSE event
     /// stream. The wire tag is the bare name `"opencode"`; the
@@ -31,8 +27,6 @@ impl ProviderKind {
         ProviderKind::Codex,
         ProviderKind::Claude,
         ProviderKind::GitHubCopilot,
-        ProviderKind::ClaudeCli,
-        ProviderKind::GitHubCopilotCli,
         ProviderKind::OpenCode,
     ];
 
@@ -41,8 +35,6 @@ impl ProviderKind {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
             Self::GitHubCopilot => "GitHub Copilot",
-            Self::ClaudeCli => "Claude (CLI)",
-            Self::GitHubCopilotCli => "GitHub Copilot (CLI)",
             Self::OpenCode => "opencode",
         }
     }
@@ -56,8 +48,6 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::GitHubCopilot => "github_copilot",
-            Self::ClaudeCli => "claude_cli",
-            Self::GitHubCopilotCli => "github_copilot_cli",
             Self::OpenCode => "opencode",
         }
     }
@@ -70,8 +60,6 @@ impl ProviderKind {
             "codex" => Self::Codex,
             "claude" => Self::Claude,
             "github_copilot" => Self::GitHubCopilot,
-            "claude_cli" => Self::ClaudeCli,
-            "github_copilot_cli" => Self::GitHubCopilotCli,
             "opencode" => Self::OpenCode,
             _ => return None,
         })
@@ -903,12 +891,10 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
             ..ProviderFeatures::default()
         },
 
-        // Claude CLI, GitHub Copilot (SaaS and CLI) don't expose any
-        // of the flagged capabilities today — the UI hides the
-        // corresponding affordances when selected.
-        ProviderKind::ClaudeCli | ProviderKind::GitHubCopilot | ProviderKind::GitHubCopilotCli => {
-            ProviderFeatures::default()
-        }
+        // GitHub Copilot (SaaS) doesn't expose any of the flagged
+        // capabilities today — the UI hides the corresponding
+        // affordances when selected.
+        ProviderKind::GitHubCopilot => ProviderFeatures::default(),
 
         // Opencode accepts a `variant` on the prompt body which maps
         // onto flowstate's reasoning-effort scale (low/medium/high/

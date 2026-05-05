@@ -929,8 +929,8 @@ impl ProviderAdapter for OpenCodeAdapter {
 
     /// Off by default. opencode is opt-in — users who don't have the
     /// binary installed shouldn't see a warning badge in Settings the
-    /// first time they open the app. Mirrors how `provider-claude-cli`
-    /// and the Codex CLI provider behave.
+    /// first time they open the app. Mirrors how the Codex CLI provider
+    /// behaves.
     fn default_enabled(&self) -> bool {
         false
     }

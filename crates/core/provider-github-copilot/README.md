@@ -18,11 +18,8 @@ Same pattern as
 
 ## When to use
 
-Prefer this over
-[`../provider-github-copilot-cli/`](../provider-github-copilot-cli/README.md)
-for deeper tool-call integration and programmatic permission handling.
-The CLI variant is simpler but exposes less of the underlying protocol
-surface.
+Use this for GitHub Copilot integration with deep tool-call support
+and programmatic permission handling.
 
 ## Dependencies
 

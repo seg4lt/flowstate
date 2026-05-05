@@ -78,10 +78,8 @@ flowstate-app-layer = { path = "../../../crates/app-layer" }
 # `src/lib.rs`; keeping the path deps here makes the set of supported
 # providers a single-file edit for downstream apps.
 zenui-provider-claude-sdk = { path = "../../../crates/core/provider-claude-sdk" }
-zenui-provider-claude-cli = { path = "../../../crates/core/provider-claude-cli" }
 zenui-provider-codex = { path = "../../../crates/core/provider-codex" }
 zenui-provider-github-copilot = { path = "../../../crates/core/provider-github-copilot" }
-zenui-provider-github-copilot-cli = { path = "../../../crates/core/provider-github-copilot-cli" }
 zenui-provider-opencode = { path = "../../../crates/core/provider-opencode" }
 
 # Types used in Tauri commands

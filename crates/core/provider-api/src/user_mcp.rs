@@ -4,9 +4,8 @@
 //! exposes a validated, deduped snapshot to every provider adapter.
 //! Each adapter merges the snapshot into its own provider-native
 //! injection path at session spawn time — see the per-adapter
-//! plumbing in `provider-claude-cli`, `provider-claude-sdk`,
-//! `provider-codex`, `provider-github-copilot{-cli}`, and
-//! `provider-opencode`.
+//! plumbing in `provider-claude-sdk`, `provider-codex`,
+//! `provider-github-copilot`, and `provider-opencode`.
 //!
 //! # Why a single file rather than per-provider config
 //!

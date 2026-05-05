@@ -4,7 +4,7 @@
 
 export type JsonValue = unknown;
 
-export type ProviderKind = "codex" | "claude" | "github_copilot" | "claude_cli" | "github_copilot_cli" | "opencode";
+export type ProviderKind = "codex" | "claude" | "github_copilot" | "opencode";
 
 export type ProviderStatusLevel = "ready" | "warning" | "error";
 

@@ -1150,8 +1150,7 @@ fn rate_limit_status_from_str(s: &str) -> RateLimitStatus {
 /// **Used ONLY to weight per-agent cost allocation** — never to
 /// compute `total_cost_usd`, which is always the provider's own
 /// number passed verbatim through the bridge (see
-/// `provider-claude-sdk/bridge/src/index.ts:2243`) or the CLI
-/// adapter (see `provider-claude-cli/src/lib.rs::Result` arm). If
+/// `provider-claude-sdk/bridge/src/index.ts:2243`). If
 /// Anthropic changes pricing, update both this table and
 /// `PRICING_TABLE_DATE` so the Settings → Usage footer can warn
 /// users to verify against the current rate card.

@@ -205,6 +205,13 @@ fn main() {
                 .env("PATH", &install_path)
                 .env("HOME", &install_home)
                 .env("NODE_ENV", "development")
+                // Cargo build scripts have no TTY. Without `CI=true`,
+                // pnpm aborts whenever it wants to purge `node_modules/`
+                // (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`), which
+                // is exactly the path build scripts hit after the
+                // workspace's lockfile or member set changes. Force CI
+                // mode so pnpm proceeds non-interactively.
+                .env("CI", "true")
                 // mise/asdf/nvm etc. pnpm respects these to find the
                 // right node binary; preserving them keeps the
                 // install pinned to the same toolchain the dev shell

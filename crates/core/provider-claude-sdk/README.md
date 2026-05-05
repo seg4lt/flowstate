@@ -22,9 +22,7 @@ bridged through a TypeScript sidecar that this crate builds and bundles.
 
 Prefer the SDK adapter for richer streaming semantics — granular
 tool-call events, plan proposals, subagent lifecycle — and for
-programmatic control over permission decisions. Use
-[`../provider-claude-cli/`](../provider-claude-cli/README.md) when you
-want to run through the shipped `claude` CLI binary instead.
+programmatic control over permission decisions.
 
 ## Dependencies
 

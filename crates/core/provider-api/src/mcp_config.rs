@@ -1,22 +1,18 @@
 //! Helper for rendering the MCP-server config JSON that provider
-//! adapters drop on disk for file-based CLI agents (Claude CLI,
-//! Copilot CLI, Codex).
+//! adapters drop on disk for file-based CLI agents (Codex).
 //!
 //! # Why a shared helper
 //!
-//! Three adapters (`provider-claude-cli`, `provider-github-copilot-cli`,
-//! `provider-codex`) all need to register the same `flowstate
-//! mcp-server` subprocess with their underlying CLI so the agent can
-//! call the cross-provider orchestration tools. The shape of the
-//! config is nearly identical across the three — they all understand
+//! `provider-codex` needs to register the `flowstate mcp-server`
+//! subprocess with its underlying CLI so the agent can call the
+//! cross-provider orchestration tools. The shape of the config follows
 //! the `{mcpServers: {name: {command, args, env}}}` JSON schema that
 //! originated with the MCP reference implementation. Codex uses TOML
 //! with the same shape; we render JSON-centered here and let the Codex
 //! adapter pass fields via its `-c` CLI flag instead of writing a
 //! file.
 //!
-//! Keep the output format locked here so a drift fix is one edit, not
-//! three.
+//! Keep the output format locked here so a drift fix is one edit.
 
 use std::path::{Path, PathBuf};
 
