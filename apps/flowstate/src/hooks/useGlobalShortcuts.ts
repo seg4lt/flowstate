@@ -259,20 +259,19 @@ function getAllSessionsInSidebarOrder(
   return flat;
 }
 
-/** Resolve the active session's "effective" project id — the parent
- *  of a worktree row, or the project itself. Mirrors the rollup the
- *  sidebar uses so ⌘N feels like "new thread in the row I'm reading
- *  the sidebar from". */
-function effectiveActiveProjectId(
+/** Resolve the active session's project id verbatim — when the active
+ *  thread runs on a worktree, this returns the worktree's own
+ *  projectId (NOT the parent). ⌘N intentionally follows the worktree
+ *  so a new thread spawned from a worktree thread lands on the same
+ *  branch, not the parent project. The sidebar groups worktree threads
+ *  visually under the parent, but the user's mental model for "new
+ *  thread here" is the branch they're working on. */
+function activeProjectId(
   state: ReturnType<typeof useApp>["state"],
 ): string | null {
   const activeId = state.activeSessionId;
   const active = activeId ? state.sessions.get(activeId) : undefined;
-  if (!active?.projectId) return null;
-  return (
-    state.projectWorktrees.get(active.projectId)?.parentProjectId ??
-    active.projectId
-  );
+  return active?.projectId ?? null;
 }
 
 interface BuildCtxArgs {
@@ -325,11 +324,11 @@ function buildCtx(args: BuildCtxArgs): ShortcutCtx {
     navigate: (opts) =>
       navigate(opts as unknown as Parameters<typeof navigate>[0]),
     startThreadOnCurrentProject: async () => {
-      // Resolve "current project" the same way the sidebar groups
-      // threads — walking through worktree links so a popout from a
-      // worktree thread still lands the new thread on the parent
-      // project (which is what the user sees as the active row).
-      const projectId = effectiveActiveProjectId(state);
+      // Use the active session's projectId verbatim — if the active
+      // thread is on a worktree, the new thread lands on the same
+      // worktree (its own project at the SDK layer), not on the parent
+      // project. See `activeProjectId` doc comment for rationale.
+      const projectId = activeProjectId(state);
       if (!projectId) {
         notify("Open a thread first to start one in its project");
         return;

@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { GitBranch } from "lucide-react";
 import {
   Command,
   CommandEmpty,
@@ -27,8 +28,15 @@ interface ProjectProviderPickerProps {
 
 interface ProjectRow {
   projectId: string;
+  /** Display label for the row. For worktree rows this is the parent
+   *  project name; the branch name is rendered separately so it can be
+   *  styled distinctly. */
   name: string;
   path: string | undefined;
+  /** Set on worktree rows; `null` for detached HEAD worktrees. */
+  branch?: string | null;
+  /** True when this row is a git worktree of another project. */
+  isWorktree: boolean;
 }
 
 /**
@@ -55,14 +63,35 @@ export function ProjectProviderPicker({
   const navigate = useNavigate();
 
   const projects = React.useMemo<ProjectRow[]>(() => {
-    const worktreeIds = new Set(state.projectWorktrees.keys());
     const nameFor = (projectId: string) =>
       state.projectDisplay.get(projectId)?.name ?? "Untitled project";
-    // Same sort as app-sidebar.tsx's `sortedActiveProjects` so the
-    // picker order matches the sidebar's, and users can navigate by
-    // muscle memory.
-    return state.projects
-      .filter((p) => !worktreeIds.has(p.projectId))
+    const projectById = new Map(state.projects.map((p) => [p.projectId, p]));
+
+    // Group worktrees by parent so each parent's worktrees can be
+    // emitted immediately after the parent row.
+    const worktreesByParent = new Map<string, typeof state.projects>();
+    const orphanWorktrees: typeof state.projects = [];
+    for (const p of state.projects) {
+      const link = state.projectWorktrees.get(p.projectId);
+      if (!link) continue;
+      const parent = projectById.get(link.parentProjectId);
+      if (!parent) {
+        // Defensive: parent project record is missing (shouldn't happen
+        // in normal use). Surface the worktree at the end so it's still
+        // pickable rather than silently dropped.
+        orphanWorktrees.push(p);
+        continue;
+      }
+      const list = worktreesByParent.get(link.parentProjectId) ?? [];
+      list.push(p);
+      worktreesByParent.set(link.parentProjectId, list);
+    }
+
+    // Sort parents the same way `app-sidebar.tsx`'s
+    // `sortedActiveProjects` does, so the picker order matches the
+    // sidebar's and users can navigate by muscle memory.
+    const parents = state.projects
+      .filter((p) => !state.projectWorktrees.has(p.projectId))
       .slice()
       .sort((a, b) => {
         const oa = state.projectDisplay.get(a.projectId)?.sortOrder;
@@ -73,12 +102,52 @@ export function ProjectProviderPicker({
         if (oa == null) return 1;
         if (ob == null) return -1;
         return oa - ob;
-      })
-      .map((p) => ({
+      });
+
+    const rows: ProjectRow[] = [];
+    for (const p of parents) {
+      rows.push({
         projectId: p.projectId,
         name: nameFor(p.projectId),
         path: p.path,
-      }));
+        isWorktree: false,
+      });
+      const childWorktrees = worktreesByParent.get(p.projectId);
+      if (!childWorktrees) continue;
+      // Sort worktrees of a given parent by branch name for stable
+      // ordering. Detached HEADs (branch === null) sink to the end.
+      const sorted = childWorktrees.slice().sort((a, b) => {
+        const ba = state.projectWorktrees.get(a.projectId)?.branch ?? "";
+        const bb = state.projectWorktrees.get(b.projectId)?.branch ?? "";
+        if (ba === "" && bb === "") return 0;
+        if (ba === "") return 1;
+        if (bb === "") return -1;
+        return ba.localeCompare(bb);
+      });
+      for (const wt of sorted) {
+        const link = state.projectWorktrees.get(wt.projectId);
+        rows.push({
+          projectId: wt.projectId,
+          // Show the parent's name as the row label; the branch is
+          // rendered as a secondary chip alongside the GitBranch icon.
+          name: nameFor(p.projectId),
+          path: wt.path,
+          branch: link?.branch ?? null,
+          isWorktree: true,
+        });
+      }
+    }
+    for (const wt of orphanWorktrees) {
+      const link = state.projectWorktrees.get(wt.projectId);
+      rows.push({
+        projectId: wt.projectId,
+        name: nameFor(wt.projectId),
+        path: wt.path,
+        branch: link?.branch ?? null,
+        isWorktree: true,
+      });
+    }
+    return rows;
   }, [state.projects, state.projectDisplay, state.projectWorktrees]);
 
   // `picked` non-null = step 2; null = step 1. Reset whenever the
@@ -145,7 +214,19 @@ export function ProjectProviderPicker({
             </button>
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
-                <div className="truncate text-sm font-medium">{picked.name}</div>
+                <div className="flex min-w-0 items-center gap-1.5">
+                  {picked.isWorktree && (
+                    <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  )}
+                  <span className="truncate text-sm font-medium">
+                    {picked.name}
+                  </span>
+                  {picked.isWorktree && (
+                    <span className="shrink-0 truncate text-xs text-muted-foreground">
+                      · {picked.branch ?? "(detached)"}
+                    </span>
+                  )}
+                </div>
                 {picked.path && (
                   <div className="truncate text-[10px] text-muted-foreground">
                     {picked.path}
@@ -189,12 +270,30 @@ export function ProjectProviderPicker({
                 {projects.map((p) => (
                   <CommandItem
                     key={p.projectId}
-                    // Combine name + path so users can type either to
-                    // find a row. cmdk's filter is substring on `value`.
-                    value={`${p.name} ${p.path ?? ""}`}
+                    // Combine name + branch + path so users can type
+                    // any of them to find a row (e.g. "fix/login" jumps
+                    // straight to that worktree). cmdk's filter is
+                    // substring on `value`.
+                    value={`${p.name} ${p.branch ?? ""} ${p.path ?? ""}`}
                     onSelect={() => setPicked(p)}
                   >
-                    <span className="flex-1 truncate">{p.name}</span>
+                    {p.isWorktree && (
+                      <GitBranch className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    )}
+                    <span
+                      className={
+                        p.isWorktree
+                          ? "truncate text-muted-foreground"
+                          : "flex-1 truncate"
+                      }
+                    >
+                      {p.name}
+                    </span>
+                    {p.isWorktree && (
+                      <span className="ml-1.5 flex-1 truncate text-xs">
+                        · {p.branch ?? "(detached)"}
+                      </span>
+                    )}
                     {p.path && (
                       <span className="ml-2 truncate text-[10px] text-muted-foreground">
                         {p.path}
