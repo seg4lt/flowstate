@@ -151,13 +151,6 @@ fn main() {
                 .env("PATH", &install_path)
                 .env("HOME", &install_home)
                 .env("NODE_ENV", "development")
-                // Cargo build scripts have no TTY. Without `CI=true`,
-                // pnpm aborts whenever it wants to purge `node_modules/`
-                // (`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`), which
-                // is exactly the path build scripts hit after the
-                // workspace's lockfile or member set changes. Force CI
-                // mode so pnpm proceeds non-interactively.
-                .env("CI", "true")
                 .env(
                     "MISE_DATA_DIR",
                     env::var("MISE_DATA_DIR").unwrap_or_default(),
@@ -432,6 +425,17 @@ fn locate_tsc(bridge_dir: &Path) -> Option<Command> {
     let shim_name = if cfg!(windows) { "tsc.cmd" } else { "tsc" };
     let shim = bin_dir.join(shim_name);
     if shim.exists() {
+        // The caller sets `current_dir(bridge_dir)` on the returned
+        // Command. The OS resolves a relative `program` path against
+        // the NEW cwd at exec time, not against build.rs's current
+        // directory — so a relative `bridge/node_modules/.bin/tsc`
+        // gets re-rooted under `bridge/`, doubling the prefix and
+        // surfacing as `os error 2 (ENOENT)` on `.status()`. Strip
+        // that footgun by canonicalizing to an absolute path. Mirror
+        // the UNC-prefix strip the script branch already does so the
+        // Windows path stays node-friendly.
+        let shim = fs::canonicalize(&shim).unwrap_or(shim);
+        let shim = strip_unc_prefix(&shim);
         return Some(Command::new(shim));
     }
 
