@@ -6,6 +6,7 @@ import { CodeBlock as ShikiCodeBlock } from "./messages/code-block";
 import { MarkdownContent } from "./messages/markdown-content";
 import { Button } from "@/components/ui/button";
 import { extractToolOutputText } from "@/lib/parse-tool-output";
+import { languageFromPath } from "@/lib/language-from-path";
 
 // Per-tool args renderers. Looked up by tool name. The default falls
 // back to GenericArgsRenderer, which produces a labeled key/value view
@@ -227,8 +228,14 @@ function DiffBlock({
     [oldStr, newStr, filePath],
   );
   if (oldStr === newStr) return null;
+  // Heights here (and in the Edit/Write/MultiEdit renderers below)
+  // were nudged ~20% above the original tight values: small content
+  // still shrinks to fit, larger content gets a bit more breathing
+  // room before the scroll kicks in. Hard cap intentional — these
+  // cards live inside a chat transcript and must never grow to
+  // fill the viewport.
   return (
-    <div className="max-h-40 overflow-auto">
+    <div className="max-h-48 overflow-auto">
       <PatchDiff
         patch={patchText}
         options={{
@@ -262,7 +269,7 @@ function EditRenderer({ args }: RendererProps) {
           {oldStr !== undefined && (
             <div>
               <p className="mb-1 text-[11px] text-muted-foreground">old</p>
-              <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px] text-destructive">
+              <pre className="max-h-48 overflow-auto rounded bg-muted p-2 text-[11px] text-destructive">
                 {oldStr}
               </pre>
             </div>
@@ -270,7 +277,7 @@ function EditRenderer({ args }: RendererProps) {
           {newStr !== undefined && (
             <div>
               <p className="mb-1 text-[11px] text-muted-foreground">new</p>
-              <pre className="max-h-40 overflow-auto rounded bg-muted p-2 text-[11px] text-emerald-600 dark:text-emerald-400">
+              <pre className="max-h-48 overflow-auto rounded bg-muted p-2 text-[11px] text-emerald-600 dark:text-emerald-400">
                 {newStr}
               </pre>
             </div>
@@ -288,13 +295,18 @@ function WriteRenderer({ args }: RendererProps) {
   const a = asRecord(args);
   const path = asString(a.file_path) ?? asString(a.path);
   const content = asString(a.content);
+  // Infer language from the file extension so the preview gets the
+  // same shiki highlighting as the file viewer / Bash tool card,
+  // rather than a flat monospace blob. Falls back to "text" when
+  // there's no path or no extension.
+  const language = path ? languageFromPath(path) : "text";
   return (
     <div className="space-y-1.5">
       {path && <PathLine label="file" path={path} />}
       {content !== undefined && (
-        <pre className="max-h-64 overflow-auto rounded bg-muted p-2 text-[11px]">
-          {content}
-        </pre>
+        <div className="max-h-[19.2rem] overflow-auto">
+          <CodeBlock language={language} code={content} />
+        </div>
       )}
       {!path && content === undefined && <GenericArgsRenderer args={args} />}
     </div>
@@ -327,12 +339,12 @@ function MultiEditRenderer({ args }: RendererProps) {
                 ) : (
                   <>
                     {oldStr !== undefined && (
-                      <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-destructive">
+                      <pre className="max-h-[9.6rem] overflow-auto rounded bg-muted p-2 text-destructive">
                         {oldStr}
                       </pre>
                     )}
                     {newStr !== undefined && (
-                      <pre className="max-h-32 overflow-auto rounded bg-muted p-2 text-emerald-600 dark:text-emerald-400">
+                      <pre className="max-h-[9.6rem] overflow-auto rounded bg-muted p-2 text-emerald-600 dark:text-emerald-400">
                         {newStr}
                       </pre>
                     )}

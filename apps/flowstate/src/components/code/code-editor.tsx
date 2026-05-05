@@ -61,6 +61,7 @@ import {
   ensureLanguageLoaded,
   getHighlighter,
 } from "@/lib/shiki-singleton";
+import { languageFromPath } from "@/lib/language-from-path";
 import { getGitDiffFile } from "@/lib/api";
 import {
   diffLines,
@@ -162,41 +163,6 @@ function ensureClipboardSyncRegistered(): void {
       });
     }
   };
-}
-
-// ─── language resolution ─────────────────────────────────────────
-
-// Map a file extension (without the dot) to a Shiki language name.
-// Only contains entries where the extension differs from Shiki's
-// canonical name; everything else falls through to the raw ext.
-const EXT_TO_LANG: Record<string, string> = {
-  ts: "typescript",
-  mts: "typescript",
-  cts: "typescript",
-  js: "javascript",
-  mjs: "javascript",
-  cjs: "javascript",
-  py: "python",
-  rs: "rust",
-  rb: "ruby",
-  yml: "yaml",
-  md: "markdown",
-  sh: "bash",
-  zsh: "bash",
-  htm: "html",
-  "c++": "cpp",
-  "h++": "cpp",
-  cc: "cpp",
-  hh: "cpp",
-  hpp: "cpp",
-  cs: "csharp",
-};
-
-function languageFromPath(path: string): string {
-  const dot = path.lastIndexOf(".");
-  if (dot === -1) return "text";
-  const ext = path.slice(dot + 1).toLowerCase();
-  return EXT_TO_LANG[ext] ?? ext;
 }
 
 // ─── long-line / large-file detection ────────────────────────────
