@@ -18,6 +18,11 @@ const EMPTY_PROVIDER_FEATURES: ProviderFeatures = {
   promptSuggestions: false,
   sessionLifecycleEvents: false,
   supportsAutoPermissionMode: false,
+  // Default-false matches the rest: an adapter that hasn't reported
+  // capabilities yet (or a daemon build older than this flag) is
+  // assumed to lack live-injection, so callers fall through to the
+  // mailbox-drain path on the next TurnCompleted.
+  liveMessageInjection: false,
 };
 
 /**
