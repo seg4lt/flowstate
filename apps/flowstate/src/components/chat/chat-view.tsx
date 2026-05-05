@@ -1322,8 +1322,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // Clear the persisted draft on send — the message is gone from
     // the composer and we don't want it to reappear if the user
     // navigates away and back before the component remounts.
+    //
+    // We deliberately do NOT call `sessionQueues.delete(sessionId)`
+    // here: the queue is owned by `ChatInput`'s React state and
+    // mirrors back into `sessionQueues` via `onQueueChange`. Calling
+    // `delete` upfront created a brief window where `sessionQueues`
+    // was empty before `setQueued(rest)` flushed, and any
+    // ChatInput remount in that window (e.g. user thread-switches
+    // during the `await sendMessage` yield) would silently lose the
+    // queue tail because `initialQueue = sessionQueues.get(...)`
+    // would resolve to `undefined`.
     sessionDrafts.delete(sessionId);
-    sessionQueues.delete(sessionId);
     if (isArchived) {
       // Defense in depth — the composer is disabled when archived,
       // but slash-command and keyboard shortcut paths could still
@@ -1413,7 +1422,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     // list either, so they correctly don't trigger a scroll).
     setUserSendTick((n) => n + 1);
     try {
-      await sendMessage({
+      // `sendMessage` (Tauri `invoke`) only throws on transport
+      // failures; a daemon-level rejection arrives as a successful
+      // resolve of `ServerMessage::Error`. The chat-input drain
+      // relies on `onSend` throwing on ANY failure — so we have to
+      // promote the Error variant into a real throw here. Without
+      // this, a queued message that the daemon rejects (session
+      // archived mid-await, turn-state race, provider auth lapse)
+      // would silently disappear from the queue with no toast and
+      // no new turn ever appearing.
+      const resp = await sendMessage({
         type: "send_turn",
         session_id: sessionId,
         input,
@@ -1426,6 +1444,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         reasoning_effort: effort,
         thinking_mode: thinkingMode,
       });
+      if (resp?.type === "error") {
+        throw new Error(resp.message);
+      }
     } catch (err) {
       setPendingInput(null);
       throw err;
@@ -1454,7 +1475,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setPendingInput(input);
     setUserSendTick((n) => n + 1);
     try {
-      await sendMessage({
+      // Same throw-on-Error-variant promotion as `handleSend` — the
+      // ChatInput's steer-watchdog needs an honest signal that the
+      // daemon refused so it can clear `steerInFlightRef` promptly
+      // (rather than waiting out the 10s watchdog) and surface a
+      // toast.
+      const resp = await sendMessage({
         type: "steer_turn",
         session_id: sessionId,
         input,
@@ -1467,6 +1493,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         reasoning_effort: effort,
         thinking_mode: thinkingMode,
       });
+      if (resp?.type === "error") {
+        throw new Error(resp.message);
+      }
     } catch (err) {
       setPendingInput(null);
       throw err;

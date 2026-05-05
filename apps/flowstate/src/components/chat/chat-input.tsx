@@ -40,13 +40,20 @@ import {
 } from "@/lib/diff-comments-store";
 
 interface ChatInputProps {
-  onSend: (input: string, images: AttachedImage[]) => void;
+  /** Dispatch a turn. Returns a promise that resolves once the
+   *  daemon has accepted the `send_turn` RPC (or rejects with the
+   *  daemon's error message). The drain effect awaits this so a
+   *  failed send leaves the queued chip in place rather than
+   *  silently popping it; callers therefore MUST throw on
+   *  `ServerMessage::Error` rather than swallowing it. */
+  onSend: (input: string, images: AttachedImage[]) => Promise<void> | void;
   onInterrupt: () => void;
   /** Atomic steer: interrupt the current turn AND dispatch `input`
    *  as the next turn in a single daemon-side RPC. Used by the
    *  "Send now" affordance on queued chips so there's no
-   *  frontend-side interrupt→send race. */
-  onSteer: (input: string, images: AttachedImage[]) => void;
+   *  frontend-side interrupt→send race. Same throw-on-error
+   *  contract as `onSend`. */
+  onSteer: (input: string, images: AttachedImage[]) => Promise<void> | void;
   sessionStatus: SessionStatus | undefined;
   disabled: boolean;
   /** When true, the session's provider has been toggled off in
@@ -484,6 +491,37 @@ export function ChatInput({
   // regular send_turn, racing the steer. We clear the ref the first
   // time we observe the steer's interrupt/ready transition.
   const steerInFlightRef = React.useRef(false);
+  /** Watchdog that clears `steerInFlightRef` if the expected
+   *  running→interrupted/ready transition never arrives — without
+   *  this the flag could pin true forever (e.g. the steer's
+   *  `sendMessage` rejected async, the daemon was killed mid-RPC,
+   *  the original turn was already finishing when the user clicked
+   *  "Send now") and silently swallow every subsequent legitimate
+   *  drain. 10s is comfortably longer than any real
+   *  interrupt→finalize round-trip (the daemon's own bound is 10s)
+   *  but short enough that a wedged flag self-heals within one
+   *  user-visible delay. */
+  const steerWatchdogRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  // Best-effort cleanup on unmount. ChatInput is keyed by sessionId
+  // so this fires on every thread switch — not strictly necessary
+  // (a fresh component starts with a fresh ref) but keeps the timer
+  // accounting tidy in dev tools.
+  React.useEffect(() => {
+    return () => {
+      if (steerWatchdogRef.current !== null) {
+        clearTimeout(steerWatchdogRef.current);
+        steerWatchdogRef.current = null;
+      }
+    };
+  }, []);
+  /** Set while a drain's `onSend` is awaiting daemon acknowledgement.
+   *  Suppresses re-entry from the effect re-running when `onSend`'s
+   *  identity changes mid-await (the parent rebuilds `handleSend`
+   *  on every render) so we don't fire two `send_turn` RPCs for the
+   *  same head. */
+  const drainInFlightRef = React.useRef(false);
   React.useEffect(() => {
     const wasRunning = prevStatusRef.current === "running";
     const nowReady = sessionStatus === "ready" || sessionStatus === "interrupted";
@@ -496,8 +534,18 @@ export function ChatInput({
     // natural completion.
     if (steerInFlightRef.current) {
       steerInFlightRef.current = false;
+      if (steerWatchdogRef.current !== null) {
+        clearTimeout(steerWatchdogRef.current);
+        steerWatchdogRef.current = null;
+      }
       return;
     }
+
+    // A previous drain hasn't resolved yet (we awaited `onSend` and
+    // the daemon hasn't acked). Don't fire a second `send_turn` for
+    // the same head — wait for the await to settle and the natural
+    // re-render to re-enter the effect with the popped queue.
+    if (drainInFlightRef.current) return;
 
     // Normal drain — pop the head of the queue.
     if (queued.length === 0) return;
@@ -509,14 +557,45 @@ export function ChatInput({
     }
     // Drain the head of the queue. Carry its images along with the
     // text — the pasted attachments rode in the queued chip and need
-    // to fire when the queued text fires. Object URLs are revoked
-    // here, after the send goes out, so the chip thumbnail stays
-    // visible until the moment the message actually leaves.
-    onSend(first.text, first.images);
-    for (const img of first.images) {
-      URL.revokeObjectURL(img.previewUrl);
-    }
-    setQueued(rest);
+    // to fire when the queued text fires.
+    //
+    // Critical: we await `onSend` BEFORE popping the head from the
+    // queue. The previous version popped optimistically (`setQueued(
+    // rest)` ran unconditionally) and called `onSend` fire-and-
+    // forget — so a daemon error (e.g. `ServerMessage::Error`,
+    // session-being-torn-down race, archived-mid-await) silently
+    // dropped the message: chip vanished, no toast, no new turn.
+    // The new contract (see the prop docstring) is that `onSend`
+    // throws on daemon error; on a throw we leave the head in the
+    // queue so the user can see the chip is still pending and
+    // optionally retry / steer / clear.
+    drainInFlightRef.current = true;
+    void (async () => {
+      try {
+        await onSend(first.text, first.images);
+        // Success: pop the head. Object URLs revoked AFTER the send
+        // succeeded so the chip thumbnail stays visible until the
+        // message actually leaves; on failure the chip stays and
+        // the URLs survive for an eventual retry.
+        for (const img of first.images) {
+          URL.revokeObjectURL(img.previewUrl);
+        }
+        setQueued(rest);
+      } catch (err) {
+        // Surface the daemon's reason to the user. The chip remains
+        // in the queue so retrying is just "send another message",
+        // which re-fires the drain after the next `running → ready`
+        // transition (or directly, if the queue is now allowed to
+        // bypass — see the dispatch logic).
+        const message = err instanceof Error ? err.message : String(err);
+        toast({
+          description: `Couldn't send queued message: ${message}`,
+          duration: 5000,
+        });
+      } finally {
+        drainInFlightRef.current = false;
+      }
+    })();
   }, [sessionStatus, queued, onSend, editingId]);
 
   function enqueue(text: string, images: AttachedImage[]) {
@@ -565,13 +644,54 @@ export function ChatInput({
     // steered message. The flag is cleared by the drain effect on
     // that next non-running tick.
     steerInFlightRef.current = true;
+    // Arm the watchdog: if no transition arrives within 10s — e.g.
+    // the steer's `sendMessage` rejected async and the daemon never
+    // acted, or the original turn finished naturally before our
+    // steer was processed and the daemon skipped the interrupt —
+    // self-clear the flag so the next legitimate drain isn't
+    // silently swallowed. Without this the previous code path could
+    // wedge the queue forever.
+    if (steerWatchdogRef.current !== null) {
+      clearTimeout(steerWatchdogRef.current);
+    }
+    steerWatchdogRef.current = setTimeout(() => {
+      steerInFlightRef.current = false;
+      steerWatchdogRef.current = null;
+    }, 10_000);
+    // `onSteer` may be async; we don't await it here because the
+    // chip pluck and the steer are intentionally decoupled (the
+    // chip is gone the moment the user clicks). An async error in
+    // `onSteer` will be surfaced by the parent's own toast/throw
+    // path; the watchdog above is what ensures `steerInFlightRef`
+    // doesn't pin true if no transition follows.
     try {
-      onSteer(target.text, target.images);
+      const ret = onSteer(target.text, target.images);
+      // If `onSteer` returned a Promise, attach a rejection handler
+      // so an async failure clears the flag promptly (don't wait
+      // for the watchdog) and surfaces a toast.
+      if (ret && typeof (ret as Promise<unknown>).then === "function") {
+        (ret as Promise<unknown>).catch((err) => {
+          steerInFlightRef.current = false;
+          if (steerWatchdogRef.current !== null) {
+            clearTimeout(steerWatchdogRef.current);
+            steerWatchdogRef.current = null;
+          }
+          const message = err instanceof Error ? err.message : String(err);
+          toast({
+            description: `Couldn't steer message: ${message}`,
+            duration: 5000,
+          });
+        });
+      }
     } catch (err) {
       // Synchronous throw: no transition will occur, so clear the
       // flag now to avoid silently swallowing a future legitimate
       // drain.
       steerInFlightRef.current = false;
+      if (steerWatchdogRef.current !== null) {
+        clearTimeout(steerWatchdogRef.current);
+        steerWatchdogRef.current = null;
+      }
       throw err;
     }
     // Revoke the attached image preview URLs now that we've handed
