@@ -303,11 +303,12 @@ function ToolCallGroup({
    *  broken-out Edits show their diff without an extra click. */
   cardsDefaultOpen?: boolean;
 }) {
-  // When the provider supplied a batch label, default-collapse;
-  // user can click the label to expand. Without a label, we keep
-  // the existing behavior (visible by default, overflow-only
-  // collapse for very long batches).
-  const [expanded, setExpanded] = React.useState(summary == null);
+  // Always default to the overflow-collapsed state — show top 5
+  // tool calls with a "Show N more" counter, click to expand. This
+  // is the historical behavior. (When `summary` is set the whole
+  // <details> additionally starts closed via `open={...}` below;
+  // that's an orthogonal collapse layer for batch labels.)
+  const [expanded, setExpanded] = React.useState(false);
 
   const calls = React.useMemo(() => {
     const out: ToolCall[] = [];
