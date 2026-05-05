@@ -1363,9 +1363,14 @@ impl ProviderAdapter for ClaudeSdkAdapter {
     ) -> Result<(), String> {
         // Forward the text to the live bridge as an
         // `append_user_message`. Bridge pushes onto its `inputQueue`
-        // with `shouldQuery: false`, so the SDK persists the message
-        // into the transcript but skips the post-message turn — no
-        // assistant response, no tools, no billing.
+        // with `shouldQuery: true` and `priority: 'next'`, so the SDK
+        // fires a turn for this message on its next iteration — that
+        // is what makes peer-injected text reach the model
+        // immediately, instead of stalling in the transcript until
+        // some other shouldQuery=true message comes along (the SDK
+        // explicitly merges shouldQuery=false messages into the next
+        // querying user input — see
+        // `bridge/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:3491`).
         //
         // Same stdin-grab pattern as `update_permission_mode`: avoids
         // deadlocking against the outer process Mutex held by an

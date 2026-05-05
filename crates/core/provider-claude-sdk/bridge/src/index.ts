@@ -1299,30 +1299,34 @@ class ClaudeBridge {
   }
 
   /**
-   * Append a user message to the active SDK Query *without*
-   * triggering an assistant turn. Pushed onto the input queue with
-   * `shouldQuery: false`, which causes the SDK to:
-   *   1. Persist the message into the conversation transcript so
-   *      it's part of the resumed history on subsequent turns.
-   *   2. Skip the post-message turn boundary — no assistant
-   *      response is generated, no tools fire, no usage is billed.
-   *   3. Skip auto-title generation and the `UserPromptSubmit`
-   *      hook (the SDK fixed this hook leak in v0.2.110).
+   * Inject a user message into the active SDK Query so it fires a
+   * turn on the model's next iteration.
    *
-   * Useful for slipping system reminders, background context, or
-   * "queue this user input while a turn is running" patterns into
-   * the transcript without paying for a turn.
+   * Pushed onto the input queue with `shouldQuery: true` and
+   * `priority: 'next'`:
+   *   - `shouldQuery: true` is what wakes the model. With
+   *     `shouldQuery: false`, the SDK only merges the message into
+   *     the next message that does query (per the SDK type docstring
+   *     in `sdk.d.ts:3491`) — meaning peer messages would stall in
+   *     the transcript until a Monitor tick or human input fired a
+   *     turn, producing a delay equal to whatever poll interval the
+   *     in-flight tool happens to use (~15s for Claude Code's
+   *     `Monitor`). That stall is the entire bug this method is
+   *     here to close, so we MUST query.
+   *   - `priority: 'next'` queues the new turn behind whatever
+   *     sub-iteration the SDK is currently driving, rather than
+   *     racing for `'now'` and risking a pre-emption of an in-flight
+   *     tool. The SDK serialises the queue, so this is safe even
+   *     when the bridge's `turnInProgress` is true.
    *
-   * No-op if no Query is active. Safe to call between turns —
-   * unlike `sendPrompt`, this does NOT lazy-open a Query because
-   * an append on a never-opened session has no resume target. The
-   * Rust caller is expected to have triggered at least one
-   * `send_prompt` first (or `list_capabilities` to seed the SDK
-   * session id).
+   * No-op if no Query is active. Safe to call between turns — but
+   * unlike `sendPrompt`, this does NOT lazy-open a Query because an
+   * append on a never-opened session has no resume target. The Rust
+   * caller is expected to have triggered at least one `send_prompt`
+   * first.
    *
-   * Available since SDK v0.2.110 (`shouldQuery` field on
-   * `SDKUserMessage`); fix for the hook-leak landed in the same
-   * release.
+   * Available since SDK v0.2.110 (`shouldQuery` / `priority` fields
+   * on `SDKUserMessage`).
    */
   appendUserMessage(text: string): void {
     if (!this.inputQueue) {
@@ -1339,8 +1343,12 @@ class ClaudeBridge {
       },
       parent_tool_use_id: null,
       session_id: '',
-      // The whole point of this method: append-only, no turn fired.
-      shouldQuery: false,
+      // Fire a turn on the model's next iteration so the peer's
+      // message is visible to the model immediately, not whenever
+      // the in-flight tool happens to tick next.
+      shouldQuery: true,
+      // Queue behind the current sub-iteration; do not pre-empt.
+      priority: 'next',
     };
     this.inputQueue.push(userMessage);
   }
@@ -2682,12 +2690,13 @@ async function main(): Promise<void> {
       }
 
       case 'append_user_message': {
-        // Push a user message onto the live SDK input queue with
-        // `shouldQuery: false` so it's added to the transcript
-        // without firing an assistant turn. Used for slipping
-        // background context, system reminders, or queueing
-        // additional user input while a turn is running. SDK
-        // v0.2.110+.
+        // Inject a user message into the live SDK Query so it fires a
+        // turn on the model's next iteration. Used by the runtime's
+        // `try_inject_peer_message` to surface a peer's
+        // `flowstate_send` payload during an in-flight long-running
+        // tool (e.g. Claude Code's `Monitor`) without waiting for the
+        // tool to next tick. See `appendUserMessage` for the full
+        // shouldQuery / priority rationale. SDK v0.2.110+.
         const text = msg.text as string | undefined;
         if (typeof text === 'string' && text.length > 0) {
           bridge.appendUserMessage(text);

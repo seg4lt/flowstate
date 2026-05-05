@@ -176,27 +176,39 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(())
     }
 
-    /// Append a user message to the session's transcript *without*
-    /// triggering an assistant turn — append-only persistence into
-    /// the conversation history.
+    /// Inject a user message into the session's *in-flight* turn so
+    /// the model sees it on its next iteration without waiting for
+    /// the current turn to complete.
     ///
-    /// Useful for slipping system reminders, background context, or
-    /// queueing additional user input while a turn is running. The
-    /// message becomes part of the resumed transcript on the next
-    /// real turn but generates no model output, no tool calls, and
-    /// no usage on its own.
+    /// Used by the runtime to surface a peer's `flowstate_send`
+    /// payload during a long-running tool such as Claude Code's
+    /// `Monitor` (which keeps the SDK Query open across many
+    /// sub-iterations without ever crossing a flowstate-visible turn
+    /// boundary). Injecting via this path is what closes the "peer
+    /// messages stall until the human user types something" bug —
+    /// the legacy mailbox-drain alternative only flushes on
+    /// `TurnStatus::Completed`, which never fires while Monitor is
+    /// active.
     ///
-    /// Currently implemented by the Claude SDK adapter via the
-    /// `shouldQuery: false` field on `SDKUserMessage` (added in
-    /// `@anthropic-ai/claude-agent-sdk` v0.2.110). Other adapters
-    /// inherit the no-op default, which silently drops the message —
-    /// the runtime should gate calls on the kind of provider when a
-    /// fallback is unsuitable.
+    /// Currently implemented by the Claude SDK adapter — pushes onto
+    /// the live `inputQueue` with `shouldQuery: true` and
+    /// `priority: 'next'` (added in
+    /// `@anthropic-ai/claude-agent-sdk` v0.2.110), so the SDK fires
+    /// a turn for this message on its next iteration. Note:
+    /// `shouldQuery: false` is *not* enough — per the SDK type
+    /// docstring (`sdk.d.ts:3491`), shouldQuery=false messages only
+    /// merge into the next querying input, producing a stall equal
+    /// to the in-flight tool's poll interval.
+    ///
+    /// Other adapters inherit the no-op default, which silently
+    /// drops the message — the runtime gates calls on
+    /// `ProviderFeatures::live_message_injection` so providers
+    /// without a real implementation fall back to the mailbox path.
     ///
     /// No-op (Ok) when no live provider session exists yet — the
     /// caller is expected to have triggered at least one
     /// `execute_turn` first; otherwise there's no transcript to
-    /// append to.
+    /// inject into.
     async fn append_user_message(
         &self,
         _session: &SessionDetail,

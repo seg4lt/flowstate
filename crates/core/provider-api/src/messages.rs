@@ -318,6 +318,29 @@ pub enum RuntimeEvent {
         to_session_id: String,
         reason: SessionLinkReason,
     },
+    /// A peer's `flowstate_send` payload was injected directly into
+    /// the target session's in-flight turn via the live-injection
+    /// path (Claude SDK `appendUserMessage` with `shouldQuery: false`)
+    /// instead of being queued for mailbox-drain at the next
+    /// `TurnCompleted`.
+    ///
+    /// Frontends should render this as a user-style chat bubble in
+    /// the target session's transcript, tagged with
+    /// `from_session_id`, so a peer message is visible to the human
+    /// the moment it arrives — even when the target is currently
+    /// streaming a long-running tool such as Claude Code's `Monitor`
+    /// (which keeps the SDK Query open across many sub-iterations
+    /// without crossing a flowstate-visible turn boundary).
+    ///
+    /// The model itself sees the same text as a `user`-role
+    /// transcript entry on its next iteration; an explicit assistant
+    /// reply is not guaranteed and depends on what the in-flight
+    /// turn is doing.
+    PeerMessageInjected {
+        session_id: String,
+        from_session_id: String,
+        message: String,
+    },
     /// The runtime observed a Claude Code `ScheduleWakeup` tool call
     /// and persisted a pending wakeup. UIs can use this to render a
     /// "zzz — next wake at <fire_at>" chip on the session row.

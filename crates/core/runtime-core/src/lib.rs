@@ -3417,6 +3417,70 @@ impl RuntimeCore {
         })
     }
 
+    /// Try to deliver a peer's message into a target session whose
+    /// `active_sinks` entry is currently populated (i.e. an
+    /// `execute_turn` is in flight).
+    ///
+    /// Returns `Ok(true)` when the message was injected directly into
+    /// the live provider Query via `append_user_message` and a
+    /// `PeerMessageInjected` event published — caller MUST skip the
+    /// mailbox `enqueue_message` to avoid re-delivering the same
+    /// message at the next `TurnCompleted`.
+    ///
+    /// Returns `Ok(false)` when injection is unavailable for this
+    /// session (provider doesn't advertise
+    /// `ProviderFeatures.live_message_injection`, session lookup
+    /// failed, or no adapter is registered for the provider) — caller
+    /// should fall back to the legacy `enqueue_message` path so the
+    /// mailbox-drain at `TurnCompleted` still delivers the message.
+    ///
+    /// Returns `Err` when injection was attempted and the adapter
+    /// surfaced a real error. Caller falls back to enqueue rather
+    /// than dropping the message; the error is logged on the way
+    /// out.
+    ///
+    /// Why this exists: long-running tools such as Claude Code's
+    /// `Monitor` keep the SDK Query open across many sub-iterations
+    /// without ever crossing a flowstate-visible turn boundary.
+    /// Without this fast path, every peer `flowstate_send` during a
+    /// Monitor watch piles up in the mailbox until the human user
+    /// types something.
+    ///
+    /// On the bridge end, the inject pushes the message onto the
+    /// live `inputQueue` with `shouldQuery: true` (fires a turn on
+    /// the SDK's next iteration — `shouldQuery: false` would only
+    /// merge into the next querying user input per the SDK type
+    /// docstring, leaving peer messages stalled for the duration of
+    /// the in-flight tool's poll interval) and `priority: 'next'`
+    /// (queues behind the current sub-iteration rather than
+    /// pre-empting it).
+    async fn try_inject_peer_message(
+        &self,
+        target_session_id: &str,
+        from_session_id: &str,
+        message: &str,
+    ) -> Result<bool, String> {
+        let Some(session) = self.persistence.get_session(target_session_id).await else {
+            return Ok(false);
+        };
+        if !zenui_provider_api::features_for_kind(session.summary.provider).live_message_injection
+        {
+            return Ok(false);
+        }
+        let Some(adapter) = self.adapters.get(&session.summary.provider).cloned() else {
+            return Ok(false);
+        };
+        adapter
+            .append_user_message(&session, message.to_string())
+            .await?;
+        self.publish(RuntimeEvent::PeerMessageInjected {
+            session_id: target_session_id.to_string(),
+            from_session_id: from_session_id.to_string(),
+            message: message.to_string(),
+        });
+        Ok(true)
+    }
+
     async fn dispatch_send_and_await(
         self: Arc<Self>,
         origin: RuntimeCallOrigin,
@@ -3453,16 +3517,41 @@ impl RuntimeCore {
             reason: SessionLinkReason::Send,
         });
 
-        // Decide: target idle → deliver immediately; target busy → queue
-        // on the mailbox and rely on the completion hook to drain.
+        // Three branches:
+        //   1. target busy + provider supports live injection →
+        //      `append_user_message` straight into the in-flight
+        //      Query so the model sees the peer's text on its next
+        //      iteration. The pending-reply we registered above is
+        //      satisfied by the next `result` the model emits, via
+        //      the existing `drain_replies_for` hook.
+        //   2. target busy + injection unsupported / failed → queue
+        //      on the mailbox so the legacy completion-hook drain
+        //      still fires when the in-flight turn finally ends.
+        //   3. target idle → spawn a fresh peer turn.
         let target_busy = {
             let guard = self.active_sinks.lock().await;
             guard.contains_key(&target_session_id)
         };
         if target_busy {
-            self.orchestration_state
-                .enqueue_message(&target_session_id, &origin.session_id, message)
-                .await;
+            let injected = match self
+                .try_inject_peer_message(&target_session_id, &origin.session_id, &message)
+                .await
+            {
+                Ok(injected) => injected,
+                Err(err) => {
+                    tracing::warn!(
+                        target_session_id = %target_session_id,
+                        error = %err,
+                        "live peer-message injection failed; falling back to mailbox"
+                    );
+                    false
+                }
+            };
+            if !injected {
+                self.orchestration_state
+                    .enqueue_message(&target_session_id, &origin.session_id, message)
+                    .await;
+            }
         } else {
             let rc_for_turn = self.clone();
             let target = target_session_id.clone();
@@ -3513,14 +3602,33 @@ impl RuntimeCore {
             reason: SessionLinkReason::Send,
         });
 
+        // See `dispatch_send_and_await` for the three-branch rationale —
+        // identical here, minus the pending-reply bookkeeping (fire-
+        // and-forget Send doesn't await a reply).
         let target_busy = {
             let guard = self.active_sinks.lock().await;
             guard.contains_key(&target_session_id)
         };
         if target_busy {
-            self.orchestration_state
-                .enqueue_message(&target_session_id, &origin.session_id, message)
-                .await;
+            let injected = match self
+                .try_inject_peer_message(&target_session_id, &origin.session_id, &message)
+                .await
+            {
+                Ok(injected) => injected,
+                Err(err) => {
+                    tracing::warn!(
+                        target_session_id = %target_session_id,
+                        error = %err,
+                        "live peer-message injection failed; falling back to mailbox"
+                    );
+                    false
+                }
+            };
+            if !injected {
+                self.orchestration_state
+                    .enqueue_message(&target_session_id, &origin.session_id, message)
+                    .await;
+            }
         } else {
             let rc_for_turn = self.clone();
             let target = target_session_id.clone();
@@ -6094,5 +6202,372 @@ mod tests {
             persistence.list_pending_wakeups().await.is_empty(),
             "a non-ScheduleWakeup tool call must not persist a wakeup row"
         );
+    }
+
+    /// Regression test for the Monitor-vs-peer-send bug.
+    ///
+    /// Setup:
+    /// - An adapter that reports `ProviderKind::Claude` (so the
+    ///   feature gate `features_for_kind(...).live_message_injection`
+    ///   evaluates to `true`) and pauses `execute_turn` until the test
+    ///   releases it. This mimics Claude Code's `Monitor` keeping the
+    ///   SDK Query open across many sub-iterations without ever
+    ///   crossing a flowstate-visible turn boundary.
+    /// - The same adapter records every `append_user_message` call so
+    ///   we can assert the peer's payload was injected straight into
+    ///   the live turn.
+    ///
+    /// Invariants asserted:
+    /// 1. `dispatch_send` calls `append_user_message` with the peer's
+    ///    text while the target's `active_sinks` entry is still
+    ///    populated.
+    /// 2. The mailbox stays empty — the message must NOT be enqueued
+    ///    when injection succeeds, otherwise the legacy completion-
+    ///    hook drain at `lib.rs:2987-3013` would re-deliver it as a
+    ///    second turn after the held one finishes.
+    /// 3. A `RuntimeEvent::PeerMessageInjected` event is broadcast
+    ///    so the front-end can render the peer's text as a user
+    ///    bubble in the live transcript.
+    /// 4. After releasing the held turn, no extra `send_turn` fires
+    ///    on the target session (mailbox-drain stays a no-op).
+    #[tokio::test]
+    async fn dispatch_send_injects_into_live_turn_for_claude_provider() {
+        use std::sync::Mutex as StdMutex;
+        use zenui_provider_api::{
+            ProviderFeatures, RuntimeCall, RuntimeCallOrigin, RuntimeCallResult, features_for_kind,
+        };
+
+        struct InjectingPausingAdapter {
+            mid_turn_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            resume_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+            appended: StdMutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl ProviderAdapter for InjectingPausingAdapter {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Claude
+            }
+
+            async fn health(&self) -> ProviderStatus {
+                ProviderStatus {
+                    kind: ProviderKind::Claude,
+                    label: "Claude".to_string(),
+                    installed: true,
+                    authenticated: true,
+                    version: Some("test".to_string()),
+                    status: ProviderStatusLevel::Ready,
+                    message: None,
+                    models: vec![],
+                    enabled: true,
+                    features: ProviderFeatures {
+                        live_message_injection: true,
+                        ..ProviderFeatures::default()
+                    },
+                }
+            }
+
+            async fn execute_turn(
+                &self,
+                _session: &SessionDetail,
+                _input: &UserInput,
+                _permission_mode: PermissionMode,
+                _reasoning_effort: Option<ReasoningEffort>,
+                _thinking_mode: Option<ThinkingMode>,
+                events: TurnEventSink,
+            ) -> Result<ProviderTurnOutput, String> {
+                events
+                    .send(ProviderTurnEvent::AssistantTextDelta {
+                        delta: "watching…".to_string(),
+                    })
+                    .await;
+                tokio::task::yield_now().await;
+                if let Some(tx) = self.mid_turn_tx.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self.resume_rx.lock().await.take() {
+                    let _ = rx.await;
+                }
+                Ok(ProviderTurnOutput {
+                    output: "watch finished".to_string(),
+                    provider_state: None,
+                })
+            }
+
+            async fn append_user_message(
+                &self,
+                _session: &SessionDetail,
+                text: String,
+            ) -> Result<(), String> {
+                self.appended.lock().unwrap().push(text);
+                Ok(())
+            }
+        }
+
+        // Sanity: the feature gate this test depends on must actually
+        // be on for Claude. If somebody flips it off in the registry
+        // the test should fail loudly here, not pretend to pass.
+        assert!(
+            features_for_kind(ProviderKind::Claude).live_message_injection,
+            "ProviderFeatures.live_message_injection must be true for ProviderKind::Claude"
+        );
+
+        let (mid_tx, mid_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(InjectingPausingAdapter {
+            mid_turn_tx: tokio::sync::Mutex::new(Some(mid_tx)),
+            resume_rx: tokio::sync::Mutex::new(Some(resume_rx)),
+            appended: StdMutex::new(Vec::new()),
+        });
+        let adapter_for_assert = adapter.clone();
+
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ));
+        runtime.install_self_ref();
+
+        // Subscribe BEFORE starting any work so we don't miss events.
+        let mut events_rx = runtime.subscribe();
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Claude,
+                model: None,
+                project_id: None,
+            })
+            .await;
+
+        let target_session_id = runtime
+            .snapshot()
+            .await
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        // Kick off a turn that will pause until we release it. While
+        // paused, `active_sinks` for this session stays populated —
+        // exactly the state Monitor leaves it in between event ticks.
+        let runtime_clone = runtime.clone();
+        let sid_clone = target_session_id.clone();
+        let turn_task = tokio::spawn(async move {
+            runtime_clone
+                .handle_client_message(ClientMessage::SendTurn {
+                    session_id: sid_clone,
+                    input: "start watching".to_string(),
+                    images: Vec::new(),
+                    permission_mode: None,
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                })
+                .await
+        });
+
+        // Wait until the adapter signals it's paused mid-turn.
+        mid_rx.await.expect("adapter should signal mid-turn");
+
+        // Sanity: the runtime really does see the session as in-flight.
+        let active_now = runtime.active_session_details().await;
+        assert!(
+            active_now.iter().any(|s| s.summary.session_id == target_session_id),
+            "target session should be in active_sinks during paused turn"
+        );
+
+        // Peer fires `flowstate_send`. This should hit the busy
+        // branch, take the live-injection path, and stay out of the
+        // mailbox.
+        let peer_origin = RuntimeCallOrigin {
+            session_id: "peer-session-id".to_string(),
+            turn_id: "peer-turn-id".to_string(),
+        };
+        let result = runtime
+            .clone()
+            .dispatch_runtime_call_external(
+                peer_origin,
+                RuntimeCall::Send {
+                    session_id: target_session_id.clone(),
+                    message: "hello from peer".to_string(),
+                },
+            )
+            .await
+            .expect("dispatch_send should succeed");
+        assert!(
+            matches!(result, RuntimeCallResult::SentAsync),
+            "Send returns SentAsync regardless of injection vs queue"
+        );
+
+        // Invariant 1: adapter saw the peer's text on append_user_message.
+        let appended_now = adapter_for_assert.appended.lock().unwrap().clone();
+        assert_eq!(
+            appended_now,
+            vec!["hello from peer".to_string()],
+            "peer's message must be injected into the live Query via append_user_message"
+        );
+
+        // Invariant 2: mailbox is empty. If it weren't, the
+        // completion-hook drain would re-deliver this same message
+        // as a second turn after we release the held one.
+        let mailbox_empty = runtime
+            .orchestration_state
+            .pop_message(&target_session_id)
+            .await
+            .is_none();
+        assert!(
+            mailbox_empty,
+            "mailbox must NOT contain the peer message when injection succeeded"
+        );
+
+        // Invariant 3: PeerMessageInjected was published.
+        let mut saw_injected = false;
+        // Drain whatever's already in the broadcast buffer; we
+        // subscribed before the work started so the event is in
+        // there.
+        loop {
+            match events_rx.try_recv() {
+                Ok(RuntimeEvent::PeerMessageInjected {
+                    session_id,
+                    from_session_id,
+                    message,
+                }) => {
+                    assert_eq!(session_id, target_session_id);
+                    assert_eq!(from_session_id, "peer-session-id");
+                    assert_eq!(message, "hello from peer");
+                    saw_injected = true;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_injected,
+            "RuntimeEvent::PeerMessageInjected must fire so the front-end renders the peer message"
+        );
+
+        // Release the paused adapter and let the original turn finish.
+        let _ = resume_tx.send(());
+        turn_task.await.expect("paused turn task should complete");
+
+        // Invariant 4: no extra peer-driven turn was queued. After
+        // completion the adapter's `appended` log should still be the
+        // single peer message — anything else means the mailbox-drain
+        // re-delivered.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let appended_after = adapter_for_assert.appended.lock().unwrap().clone();
+        assert_eq!(
+            appended_after,
+            vec!["hello from peer".to_string()],
+            "no follow-up peer-driven turn or duplicate inject expected after the held turn ends"
+        );
+    }
+
+    /// Regression test for the fallback path: when the target's
+    /// provider does NOT advertise `live_message_injection`, peer
+    /// messages must still reach the session via the legacy mailbox-
+    /// drain path. This protects every non-Claude adapter from
+    /// silently dropping peer messages once the inject path exists.
+    #[tokio::test]
+    async fn dispatch_send_falls_back_to_mailbox_when_injection_unsupported() {
+        use zenui_provider_api::{RuntimeCall, RuntimeCallOrigin, features_for_kind};
+
+        // FakeAdapter reports `ProviderKind::Codex`, which does NOT
+        // advertise `live_message_injection`. Sanity-check that here
+        // — if Codex ever gains the flag, this test changes shape.
+        assert!(
+            !features_for_kind(ProviderKind::Codex).live_message_injection,
+            "this test assumes Codex does not support live_message_injection"
+        );
+
+        // `PausingAdapter` (kind=Codex) is exactly the right fixture:
+        // it pauses execute_turn so we can fire a peer send during
+        // the pause; its default `append_user_message` is the trait's
+        // no-op (silently returns Ok), but our gate checks the
+        // feature flag BEFORE calling it, so we never reach that path.
+        let (mid_tx, mid_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let adapter = Arc::new(PausingAdapter {
+            mid_turn_tx: tokio::sync::Mutex::new(Some(mid_tx)),
+            resume_rx: tokio::sync::Mutex::new(Some(resume_rx)),
+        });
+        let runtime = Arc::new(RuntimeCore::new(
+            vec![adapter],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ));
+        runtime.install_self_ref();
+
+        runtime
+            .handle_client_message(ClientMessage::StartSession {
+                provider: ProviderKind::Codex,
+                model: None,
+                project_id: None,
+            })
+            .await;
+        let target_session_id = runtime
+            .snapshot()
+            .await
+            .sessions
+            .first()
+            .expect("session should exist")
+            .summary
+            .session_id
+            .clone();
+
+        let runtime_clone = runtime.clone();
+        let sid_clone = target_session_id.clone();
+        let turn_task = tokio::spawn(async move {
+            runtime_clone
+                .handle_client_message(ClientMessage::SendTurn {
+                    session_id: sid_clone,
+                    input: "go".to_string(),
+                    images: Vec::new(),
+                    permission_mode: None,
+                    reasoning_effort: None,
+                    thinking_mode: None,
+                })
+                .await
+        });
+        mid_rx.await.expect("adapter should signal mid-turn");
+
+        let peer_origin = RuntimeCallOrigin {
+            session_id: "peer-session".to_string(),
+            turn_id: "peer-turn".to_string(),
+        };
+        runtime
+            .clone()
+            .dispatch_runtime_call_external(
+                peer_origin,
+                RuntimeCall::Send {
+                    session_id: target_session_id.clone(),
+                    message: "queue me".to_string(),
+                },
+            )
+            .await
+            .expect("dispatch_send should succeed");
+
+        // The mailbox MUST now hold the peer message — Codex doesn't
+        // support live injection, so we fell through to enqueue.
+        let queued = runtime
+            .orchestration_state
+            .pop_message(&target_session_id)
+            .await
+            .expect("peer message must be on mailbox when injection is unsupported");
+        assert_eq!(queued.message, "queue me");
+        assert_eq!(queued.from_session_id, "peer-session");
+
+        // Cleanup: release the paused turn so the test exits cleanly.
+        let _ = resume_tx.send(());
+        let _ = turn_task.await;
     }
 }

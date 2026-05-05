@@ -808,6 +808,18 @@ pub struct ProviderFeatures {
     /// mode selector only when true, so providers that would silently
     /// treat it as `Default` don't expose a non-functional choice.
     pub supports_auto_permission_mode: bool,
+    /// Adapter implements `append_user_message` against a live
+    /// in-flight turn — i.e. a peer's `flowstate_send` payload can be
+    /// injected directly into the running provider Query and surface
+    /// to the model on its next iteration, instead of waiting for the
+    /// current turn to complete and the mailbox to drain.
+    ///
+    /// Today only the Claude Agent SDK bridge meets this contract
+    /// (`shouldQuery: false` on the live `inputQueue`). Adapters
+    /// without it fall back to the legacy mailbox-drain path, which
+    /// only flushes on `TurnStatus::Completed` — that's the bug this
+    /// flag exists to gate around for everyone else.
+    pub live_message_injection: bool,
 }
 
 /// Central registry mapping every `ProviderKind` to the capability
@@ -872,6 +884,14 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
             // leaves `canUseTool` untouched for classifier-escalated
             // calls.
             supports_auto_permission_mode: true,
+
+            // The bridge's `appendUserMessage` pushes onto the live
+            // `inputQueue` with `shouldQuery: false`, so a peer's
+            // `flowstate_send` payload reaches the model on its next
+            // iteration of an in-flight turn (e.g. between Monitor
+            // ticks) instead of stalling in the mailbox until the
+            // turn ends.
+            live_message_injection: true,
         },
 
         // Codex CLI adapter has native `reasoning_effort` on its

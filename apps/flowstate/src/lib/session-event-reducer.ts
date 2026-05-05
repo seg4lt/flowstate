@@ -304,6 +304,51 @@ export function applyEventToTurns(
       return prev.map((t) =>
         t.turnId === event.turn_id ? { ...t, usage: event.usage } : t,
       );
+    // A peer agent's `flowstate_send` payload was injected directly
+    // into the live SDK Query mid-turn (see RuntimeEvent docstring
+    // on the Rust side for the full mechanism). Synthesize a
+    // completed turn-record carrying the peer's text as `input` so
+    // the standard `<UserMessage>` bubble appears in the transcript
+    // immediately — without this, the message reaches the model on
+    // its next iteration but the human user never sees what the
+    // peer actually said until the session is reloaded from
+    // persistence.
+    //
+    // Slotted at the end of the array so it lands above whatever the
+    // in-flight assistant turn is rendering (the streaming arms
+    // mutate that turn in place, and the synthetic turn appears
+    // chronologically after it — exactly where the peer's bubble
+    // belongs visually, since the inject just happened).
+    //
+    // Caveat: synthetic turns are live-only. They are not persisted
+    // (the daemon only ships text-deltas / tool-calls into the
+    // parent turn record; the appended peer message lives in the
+    // Claude SDK's internal transcript for context but does not
+    // show up as a TurnRecord on session reload). Acceptable for
+    // v1 — the bug being closed is "I can't see peer messages
+    // until I type"; a reload-survives version is a follow-up.
+    case "peer_message_injected": {
+      // Random suffix avoids id collisions when a peer fires two
+      // identical messages back-to-back (each must render as its
+      // own bubble). Math.random is fine here — these ids never
+      // leave the local query cache.
+      const turnId = `peer-${event.from_session_id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const now = new Date().toISOString();
+      const synthetic: TurnRecord = {
+        turnId,
+        input: `[peer ${event.from_session_id}] ${event.message}`,
+        output: "",
+        status: "completed",
+        createdAt: now,
+        updatedAt: now,
+        toolCalls: [],
+        fileChanges: [],
+        subagents: [],
+        blocks: [],
+        inputAttachments: [],
+      };
+      return [...prev, synthetic];
+    }
     default:
       return prev;
   }
