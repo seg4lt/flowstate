@@ -1403,7 +1403,15 @@ export function CodeView(props: CodeViewProps) {
             </button>
           )}
 
-          <div className="min-h-0 flex-1 overflow-hidden">
+          {/* `min-w-0` is required here too: this is the flex-column
+              child that hosts EditorPanes (and Multibuffer below).
+              Without `min-w-0` the default `min-width: auto` resolves
+              to the children's intrinsic width — for CodeMirror that's
+              the longest source line — so the whole subtree (.cm-editor
+              → .cm-scroller → .cm-content) measures wider than the
+              panel and `EditorView.lineWrapping` wraps off-screen,
+              leaving the right edge clipped by `overflow-hidden`. */}
+          <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
             {showMultibuffer ? (
               <Multibuffer
                 query={query}
@@ -2039,7 +2047,7 @@ function TabPaneView({
         dock.
       */}
       <div
-        className="relative z-0 min-h-0 flex-1 overflow-hidden"
+        className="relative z-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
         onMouseDown={onFocus}
       >
         <CodeViewBody
@@ -2160,13 +2168,26 @@ const CodeViewBody = React.memo(function CodeViewBody({
   // never appears over this editor. Documented regression; the
   // wrapper stays so the data-code-path attribute is in place for
   // a future CM6-aware overlay (`view.posAtCoords` + `lineBlockAt`).
+  //
+  // Both wrappers below MUST carry the full width chain
+  // (`flex min-w-0 flex-1 flex-col`) so the CodeMirror container
+  // inside `LazyCodeEditor` can measure a width that's bounded by
+  // the panel's actual width. Without `min-w-0` and the flex chain,
+  // CM6's `.cm-content` intrinsic width (long markdown lines, code
+  // tokens) propagates back up through plain `h-full` blocks and
+  // line-wrapping fails to wrap at the panel edge — text gets
+  // clipped mid-word by the `overflow-hidden` ancestor instead of
+  // wrapping inside it.
   return (
-    <div className="h-full" data-code-path={loadedFile.path}>
+    <div
+      className="flex h-full min-h-0 min-w-0 flex-1 flex-col"
+      data-code-path={loadedFile.path}
+    >
       <DiffCommentOverlay
         sessionId={sessionId}
         surface="code"
         pathAttr="data-code-path"
-        className="h-full"
+        className="flex h-full min-h-0 min-w-0 flex-1 flex-col"
       >
         <React.Suspense
           fallback={

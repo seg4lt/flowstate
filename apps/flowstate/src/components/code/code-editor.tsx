@@ -1206,7 +1206,19 @@ export function CodeEditor({
           File is read-only.
         </div>
       ) : null}
-      <div ref={containerRef} className="min-h-0 flex-1 overflow-hidden" />
+      {/* `min-w-0` is required: this div hosts the CM6 EditorView,
+          and as a flex child its default `min-width: auto` resolves to
+          its content's intrinsic width — long markdown / code lines
+          inside `.cm-content` would push this flex item wider than
+          the panel, defeating `EditorView.lineWrapping` (the scroller
+          would measure the inflated intrinsic width and wrap too far
+          right, then the ancestor's `overflow-hidden` clips the
+          right edge mid-word). `min-w-0` lets the flex child shrink
+          to the panel width so CM measures the correct wrap budget. */}
+      <div
+        ref={containerRef}
+        className="min-h-0 min-w-0 flex-1 overflow-hidden"
+      />
     </div>
   );
 }

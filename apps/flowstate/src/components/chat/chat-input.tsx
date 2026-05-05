@@ -152,6 +152,34 @@ const EMPTY_MENTION_FILES: readonly string[] = Object.freeze([]);
  *  silently dropped the long tail at 50 with no UI signal. */
 const MENTION_POPUP_LIMIT = 50;
 
+/** Resize a textarea to fit its content, capped by:
+ *    - an absolute ceiling (`hardCap`, default 200px) so very long
+ *      drafts still produce a scrollable textarea rather than
+ *      swallowing the chat list, and
+ *    - the room actually available below the textarea's top edge in
+ *      its nearest positioned ancestor, so the composer never grows
+ *      past the bottom of the viewport / popout window.
+ *  This replaces the previous hard `Math.min(scrollHeight, 200)`
+ *  formula which ignored available space — when the window (or
+ *  popout) was short the composer would punch out the bottom of
+ *  ChatView's `overflow-hidden` clip and lose its toolbar / send
+ *  button. */
+function autosizeTextarea(el: HTMLTextAreaElement, hardCap = 200) {
+  el.style.height = "auto";
+  // `offsetParent` is the nearest positioned ancestor; for the
+  // composer that's the `relative flex-1` wrapper around the
+  // textarea, whose own bottom is bounded by the composer's
+  // max-h. Falls back to viewport height during initial layout
+  // (offsetParent can be null when the element is detached or
+  // inside `display: none` — both transient). The `40` floor
+  // matches `min-h-10` so we never report a negative budget.
+  const parent = el.offsetParent as HTMLElement | null;
+  const available = parent
+    ? Math.max(40, parent.clientHeight - el.offsetTop - 4)
+    : window.innerHeight;
+  el.style.height = `${Math.min(el.scrollHeight, hardCap, available)}px`;
+}
+
 /** Does `mediaType` classify as drag-and-drop media (image/audio/video)? */
 function isMediaMimeType(mediaType: string): boolean {
   return MEDIA_MIME_PREFIXES.some((prefix) => mediaType.startsWith(prefix));
@@ -305,8 +333,7 @@ export function ChatInput({
     // When restoring a saved draft the textarea starts at rows=1;
     // auto-size it so the full draft is visible on mount.
     if (el.value.length > 0) {
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      autosizeTextarea(el);
     }
   }, [disabled, providerDisabled, archived]);
 
@@ -337,8 +364,7 @@ export function ChatInput({
       const el = editTextareaRef.current;
       el.focus();
       el.selectionStart = el.selectionEnd = el.value.length;
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      autosizeTextarea(el);
     }
   }, [editingId]);
 
@@ -596,8 +622,7 @@ export function ChatInput({
   function handleEditInput() {
     const el = editTextareaRef.current;
     if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    autosizeTextarea(el);
   }
 
   function removeAttachedImage(id: string) {
@@ -647,8 +672,7 @@ export function ChatInput({
       node.selectionStart = node.selectionEnd = nextCaret;
       // The insertion may have grown the textarea past its current
       // row count — mirror `handleInput`'s autosize math.
-      node.style.height = "auto";
-      node.style.height = `${Math.min(node.scrollHeight, 200)}px`;
+      autosizeTextarea(node);
     });
   }
 
@@ -692,8 +716,7 @@ export function ChatInput({
       if (!node) return;
       node.focus();
       node.selectionStart = node.selectionEnd = node.value.length;
-      node.style.height = "auto";
-      node.style.height = `${Math.min(node.scrollHeight, 200)}px`;
+      autosizeTextarea(node);
     });
   }
 
@@ -950,8 +973,7 @@ export function ChatInput({
       if (!el) return;
       el.focus();
       el.selectionStart = el.selectionEnd = el.value.length;
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      autosizeTextarea(el);
     });
   }
 
@@ -1077,8 +1099,7 @@ export function ChatInput({
   function handleInput() {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+    autosizeTextarea(el);
   }
 
   const hasText = value.trim().length > 0;
@@ -1101,9 +1122,19 @@ export function ChatInput({
     // the divider in the chat area, not inside the composer box. When the
     // queue is empty the extra wrapper collapses and the composer renders
     // exactly as it did before.
-    <div className="shrink-0">
+    //
+    // The wrapper is a bounded flex column rather than `shrink-0` so the
+    // composer yields when its parent's column runs out of room — without
+    // that, the composer punches out the bottom of ChatView's clip
+    // boundary in short windows / shrunk popouts and loses its toolbar.
+    // `max-h-[50vh]` is generous (a normal composer is ~40–280 px) but
+    // stops a runaway chip stack from eating the entire window.
+    <div className="flex min-h-0 shrink flex-col" style={{ maxHeight: "50vh" }}>
       {queued.length > 0 && (
-        <div className="px-3 pb-1 pt-2">
+        <div
+          className="shrink-0 overflow-y-auto px-3 pb-1 pt-2"
+          style={{ maxHeight: "30vh" }}
+        >
           <div className="space-y-1">
             {queued.map((item, idx) => (
               <div
@@ -1169,7 +1200,7 @@ export function ChatInput({
       )}
       <div
         className={cn(
-          "border-t border-border px-3 pb-2 pt-3 transition-colors",
+          "flex min-h-0 flex-1 flex-col border-t border-border px-3 pb-2 pt-3 transition-colors",
           // While a drag is over the window we paint a subtle
           // primary-tinted tint + border over the composer surface
           // to signal "drop here to attach". Cleared on leave/drop
@@ -1178,11 +1209,11 @@ export function ChatInput({
             "border-primary/70 bg-primary/5 ring-1 ring-primary/40",
         )}
       >
-        <div>
+        <div className="flex min-h-0 flex-1 flex-col">
           {(attachedImages.length > 0 ||
             attachedFiles.length > 0 ||
             comments.length > 0) && (
-            <div className="mb-2 flex flex-wrap gap-1">
+            <div className="mb-2 flex max-h-20 shrink-0 flex-wrap gap-1 overflow-y-auto">
               {attachedImages.map((img) => (
                 <InFluxAttachmentChip
                   key={img.id}
@@ -1215,7 +1246,7 @@ export function ChatInput({
                 ))}
             </div>
           )}
-          <div className="relative flex items-end gap-2">
+          <div className="relative flex min-h-0 flex-1 items-end gap-2">
             {/* Autocomplete popup — positioned above the textarea */}
             {showPopup && matches.length > 0 && (
               <SlashCommandPopup
@@ -1233,7 +1264,7 @@ export function ChatInput({
               />
             )}
 
-            <div className="relative flex-1">
+            <div className="relative flex min-h-0 flex-1">
               <textarea
                 ref={textareaRef}
                 value={value}
@@ -1276,7 +1307,15 @@ export function ChatInput({
                 disabled={disabled || providerDisabled || archived}
                 rows={1}
                 className={cn(
-                  "block h-10 min-h-10 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                  // No fixed `h-10` here on purpose — the JS autosizer
+                  // (`autosizeTextarea`) is the sole source of truth
+                  // for the height. A class-set height fights the
+                  // inline `style.height` until the first input event,
+                  // producing a one-frame jump on draft restore.
+                  // `min-h-10` keeps the empty-state floor; `w-full`
+                  // makes the textarea fill the flex wrapper around
+                  // it (which carries the width).
+                  "block min-h-10 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
                   // Mode tint. Plan, bypass, and auto are the modes
                   // where the next send behaves *differently* from the
                   // defaults, so they each get a coloured border and a

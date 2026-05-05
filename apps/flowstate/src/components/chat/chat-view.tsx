@@ -1755,7 +1755,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       >
         <div
           className={cn(
-            "flex min-w-0 flex-col",
+            // `min-h-0` is required so this column honours the
+            // split-row's height bound — without it, flex children's
+            // intrinsic content height ignores the parent's `min-h-0`,
+            // and the composer below this column punches out of
+            // ChatView's `overflow-hidden` clip in short windows.
+            "flex min-h-0 min-w-0 flex-col",
             diffFullscreen || contextFullscreen || codeViewFullscreen
               ? "hidden"
               : "flex-1",
@@ -1839,8 +1844,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             )}
             <aside
               className={cn(
-                "border-l border-border bg-background",
-                diffFullscreen ? "flex-1" : "shrink-0",
+                // See comment on the codeView aside below: `min-w-0`
+                // + `overflow-hidden` let the panel honour its saved
+                // pixel width when the window is wide enough but
+                // yield gracefully when it isn't, instead of
+                // freezing at content's intrinsic width.
+                "min-w-0 overflow-hidden border-l border-border bg-background",
+                diffFullscreen ? "flex-1" : "",
               )}
               style={diffFullscreen ? undefined : { width: diffWidth }}
             >
@@ -1877,8 +1887,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             )}
             <aside
               className={cn(
-                "border-l border-border bg-background",
-                contextFullscreen ? "flex-1" : "shrink-0",
+                // See comment on the codeView aside below.
+                "min-w-0 overflow-hidden border-l border-border bg-background",
+                contextFullscreen ? "flex-1" : "",
               )}
               style={contextFullscreen ? undefined : { width: contextWidth }}
             >
@@ -1910,8 +1921,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             )}
             <aside
               className={cn(
-                "border-l border-border bg-background",
-                codeViewFullscreen ? "flex-1" : "shrink-0",
+                // `min-w-0` + `overflow-hidden` are load-bearing:
+                // without them, the default `min-width: auto` of a
+                // flex item resolves to the content's intrinsic
+                // width (CodeMirror's longest source line), so the
+                // aside refuses to shrink as the window narrows and
+                // the editor visibly clips off the right edge of the
+                // viewport instead of soft-wrapping. With `min-w-0`
+                // the aside honours the saved `width` as a *preferred*
+                // size (flex-basis) but still yields when the parent
+                // doesn't have room.
+                "min-w-0 overflow-hidden border-l border-border bg-background",
+                codeViewFullscreen ? "flex-1" : "",
               )}
               style={codeViewFullscreen ? undefined : { width: codeViewWidth }}
             >
