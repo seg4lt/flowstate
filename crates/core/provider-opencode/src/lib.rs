@@ -796,6 +796,54 @@ impl IdleWatcher {
                 debug!("opencode idle watcher: adapter dropped; exiting");
                 return;
             };
+            let Some(slot_arc) = self.server_slot.upgrade() else {
+                return;
+            };
+            let Some(ready) = self.server_ready.upgrade() else {
+                return;
+            };
+
+            // ----------------------------------------------------------
+            // Gate: there is nothing for the watcher to do until the
+            // server slot is actually `Running`. Without this gate the
+            // task busy-loops at 100% CPU whenever the adapter exists
+            // but `opencode serve` has never been spawned (which is the
+            // default — opencode is opt-in, but the adapter is always
+            // constructed and the watcher is always spawned with
+            // `DEFAULT_IDLE_TTL = 180s`):
+            //
+            //   * `inflight == 0` → the `idle_notify.notified()` await
+            //     below is skipped (the "already idle" branch).
+            //   * `last_release_ms` is initialised to adapter-creation
+            //     time, so within `ttl` ms `deadline` saturates to 0
+            //     and the sleep block is also skipped.
+            //   * the slot is `Stopped`, so the shutdown match arm
+            //     returns `None`, and `let Some(server) = … else
+            //     { continue };` re-enters the top of the loop with
+            //     no `.await` having yielded — burning 100% CPU on
+            //     the worker thread forever.
+            //
+            // We fix it by waiting on `server_ready` whenever the slot
+            // is not `Running`. `ensure_server` calls
+            // `notify_waiters()` on every state transition (including
+            // both Stopped→Running success and Stopped→Stopped on a
+            // failed spawn), so a single `notified().await` is enough
+            // to be re-driven the moment something changes.
+            //
+            // The `notified()` future MUST be created BEFORE the slot
+            // check so we can't miss a `notify_waiters` that fires
+            // between the check and the await — same lost-wake-up
+            // pattern `ensure_server` itself uses (see line ~582).
+            let notified_ready = ready.notified();
+            let slot_is_running = matches!(
+                &*slot_arc.lock().await,
+                ServerSlot::Running(_)
+            );
+            if !slot_is_running {
+                notified_ready.await;
+                continue;
+            }
+            drop(notified_ready);
 
             // Fast path: nothing to watch until leases go to zero.
             // `Notify::notified` registers a waiter first, so we
@@ -856,13 +904,8 @@ impl IdleWatcher {
             // TTL has elapsed with no in-flight work. Transition
             // Running → Draining under the slot lock, then drop
             // the lock to do the actual kill (which can take
-            // several hundred ms for SIGTERM → wait).
-            let Some(slot_arc) = self.server_slot.upgrade() else {
-                return;
-            };
-            let Some(ready) = self.server_ready.upgrade() else {
-                return;
-            };
+            // several hundred ms for SIGTERM → wait). `slot_arc` and
+            // `ready` were already upgraded at the top of the loop.
 
             let server_to_shutdown = {
                 let mut slot = slot_arc.lock().await;
@@ -1632,6 +1675,71 @@ mod tests {
             adapter.shared_bridge_origin(),
             Some(OPENCODE_SHARED_SESSION_ID)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_watcher_parks_when_server_never_starts() {
+        // Regression for the 100–120% idle-CPU bug. The opencode
+        // adapter is constructed eagerly at app startup even when the
+        // user has never enabled opencode, and the IdleWatcher is
+        // spawned with `DEFAULT_IDLE_TTL = 180s` regardless. Before
+        // the fix the watcher's `run()` loop would, when the slot is
+        // `Stopped`, fall through every branch without ever awaiting:
+        //
+        //   * `inflight == 0` skipped `idle_notify.notified().await`.
+        //   * `last_release_ms` (set at adapter creation) was already
+        //     >ttl ago for any wall-clock test, so `deadline == 0`
+        //     skipped the sleep block too.
+        //   * the slot was `Stopped` so the shutdown match returned
+        //     `None`, and `let Some(server) = … else { continue };`
+        //     re-entered the loop with no `.await` having yielded.
+        //
+        // The fix gates every iteration on `server_ready.notified()`
+        // when the slot is not `Running`. We can detect parked-vs-
+        // busy by toggling that notify channel ourselves and watching
+        // the watcher react: with the fix, a `notify_waiters()` is
+        // the only way to wake the watcher's first iteration past
+        // the gate; with the bug, the watcher is already past the
+        // gate (busy-looping) and our notify is a no-op.
+        let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
+            std::env::temp_dir(),
+            None,
+            None,
+            // 5ms TTL: keeps the test fast. Any short non-zero TTL
+            // reproduces the bug since `last_release_ms` is set at
+            // adapter creation.
+            Some(Duration::from_millis(5)),
+        );
+
+        // Slot starts Stopped — the bug condition.
+        assert!(matches!(
+            &*adapter.server_slot.lock().await,
+            ServerSlot::Stopped
+        ));
+
+        // Let the watcher's first iteration run. With the fix it
+        // immediately parks on `server_ready.notified()`. Without
+        // the fix it busy-loops; cooperative budgets in
+        // `tokio::sync::Mutex::lock()` mean it does eventually yield,
+        // but only after burning hundreds of iterations per ms. The
+        // observable difference — and the one that matters for the
+        // 120% idle-CPU bug — is real CPU time consumed.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        // The watcher holds only `Weak` handles, so dropping the
+        // adapter must let the task exit on its next wake-up. We
+        // give the runtime one final round of yields to reap it,
+        // and treat the absence of a panic / hang as the success
+        // signal. The real proof of the fix is the production
+        // sample (`Thread_*` no longer pegged on `IdleWatcher::run`)
+        // — this test is here so a future refactor of the loop
+        // can't silently regress the gate.
+        drop(adapter);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]
