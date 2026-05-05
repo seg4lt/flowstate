@@ -8,13 +8,36 @@ import { invoke } from "@tauri-apps/api/core";
 // and live entirely in the app's store. See
 // `src-tauri/src/usage.rs` for schema and boundary rationale.
 
+// Mirrors `flowstate_app_layer::usage::UsageRange` (serde
+// snake_case, externally-tagged enum). Presets are bare strings;
+// the custom variant carries `from`/`to` as `YYYY-MM-DD` UTC day
+// strings — the dashboard's date input only resolves to whole
+// days, and the SQL filter is `>= from AND <= to` on day strings,
+// so the user's selected range fully covers from the start of `from`
+// (00:00:00) through the end of `to` (23:59:59) without ever sending
+// a time-of-day value over the wire.
 export type UsageRange =
   | "last7_days"
   | "last30_days"
   | "last90_days"
   | "last120_days"
   | "last180_days"
-  | "all_time";
+  | "all_time"
+  | { custom: { from: string; to: string } };
+
+export function isCustomRange(
+  r: UsageRange,
+): r is { custom: { from: string; to: string } } {
+  return typeof r === "object" && r !== null && "custom" in r;
+}
+
+/// Construct a Custom range from two `YYYY-MM-DD` day strings. The
+/// caller is responsible for normalisation upstream (the date input
+/// emits the canonical form already); the Rust side validates and
+/// re-formats anyway, so this is a pure type wrapper.
+export function customRange(from: string, to: string): UsageRange {
+  return { custom: { from, to } };
+}
 
 export type UsageGroupBy = "by_provider" | "by_model";
 

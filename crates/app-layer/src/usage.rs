@@ -36,7 +36,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +47,21 @@ use zenui_provider_api::{
 
 /// Requested time range for dashboard queries. Resolved to an
 /// inclusive `[from, to]` pair in UTC before hitting SQL.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// `Custom { from, to }` carries inclusive day boundaries supplied by
+/// the UI. Both fields are `YYYY-MM-DD` UTC day strings — the
+/// dashboard's date picker only resolves to whole days, and the
+/// existing SQL filters compare against `occurred_day_utc` (also a
+/// day string), so passing strings end-to-end avoids any
+/// timezone/instant ambiguity. The "selected start day covers
+/// 00:00:00 → 23:59:59" semantics the UI advertises is automatic:
+/// the SQL is `occurred_day_utc >= ?from AND occurred_day_utc <= ?to`,
+/// inclusive on both ends.
+///
+/// Not `Copy` because `Custom` carries owned strings; methods take
+/// `&self` so callers can still write `range.to_day_bounds(now)` and
+/// then move `range` into the payload afterward.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageRange {
     Last7Days,
@@ -56,24 +70,67 @@ pub enum UsageRange {
     Last120Days,
     Last180Days,
     AllTime,
+    Custom { from: String, to: String },
 }
 
 impl UsageRange {
     /// Returns `(start_day_utc, end_day_utc)` inclusive, both as
     /// `YYYY-MM-DD` strings. For `AllTime` the start is a sentinel
-    /// older than any conceivable flowstate install.
-    fn to_day_bounds(self, now: DateTime<Utc>) -> (String, String) {
-        let end = now.format("%Y-%m-%d").to_string();
-        let start = match self {
-            UsageRange::Last7Days => (now - Duration::days(6)).format("%Y-%m-%d").to_string(),
-            UsageRange::Last30Days => (now - Duration::days(29)).format("%Y-%m-%d").to_string(),
-            UsageRange::Last90Days => (now - Duration::days(89)).format("%Y-%m-%d").to_string(),
-            UsageRange::Last120Days => (now - Duration::days(119)).format("%Y-%m-%d").to_string(),
-            UsageRange::Last180Days => (now - Duration::days(179)).format("%Y-%m-%d").to_string(),
-            UsageRange::AllTime => "0000-01-01".to_string(),
-        };
-        (start, end)
+    /// older than any conceivable flowstate install. For `Custom`
+    /// the supplied day strings are validated and clamped so a
+    /// reversed pair (`from > to`) is rejected and a malformed
+    /// string can't reach SQL.
+    fn to_day_bounds(&self, now: DateTime<Utc>) -> Result<(String, String), String> {
+        let end_today = now.format("%Y-%m-%d").to_string();
+        Ok(match self {
+            UsageRange::Last7Days => (
+                (now - Duration::days(6)).format("%Y-%m-%d").to_string(),
+                end_today,
+            ),
+            UsageRange::Last30Days => (
+                (now - Duration::days(29)).format("%Y-%m-%d").to_string(),
+                end_today,
+            ),
+            UsageRange::Last90Days => (
+                (now - Duration::days(89)).format("%Y-%m-%d").to_string(),
+                end_today,
+            ),
+            UsageRange::Last120Days => (
+                (now - Duration::days(119)).format("%Y-%m-%d").to_string(),
+                end_today,
+            ),
+            UsageRange::Last180Days => (
+                (now - Duration::days(179)).format("%Y-%m-%d").to_string(),
+                end_today,
+            ),
+            UsageRange::AllTime => ("0000-01-01".to_string(), end_today),
+            UsageRange::Custom { from, to } => parse_custom_bounds(from, to)?,
+        })
     }
+}
+
+/// Validate a Custom range's `from`/`to` strings. Returns the same
+/// strings normalized to `YYYY-MM-DD` if both parse and `from <= to`.
+/// Errors surface as a single readable string; the dashboard wraps it
+/// in a toast rather than blowing up the page. We re-format via
+/// `NaiveDate` so leading-zero variants and other lookalike inputs
+/// (e.g. `"2026-1-3"`) become canonical before they hit SQL — the
+/// `occurred_day_utc` column was always written by `format("%Y-%m-%d")`,
+/// so a lexical mismatch on the filter would silently return zero rows.
+fn parse_custom_bounds(from: &str, to: &str) -> Result<(String, String), String> {
+    let from_d = NaiveDate::parse_from_str(from.trim(), "%Y-%m-%d")
+        .map_err(|e| format!("invalid custom-range start date {from:?}: {e}"))?;
+    let to_d = NaiveDate::parse_from_str(to.trim(), "%Y-%m-%d")
+        .map_err(|e| format!("invalid custom-range end date {to:?}: {e}"))?;
+    if from_d > to_d {
+        return Err(format!(
+            "custom-range start ({from_d}) is after end ({to_d}); pick a start date on or before the end date"
+        ));
+    }
+    Ok((
+        from_d.format("%Y-%m-%d").to_string(),
+        to_d.format("%Y-%m-%d").to_string(),
+    ))
 }
 
 /// Axis of the dashboard's breakdown. Passed through to SQL
@@ -751,7 +808,7 @@ impl UsageStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Utc::now();
-        let (from, to) = range.to_day_bounds(now);
+        let (from, to) = range.to_day_bounds(now)?;
 
         let totals = read_totals(&connection, &from, &to)?;
         let by_provider = read_group(&connection, &from, &to, UsageGroupBy::ByProvider)?;
@@ -786,7 +843,7 @@ impl UsageStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Utc::now();
-        let (from, to) = range.to_day_bounds(now);
+        let (from, to) = range.to_day_bounds(now)?;
 
         // For AllTime we use the earliest event day as the start of
         // the zero-fill axis, falling back to `to` when there's no
@@ -835,7 +892,7 @@ impl UsageStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Utc::now();
-        let (from, to) = range.to_day_bounds(now);
+        let (from, to) = range.to_day_bounds(now)?;
 
         // Use COALESCE(agent_type, 'main') both as the GROUP BY key
         // and as the returned key so the main bucket has a stable
@@ -919,7 +976,7 @@ impl UsageStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Utc::now();
-        let (from, to) = range.to_day_bounds(now);
+        let (from, to) = range.to_day_bounds(now)?;
 
         // Stable 2-key GROUP BY: `agent_type IS NULL` identifies the
         // main bucket (see `insert_agent_rows` where parent rows are
@@ -996,7 +1053,7 @@ impl UsageStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let now = Utc::now();
-        let (from, to) = range.to_day_bounds(now);
+        let (from, to) = range.to_day_bounds(now)?;
         let capped = limit.clamp(1, 50) as i64;
         let mut stmt = connection
             .prepare(
@@ -1877,6 +1934,124 @@ mod tests {
             .summary(UsageRange::AllTime, UsageGroupBy::ByProvider)
             .unwrap();
         assert_eq!(all.totals.turn_count, 2);
+    }
+
+    /// Custom range honors the supplied inclusive day window — both
+    /// endpoints. The 7d-inside event is at -3 days; the 90d-inside
+    /// one is at -40 days. A custom window covering only [-50d, -30d]
+    /// must include only the second (and prove the inclusive bounds
+    /// don't bleed in the -3d row from outside the window).
+    #[test]
+    fn custom_range_filters_to_inclusive_window() {
+        let store = UsageStore::in_memory().unwrap();
+        let today = Utc::now();
+        let inside = (today - Duration::days(3))
+            .format("%Y-%m-%dT12:00:00Z")
+            .to_string();
+        let mid = (today - Duration::days(40))
+            .format("%Y-%m-%dT12:00:00Z")
+            .to_string();
+        store
+            .record_turn(&sample_event(
+                "inside", "s1", ProviderKind::Claude, Some("m"), &inside, 10, 20, Some(0.01),
+            ))
+            .unwrap();
+        store
+            .record_turn(&sample_event(
+                "mid", "s2", ProviderKind::Claude, Some("m"), &mid, 10, 20, Some(0.01),
+            ))
+            .unwrap();
+
+        let from = (today - Duration::days(50))
+            .format("%Y-%m-%d")
+            .to_string();
+        let to = (today - Duration::days(30))
+            .format("%Y-%m-%d")
+            .to_string();
+        let summary = store
+            .summary(
+                UsageRange::Custom { from, to },
+                UsageGroupBy::ByProvider,
+            )
+            .unwrap();
+        assert_eq!(summary.totals.turn_count, 1);
+    }
+
+    #[test]
+    fn custom_range_inclusive_at_both_endpoints() {
+        // An event recorded exactly on `from` and another exactly on
+        // `to` must both fall inside a custom range whose endpoints
+        // match those days. This is the semantic the dashboard's
+        // copy advertises ("start date = 00:00, end date = 23:59"):
+        // the SQL filter is `>= from AND <= to` on day strings, so
+        // the user's selected days are fully covered.
+        let store = UsageStore::in_memory().unwrap();
+        let today = Utc::now();
+        let day_a = (today - Duration::days(10))
+            .format("%Y-%m-%d")
+            .to_string();
+        let day_b = (today - Duration::days(2))
+            .format("%Y-%m-%d")
+            .to_string();
+        let at_a = format!("{day_a}T00:00:00Z");
+        let at_b = format!("{day_b}T23:59:59Z");
+        store
+            .record_turn(&sample_event(
+                "a", "s1", ProviderKind::Claude, Some("m"), &at_a, 10, 20, Some(0.01),
+            ))
+            .unwrap();
+        store
+            .record_turn(&sample_event(
+                "b", "s2", ProviderKind::Claude, Some("m"), &at_b, 10, 20, Some(0.01),
+            ))
+            .unwrap();
+
+        let summary = store
+            .summary(
+                UsageRange::Custom {
+                    from: day_a,
+                    to: day_b,
+                },
+                UsageGroupBy::ByProvider,
+            )
+            .unwrap();
+        assert_eq!(summary.totals.turn_count, 2);
+    }
+
+    #[test]
+    fn custom_range_rejects_reversed_dates() {
+        let store = UsageStore::in_memory().unwrap();
+        let err = store
+            .summary(
+                UsageRange::Custom {
+                    from: "2026-05-10".to_string(),
+                    to: "2026-05-01".to_string(),
+                },
+                UsageGroupBy::ByProvider,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("after end"),
+            "expected ordering error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn custom_range_rejects_malformed_dates() {
+        let store = UsageStore::in_memory().unwrap();
+        let err = store
+            .summary(
+                UsageRange::Custom {
+                    from: "not-a-date".to_string(),
+                    to: "2026-05-01".to_string(),
+                },
+                UsageGroupBy::ByProvider,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("invalid custom-range start date"),
+            "expected parse error, got: {err}"
+        );
     }
 
     #[test]
