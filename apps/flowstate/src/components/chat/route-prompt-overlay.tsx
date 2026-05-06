@@ -1,6 +1,11 @@
 import * as React from "react";
 import { useLocation, useMatches } from "@tanstack/react-router";
 import { sendMessage } from "@/lib/api";
+import {
+  broadcastPermissionConsumed,
+  broadcastPermissionModeChanged,
+  broadcastQuestionConsumed,
+} from "@/lib/cross-window-sync";
 import { useApp } from "@/stores/app-store";
 import { readStrictPlanMode } from "@/lib/defaults-settings";
 import { PLAN_MODE_MUTATING_TOOLS } from "@/lib/tool-policy";
@@ -124,6 +129,11 @@ export function RoutePromptOverlay() {
         sessionId,
         requestId: head.requestId,
       });
+      // Mirror the consume into sibling windows so the popout and
+      // main view drop the same head together — without this the
+      // user would see the prompt linger in whichever window they
+      // didn't click.
+      broadcastPermissionConsumed(sessionId, head.requestId);
       // Apply mode override locally first: write to sessionStorage so a
       // ChatView remount picks it up via its initializer, and dispatch
       // to the app-store so the toolbar / sidebar (and ChatView while
@@ -144,6 +154,10 @@ export function RoutePromptOverlay() {
           sessionId,
           mode: modeOverride,
         });
+        // Mode change must also propagate cross-window so the
+        // toolbar badge in the other view follows the PlanExit
+        // pick (Default / Accept Edits / Bypass / Auto / plan).
+        broadcastPermissionModeChanged(sessionId, modeOverride);
       }
       await sendMessage({
         type: "answer_permission",
@@ -189,6 +203,7 @@ export function RoutePromptOverlay() {
       if (!sessionId || !pendingQuestion) return;
       const requestId = pendingQuestion.requestId;
       dispatch({ type: "consume_pending_question", sessionId, requestId });
+      broadcastQuestionConsumed(sessionId, requestId);
       await sendMessage({
         type: "answer_question",
         session_id: sessionId,
@@ -203,6 +218,7 @@ export function RoutePromptOverlay() {
     if (!sessionId || !pendingQuestion) return;
     const requestId = pendingQuestion.requestId;
     dispatch({ type: "consume_pending_question", sessionId, requestId });
+    broadcastQuestionConsumed(sessionId, requestId);
     await sendMessage({
       type: "cancel_question",
       session_id: sessionId,

@@ -177,7 +177,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
 
 function PathLine({ label, path }: { label?: string; path: string }) {
   return (
-    <div className="text-xs">
+    <div className="min-w-0 break-all text-xs">
       {label && <span className="text-muted-foreground">{label} </span>}
       <span className="font-mono">{path}</span>
     </div>

@@ -25,6 +25,11 @@ import type {
   UserInputQuestion,
 } from "@/lib/types";
 import { sendMessage } from "@/lib/api";
+import {
+  broadcastPermissionConsumed,
+  broadcastPermissionModeChanged,
+  broadcastQuestionConsumed,
+} from "@/lib/cross-window-sync";
 import { useSessionStreamSubscription } from "@/hooks/useSessionStreamSubscription";
 import {
   gitBranchQueryOptions,
@@ -345,6 +350,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         sessionId,
         mode,
       });
+      // Tell the popout (or main, if we're inside the popout) to
+      // mirror the change. The receiver applies the same dispatch
+      // and sessionStorage write, so the toolbar badge / sidebar
+      // tint stay aligned regardless of which window the user
+      // clicked in.
+      broadcastPermissionModeChanged(sessionId, mode);
     },
     [dispatch, permissionStorageKey, sessionId],
   );
@@ -1518,6 +1529,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       sessionId,
       requestId: head.requestId,
     });
+    // Sibling windows (popout ↔ main) should drop the same head
+    // immediately so the user doesn't see a stale Allow / Deny in
+    // the other view while the daemon round-trip completes.
+    broadcastPermissionConsumed(sessionId, head.requestId);
     await sendMessage({
       type: "answer_permission",
       session_id: sessionId,
@@ -1545,6 +1560,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!pendingQuestion) return;
     const requestId = pendingQuestion.requestId;
     dispatch({ type: "consume_pending_question", sessionId, requestId });
+    broadcastQuestionConsumed(sessionId, requestId);
     await sendMessage({
       type: "answer_question",
       session_id: sessionId,
@@ -1557,6 +1573,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     if (!pendingQuestion) return;
     const requestId = pendingQuestion.requestId;
     dispatch({ type: "consume_pending_question", sessionId, requestId });
+    broadcastQuestionConsumed(sessionId, requestId);
     await sendMessage({
       type: "cancel_question",
       session_id: sessionId,

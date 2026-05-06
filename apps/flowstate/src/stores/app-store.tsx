@@ -46,6 +46,11 @@ import {
 } from "@/lib/defaults-settings";
 import { deriveAutoTitle } from "@/lib/auto-title";
 import { useNavigate } from "@tanstack/react-router";
+import {
+  listenPermissionConsumed,
+  listenPermissionModeChanged,
+  listenQuestionConsumed,
+} from "@/lib/cross-window-sync";
 
 /** Single permission prompt awaiting the user's answer. */
 export interface PendingPermission {
@@ -1446,6 +1451,93 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
       if (unlisten) unlisten();
+    };
+  }, []);
+
+  // Cross-window state sync. The popout window (`thread-<sessionId>`)
+  // and the main window each run their own AppProvider with an
+  // independent reducer + sessionStorage. The daemon already keeps
+  // server-side state (sessions, pending permissions, model picks)
+  // in sync via `connectStream`, but optimistic local dispatches
+  // don't cross window boundaries — answering a permission in the
+  // popout would leave the main window's banner visible until the
+  // user re-clicked. These listeners apply the broadcast-emitted
+  // dispatches from the OTHER window so both UIs stay aligned.
+  // Self-emissions are filtered inside the cross-window-sync helpers
+  // by comparing payload `source` against `getCurrentWindow().label`.
+  React.useEffect(() => {
+    let cancelled = false;
+    let unlistenPermission: UnlistenFn | null = null;
+    let unlistenQuestion: UnlistenFn | null = null;
+    let unlistenMode: UnlistenFn | null = null;
+    (async () => {
+      try {
+        const u = await listenPermissionConsumed((sessionId, requestId) => {
+          dispatchRef.current({
+            type: "consume_pending_permission",
+            sessionId,
+            requestId,
+          });
+        });
+        if (cancelled) u();
+        else unlistenPermission = u;
+      } catch (err) {
+        console.warn(
+          "[app-store] permission-consumed subscription failed:",
+          err,
+        );
+      }
+      try {
+        const u = await listenQuestionConsumed((sessionId, requestId) => {
+          dispatchRef.current({
+            type: "consume_pending_question",
+            sessionId,
+            requestId,
+          });
+        });
+        if (cancelled) u();
+        else unlistenQuestion = u;
+      } catch (err) {
+        console.warn(
+          "[app-store] question-consumed subscription failed:",
+          err,
+        );
+      }
+      try {
+        const u = await listenPermissionModeChanged((sessionId, mode) => {
+          // Mirror the chat-view setter: persist to sessionStorage so
+          // a subsequent ChatView remount picks up the change, and
+          // dispatch into the store so the live toolbar/sidebar UI
+          // reflects it immediately.
+          try {
+            window.sessionStorage.setItem(
+              `flowstate:permissionMode:${sessionId}`,
+              mode,
+            );
+          } catch {
+            // sessionStorage can throw in private mode; the dispatch
+            // is still authoritative for live UI.
+          }
+          dispatchRef.current({
+            type: "set_session_permission_mode",
+            sessionId,
+            mode,
+          });
+        });
+        if (cancelled) u();
+        else unlistenMode = u;
+      } catch (err) {
+        console.warn(
+          "[app-store] permission-mode-changed subscription failed:",
+          err,
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlistenPermission) unlistenPermission();
+      if (unlistenQuestion) unlistenQuestion();
+      if (unlistenMode) unlistenMode();
     };
   }, []);
 

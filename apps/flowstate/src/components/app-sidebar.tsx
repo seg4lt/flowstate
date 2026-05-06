@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
+  ArchiveRestore,
   BarChart3,
   ChevronRight,
   EllipsisVertical,
@@ -698,6 +699,20 @@ function AppSidebarBody() {
                                       onClick={(e) => e.stopPropagation()}
                                       onKeyDown={(e) => e.stopPropagation()}
                                     >
+                                      <button
+                                        type="button"
+                                        title="Unarchive"
+                                        aria-label="Unarchive thread"
+                                        className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
+                                        onClick={() =>
+                                          send({
+                                            type: "unarchive_session",
+                                            session_id: session.sessionId,
+                                          })
+                                        }
+                                      >
+                                        <ArchiveRestore className="h-3 w-3" />
+                                      </button>
                                       <DropdownMenu>
                                         <DropdownMenuTrigger asChild>
                                           <button
