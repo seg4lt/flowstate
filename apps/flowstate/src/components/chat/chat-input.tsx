@@ -159,32 +159,18 @@ const EMPTY_MENTION_FILES: readonly string[] = Object.freeze([]);
  *  silently dropped the long tail at 50 with no UI signal. */
 const MENTION_POPUP_LIMIT = 50;
 
-/** Resize a textarea to fit its content, capped by:
- *    - an absolute ceiling (`hardCap`, default 200px) so very long
- *      drafts still produce a scrollable textarea rather than
- *      swallowing the chat list, and
- *    - the room actually available below the textarea's top edge in
- *      its nearest positioned ancestor, so the composer never grows
- *      past the bottom of the viewport / popout window.
- *  This replaces the previous hard `Math.min(scrollHeight, 200)`
- *  formula which ignored available space — when the window (or
- *  popout) was short the composer would punch out the bottom of
- *  ChatView's `overflow-hidden` clip and lose its toolbar / send
- *  button. */
+/** Resize a textarea to fit its content, capped at `hardCap`
+ *  (default 200px ≈ 10 lines at leading-5) so very long drafts still
+ *  produce a scrollable textarea rather than swallowing the chat
+ *  list. Popout / short-window safety is handled one layer up by the
+ *  composer wrapper's `max-h: 50vh` (see line ~1252) — we don't
+ *  measure available space here because the textarea's immediate
+ *  flex parent (`flex min-h-0 flex-1`) reports its own collapsed
+ *  height during layout, which would pin the textarea at `min-h-10`
+ *  regardless of content. */
 function autosizeTextarea(el: HTMLTextAreaElement, hardCap = 200) {
   el.style.height = "auto";
-  // `offsetParent` is the nearest positioned ancestor; for the
-  // composer that's the `relative flex-1` wrapper around the
-  // textarea, whose own bottom is bounded by the composer's
-  // max-h. Falls back to viewport height during initial layout
-  // (offsetParent can be null when the element is detached or
-  // inside `display: none` — both transient). The `40` floor
-  // matches `min-h-10` so we never report a negative budget.
-  const parent = el.offsetParent as HTMLElement | null;
-  const available = parent
-    ? Math.max(40, parent.clientHeight - el.offsetTop - 4)
-    : window.innerHeight;
-  el.style.height = `${Math.min(el.scrollHeight, hardCap, available)}px`;
+  el.style.height = `${Math.min(el.scrollHeight, hardCap)}px`;
 }
 
 /** Does `mediaType` classify as drag-and-drop media (image/audio/video)? */
