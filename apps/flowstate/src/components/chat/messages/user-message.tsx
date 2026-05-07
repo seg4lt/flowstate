@@ -32,7 +32,7 @@ function UserMessageInner({
       )}
       <div className="max-w-[80%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
         {input.length > 0 && (
-          <p className="whitespace-pre-wrap">{input}</p>
+          <p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{input}</p>
         )}
         {hasAttachments && (
           <div

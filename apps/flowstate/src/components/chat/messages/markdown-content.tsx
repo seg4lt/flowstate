@@ -27,7 +27,7 @@ function handleLinkClick(
 
 const components: Components = {
   p({ children }) {
-    return <p className="mb-3 leading-relaxed last:mb-0">{children}</p>;
+    return <p className="mb-3 leading-relaxed last:mb-0 [overflow-wrap:anywhere]">{children}</p>;
   },
   h1({ children }) {
     return (
