@@ -1235,7 +1235,7 @@ export function ChatInput({
     // boundary in short windows / shrunk popouts and loses its toolbar.
     // `max-h-[50vh]` is generous (a normal composer is ~40–280 px) but
     // stops a runaway chip stack from eating the entire window.
-    <div className="flex min-h-0 shrink flex-col" style={{ maxHeight: "50vh" }}>
+    <div className="flex min-h-0 min-w-0 shrink flex-col" style={{ maxHeight: "50vh" }}>
       {queued.length > 0 && (
         <div
           className="shrink-0 overflow-y-auto px-3 pb-1 pt-2"
@@ -1245,7 +1245,7 @@ export function ChatInput({
             {queued.map((item, idx) => (
               <div
                 key={item.id}
-                className="flex items-start gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs"
+                className="flex min-w-0 items-start gap-2 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs"
               >
                 <Clock className="mt-0.5 h-3 w-3 shrink-0 text-muted-foreground" />
                 <div className="min-w-0 flex-1">
@@ -1261,7 +1261,7 @@ export function ChatInput({
                       onBlur={() => requestAnimationFrame(() => saveEditQueued())}
                       onInput={handleEditInput}
                       rows={1}
-                      className="mt-0.5 w-full resize-none rounded border border-input bg-background px-1.5 py-1 text-xs text-foreground/85 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      className="mt-0.5 min-w-0 w-full resize-none rounded border border-input bg-background px-1.5 py-1 text-xs text-foreground/85 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     />
                   ) : (
                     <div className="mt-0.5 break-words whitespace-pre-wrap text-foreground/85">
@@ -1306,7 +1306,7 @@ export function ChatInput({
       )}
       <div
         className={cn(
-          "flex min-h-0 flex-1 flex-col border-t border-border px-3 pb-2 pt-3 transition-colors",
+          "flex min-h-0 min-w-0 flex-1 flex-col border-t border-border px-3 pb-2 pt-3 transition-colors",
           // While a drag is over the window we paint a subtle
           // primary-tinted tint + border over the composer surface
           // to signal "drop here to attach". Cleared on leave/drop
@@ -1315,7 +1315,7 @@ export function ChatInput({
             "border-primary/70 bg-primary/5 ring-1 ring-primary/40",
         )}
       >
-        <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           {(attachedImages.length > 0 ||
             attachedFiles.length > 0 ||
             comments.length > 0) && (
@@ -1352,7 +1352,7 @@ export function ChatInput({
                 ))}
             </div>
           )}
-          <div className="relative flex min-h-0 flex-1 items-end gap-2">
+          <div className="relative flex min-h-0 min-w-0 flex-1 items-end gap-2">
             {/* Autocomplete popup — positioned above the textarea */}
             {showPopup && matches.length > 0 && (
               <SlashCommandPopup
@@ -1370,7 +1370,7 @@ export function ChatInput({
               />
             )}
 
-            <div className="relative flex min-h-0 flex-1">
+            <div className="relative flex min-h-0 min-w-0 flex-1">
               <textarea
                 ref={textareaRef}
                 value={value}
@@ -1421,7 +1421,7 @@ export function ChatInput({
                   // `min-h-10` keeps the empty-state floor; `w-full`
                   // makes the textarea fill the flex wrapper around
                   // it (which carries the width).
-                  "block min-h-10 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
+                  "block min-h-10 min-w-0 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
                   // Mode tint. Plan, bypass, and auto are the modes
                   // where the next send behaves *differently* from the
                   // defaults, so they each get a coloured border and a

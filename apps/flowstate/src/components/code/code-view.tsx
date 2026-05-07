@@ -184,8 +184,7 @@ interface CodeViewProps {
   initialSearchMode?: SearchMode;
   /** When true, the view is mounted as a side panel inside ChatView
    *  rather than as a full-screen route. In this mode:
-   *   * Use `h-full` so the host's flex container governs height
-   *     (the standalone route uses `h-svh`).
+   *   * Use `h-full` so the host's flex container governs height.
    *   * Hide the SidebarTrigger + back-to-chat button — both are
    *     redundant inside the chat view.
    *   * Skip the plain-Esc → navigate-to-chat handler — the parent
@@ -1170,10 +1169,7 @@ export function CodeView(props: CodeViewProps) {
 
   return (
     <div
-      className={cn(
-        "flex min-w-0 flex-col overflow-hidden",
-        embedded ? "h-full" : "h-svh",
-      )}
+      className="flex h-full min-w-0 flex-col overflow-hidden"
     >
       <header
         // Only the top-level code route is the window's titlebar — when

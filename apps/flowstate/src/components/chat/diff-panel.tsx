@@ -161,21 +161,21 @@ export function DiffPanel({
   const isStreaming = streamStatus === "streaming";
 
   return (
-    <div className="flex h-full flex-col">
-      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-background/80 px-2">
-        <span className="truncate text-[11px] font-medium">
+    <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+      <header className="flex h-10 min-w-0 shrink-0 items-center gap-2 border-b border-border bg-background/80 px-2">
+        <span className="min-w-0 truncate text-[11px] font-medium">
           {fileCount} {fileCount === 1 ? "file" : "files"} changed
         </span>
         {isStreaming && (
           <span
-            className="truncate text-[10px] text-muted-foreground"
+            className="min-w-0 truncate text-[10px] text-muted-foreground"
             title="Streaming line counts from git…"
           >
             · scanning…
           </span>
         )}
 
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
           <div
             role="tablist"
             aria-label="Diff layout"
@@ -234,7 +234,7 @@ export function DiffPanel({
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className="min-h-0 min-w-0 flex-1 overflow-auto">
         {fileCount === 0 ? (
           <div className="flex h-full items-center justify-center px-4 text-center text-xs text-muted-foreground">
             No changes in this session yet.
@@ -342,16 +342,16 @@ const FileSection = React.memo(function FileSection({
     // on the outermost <section> means nested lookups only walk up
     // a shallow tree (line element → section) regardless of how
     // many wrappers @pierre/diffs inserts internally.
-    <section
-      ref={sectionRef}
-      className="border-b border-border/50"
-      data-diff-path={diff.path}
-    >
+      <section
+        ref={sectionRef}
+        className="min-w-0 border-b border-border/50"
+        data-diff-path={diff.path}
+      >
       <button
         type="button"
         onClick={toggleCollapsed}
         aria-expanded={!collapsed}
-        className="sticky top-0 z-10 flex w-full items-center gap-2 border-b border-border/40 bg-background/95 px-2 py-1.5 text-left backdrop-blur hover:bg-muted/40"
+        className="sticky top-0 z-10 flex min-w-0 w-full items-center gap-2 border-b border-border/40 bg-background/95 px-2 py-1.5 text-left backdrop-blur hover:bg-muted/40"
         title={diff.path}
       >
         {collapsed ? (
@@ -359,8 +359,8 @@ const FileSection = React.memo(function FileSection({
         ) : (
           <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" />
         )}
-        <span className="truncate font-mono text-[11px]">{diff.path}</span>
-        <span className="ml-auto shrink-0 tabular-nums text-[10px]">
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{diff.path}</span>
+        <span className="shrink-0 tabular-nums text-[10px]">
           {countsPending ? (
             <span className="text-muted-foreground">+… −…</span>
           ) : (

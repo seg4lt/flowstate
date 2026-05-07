@@ -802,12 +802,55 @@ class CopilotBridge {
     // Subscribe to streaming events. Each returns an unsubscribe fn.
     const unsubs: Array<() => void> = [];
     let deltasSeen = 0;
+    let lastAssistantMessage: string | null = null;
     // Context-window usage buffered from `session.usage_info` so that
     // when `assistant.usage` fires we can compose a full turn_usage
     // event in one shot. The Copilot SDK reports these in two
     // separate events, so we hold the latest context snapshot here.
     let latestTokenLimit: number | null = null;
     let latestCurrentTokens: number | null = null;
+    const sendPromptTimeoutMs = 120_000;
+    // `session.sendAndWait()` waits only for `session.idle`. In practice
+    // some Copilot turns produce a complete root assistant turn
+    // (`assistant.turn_end` + final `assistant.message`) but never emit
+    // `session.idle`, which turns a successful response into a hard
+    // timeout after 120s. Wait on the streamed turn lifecycle directly,
+    // still preferring `session.idle` when it arrives.
+    const turnEndSettleMs = 1500;
+    let completionTimeout: ReturnType<typeof setTimeout> | undefined;
+    let turnEndSettleTimer: ReturnType<typeof setTimeout> | undefined;
+    let turnEnded = false;
+    let turnResolved = false;
+    let resolveTurn!: () => void;
+    let rejectTurn!: (err: Error) => void;
+    const turnComplete = new Promise<void>((resolve, reject) => {
+      resolveTurn = () => {
+        if (turnResolved) return;
+        turnResolved = true;
+        resolve();
+      };
+      rejectTurn = (err: Error) => {
+        if (turnResolved) return;
+        turnResolved = true;
+        reject(err);
+      };
+    });
+    // Some Copilot turns emit the root `assistant.turn_end` before all
+    // trailing stream events (tool completions, final assistant.message,
+    // usage snapshots, etc.) have landed. Treat turn_end as "start a
+    // quiet-period timer", then re-arm that timer on every subsequent
+    // event so we only resolve once the stream has actually gone quiet.
+    const settleAfterTurnEnd = () => {
+      if (!turnEnded || turnResolved) return;
+      if (turnEndSettleTimer) clearTimeout(turnEndSettleTimer);
+      turnEndSettleTimer = setTimeout(() => {
+        resolveTurn();
+      }, turnEndSettleMs);
+    };
+    const noteTurnActivity = () => {
+      if (!turnEnded || turnResolved) return;
+      settleAfterTurnEnd();
+    };
 
     // Copilot quota ids come from the SDK's `quotaSnapshots` map —
     // known ids include "chat", "completions", "premium_interactions".
@@ -833,6 +876,7 @@ class CopilotBridge {
         if (delta) {
           deltasSeen++;
           writeStream({ event: 'text_delta', delta });
+          noteTurnActivity();
         }
       }),
     );
@@ -841,13 +885,16 @@ class CopilotBridge {
     // without per-token deltas. If no deltas fired, emit the full content as one delta.
     unsubs.push(
       this.session.on('assistant.message', (event: any) => {
+        const content: string = event?.data?.content ?? '';
+        lastAssistantMessage = content;
         if (deltasSeen === 0) {
-          const content: string = event?.data?.content ?? '';
           if (content) {
             writeStream({ event: 'text_delta', delta: content });
           }
         }
         deltasSeen = 0;
+        noteTurnActivity();
+        settleAfterTurnEnd();
       }),
     );
 
@@ -857,6 +904,7 @@ class CopilotBridge {
         const delta: string = event?.data?.deltaContent ?? '';
         if (delta) {
           writeStream({ event: 'reasoning_delta', delta });
+          noteTurnActivity();
         }
       }),
     );
@@ -871,6 +919,7 @@ class CopilotBridge {
           name: d.toolName ?? '',
           args: d.arguments ?? {},
         });
+        noteTurnActivity();
       }),
     );
 
@@ -891,6 +940,17 @@ class CopilotBridge {
           output,
           ...(errMsg !== undefined ? { error: errMsg } : {}),
         });
+        noteTurnActivity();
+      }),
+    );
+
+    // Root turn completion. This is more reliable than `session.idle`
+    // for determining when the current response is done streaming.
+    unsubs.push(
+      this.session.on('assistant.turn_end', (event: any) => {
+        if (event?.agentId) return;
+        turnEnded = true;
+        settleAfterTurnEnd();
       }),
     );
 
@@ -900,6 +960,17 @@ class CopilotBridge {
         const msg: string = event?.data?.message ?? 'Unknown Copilot error';
         console.error(`[bridge] Session error: ${msg}`);
         writeStream({ event: 'info', message: `Copilot error: ${msg}` });
+        noteTurnActivity();
+        rejectTurn(new Error(msg));
+      }),
+    );
+
+    // Canonical SDK "done" signal when it appears. Resolve immediately:
+    // any trailing usage snapshots have already been observed in practice,
+    // and if not, they're not worth turning a good response into a timeout.
+    unsubs.push(
+      this.session.on('session.idle', () => {
+        resolveTurn();
       }),
     );
 
@@ -911,6 +982,7 @@ class CopilotBridge {
         if (typeof d.tokenLimit === 'number') latestTokenLimit = d.tokenLimit;
         if (typeof d.currentTokens === 'number')
           latestCurrentTokens = d.currentTokens;
+        noteTurnActivity();
       }),
     );
 
@@ -941,6 +1013,7 @@ class CopilotBridge {
               model: d.model ?? null,
             },
           });
+          noteTurnActivity();
         }
 
         const snapshots = d.quotaSnapshots as
@@ -985,16 +1058,17 @@ class CopilotBridge {
                 isUsingOverage,
               },
             });
+            noteTurnActivity();
           }
         }
       }),
     );
 
     try {
-      // sendAndWait blocks until session.idle, streaming events fire via the handlers above.
-      // The Copilot SDK does not have a documented `reasoning_effort` field; we forward it
-      // alongside the prompt so the SDK can pick it up if a future version supports it, and
-      // ignore it silently otherwise.
+      // The Copilot SDK does not have a documented `reasoning_effort`
+      // field; we forward it alongside the prompt so the SDK can pick
+      // it up if a future version supports it, and ignore it silently
+      // otherwise.
       const sendPayload: Record<string, unknown> = { prompt };
       if (reasoningEffort !== undefined) {
         sendPayload.reasoning_effort = reasoningEffort;
@@ -1018,12 +1092,26 @@ class CopilotBridge {
           data: img.data_base64,
         }));
       }
-      const response = await this.session.sendAndWait(sendPayload as { prompt: string }, 120_000);
-      const content: string =
-        response?.data?.content ?? '[No response from Copilot]';
+      completionTimeout = setTimeout(() => {
+        if (lastAssistantMessage !== null || turnEnded) {
+          console.error(
+            '[bridge] Timed out waiting for session.idle; returning completed turn output from streamed events',
+          );
+          resolveTurn();
+          return;
+        }
+        rejectTurn(
+          new Error(`Timeout after ${sendPromptTimeoutMs}ms waiting for session.idle`),
+        );
+      }, sendPromptTimeoutMs);
+      await this.session.send(sendPayload as { prompt: string });
+      await turnComplete;
+      const content: string = lastAssistantMessage ?? '[No response from Copilot]';
       console.error('[bridge] Turn complete');
       return content;
     } finally {
+      if (completionTimeout) clearTimeout(completionTimeout);
+      if (turnEndSettleTimer) clearTimeout(turnEndSettleTimer);
       // Always unsubscribe so handlers from this turn don't leak into the next.
       unsubs.forEach((fn) => fn());
     }

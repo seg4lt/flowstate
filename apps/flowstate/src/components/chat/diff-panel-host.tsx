@@ -176,7 +176,7 @@ export const DiffPanelHost = React.forwardRef<
       )}
       <aside
         className={cn(
-          "border-l border-border bg-background",
+          "flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-border bg-background",
           fullscreen ? "flex-1" : "shrink-0",
         )}
         style={fullscreen ? undefined : { width: diffWidth }}

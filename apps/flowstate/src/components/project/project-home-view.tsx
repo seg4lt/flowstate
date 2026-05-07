@@ -425,7 +425,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
   if (!project || !projectPath) {
     return (
-      <div className="flex h-svh flex-col">
+      <div className="flex h-full flex-col">
         <header
           data-tauri-drag-region
           className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-sm text-muted-foreground"
@@ -444,7 +444,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   }
 
   return (
-    <div className="flex h-svh min-w-0 flex-col overflow-hidden">
+    <div className="flex h-full min-w-0 flex-col overflow-hidden">
       <header
         data-tauri-drag-region
         className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-sm"
@@ -745,7 +745,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
 
         {diffFor && (
           <aside
-            className="flex w-[min(620px,55vw)] shrink-0 flex-col border-l border-border bg-background"
+            className="flex min-h-0 w-[min(620px,55vw)] shrink-0 flex-col overflow-hidden border-l border-border bg-background"
           >
             <WorktreeDiffBody
               key={diffFor.path}

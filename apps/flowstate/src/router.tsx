@@ -313,7 +313,7 @@ function PopoutShell() {
           actually shrink to fit a narrow window instead of refusing to
           go below their intrinsic content width.
         */}
-        <div className="h-svh w-svw min-w-0 overflow-hidden">
+        <div className="relative h-svh w-svw min-w-0 overflow-hidden">
           {state.ready ? (
             <Outlet />
           ) : (
@@ -410,9 +410,7 @@ function AppShell() {
             window) push the panel past the Tauri window edge, breaking
             the layout for every sibling. overflow-hidden makes any
             residual horizontal overflow clip cleanly inside the panel
-            instead of producing a window-level scrollbar. The `relative`
-            anchor is what the TerminalDock positions itself against
-            (absolute bottom). */}
+            instead of producing a window-level scrollbar. */}
         <SidebarInset className="relative min-w-0 overflow-hidden">
           {/* `state.ready` flips true the moment the daemon's `welcome`
               message lands and `state.sessions` / `state.projects` are
@@ -423,16 +421,18 @@ function AppShell() {
               session state too, so they sit inside the same gate. */}
           {state.ready ? (
             <>
-              <Outlet />
-              {/* Route-independent surface for the per-session
-                  permission and clarifying-question prompts. Yields
-                  to ChatView's inline rendering on /chat/$sessionId;
-                  on every other route that carries a sessionId param
-                  (notably /code/$sessionId) it surfaces the same
-                  prompt at the bottom of the viewport so the daemon's
-                  pause for input isn't invisible while the user is in
-                  the code view. */}
-              <RoutePromptOverlay />
+              <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+                <Outlet />
+                {/* Route-independent surface for the per-session
+                    permission and clarifying-question prompts. Yields
+                    to ChatView's inline rendering on /chat/$sessionId;
+                    on every other route that carries a sessionId param
+                    (notably /code/$sessionId) it surfaces the same
+                    prompt at the bottom of the route viewport so the
+                    daemon's pause for input isn't invisible while the
+                    user is in the code view. */}
+                <RoutePromptOverlay />
+              </div>
               <TerminalDock />
             </>
           ) : null}
@@ -494,7 +494,7 @@ const indexRoute = createRoute({
     const { state: sidebarState } = useSidebar();
     const showMacTrafficSpacer = isMacOS() && sidebarState === "collapsed";
     return (
-      <div className="flex h-svh flex-col">
+      <div className="flex h-full flex-col">
         <header
           data-tauri-drag-region
           className="flex h-9 items-center gap-1 border-b border-border px-2 text-sm text-muted-foreground"
@@ -558,7 +558,7 @@ const browseRoute = createRoute({
     const { path } = browseRoute.useSearch();
     if (!path) {
       return (
-        <div className="flex h-svh items-center justify-center text-sm text-muted-foreground">
+        <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
           No path specified.
         </div>
       );

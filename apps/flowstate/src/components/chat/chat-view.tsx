@@ -1700,7 +1700,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   ) : null;
 
   return (
-    <div className="flex h-svh min-w-0 flex-col overflow-hidden">
+    <div className="absolute inset-0 flex min-w-0 flex-col overflow-hidden">
       <header
         data-tauri-drag-region
         className="flex h-9 shrink-0 items-center gap-1 border-b border-border px-2 text-sm"
@@ -1797,7 +1797,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           or code blocks don't push the diff pane off-screen. */}
       <div
         ref={splitContainerRef}
-        className="flex min-h-0 min-w-0 flex-1"
+        className="flex min-h-0 min-w-0 flex-1 overflow-hidden"
       >
         <div
           className={cn(
@@ -1888,18 +1888,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 ariaLabel="Resize diff panel"
               />
             )}
-            <aside
-              className={cn(
-                // See comment on the codeView aside below: `min-w-0`
-                // + `overflow-hidden` let the panel honour its saved
-                // pixel width when the window is wide enough but
-                // yield gracefully when it isn't, instead of
-                // freezing at content's intrinsic width.
-                "min-w-0 overflow-hidden border-l border-border bg-background",
-                diffFullscreen ? "flex-1" : "",
-              )}
-              style={diffFullscreen ? undefined : { width: diffWidth }}
-            >
+              <aside
+                className={cn(
+                  "flex min-h-0 flex-col",
+                  // See comment on the codeView aside below: `min-w-0`
+                  // + `overflow-hidden` let the panel honour its saved
+                  // pixel width when the window is wide enough but
+                  // yield gracefully when it isn't, instead of
+                  // freezing at content's intrinsic width.
+                  "min-w-0 overflow-hidden border-l border-border bg-background",
+                  diffFullscreen ? "flex-1" : "",
+                )}
+                style={diffFullscreen ? undefined : { width: diffWidth }}
+              >
               <DiffPanel
                 projectPath={projectPath}
                 sessionId={sessionId}

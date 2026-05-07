@@ -83,7 +83,7 @@ export function UsageView() {
     costTimeseriesQuery.data !== undefined;
 
   return (
-    <div className="flex h-svh flex-col">
+    <div className="flex h-full flex-col">
       <header
         data-tauri-drag-region
         className="flex h-9 items-center gap-1 border-b border-border px-2"

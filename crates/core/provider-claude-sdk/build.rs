@@ -244,6 +244,10 @@ fn main() {
             }
             cmd.args(install_args)
                 .arg("--prod=false")
+                // Build scripts run without a TTY; allow pnpm to
+                // refresh an existing node_modules/ tree without an
+                // interactive confirmation prompt.
+                .arg("--config.confirmModulesPurge=false")
                 .current_dir(&bridge_dir)
                 .status()
         };

@@ -238,7 +238,7 @@ export function MessageList({
   const showColdLoader = loading && displayItems.length === 0;
 
   return (
-    <div className="relative min-h-0 flex-1">
+    <div className="relative min-h-0 min-w-0 flex-1">
       {showColdLoader && (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center text-xs text-muted-foreground">
           <Loader2 className="mr-2 h-3 w-3 animate-spin" />
