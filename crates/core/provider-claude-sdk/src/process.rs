@@ -47,7 +47,7 @@ pub(crate) struct ClaudeBridgeProcess {
 
 /// Idle timeout: a cached bridge with no in-flight turn is killed after
 /// this many seconds of inactivity.
-pub(crate) const BRIDGE_IDLE_TIMEOUT_SECS: u64 = 120;
+pub(crate) const BRIDGE_IDLE_TIMEOUT_SECS: u64 = 30 * 60;
 /// Watchdog tick interval. Determines the worst-case delay between a
 /// bridge crossing the idle threshold and actually being killed.
 pub(crate) const BRIDGE_WATCHDOG_INTERVAL_SECS: u64 = 30;

@@ -119,12 +119,12 @@ const OPENCODE_SHARED_SESSION_ID: &str = "opencode-shared";
 /// would needlessly churn conversation state.
 const GENERATION_METADATA_KEY: &str = "opencode_generation";
 
-/// Default idle TTL baked into the adapter. 3 minutes — long enough
-/// to absorb "close a tab, open another" cycles without a cold
-/// start, short enough that an idle laptop returns the opencode
-/// child's memory promptly. Hosts can pass an explicit override via
-/// `new_with_orchestration_and_idle_ttl` (zero disables idle-kill).
-const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(180);
+/// Default idle TTL baked into the adapter. 30 minutes — long enough
+/// to absorb long pauses between turns without a cold start while
+/// still eventually reclaiming the shared server. Hosts can pass an
+/// explicit override via `new_with_orchestration_and_idle_ttl` (zero
+/// disables idle-kill).
+const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
 /// Cadence at which the idle watcher re-checks the lease tracker
 /// while the server is idle. Tighter than `DEFAULT_IDLE_TTL` so the
@@ -348,9 +348,8 @@ impl OpenCodeAdapter {
     /// with idle-kill **disabled**. Used by headless tests and dev
     /// builds that don't want a background watcher task running.
     /// The Tauri `setup` closure uses
-    /// [`Self::new_with_orchestration_and_idle_ttl`] with the TTL
-    /// resolved from [`UserConfigStore`], which defaults ON at 10
-    /// minutes.
+    /// [`Self::new_with_orchestration_and_idle_ttl`] when a host wants
+    /// to inject a specific idle TTL instead of leaving it disabled.
     pub fn new(working_directory: PathBuf) -> Self {
         Self::new_with_orchestration_and_idle_ttl(working_directory, None, None, None)
     }
@@ -810,7 +809,7 @@ impl IdleWatcher {
             // but `opencode serve` has never been spawned (which is the
             // default — opencode is opt-in, but the adapter is always
             // constructed and the watcher is always spawned with
-            // `DEFAULT_IDLE_TTL = 180s`):
+            // `DEFAULT_IDLE_TTL = 1800s`):
             //
             //   * `inflight == 0` → the `idle_notify.notified()` await
             //     below is skipped (the "already idle" branch).
@@ -1682,7 +1681,7 @@ mod tests {
         // Regression for the 100–120% idle-CPU bug. The opencode
         // adapter is constructed eagerly at app startup even when the
         // user has never enabled opencode, and the IdleWatcher is
-        // spawned with `DEFAULT_IDLE_TTL = 180s` regardless. Before
+        // spawned with `DEFAULT_IDLE_TTL = 1800s` regardless. Before
         // the fix the watcher's `run()` loop would, when the slot is
         // `Stopped`, fall through every branch without ever awaiting:
         //

@@ -800,7 +800,7 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         let cached = self.ensure_session_process(session).await?;
         // Held for the entire turn. Drops after `process` is released,
         // decrementing in_flight and stamping last_activity = now so the
-        // 2-minute idle timer starts ticking.
+        // 30-minute idle timer starts ticking.
         let _activity = cached.activity_guard();
         let result = {
             let mut process = cached.inner().lock().await;

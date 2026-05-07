@@ -809,16 +809,21 @@ class CopilotBridge {
     // separate events, so we hold the latest context snapshot here.
     let latestTokenLimit: number | null = null;
     let latestCurrentTokens: number | null = null;
-    const sendPromptTimeoutMs = 120_000;
+    // Max silence between any two consecutive SDK events before we
+    // consider the session hung. Resets on every meaningful event via
+    // resetIdleTimer(), so long agentic turns survive as long as the
+    // SDK keeps emitting — only genuine silences trigger the timeout.
+    const idleTimeoutMs = 10 * 60 * 1_000;
     // `session.sendAndWait()` waits only for `session.idle`. In practice
     // some Copilot turns produce a complete root assistant turn
     // (`assistant.turn_end` + final `assistant.message`) but never emit
     // `session.idle`, which turns a successful response into a hard
-    // timeout after 120s. Wait on the streamed turn lifecycle directly,
+    // timeout. Wait on the streamed turn lifecycle directly,
     // still preferring `session.idle` when it arrives.
     const turnEndSettleMs = 1500;
-    let completionTimeout: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let turnEndSettleTimer: ReturnType<typeof setTimeout> | undefined;
+    let openTurns = 0;         // root-agent turns currently in flight
     let turnEnded = false;
     let turnResolved = false;
     let resolveTurn!: () => void;
@@ -851,6 +856,29 @@ class CopilotBridge {
       if (!turnEnded || turnResolved) return;
       settleAfterTurnEnd();
     };
+    // Debounced idle watchdog. Re-arms on every meaningful SDK event so
+    // the timer only fires when the SDK goes completely silent for
+    // idleTimeoutMs. Applied in addition to (not instead of) the
+    // turnEndSettleTimer — they serve different purposes.
+    const resetIdleTimer = () => {
+      if (turnResolved) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (lastAssistantMessage !== null || turnEnded) {
+          console.error(
+            `[bridge] Idle timeout: no SDK events for ${idleTimeoutMs}ms; ` +
+              'returning completed turn output',
+          );
+          resolveTurn();
+          return;
+        }
+        rejectTurn(
+          new Error(
+            `Idle timeout after ${idleTimeoutMs}ms: no SDK events received`,
+          ),
+        );
+      }, idleTimeoutMs);
+    };
 
     // Copilot quota ids come from the SDK's `quotaSnapshots` map —
     // known ids include "chat", "completions", "premium_interactions".
@@ -877,6 +905,7 @@ class CopilotBridge {
           deltasSeen++;
           writeStream({ event: 'text_delta', delta });
           noteTurnActivity();
+          resetIdleTimer();
         }
       }),
     );
@@ -894,6 +923,7 @@ class CopilotBridge {
         }
         deltasSeen = 0;
         noteTurnActivity();
+        resetIdleTimer();
         settleAfterTurnEnd();
       }),
     );
@@ -905,6 +935,7 @@ class CopilotBridge {
         if (delta) {
           writeStream({ event: 'reasoning_delta', delta });
           noteTurnActivity();
+          resetIdleTimer();
         }
       }),
     );
@@ -920,6 +951,7 @@ class CopilotBridge {
           args: d.arguments ?? {},
         });
         noteTurnActivity();
+        resetIdleTimer();
       }),
     );
 
@@ -941,16 +973,48 @@ class CopilotBridge {
           ...(errMsg !== undefined ? { error: errMsg } : {}),
         });
         noteTurnActivity();
+        resetIdleTimer();
+      }),
+    );
+
+    // Track when a root-agent turn starts so we can cancel a settle
+    // timer that fired between iterations of a multi-turn agentic loop.
+    // The Copilot SDK emits assistant.turn_start / assistant.turn_end
+    // pairs for every reasoning iteration, not just for the final one.
+    // Without this handler, the 1500 ms settle window fires during the
+    // inter-turn silence (model reasoning), which resolves the bridge
+    // promise prematurely after only 2-3 tool calls.
+    unsubs.push(
+      this.session.on('assistant.turn_start', (event: any) => {
+        if (event?.agentId) return;   // skip sub-agent turns
+        openTurns++;
+        // Cancel any settle timer that started after the previous
+        // turn_end — a new turn is beginning so we are not done yet.
+        turnEnded = false;
+        if (turnEndSettleTimer) {
+          clearTimeout(turnEndSettleTimer);
+          turnEndSettleTimer = undefined;
+        }
+        noteTurnActivity();
+        resetIdleTimer();
       }),
     );
 
     // Root turn completion. This is more reliable than `session.idle`
     // for determining when the current response is done streaming.
+    // Only begin settling once all open root-agent turns have ended —
+    // multi-turn agentic runs emit one turn_end per iteration, and the
+    // next iteration's turn_start cancels the timer if it arrives in
+    // time.  session.idle (below) resolves immediately when it fires.
     unsubs.push(
       this.session.on('assistant.turn_end', (event: any) => {
         if (event?.agentId) return;
-        turnEnded = true;
-        settleAfterTurnEnd();
+        openTurns = Math.max(0, openTurns - 1);
+        resetIdleTimer();
+        if (openTurns === 0) {
+          turnEnded = true;
+          settleAfterTurnEnd();
+        }
       }),
     );
 
@@ -961,6 +1025,7 @@ class CopilotBridge {
         console.error(`[bridge] Session error: ${msg}`);
         writeStream({ event: 'info', message: `Copilot error: ${msg}` });
         noteTurnActivity();
+        resetIdleTimer();
         rejectTurn(new Error(msg));
       }),
     );
@@ -983,6 +1048,7 @@ class CopilotBridge {
         if (typeof d.currentTokens === 'number')
           latestCurrentTokens = d.currentTokens;
         noteTurnActivity();
+        resetIdleTimer();
       }),
     );
 
@@ -1014,6 +1080,7 @@ class CopilotBridge {
             },
           });
           noteTurnActivity();
+          resetIdleTimer();
         }
 
         const snapshots = d.quotaSnapshots as
@@ -1059,6 +1126,7 @@ class CopilotBridge {
               },
             });
             noteTurnActivity();
+            resetIdleTimer();
           }
         }
       }),
@@ -1092,25 +1160,17 @@ class CopilotBridge {
           data: img.data_base64,
         }));
       }
-      completionTimeout = setTimeout(() => {
-        if (lastAssistantMessage !== null || turnEnded) {
-          console.error(
-            '[bridge] Timed out waiting for session.idle; returning completed turn output from streamed events',
-          );
-          resolveTurn();
-          return;
-        }
-        rejectTurn(
-          new Error(`Timeout after ${sendPromptTimeoutMs}ms waiting for session.idle`),
-        );
-      }, sendPromptTimeoutMs);
+      // Arm the idle watchdog before sending. resetIdleTimer() will be
+      // called on every subsequent SDK event, so the timer only fires
+      // when the SDK goes completely silent for idleTimeoutMs.
+      resetIdleTimer();
       await this.session.send(sendPayload as { prompt: string });
       await turnComplete;
       const content: string = lastAssistantMessage ?? '[No response from Copilot]';
       console.error('[bridge] Turn complete');
       return content;
     } finally {
-      if (completionTimeout) clearTimeout(completionTimeout);
+      if (idleTimer) clearTimeout(idleTimer);
       if (turnEndSettleTimer) clearTimeout(turnEndSettleTimer);
       // Always unsubscribe so handlers from this turn don't leak into the next.
       unsubs.forEach((fn) => fn());

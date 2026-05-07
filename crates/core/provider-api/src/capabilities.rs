@@ -143,9 +143,9 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     },
                     "timeout_secs": {
                         "type": "integer",
-                        "description": "Seconds to wait for the reply before giving up. Defaults to 120, max 600.",
+                        "description": "Seconds to wait for the reply before giving up. Defaults to 1800, max 1800.",
                         "minimum": 1,
-                        "maximum": 600
+                        "maximum": 1800
                     }
                 },
                 "required": ["initial_message"]
@@ -197,7 +197,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 600
+                        "maximum": 1800
                     }
                 },
                 "required": ["session_id", "message"]
@@ -370,7 +370,7 @@ pub fn capability_tools() -> Vec<AgentCapabilityTool> {
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 600
+                        "maximum": 1800
                     }
                 },
                 "required": ["base_project_id", "branch", "initial_message"]

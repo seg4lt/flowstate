@@ -23,11 +23,11 @@ use crate::RuntimeCore;
 pub const DEFAULT_TURN_BUDGET: u32 = 10;
 
 /// Default per-call timeout (seconds) when the caller doesn't provide
-/// one. Matches the rough round-trip feel of a normal chat reply.
-pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 120;
+/// one. Long enough to cover agentic turns that take several minutes.
+pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Upper bound we'll honor when a caller *does* provide a timeout.
-pub const MAX_AWAIT_TIMEOUT_SECS: u64 = 600;
+pub const MAX_AWAIT_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Max depth of the awaiting-graph chain. A→B→C→D is fine; A→B→C→D→E
 /// trips the cycle guard. Keeps runaway delegation bounded even when

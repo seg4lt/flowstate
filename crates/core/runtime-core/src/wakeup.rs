@@ -7,7 +7,8 @@
 //! those tool calls in the streaming output and shoulder the fire
 //! path ourselves, because Claude Code's internal timer dies the
 //! moment flowstate's [`ProcessCache`](zenui_provider_api::ProcessCache)
-//! reaps the bridge (which happens 120 s after the last turn ends).
+//! reaps the bridge (which happens 30 minutes after the last turn
+//! ends).
 //!
 //! ## Flow
 //!
@@ -46,14 +47,14 @@
 //!   now_unix).max(0)`.
 //!
 //! - **Claude Code may double-fire on short delays.** If `delaySeconds
-//!   < BRIDGE_IDLE_TIMEOUT_SECS` (120s), Claude Code's in-CLI timer
-//!   will fire before our `ProcessCache` reaps the bridge. That
-//!   produces assistant output the Rust side doesn't read (no active
-//!   `run_turn` after the turn that scheduled the wakeup ended), so
-//!   it sits in the stdout pipe buffer. Callers that want to avoid
-//!   the deadlock invalidate the bridge at the end of the turn that
-//!   observed the wakeup — see the observe-hook wiring in
-//!   `runtime-core/src/lib.rs`.
+//!   < BRIDGE_IDLE_TIMEOUT_SECS` (now 30 minutes), Claude Code's
+//!   in-CLI timer will fire before our `ProcessCache` reaps the
+//!   bridge. That produces assistant output the Rust side doesn't
+//!   read (no active `run_turn` after the turn that scheduled the
+//!   wakeup ended), so it sits in the stdout pipe buffer. Callers
+//!   that want to avoid the deadlock invalidate the bridge at the end
+//!   of the turn that observed the wakeup — see the observe-hook
+//!   wiring in `runtime-core/src/lib.rs`.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;

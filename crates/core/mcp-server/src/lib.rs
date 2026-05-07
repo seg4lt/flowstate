@@ -59,7 +59,7 @@
 //!   `origin.session_id`. Provider adapters set this when they spawn
 //!   the MCP server subprocess (one subprocess per session).
 //! - `--timeout-secs <N>` / `FLOWSTATE_HTTP_TIMEOUT_SECS` (optional,
-//!   default 120) — per-dispatch HTTP timeout. Matches
+//!   default 1800) — per-dispatch HTTP timeout. Matches
 //!   `DEFAULT_AWAIT_TIMEOUT_SECS` in `runtime-core/src/orchestration.rs`.
 
 use std::env;
@@ -75,7 +75,7 @@ use tracing::{debug, error, info, warn};
 /// MCP protocol version this server speaks. Clients pin on the
 /// handshake and decide whether they can talk to us.
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
-const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30 * 60;
 
 #[derive(Debug, Clone)]
 struct Config {

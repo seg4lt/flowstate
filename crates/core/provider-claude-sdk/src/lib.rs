@@ -538,7 +538,7 @@ impl ClaudeSdkAdapter {
     ) -> Result<(String, Option<String>), String> {
         // Held for the entire turn. Drops after `process` is released,
         // decrementing in_flight and stamping last_activity = now so the
-        // 2-minute idle timer starts ticking.
+        // 30-minute idle timer starts ticking.
         let _activity = cached.activity_guard();
         let mut process = cached.inner().lock().await;
 
