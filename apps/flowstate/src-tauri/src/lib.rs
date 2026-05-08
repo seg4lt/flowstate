@@ -3017,10 +3017,11 @@ pub fn run() {
                         Some(user_mcp_registry.clone()),
                         Some(idle_timeout_secs),
                     )) as Arc<dyn ProviderAdapter>,
-                    Arc::new(CodexAdapter::new_with_orchestration(
+                    Arc::new(CodexAdapter::new_with_orchestration_and_idle_ttl(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
+                        Some(idle_timeout_secs),
                     )),
                     Arc::new(GitHubCopilotAdapter::new_with_orchestration_and_idle_ttl(
                         flowstate_root.clone(),

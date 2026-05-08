@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -6,16 +5,27 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 use zenui_provider_api::{
-    McpServerConfig, OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode,
-    ProbeCliOptions, ProviderAdapter, ProviderKind, ProviderModel, ProviderSessionState,
-    ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, SessionDetail,
-    TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
+    CachedProcess, McpServerConfig, OrchestrationIpcHandle, OrchestrationIpcInfo, PermissionMode,
+    ProbeCliOptions, ProcessCache, ProviderAdapter, ProviderKind, ProviderModel,
+    ProviderSessionState, ProviderStatus, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort,
+    SessionDetail, TurnEventSink, UserInput, UserInputAnswer, UserInputOption, UserInputQuestion,
     UserMcpRegistry, probe_cli, session_cwd,
 };
+
+/// Idle TTL baked into the adapter. A Codex `app-server` process is
+/// killed after this many seconds of inactivity (no turn in flight).
+/// Hosts can override via [`CodexAdapter::new_with_orchestration_and_idle_ttl`].
+const IDLE_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// How often the idle watchdog wakes to scan for stale entries.
+const WATCHDOG_INTERVAL_SECS: u64 = 30;
+
+/// Convenience alias — the cached Codex bridge handle returned by
+/// `ensure_session_process`.
+type CachedCodex = CachedProcess<CodexSessionProcess>;
 
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
@@ -28,7 +38,7 @@ const RECOVERABLE_THREAD_RESUME_ERRORS: &[&str] = &[
     "no rollout found",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CodexAdapter {
     binary_path: String,
     working_directory: PathBuf,
@@ -46,7 +56,7 @@ pub struct CodexAdapter {
     /// with a warn (Codex's `-c` TOML override doesn't support
     /// remote transports today). `None` means no user MCPs.
     user_mcp: Option<UserMcpRegistry>,
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<CodexSessionProcess>>>>>,
+    sessions: Arc<ProcessCache<CodexSessionProcess>>,
 }
 
 #[derive(Debug)]
@@ -112,18 +122,43 @@ impl CodexAdapter {
     /// Construct with an optional [`OrchestrationIpcHandle`]. When
     /// populated, every Codex app-server spawn picks up a
     /// `-c mcp_servers.flowstate=…` TOML override registering the
-    /// flowstate MCP server for that session.
+    /// flowstate MCP server for that session. Uses [`IDLE_TIMEOUT_SECS`]
+    /// for idle-kill; prefer
+    /// [`Self::new_with_orchestration_and_idle_ttl`] when the host has
+    /// a user-config store to read the TTL from.
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
         user_mcp: Option<UserMcpRegistry>,
+    ) -> Self {
+        Self::new_with_orchestration_and_idle_ttl(
+            working_directory,
+            orchestration,
+            user_mcp,
+            Some(IDLE_TIMEOUT_SECS),
+        )
+    }
+
+    /// Construct with an optional orchestration handle, user MCP
+    /// registry, and an explicit idle-kill timeout. Pass `None` to
+    /// disable idle-kill (useful in tests). Pass `Some(secs)` to
+    /// override the compiled-in [`IDLE_TIMEOUT_SECS`] default.
+    pub fn new_with_orchestration_and_idle_ttl(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
+        idle_timeout_secs: Option<u64>,
     ) -> Self {
         Self {
             binary_path: Self::find_codex_binary(),
             working_directory,
             orchestration,
             user_mcp,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(ProcessCache::new(
+                idle_timeout_secs.unwrap_or(IDLE_TIMEOUT_SECS),
+                WATCHDOG_INTERVAL_SECS,
+                "provider-codex",
+            )),
         }
     }
 
@@ -140,30 +175,40 @@ impl CodexAdapter {
             .unwrap_or_else(|| "codex".to_string())
     }
 
+    /// Spawn the idle-kill watchdog exactly once. Called at the top of
+    /// `ensure_session_process` so the first session creation arms it.
+    fn ensure_watchdog(&self) {
+        self.sessions.ensure_watchdog(|cached| async move {
+            let mut process = cached.inner().lock().await;
+            // Kill the process group first so any MCP subprocesses
+            // Codex forked die alongside the app-server.
+            process.process_group.kill_best_effort();
+            process.stderr_task.abort();
+            let _ = process.child.start_kill();
+        });
+    }
+
     async fn ensure_session_process(
         &self,
         session: &SessionDetail,
         permission_mode: PermissionMode,
-    ) -> Result<Arc<Mutex<CodexSessionProcess>>, String> {
-        if let Some(existing) = self
-            .sessions
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned()
-        {
+    ) -> Result<CachedCodex, String> {
+        self.ensure_watchdog();
+        if let Some(existing) = self.sessions.get(&session.summary.session_id).await {
             return Ok(existing);
         }
-
         let process = self
             .create_session_process(session, permission_mode)
             .await?;
-        let process = Arc::new(Mutex::new(process));
-        let mut sessions = self.sessions.lock().await;
-        Ok(sessions
-            .entry(session.summary.session_id.clone())
-            .or_insert_with(|| process.clone())
-            .clone())
+        // Double-check: another task may have inserted while we were
+        // spawning. Prefer the winner; Drop on our `process` kills it.
+        if let Some(existing) = self.sessions.get(&session.summary.session_id).await {
+            return Ok(existing);
+        }
+        Ok(self
+            .sessions
+            .insert(session.summary.session_id.clone(), process)
+            .await)
     }
 
     async fn create_session_process(
@@ -312,9 +357,8 @@ impl CodexAdapter {
     // ---------------------------------------------------------
 
     async fn invalidate_session(&self, session_id: &str) {
-        let process = self.sessions.lock().await.remove(session_id);
-        if let Some(process) = process {
-            let mut process = process.lock().await;
+        if let Some(cached) = self.sessions.remove(session_id).await {
+            let mut process = cached.inner().lock().await;
             process.stderr_task.abort();
             let _ = process.child.start_kill();
         }
@@ -482,22 +526,27 @@ impl ProviderAdapter for CodexAdapter {
         // mode switch requires tearing down and recreating the thread. The runtime's
         // provider_state round-trips native_thread_id, so the recreated process
         // can call thread/resume and conversation history is preserved.
-        let process = self
+        let cached = self
             .ensure_session_process(session, permission_mode)
             .await?;
         {
-            let current_mode = process.lock().await.active_mode;
+            let current_mode = cached.inner().lock().await.active_mode;
             if current_mode != permission_mode {
-                drop(process);
+                drop(cached);
                 self.invalidate_session(&session.summary.session_id).await;
             }
         }
-        let process = self
+        let cached = self
             .ensure_session_process(session, permission_mode)
             .await?;
 
+        // Hold the activity guard for the entire turn so the idle
+        // watchdog cannot kill this bridge while a turn is in flight.
+        // Drops (and stamps last_activity) when `execute_turn` returns.
+        let _activity = cached.activity_guard();
+
         let result = {
-            let mut process = process.lock().await;
+            let mut process = cached.inner().lock().await;
             let provider_thread_id = process.provider_thread_id.clone();
             let effort_str = reasoning_effort.unwrap_or(ReasoningEffort::Medium).as_str();
             let mut turn_params = json!({
@@ -574,14 +623,9 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     async fn interrupt_turn(&self, session: &SessionDetail) -> Result<String, String> {
-        let process = self
-            .sessions
-            .lock()
-            .await
-            .get(&session.summary.session_id)
-            .cloned();
+        let cached = self.sessions.get(&session.summary.session_id).await;
 
-        let Some(process) = process else {
+        let Some(cached) = cached else {
             return Ok(format!(
                 "Codex interrupt requested for session `{}`.",
                 session.summary.session_id
@@ -602,7 +646,7 @@ impl ProviderAdapter for CodexAdapter {
             ));
         };
 
-        let mut process = process.lock().await;
+        let mut process = cached.inner().lock().await;
         let provider_thread_id = process.provider_thread_id.clone();
         process
             .send_request(
@@ -626,12 +670,8 @@ impl ProviderAdapter for CodexAdapter {
     /// `CodexSessionProcess` does the same thing, but explicit here
     /// keeps us independent of Arc-refcount timing.
     async fn shutdown(&self) {
-        let drained: Vec<(String, Arc<Mutex<CodexSessionProcess>>)> = {
-            let mut map = self.sessions.lock().await;
-            map.drain().collect()
-        };
-        for (session_id, process) in drained {
-            let mut proc = process.lock().await;
+        for (session_id, cached) in self.sessions.drain_all().await {
+            let mut proc = cached.inner().lock().await;
             proc.stderr_task.abort();
             if let Err(e) = proc.child.start_kill() {
                 debug!(
