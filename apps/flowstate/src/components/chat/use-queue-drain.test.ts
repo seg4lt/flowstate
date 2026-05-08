@@ -61,12 +61,11 @@ describe("useQueueDrain", () => {
     });
   });
 
-  it("keeps the chip in the queue when onSend rejects (regression for the silent-drop bug)", async () => {
-    // Repro of the user-reported symptom: queue chip showed up when
-    // the turn finished, but the message never appeared in chat
-    // and no error was surfaced. The pre-fix drain effect popped the
-    // head BEFORE awaiting `onSend`, so a daemon error
-    // (ServerMessage::Error) silently dropped the message.
+  it("removes the chip optimistically and fires onSendError when onSend rejects", async () => {
+    // The drain effect pops the head BEFORE awaiting `onSend` (optimistic
+    // removal). The chip disappears immediately on dispatch regardless of
+    // whether the daemon accepts the message. On failure, onSendError is
+    // called so the parent can surface a toast.
     const onSend = vi.fn(async () => {
       throw new Error("daemon rejected: session being torn down");
     });
@@ -86,8 +85,7 @@ describe("useQueueDrain", () => {
     await waitFor(() => {
       expect(onSend).toHaveBeenCalledTimes(1);
     });
-    // The error callback fired with the daemon's reason. The drain
-    // effect surfaced the failure to the parent for toasting.
+    // The error callback fired with the daemon's reason.
     await waitFor(() => {
       expect(onSendError).toHaveBeenCalledTimes(1);
     });
@@ -95,13 +93,8 @@ describe("useQueueDrain", () => {
       "daemon rejected",
     );
 
-    // Critical: the head is STILL in the queue. The chip stays
-    // visible so the user can retry. Pre-fix this was [] (silent drop).
-    expect(result.current.queued).toHaveLength(1);
-    expect(result.current.queued[0]!.text).toBe("hello");
-    // Image URLs survive too — would matter if there were any
-    // attachments. None here, but also none revoked.
-    expect(revokeSpy).not.toHaveBeenCalled();
+    // The chip is removed optimistically — queue is empty even on failure.
+    expect(result.current.queued).toHaveLength(0);
   });
 
   it("does not fire onSend twice when the effect re-runs mid-await (re-entry guard)", async () => {

@@ -555,24 +555,24 @@ export function ChatInput({
     // throws on daemon error; on a throw we leave the head in the
     // queue so the user can see the chip is still pending and
     // optionally retry / steer / clear.
+    // Optimistically pop the head before the daemon acks — chip
+    // disappears as soon as the message is dispatched, not after
+    // the round-trip completes. On failure, a toast surfaces the
+    // error; the chip is already gone (matches old pre-pessimistic
+    // behavior). Object URLs are revoked immediately since we no
+    // longer need the thumbnail for retry purposes.
     drainInFlightRef.current = true;
+    setQueued(rest);
+    for (const img of first.images) {
+      URL.revokeObjectURL(img.previewUrl);
+    }
     void (async () => {
       try {
         await onSend(first.text, first.images);
-        // Success: pop the head. Object URLs revoked AFTER the send
-        // succeeded so the chip thumbnail stays visible until the
-        // message actually leaves; on failure the chip stays and
-        // the URLs survive for an eventual retry.
-        for (const img of first.images) {
-          URL.revokeObjectURL(img.previewUrl);
-        }
-        setQueued(rest);
       } catch (err) {
-        // Surface the daemon's reason to the user. The chip remains
-        // in the queue so retrying is just "send another message",
-        // which re-fires the drain after the next `running → ready`
-        // transition (or directly, if the queue is now allowed to
-        // bypass — see the dispatch logic).
+        // Surface the daemon's reason to the user. The chip has
+        // already been removed optimistically; only the toast
+        // remains to indicate the failure.
         const message = err instanceof Error ? err.message : String(err);
         toast({
           description: `Couldn't send queued message: ${message}`,

@@ -183,18 +183,18 @@ export function useQueueDrain(opts: UseQueueDrainOptions): QueueDrainHandle {
     const [first, ...rest] = queued;
     onDrainStartRef.current?.(first);
 
+    // Optimistically pop the head before the daemon acks — chip
+    // disappears as soon as the message is dispatched, not after
+    // the round-trip completes. On failure, onSendError is called;
+    // the chip is already gone.
     drainInFlightRef.current = true;
+    setQueued(rest);
+    for (const img of first.images) {
+      URL.revokeObjectURL(img.previewUrl);
+    }
     void (async () => {
       try {
         await onSend(first.text, first.images);
-        // Success: pop the head. Object URLs revoked AFTER the send
-        // succeeded so the chip thumbnail stays visible until the
-        // message actually leaves; on failure the chip stays and
-        // the URLs survive for an eventual retry.
-        for (const img of first.images) {
-          URL.revokeObjectURL(img.previewUrl);
-        }
-        setQueued(rest);
       } catch (err) {
         onSendErrorRef.current?.(err);
       } finally {
