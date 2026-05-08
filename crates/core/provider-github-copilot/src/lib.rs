@@ -68,18 +68,39 @@ impl GitHubCopilotAdapter {
     /// populated, the Copilot TS bridge gets the loopback base URL,
     /// auth token, and executable path as env vars at spawn time;
     /// it uses them to register the flowstate MCP server in every
-    /// `SessionConfig.mcpServers` payload it builds.
+    /// `SessionConfig.mcpServers` payload it builds. Uses
+    /// [`BRIDGE_IDLE_TIMEOUT_SECS`] for idle-kill; prefer
+    /// [`Self::new_with_orchestration_and_idle_ttl`] when the host has
+    /// a user-config store to read the TTL from.
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
         user_mcp: Option<UserMcpRegistry>,
+    ) -> Self {
+        Self::new_with_orchestration_and_idle_ttl(
+            working_directory,
+            orchestration,
+            user_mcp,
+            Some(BRIDGE_IDLE_TIMEOUT_SECS),
+        )
+    }
+
+    /// Construct with an optional orchestration handle, user MCP
+    /// registry, and an explicit idle-kill timeout. Pass `None` to
+    /// disable idle-kill (useful in tests). Pass `Some(secs)` to
+    /// override the compiled-in [`BRIDGE_IDLE_TIMEOUT_SECS`] default.
+    pub fn new_with_orchestration_and_idle_ttl(
+        working_directory: PathBuf,
+        orchestration: Option<zenui_provider_api::OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
+        idle_timeout_secs: Option<u64>,
     ) -> Self {
         Self {
             working_directory,
             orchestration,
             user_mcp,
             sessions: Arc::new(zenui_provider_api::ProcessCache::new(
-                BRIDGE_IDLE_TIMEOUT_SECS,
+                idle_timeout_secs.unwrap_or(BRIDGE_IDLE_TIMEOUT_SECS),
                 BRIDGE_WATCHDOG_INTERVAL_SECS,
                 "provider-github-copilot",
             )),

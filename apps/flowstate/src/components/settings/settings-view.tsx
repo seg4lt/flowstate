@@ -74,6 +74,11 @@ import {
   readBinarySearchPaths,
   writeBinarySearchPaths,
   DEFAULT_PROVIDER,
+  IDLE_TIMEOUT_MINS_DEFAULT,
+  IDLE_TIMEOUT_MINS_MIN,
+  IDLE_TIMEOUT_MINS_MAX,
+  readIdleTimeoutMins,
+  writeIdleTimeoutMins,
 } from "@/lib/defaults-settings";
 import { PLAN_MODE_MUTATING_TOOLS_LABEL } from "@/lib/tool-policy";
 import { ShortcutsDialog } from "@/lib/keyboard";
@@ -1158,6 +1163,72 @@ function PoolSizeRow() {
   );
 }
 
+// How long (in minutes) a provider bridge (Claude SDK, GitHub
+// Copilot, OpenCode) can sit idle before Flowstate shuts it down.
+// Stored in `user_config.sqlite`; read once at daemon start and
+// threaded through the adapter constructors — so a restart is
+// needed for the change to take effect.
+function IdleTimeoutRow() {
+  // `null` = still loading from sqlite; swap to a number once resolved.
+  const [value, setValue] = React.useState<number | null>(null);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    readIdleTimeoutMins()
+      .then((resolved) => {
+        if (cancelled) return;
+        setValue(resolved);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setValue(IDLE_TIMEOUT_MINS_DEFAULT);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const commit = React.useCallback((next: number) => {
+    const clamped = Math.max(
+      IDLE_TIMEOUT_MINS_MIN,
+      Math.min(IDLE_TIMEOUT_MINS_MAX, Math.round(next)),
+    );
+    setValue(clamped);
+    void writeIdleTimeoutMins(clamped);
+  }, []);
+
+  return (
+    <div className="flex items-start gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Provider idle timeout</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          How long a provider bridge can sit idle before it is shut down.
+          Shorter saves memory; longer avoids cold-start delays between turns.
+        </div>
+        <div className="mt-1 text-[11px] text-muted-foreground">
+          minutes · default {IDLE_TIMEOUT_MINS_DEFAULT} · range{" "}
+          {IDLE_TIMEOUT_MINS_MIN}–{IDLE_TIMEOUT_MINS_MAX} · restart Flowstate
+          to apply.
+        </div>
+      </div>
+      <input
+        type="number"
+        min={IDLE_TIMEOUT_MINS_MIN}
+        max={IDLE_TIMEOUT_MINS_MAX}
+        step={1}
+        value={value ?? ""}
+        disabled={value === null}
+        onChange={(e) => {
+          const parsed = Number.parseInt(e.target.value, 10);
+          if (Number.isFinite(parsed)) commit(parsed);
+        }}
+        className="h-8 w-16 rounded-md border border-input bg-background px-2 text-sm disabled:opacity-50"
+        aria-label="Provider idle timeout in minutes"
+      />
+    </div>
+  );
+}
+
 // Configurable base directory under which new git worktrees are
 // created. Persisted to `user_config.sqlite` via the kv table. When
 // empty, the branch-switcher's create-worktree flow falls back to
@@ -1979,6 +2050,7 @@ export function SettingsView() {
             description="Tune how Flowstate uses your machine's resources."
           >
             <PoolSizeRow />
+            <IdleTimeoutRow />
           </SettingsGroup>
           {caffeinateSupported && (
             <SettingsGroup

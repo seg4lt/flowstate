@@ -439,6 +439,8 @@ export interface EditorTabsApi {
   /** Set the dirty bit on the matching tab. No-op if the tab doesn't
    *  exist or the bit is already in the requested state. */
   setTabDirty: (path: string, pane: PaneIndex, dirty: boolean) => void;
+  /** Close every tab in the focused pane except the currently active one. */
+  closeOtherTabs: () => void;
 }
 
 /**

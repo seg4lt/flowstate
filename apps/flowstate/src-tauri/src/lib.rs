@@ -2996,21 +2996,37 @@ pub fn run() {
                 // injection path.
                 let user_mcp_registry = user_mcp_for_adapters;
 
+                // Read the user's preferred provider idle timeout from
+                // `user_config.sqlite` (key: "provider.idle_timeout_mins").
+                // Falls back to 30 minutes when unset or out of range.
+                // Applies to Claude SDK, GitHub Copilot, and OpenCode
+                // bridges. Takes effect immediately — adapters are
+                // constructed once at daemon start each launch.
+                let idle_timeout_secs: u64 = user_config_for_orch
+                    .get("provider.idle_timeout_mins")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|m| m.clamp(5, 480) * 60)
+                    .unwrap_or(30 * 60);
+
                 config.adapters = vec![
-                    Arc::new(ClaudeSdkAdapter::new_with_orchestration(
+                    Arc::new(ClaudeSdkAdapter::new_with_orchestration_and_idle_ttl(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
+                        Some(idle_timeout_secs),
                     )) as Arc<dyn ProviderAdapter>,
                     Arc::new(CodexAdapter::new_with_orchestration(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
                     )),
-                    Arc::new(GitHubCopilotAdapter::new_with_orchestration(
+                    Arc::new(GitHubCopilotAdapter::new_with_orchestration_and_idle_ttl(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
+                        Some(idle_timeout_secs),
                     )),
                     // Opencode runs as a shared-server singleton for
                     // startup-latency reasons (one `opencode serve`
@@ -3023,15 +3039,11 @@ pub fn run() {
                     // with the same origin.session_id — see the
                     // docstring on `OPENCODE_SHARED_SESSION_ID` for
                     // the implications.
-                    // Use the crate-local `DEFAULT_IDLE_TTL` baked
-                    // into `new_with_orchestration`. No Settings UI
-                    // exposes this today; if/when one does, switch
-                    // back to `new_with_orchestration_and_idle_ttl`
-                    // and read the override from user_config.
-                    Arc::new(OpenCodeAdapter::new_with_orchestration(
+                    Arc::new(OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
                         flowstate_root.clone(),
                         Some(ipc_handle.clone()),
                         Some(user_mcp_registry.clone()),
+                        Some(Duration::from_secs(idle_timeout_secs)),
                     )),
                 ];
 

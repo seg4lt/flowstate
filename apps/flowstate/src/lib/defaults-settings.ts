@@ -22,6 +22,7 @@ const CONFIG_KEY_DEFAULT_PROVIDER = "defaults.provider";
 const CONFIG_KEY_STRICT_PLAN_MODE = "defaults.strict_plan_mode";
 const CONFIG_KEY_CAFFEINATE = "system.caffeinate";
 const CONFIG_KEY_BINARY_SEARCH_PATHS = "binaries.search_paths";
+const CONFIG_KEY_IDLE_TIMEOUT_MINS = "provider.idle_timeout_mins";
 
 // --- Provider-enabled defaults ---
 
@@ -276,6 +277,49 @@ export async function writeBinarySearchPaths(paths: string[]): Promise<void> {
       CONFIG_KEY_BINARY_SEARCH_PATHS,
       JSON.stringify(cleaned),
     );
+  } catch {
+    /* storage may be unavailable */
+  }
+}
+
+// --- Provider idle timeout ---
+
+/**
+ * How many minutes a provider bridge (Claude SDK, GitHub Copilot,
+ * OpenCode) can remain idle before it is shut down. Shorter values
+ * free memory sooner; longer values avoid cold-start delays between
+ * turns. Takes effect on the next app launch — adapters are
+ * constructed once at daemon start.
+ */
+export const IDLE_TIMEOUT_MINS_DEFAULT = 30;
+export const IDLE_TIMEOUT_MINS_MIN = 5;
+export const IDLE_TIMEOUT_MINS_MAX = 480;
+
+export async function readIdleTimeoutMins(): Promise<number> {
+  try {
+    const raw = await getUserConfig(CONFIG_KEY_IDLE_TIMEOUT_MINS);
+    if (raw !== null) {
+      const parsed = Number.parseInt(raw, 10);
+      if (Number.isFinite(parsed)) {
+        return Math.max(
+          IDLE_TIMEOUT_MINS_MIN,
+          Math.min(IDLE_TIMEOUT_MINS_MAX, parsed),
+        );
+      }
+    }
+    return IDLE_TIMEOUT_MINS_DEFAULT;
+  } catch {
+    return IDLE_TIMEOUT_MINS_DEFAULT;
+  }
+}
+
+export async function writeIdleTimeoutMins(mins: number): Promise<void> {
+  try {
+    const clamped = Math.max(
+      IDLE_TIMEOUT_MINS_MIN,
+      Math.min(IDLE_TIMEOUT_MINS_MAX, Math.round(mins)),
+    );
+    await setUserConfig(CONFIG_KEY_IDLE_TIMEOUT_MINS, String(clamped));
   } catch {
     /* storage may be unavailable */
   }

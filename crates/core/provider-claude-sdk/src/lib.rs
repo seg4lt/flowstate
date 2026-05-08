@@ -97,11 +97,32 @@ impl ClaudeSdkAdapter {
 
     /// Construct with an optional orchestration handle (kept for API
     /// symmetry — see field doc) and a user MCP registry. Both
-    /// `None` is the legacy in-process-only configuration.
+    /// `None` is the legacy in-process-only configuration. Uses
+    /// [`BRIDGE_IDLE_TIMEOUT_SECS`] for idle-kill; prefer
+    /// [`Self::new_with_orchestration_and_idle_ttl`] when the host has
+    /// a user-config store to read the TTL from.
     pub fn new_with_orchestration(
         working_directory: PathBuf,
         orchestration: Option<OrchestrationIpcHandle>,
         user_mcp: Option<UserMcpRegistry>,
+    ) -> Self {
+        Self::new_with_orchestration_and_idle_ttl(
+            working_directory,
+            orchestration,
+            user_mcp,
+            Some(BRIDGE_IDLE_TIMEOUT_SECS),
+        )
+    }
+
+    /// Construct with an optional orchestration handle, user MCP
+    /// registry, and an explicit idle-kill timeout. Pass `None` to
+    /// disable idle-kill (useful in tests). Pass `Some(secs)` to
+    /// override the compiled-in [`BRIDGE_IDLE_TIMEOUT_SECS`] default.
+    pub fn new_with_orchestration_and_idle_ttl(
+        working_directory: PathBuf,
+        orchestration: Option<OrchestrationIpcHandle>,
+        user_mcp: Option<UserMcpRegistry>,
+        idle_timeout_secs: Option<u64>,
     ) -> Self {
         Self {
             working_directory,
@@ -109,7 +130,7 @@ impl ClaudeSdkAdapter {
             user_mcp,
             rpc_counter: Arc::new(AtomicU64::new(0)),
             sessions: Arc::new(zenui_provider_api::ProcessCache::new(
-                BRIDGE_IDLE_TIMEOUT_SECS,
+                idle_timeout_secs.unwrap_or(BRIDGE_IDLE_TIMEOUT_SECS),
                 BRIDGE_WATCHDOG_INTERVAL_SECS,
                 "provider-claude-sdk",
             )),
