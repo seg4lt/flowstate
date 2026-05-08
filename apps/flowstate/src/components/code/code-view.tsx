@@ -1002,11 +1002,19 @@ export function CodeView(props: CodeViewProps) {
     function isInTextInput(target: EventTarget | null): boolean {
       if (!(target instanceof HTMLElement)) return false;
       const tag = target.tagName;
-      return (
-        tag === "INPUT" ||
-        tag === "TEXTAREA" ||
-        target.isContentEditable === true
-      );
+      if (tag === "INPUT" || tag === "TEXTAREA") return true;
+      // CodeMirror 6's editor surface (.cm-content) is contenteditable but
+      // is NOT a "real" text input for tab-bar shortcut purposes — we want
+      // cmd+W, cmd+tab, etc. to fire even when the editor (including vim
+      // normal mode) has focus. Any other contenteditable node (e.g. a
+      // rich-text widget) is still treated as a text input.
+      if (
+        target.isContentEditable &&
+        !target.classList.contains("cm-content")
+      ) {
+        return true;
+      }
+      return false;
     }
     function onKeyDown(e: KeyboardEvent) {
       const mod = e.metaKey || e.ctrlKey;
@@ -1057,6 +1065,16 @@ export function CodeView(props: CodeViewProps) {
       if (!e.shiftKey && key === "w") {
         e.preventDefault();
         tabs.closeActiveTab();
+        setMultibufferOverride(false);
+        return;
+      }
+      if (e.altKey && !e.shiftKey && e.code === "KeyT") {
+        // Cmd/Ctrl+Opt+T — close all other tabs in the focused pane,
+        // keeping only the currently active one.
+        // Use e.code (physical key) instead of e.key because opt+T on
+        // macOS produces "†" (dagger), not "t".
+        e.preventDefault();
+        tabs.closeOtherTabs();
         setMultibufferOverride(false);
         return;
       }

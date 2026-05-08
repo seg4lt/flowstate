@@ -163,6 +163,7 @@ function loadLayout(
 type Action =
   | { type: "openFile"; pane: PaneIndex; path: string }
   | { type: "closeTab"; pane: PaneIndex; path: string }
+  | { type: "closeOtherTabs"; pane: PaneIndex; path: string }
   | { type: "activateTab"; pane: PaneIndex; path: string }
   | { type: "focusPane"; pane: PaneIndex }
   | { type: "splitPane"; direction: SplitDirection }
@@ -285,6 +286,17 @@ function reducer(layout: EditorLayout, action: Action): EditorLayout {
         action.pane < layout.panes.length ? action.pane : 0;
       const pane = layout.panes[idx]!;
       const nextPane = removeTab(pane, action.path);
+      return collapseIfEmpty(setPane(layout, idx as PaneIndex, nextPane));
+    }
+    case "closeOtherTabs": {
+      const idx =
+        action.pane < layout.panes.length ? action.pane : 0;
+      const pane = layout.panes[idx]!;
+      const kept = pane.tabs.find((t) => t.path === action.path);
+      const nextPane: Pane = {
+        tabs: kept ? [kept] : [],
+        activePath: kept ? action.path : null,
+      };
       return collapseIfEmpty(setPane(layout, idx as PaneIndex, nextPane));
     }
     case "activateTab": {
@@ -531,6 +543,16 @@ export function useEditorTabs(
         if (pane.activePath) {
           dispatch({
             type: "closeTab",
+            pane: layout.focusedPaneIndex,
+            path: pane.activePath,
+          });
+        }
+      },
+      closeOtherTabs: () => {
+        const pane = layout.panes[layout.focusedPaneIndex]!;
+        if (pane.activePath) {
+          dispatch({
+            type: "closeOtherTabs",
             pane: layout.focusedPaneIndex,
             path: pane.activePath,
           });
