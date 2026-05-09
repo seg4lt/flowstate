@@ -87,6 +87,11 @@ const LazyMarkdownEditor = React.lazy(
 const LazyExcalidrawEditor = React.lazy(
   () => import("../markdown/excalidraw-editor"),
 );
+// Thin wrapper over `LazyCodeEditor` adding a code/preview toggle for
+// `.html` / `.htm` files. Lazy because it pulls in CodeEditor anyway
+// and we don't want HTML-specific bytes in the bundle until first
+// HTML file is opened.
+const LazyHtmlEditor = React.lazy(() => import("../html/html-editor"));
 
 // Frontend-side max size for inline editing. The Rust read API
 // caps at 4 MiB (CODE_VIEW_MAX_FILE_BYTES) so files above that
@@ -2508,6 +2513,19 @@ const CodeViewBody = React.memo(function CodeViewBody({
                 void onSave(data);
               }}
               onDirty={() => onDirtyChange(true)}
+            />
+          ) : editorKind === "html" ? (
+            <LazyHtmlEditor
+              key={loadedFile.path}
+              path={loadedFile.path}
+              initialContent={loadedFile.contents}
+              theme={resolvedTheme}
+              vimEnabled={vimEnabled}
+              gitModeEnabled={gitModeEnabled}
+              projectPath={projectPath}
+              sessionId={sessionId}
+              onSave={onSave}
+              onDirtyChange={onDirtyChange}
             />
           ) : (
             <LazyCodeEditor

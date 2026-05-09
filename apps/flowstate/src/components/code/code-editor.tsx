@@ -395,6 +395,15 @@ export interface CodeEditorProps {
    *  unsaved-dot in the tab bar. Always called with the latest
    *  boolean value (deduped — won't fire twice in a row). */
   onDirtyChange: (dirty: boolean) => void;
+  /** Optional: fires on every doc change with the current buffer
+   *  text. Used by wrapper editors that need a live mirror of the
+   *  contents (e.g. the HTML viewer's preview iframe). Off by
+   *  default — the doc-change updateListener already runs for the
+   *  dirty-bit check, so opting in only adds a string materialize.
+   *  Note: the HTML viewer pays this cost on every keystroke; if a
+   *  caller cares about typing latency on huge buffers, throttle on
+   *  their side before passing the callback in. */
+  onChange?: (contents: string) => void;
 }
 
 export function CodeEditor({
@@ -408,11 +417,13 @@ export function CodeEditor({
   readOnly = false,
   onSave,
   onDirtyChange,
+  onChange,
 }: CodeEditorProps): React.ReactElement {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const viewRef = React.useRef<EditorView | null>(null);
   const onSaveRef = React.useRef<() => Promise<void>>(() => Promise.resolve());
   const onDirtyChangeRef = React.useRef(onDirtyChange);
+  const onChangeRef = React.useRef(onChange);
   const savedContentRef = React.useRef<string>(initialContent);
   const isDirtyRef = React.useRef<boolean>(false);
   const inImeRef = React.useRef<boolean>(false);
@@ -457,6 +468,10 @@ export function CodeEditor({
   React.useEffect(() => {
     onDirtyChangeRef.current = onDirtyChange;
   }, [onDirtyChange]);
+
+  React.useEffect(() => {
+    onChangeRef.current = onChange;
+  }, [onChange]);
 
   React.useEffect(() => {
     onSaveRef.current = async () => {
@@ -504,11 +519,16 @@ export function CodeEditor({
     // compartment as soon as the grammar lazy-loads.
     const updateListener = EditorView.updateListener.of((u) => {
       if (!u.docChanged) return;
-      const dirty = u.state.doc.toString() !== savedContentRef.current;
+      const text = u.state.doc.toString();
+      const dirty = text !== savedContentRef.current;
       if (dirty !== isDirtyRef.current) {
         isDirtyRef.current = dirty;
         onDirtyChangeRef.current(dirty);
       }
+      // Optional live-content callback. Materializing the doc to a
+      // string is the only added cost; we skip it entirely when no
+      // caller subscribed.
+      onChangeRef.current?.(text);
     });
 
     const blurAutoSave = EditorView.domEventHandlers({

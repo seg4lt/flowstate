@@ -79,6 +79,19 @@ export function isMarkdownPath(path: string): boolean {
   return MARKDOWN_EXTS.has(path.slice(dot + 1).toLowerCase());
 }
 
+/** HTML extensions the toggle viewer opens. Kept narrow on purpose —
+ *  things like `.shtml` / `.htmlx` / template-fragment files fall
+ *  through to the plain code editor. */
+export const HTML_EXTS: ReadonlySet<string> = new Set(["html", "htm"]);
+
+/** True when `path` ends with an HTML extension that the
+ *  code-or-preview toggle viewer claims. */
+export function isHtmlPath(path: string): boolean {
+  const dot = path.lastIndexOf(".");
+  if (dot === -1) return false;
+  return HTML_EXTS.has(path.slice(dot + 1).toLowerCase());
+}
+
 /** True when `path` is an Excalidraw drawing — either the SVG or PNG
  *  flavour (both formats embed the scene in a metadata block excalidraw
  *  can round-trip). Order matters: `.excalidraw.svg` is checked before
@@ -91,12 +104,13 @@ export function isExcalidrawPath(path: string): boolean {
   );
 }
 
-export type EditorKind = "markdown" | "excalidraw" | "code";
+export type EditorKind = "markdown" | "excalidraw" | "html" | "code";
 
 /** Pick the editor component for a given file path. Excalidraw beats
- *  markdown beats code; everything else is `code`. */
+ *  markdown beats html beats code; everything else is `code`. */
 export function getEditorKind(path: string): EditorKind {
   if (isExcalidrawPath(path)) return "excalidraw";
   if (isMarkdownPath(path)) return "markdown";
+  if (isHtmlPath(path)) return "html";
   return "code";
 }
