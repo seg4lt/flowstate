@@ -1,6 +1,24 @@
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 use crate::*;
+
+/// A spontaneous model turn that arrived between user-initiated turns.
+///
+/// Emitted by the bridge when the Claude Code SDK fires a new model
+/// iteration with no active user prompt — the most common cause is a
+/// background `Bash` task completing and the CLI sending a completion
+/// notification. The `RuntimeCore` subscribes to these events via
+/// `init_spontaneous_turn_listener` and fires a new `spawn_peer_turn`
+/// so the model's response reaches the user without requiring explicit
+/// user input.
+#[derive(Debug, Clone)]
+pub struct SpontaneousTurnEvent {
+    /// Flowstate session id of the session that produced this turn.
+    pub session_id: String,
+    /// The model's full output text for the spontaneous turn.
+    pub output: String,
+}
 
 /// Opaque RAII guard returned from
 /// [`ProviderAdapter::acquire_shared_bridge_lease`]. Holding the guard
@@ -374,5 +392,23 @@ pub trait ProviderAdapter: Send + Sync {
             "{} has no in-app upgrade flow. Update it through your usual package manager.",
             self.kind().label()
         ))
+    }
+
+    /// Return a one-shot receiver for spontaneous model turns that arrive
+    /// between user-initiated turns.
+    ///
+    /// Called at most once by `RuntimeCore::init_spontaneous_turn_listener`
+    /// during daemon bootstrap (after `install_self_ref`). The runtime
+    /// spawns a background task that reads from the receiver and calls
+    /// `spawn_peer_turn` for each event.
+    ///
+    /// Default: `None` — adapters that don't support between-turn
+    /// notifications inherit a no-op. Currently only the Claude SDK
+    /// adapter overrides this (via the bridge's persistent background
+    /// stdout reader).
+    fn take_spontaneous_turn_receiver(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<SpontaneousTurnEvent>> {
+        None
     }
 }

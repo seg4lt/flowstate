@@ -32,7 +32,7 @@ use zenui_provider_api::{
 
 use crate::process::{
     BRIDGE_IDLE_TIMEOUT_SECS, BRIDGE_WATCHDOG_INTERVAL_SECS, CachedBridge, ClaudeBridgeProcess,
-    write_request,
+    SpontaneousTurnEvent, write_request,
 };
 use crate::rpc::{BridgeRpcKind, BridgeRpcResponse};
 use crate::stream::forward_stream;
@@ -71,8 +71,8 @@ pub struct ClaudeSdkAdapter {
     sessions: Arc<zenui_provider_api::ProcessCache<ClaudeBridgeProcess>>,
     /// Direct, lock-free-from-outside handles to each session's bridge
     /// stdin. `run_turn` holds the cached process Mutex guard for the
-    /// duration of the turn (because it owns `&mut process.stdout`), so
-    /// any control message that needs to write to the bridge mid-turn
+    /// duration of the turn (because it owns `&mut process.line_rx`),
+    /// so any control message that needs to write to the bridge mid-turn
     /// (interrupt, set_permission_mode, …) would deadlock if it had to
     /// re-lock the same Mutex. Storing a clone of the inner stdin Arc
     /// here lets control paths bypass the process lock entirely; the
@@ -86,6 +86,15 @@ pub struct ClaudeSdkAdapter {
     /// as the owning `ClaudeBridgeProcess.pending_rpcs`, so the drain
     /// loop and out-of-band RPC callers mutate the same storage.
     session_pending_rpcs: Arc<Mutex<HashMap<String, PendingRpcsMap>>>,
+    /// Sender half of the spontaneous-turn channel. Cloned into each
+    /// session's persistent background reader task so all sessions share
+    /// one receiver that the `RuntimeCore` subscribes to via
+    /// `init_spontaneous_turn_listener`.
+    spontaneous_tx: mpsc::UnboundedSender<SpontaneousTurnEvent>,
+    /// Receiver half of the spontaneous-turn channel. Wrapped in
+    /// `Mutex<Option<...>>` so `take_spontaneous_turn_receiver` can
+    /// hand it out exactly once (the runtime takes ownership).
+    spontaneous_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<SpontaneousTurnEvent>>>>,
 }
 
 type PendingRpcsMap = Arc<Mutex<HashMap<String, oneshot::Sender<BridgeRpcResponse>>>>;
@@ -124,6 +133,7 @@ impl ClaudeSdkAdapter {
         user_mcp: Option<UserMcpRegistry>,
         idle_timeout_secs: Option<u64>,
     ) -> Self {
+        let (spontaneous_tx, spontaneous_rx) = mpsc::unbounded_channel::<SpontaneousTurnEvent>();
         Self {
             working_directory,
             orchestration,
@@ -136,6 +146,8 @@ impl ClaudeSdkAdapter {
             )),
             session_stdins: Arc::new(Mutex::new(HashMap::new())),
             session_pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
+            spontaneous_tx,
+            spontaneous_rx: Arc::new(Mutex::new(Some(spontaneous_rx))),
         }
     }
 
@@ -363,17 +375,13 @@ impl ClaudeSdkAdapter {
             });
         }
 
-        let mut process = ClaudeBridgeProcess {
+        // bridge_session_id and pending_rpcs are overwritten by ensure_session_process.
+        let mut process = ClaudeBridgeProcess::new(
             child,
             process_group,
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: BufReader::new(stdout).lines(),
-            bridge_session_id: String::new(),
-            // Overwritten by `ensure_session_process` with an Arc that's
-            // also cloned into `session_pending_rpcs` so mid-turn RPC
-            // callers can insert without re-locking the bridge.
-            pending_rpcs: Arc::new(Mutex::new(HashMap::new())),
-        };
+            Arc::new(Mutex::new(stdin)),
+            BufReader::new(stdout).lines(),
+        );
 
         debug!("Waiting for bridge ready signal...");
         match tokio::time::timeout(std::time::Duration::from_secs(15), process.read_response())
@@ -509,6 +517,17 @@ impl ClaudeSdkAdapter {
         let pending_rpcs_clone: PendingRpcsMap = Arc::new(Mutex::new(HashMap::new()));
         let mut bridge = bridge;
         bridge.pending_rpcs = pending_rpcs_clone.clone();
+
+        // Promote the bridge from direct-stdout mode to channel mode.
+        // This spawns the persistent background reader task that owns
+        // the raw ChildStdout and routes spontaneous_turn events (from
+        // background Bash task completions) to `spontaneous_tx` so
+        // RuntimeCore can fire a new turn without user input.
+        bridge.promote_to_session_bridge(
+            session.summary.session_id.clone(),
+            self.spontaneous_tx.clone(),
+        );
+
         {
             let mut stdins = self.session_stdins.lock().await;
             stdins
@@ -1675,6 +1694,19 @@ impl ProviderAdapter for ClaudeSdkAdapter {
                 );
             }
         }
+    }
+
+    /// Hand the spontaneous-turn receiver to `RuntimeCore` so it can
+    /// subscribe and fire `spawn_peer_turn` when background tasks complete.
+    /// Returns `Some` on the first call; `None` on subsequent calls
+    /// (the receiver has already been taken).
+    fn take_spontaneous_turn_receiver(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<SpontaneousTurnEvent>> {
+        self.spontaneous_rx
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
     }
 }
 

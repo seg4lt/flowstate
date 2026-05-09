@@ -2278,7 +2278,27 @@ class ClaudeBridge {
           });
         }
         if (r.subtype === 'success') {
-          return r.result ?? '';
+          const text = r.result ?? '';
+          if (this.pendingTurn) {
+            // Normal path: an active user turn is waiting for this result.
+            return text;
+          }
+          // No pending turn — the SDK fired a spontaneous model iteration
+          // (most commonly: a background Bash task completed and the CLI
+          // sent a notification that triggered a new model response). Since
+          // no `sendPrompt` is awaiting this, we can't resolve a promise.
+          // Instead, emit a typed event so the Rust adapter's persistent
+          // background reader can detect it and fire a new session turn via
+          // spawn_peer_turn — the same mechanism that wakeups use.
+          console.error(
+            `[bridge] spontaneous turn (no pendingTurn): output_len=${text.length}`,
+          );
+          writeJson({
+            type: 'spontaneous_turn',
+            output: text,
+            session_id: this.resumeSessionId ?? null,
+          });
+          return null;
         }
         // Every `result` message is a turn boundary — the SDK emits
         // exactly one per turn. If we fall through to `return null`

@@ -323,6 +323,14 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
     // the fire handler holds a `Weak<RuntimeCore>`.
     runtime_core.init_wakeup_scheduler().await;
 
+    // Subscribe to spontaneous turns from adapters that support
+    // between-turn notifications (e.g. the Claude SDK adapter's
+    // persistent background reader detects background Bash task
+    // completions and forwards them here). Must come after
+    // `install_self_ref` since the listener task holds a
+    // `Weak<RuntimeCore>`.
+    runtime_core.init_spontaneous_turn_listener();
+
     Ok(InProcessCore {
         runtime_core,
         lifecycle,

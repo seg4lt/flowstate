@@ -576,7 +576,7 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
 
   return (
     <div className="space-y-3">
-      {item.input !== null && (
+      {item.input !== null && item.input !== "" && (
         <>
           {/* Divider + "Restore to before" pill. Sits ABOVE the user
               message so it visually separates one exchange from the

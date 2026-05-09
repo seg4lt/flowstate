@@ -297,6 +297,23 @@ pub(crate) enum BridgeResponse {
         #[serde(default)]
         session_id: Option<String>,
     },
+    /// Emitted by the bridge when a `result` message arrives from the SDK
+    /// but no user-initiated turn is in flight (`pendingTurn` is null).
+    /// This happens when a background Bash task completes and the Claude
+    /// Code CLI sends a completion notification that triggers a new model
+    /// iteration. The persistent background reader task on the Rust side
+    /// intercepts this variant and fires a new `spawn_peer_turn` so the
+    /// model's response reaches the user without requiring a new prompt.
+    #[serde(rename = "spontaneous_turn")]
+    SpontaneousTurn {
+        /// The model's full output text for this turn.
+        output: String,
+        /// The Claude SDK native session id at the time the turn completed.
+        /// Used by the background reader to correlate with the flowstate
+        /// session that owns this bridge process.
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     #[serde(rename = "interrupted")]
     #[allow(dead_code)]
     Interrupted,

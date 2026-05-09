@@ -518,6 +518,141 @@ impl RuntimeCore {
         self.wakeup_scheduler.read().ok()?.clone()
     }
 
+    /// Subscribe to spontaneous turns emitted by provider adapters that
+    /// support between-turn notifications (currently only the Claude SDK
+    /// adapter via the bridge's persistent background reader).
+    ///
+    /// A spontaneous turn is a model response that arrived without a
+    /// user-initiated `send_turn` — the canonical example is a background
+    /// `Bash` task completing and the Claude Code CLI sending a completion
+    /// notification that triggers a new SDK model iteration.
+    ///
+    /// For each event, this method fires `spawn_peer_turn` on the
+    /// originating session so the model's response reaches the user
+    /// automatically, without requiring a new user message.
+    ///
+    /// Call once from the daemon bootstrap *after* [`install_self_ref`] —
+    /// the spawned listener task holds a `Weak<RuntimeCore>`.
+    pub fn init_spontaneous_turn_listener(self: &Arc<Self>) {
+        for adapter in self.adapters.values() {
+            let mut rx = match adapter.take_spontaneous_turn_receiver() {
+                Some(rx) => rx,
+                None => continue,
+            };
+            let rc_weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    let event = match rx.recv().await {
+                        Some(e) => e,
+                        None => {
+                            // Channel closed (adapter dropped). Stop listening.
+                            tracing::debug!("spontaneous-turn channel closed; listener exiting");
+                            break;
+                        }
+                    };
+                    let rc = match rc_weak.upgrade() {
+                        Some(rc) => rc,
+                        None => break, // RuntimeCore dropped; stop.
+                    };
+                    tracing::info!(
+                        session_id = %event.session_id,
+                        output_len = event.output.len(),
+                        "RuntimeCore: delivering spontaneous background-task turn"
+                    );
+                    // Deliver directly as a completed turn — do NOT call
+                    // spawn_peer_turn because event.output is already the
+                    // model's response (not a user prompt). Calling the model
+                    // again would (a) generate a redundant reply and (b) cause
+                    // multi-task races on the bridge mutex where a later task's
+                    // SDK `result` resolves an earlier task's pendingTurn.
+                    rc.deliver_spontaneous_turn(event.session_id, event.output).await;
+                }
+            });
+        }
+    }
+
+    /// Create and publish a completed `TurnRecord` from a spontaneous model
+    /// response, **without** calling the model again.
+    ///
+    /// Used by `init_spontaneous_turn_listener` when a background Bash task
+    /// completes: the model has already generated its response inside the SDK
+    /// session (captured as `output`). We surface that response as a new
+    /// turn visible to the user rather than sending it back as a user message.
+    ///
+    /// Safe to call concurrently for multiple background tasks — there is no
+    /// bridge interaction so no `pendingTurn` races occur.
+    async fn deliver_spontaneous_turn(&self, session_id: String, output: String) {
+        // Load the session. If it no longer exists (session deleted between
+        // background task start and completion), log and bail gracefully.
+        let Some(mut session) = self.persistence.get_session(&session_id).await else {
+            tracing::warn!(
+                session_id = %session_id,
+                "deliver_spontaneous_turn: session not found; dropping spontaneous response"
+            );
+            return;
+        };
+
+        // Create a turn with empty input — the model responded autonomously,
+        // not in reaction to a user message.
+        let turn = self.orchestration.start_turn(&mut session, String::new(), None, None);
+
+        // Finalize with the spontaneous output.
+        let Some(finished) = self
+            .orchestration
+            .finish_turn(&mut session, &turn.turn_id, output.clone(), TurnStatus::Completed)
+        else {
+            tracing::warn!(
+                session_id = %session_id,
+                turn_id = %turn.turn_id,
+                "deliver_spontaneous_turn: finish_turn returned None (turn not found in session)"
+            );
+            return;
+        };
+
+        // Merge a Text block into the turn so the frontend has content to render.
+        // The chat UI renders from `turn.blocks`, not `turn.output` — without this
+        // the turn would be a silent gap (empty user bubble, no assistant message).
+        // Mirrors the blocks-merge step at the tail of `send_turn`.
+        let merged_turn = if let Some(t) = session
+            .turns
+            .iter_mut()
+            .find(|t| t.turn_id == finished.turn_id)
+        {
+            t.blocks = vec![ContentBlock::Text { text: output }];
+            t.clone()
+        } else {
+            finished
+        };
+
+        // Persist before publishing so the turn is durable even if the
+        // broadcast fails (same ordering guarantee as send_turn).
+        self.persistence.upsert_session(session.clone()).await;
+
+        // Broadcast to all connected frontends.
+        self.publish(RuntimeEvent::TurnCompleted {
+            session_id: session.summary.session_id.clone(),
+            session: session.summary.clone(),
+            turn: merged_turn,
+        });
+
+        // Drain one queued mailbox message if any are pending, mirroring
+        // the end-of-send_turn mailbox-drain so peer messages queued while
+        // this session was "busy" are not stuck indefinitely.
+        if let (Some(next), Some(rc)) = (
+            self.orchestration_state.pop_message(&session_id).await,
+            self.self_arc(),
+        ) {
+            crate::orchestration::spawn_peer_turn(
+                rc,
+                session_id,
+                next.message,
+                "spontaneous_mailbox_drain",
+                PermissionMode::Default,
+                None,
+            );
+        }
+    }
+
     /// Observe a Claude Code `ScheduleWakeup` tool call surfaced by
     /// the adapter's stream. Parses the tool args, persists a row,
     /// arms the scheduler, and publishes `WakeupScheduled`. Invoked
