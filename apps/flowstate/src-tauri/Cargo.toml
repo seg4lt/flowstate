@@ -30,7 +30,7 @@ embed-all = [
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = ["devtools", "protocol-asset", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 # Auto-updater. Pulls signed manifests from the URL configured in
@@ -41,6 +41,18 @@ tauri-plugin-dialog = "2"
 # ship updates to existing installs.
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Clipboard image write — used by the markdown editor's mermaid
+# "Copy as PNG" action. WKWebView's `<canvas>.toBlob` taints any canvas
+# an SVG `<img>` has been drawn into, so we rasterise on the Rust side
+# with `resvg` and push the bytes through this plugin instead of
+# routing back through `navigator.clipboard`.
+tauri-plugin-clipboard-manager = "2"
+# Pure-Rust SVG → raster pipeline used by `markdown_copy_svg_as_png`.
+# `resvg` re-exports `usvg` + `tiny-skia`; we render to RGBA and hand
+# those bytes to tauri-plugin-clipboard-manager. `text` + `system-fonts`
+# features pick up the OS font db so mermaid diagrams with custom font
+# faces still rasterise correctly.
+resvg = { version = "0.45", default-features = false, features = ["text", "system-fonts"] }
 # Global keyboard shortcut (Cmd+Option+Shift+O) for window toggle.
 # Uses Carbon `RegisterEventHotKey` on macOS, so no Accessibility
 # permission / entitlements are required. Registration is Rust-only

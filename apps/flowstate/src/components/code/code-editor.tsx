@@ -33,27 +33,24 @@ import {
   indentUnit,
 } from "@codemirror/language";
 import {
-  copyLineDown,
-  copyLineUp,
   defaultKeymap,
   history,
   historyKeymap,
-  indentWithTab,
-  moveLineDown,
-  moveLineUp,
-  toggleBlockComment,
-  toggleLineComment,
 } from "@codemirror/commands";
 import {
-  gotoLine,
   highlightSelectionMatches,
   search,
   searchKeymap,
-  selectMatches,
-  selectNextOccurrence,
 } from "@codemirror/search";
 import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
 import { Vim, vim } from "@replit/codemirror-vim";
+import {
+  buildExtraKeymap,
+  ensureClipboardSyncRegistered,
+  ensureVimWriteRegistered,
+  saveHandlers,
+} from "./cm-shared";
+import { buildEditorTheme } from "./editor-theme";
 import type { HighlighterCore, ThemeRegistrationAny } from "shiki/core";
 import {
   DARK_THEME,
@@ -93,77 +90,10 @@ import { commentExtension } from "./comment-extension";
 //     used to be Compartment-backed too but is now hardcoded on; long
 //     lines were breaking the viewport and there was no UI toggle.
 
-// ─── shared module-level state ───────────────────────────────────
-
-// Per-view onSave handler, looked up by Vim `:w` and any other
-// command that needs the active editor's save path. WeakMap so the
-// entry vanishes when the view is GC'd; no manual cleanup needed.
-const saveHandlers = new WeakMap<EditorView, () => Promise<void>>();
-
-// Vim `:w` registered exactly once per module load. Looks up the
-// focused view's save handler at fire time so it always targets the
-// editor the user is actually in.
-let vimWriteRegistered = false;
-function ensureVimWriteRegistered(): void {
-  if (vimWriteRegistered) return;
-  vimWriteRegistered = true;
-  Vim.defineEx("write", "w", (cm: { cm6: EditorView }) => {
-    const view = cm.cm6;
-    const handler = saveHandlers.get(view);
-    if (handler) void handler();
-  });
-}
-
-// Mirror vim yank / delete / change to the OS clipboard. The plugin
-// only writes to `navigator.clipboard` when the user explicitly
-// names the `+` register (`"+y`, `"+d`); plain `y`, `dd`, `cw`
-// stay inside vim's own registers. That matches stock vim, but
-// most people running vim in a GUI editor expect `set clipboard=
-// unnamed` semantics — yank in here, paste with Cmd+V over there.
-//
-// We patch `RegisterController.pushText` once at module load. Every
-// operation that targets the unnamed register (no explicit `"x`
-// prefix) for yank / delete / change additionally fires
-// `navigator.clipboard.writeText`. Failures are swallowed: the
-// vim register is still updated, the user just won't get the OS
-// clipboard sync (e.g., insecure context, permission denied).
-let clipboardSyncRegistered = false;
-function ensureClipboardSyncRegistered(): void {
-  if (clipboardSyncRegistered) return;
-  clipboardSyncRegistered = true;
-  if (typeof navigator === "undefined" || !navigator.clipboard) return;
-  // The Vim runtime API isn't strictly typed for the controller's
-  // `pushText` method — pull it through `unknown` so TS doesn't
-  // complain about the mutation while preserving runtime safety.
-  const ctrl = (
-    Vim as unknown as { getRegisterController?: () => unknown }
-  ).getRegisterController?.();
-  if (!ctrl) return;
-  type PushText = (
-    registerName: string | null | undefined,
-    operator: string,
-    text: string,
-    linewise?: boolean,
-    blockwise?: boolean,
-  ) => void;
-  const c = ctrl as { pushText?: PushText };
-  const original = c.pushText;
-  if (typeof original !== "function") return;
-  c.pushText = function (registerName, operator, text, linewise, blockwise) {
-    original.call(this, registerName, operator, text, linewise, blockwise);
-    if (
-      text &&
-      !registerName &&
-      (operator === "yank" || operator === "delete" || operator === "change")
-    ) {
-      // Fire and forget — the clipboard call is async but we
-      // don't gate the vim register write on it.
-      void navigator.clipboard.writeText(text).catch(() => {
-        /* silent — vim register is still updated */
-      });
-    }
-  };
-}
+// `saveHandlers`, `ensureVimWriteRegistered`,
+// `ensureClipboardSyncRegistered`, and `buildExtraKeymap` live in
+// `./cm-shared` so the markdown editor can reuse them without
+// duplicating the global one-shot registrations.
 
 // ─── long-line / large-file detection ────────────────────────────
 
@@ -420,276 +350,9 @@ function shikiPlugin(cfg: ShikiPluginConfig): Extension {
 }
 
 // ─── base editor theme ───────────────────────────────────────────
+//
+// Imported from ./editor-theme so the markdown editor can reuse it.
 
-// CM6 theme that just sets the chrome (background, gutter, caret,
-// selection) to match the rest of the app. Token colors come from
-// Shiki via `style="color:..."` attributes on Decoration.mark, so
-// this theme stays minimal.
-function buildEditorTheme(theme: "light" | "dark"): Extension {
-  // Source-of-truth palette is the pierre theme; we read it
-  // dynamically so any palette tweak there flows through. The
-  // explicit fallbacks keep us rendering even if the theme JSON
-  // omits a key.
-  const t = theme === "dark" ? DARK_THEME : LIGHT_THEME;
-  // Shiki theme JSON shape: `bg`, `fg`, `colors`, `tokenColors`.
-  // We only need bg/fg/cursor/selection here.
-  const bg = (t as { bg?: string }).bg ?? (theme === "dark" ? "#0b0b0c" : "#ffffff");
-  const fg = (t as { fg?: string }).fg ?? (theme === "dark" ? "#e5e5e5" : "#1f1f1f");
-  const colors = (t as { colors?: Record<string, string> }).colors ?? {};
-  const cursor = colors["editorCursor.foreground"] ?? fg;
-  const selectionBg =
-    colors["editor.selectionBackground"] ??
-    (theme === "dark" ? "#264f7855" : "#add6ff88");
-  const lineHighlightBg =
-    colors["editor.lineHighlightBackground"] ??
-    (theme === "dark" ? "#ffffff0a" : "#0000000a");
-  const gutterBg = colors["editorGutter.background"] ?? bg;
-  const gutterFg =
-    colors["editorLineNumber.foreground"] ??
-    (theme === "dark" ? "#6b7280" : "#9ca3af");
-
-  // Vim mode badge palette. The `.cm-vim-panel` text content is
-  // `--NORMAL--`, `--INSERT--`, or `--VISUAL--` — we don't have a
-  // mode-specific class to colour against, so we just make the
-  // whole panel bold/prominent regardless of mode. The fat-cursor
-  // colour is what really differentiates modes at-a-glance:
-  // block in NORMAL, line in INSERT, the plugin handles the shape;
-  // we just pick a colour with enough contrast on either theme.
-  const fatCursorBg = theme === "dark" ? "#7dd3fc" : "#0284c7";
-  const fatCursorFg = theme === "dark" ? "#0b0b0c" : "#ffffff";
-  const panelBg = theme === "dark" ? "#1f1f23" : "#f4f4f5";
-  const panelBorder = theme === "dark" ? "#2e2e35" : "#d4d4d8";
-  const panelAccent = theme === "dark" ? "#7dd3fc" : "#0369a1";
-
-  return EditorView.theme(
-    {
-      "&": {
-        backgroundColor: bg,
-        color: fg,
-        height: "100%",
-        fontSize: "13px",
-      },
-      ".cm-scroller": {
-        fontFamily:
-          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
-        lineHeight: "1.55",
-      },
-      ".cm-content": { caretColor: cursor },
-      ".cm-cursor, .cm-dropCursor": { borderLeftColor: cursor },
-      "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, ::selection":
-        { backgroundColor: selectionBg },
-      ".cm-activeLine": { backgroundColor: lineHighlightBg },
-      ".cm-gutters": {
-        backgroundColor: gutterBg,
-        color: gutterFg,
-        border: "none",
-      },
-      ".cm-activeLineGutter": { backgroundColor: lineHighlightBg },
-      ".cm-foldGutter .cm-gutterElement": {
-        cursor: "pointer",
-        opacity: "0.6",
-      },
-      ".cm-foldGutter .cm-gutterElement:hover": { opacity: "1" },
-
-      // ── Vim panel (bottom status bar) ──
-      // The plugin renders `<div class="cm-vim-panel"><span>--MODE--</span>
-      // <span flex:1></span><span>{partial command}</span></div>`.
-      // We override the default ~13px monospace strip with a more
-      // prominent bar so the mode is impossible to miss. The first
-      // child span is the mode badge — bold + accent colour. The
-      // last child span is the partial command (e.g., `2dd` while
-      // the user is mid-keystroke); kept dimmer so it doesn't
-      // compete visually.
-      ".cm-vim-panel": {
-        padding: "4px 10px",
-        fontFamily:
-          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
-        fontSize: "11px",
-        minHeight: "1.8em",
-        backgroundColor: panelBg,
-        borderTop: `1px solid ${panelBorder}`,
-        display: "flex",
-        alignItems: "center",
-        gap: "8px",
-      },
-      ".cm-vim-panel > span:first-child": {
-        fontWeight: "700",
-        letterSpacing: "0.04em",
-        color: panelAccent,
-        cursor: "pointer",
-      },
-      ".cm-vim-panel > span:last-child": {
-        opacity: "0.7",
-      },
-      ".cm-vim-panel input": {
-        border: "none",
-        outline: "none",
-        backgroundColor: "transparent",
-        color: fg,
-        flex: "1",
-        fontFamily: "inherit",
-        fontSize: "inherit",
-      },
-
-      // ── Vim block cursor (NORMAL / VISUAL mode) ──
-      // The plugin's default green block (`#77ee77`) clashes with
-      // every theme. Override with theme-tuned colours so the block
-      // cursor is obvious without being garish, and so characters
-      // sitting under the block stay legible.
-      ".cm-fat-cursor": {
-        backgroundColor: fatCursorBg + " !important",
-        color: fatCursorFg + " !important",
-        border: "none !important",
-      },
-      "&:not(.cm-focused) .cm-fat-cursor": {
-        backgroundColor: "transparent !important",
-        outline: `1px solid ${fatCursorBg}`,
-        color: "inherit !important",
-      },
-
-      // ── Search / replace panel ──
-      // CM6 ships the search panel with raw browser defaults
-      // (Helvetica, square buttons, native checkboxes). Re-skin
-      // to match the rest of the editor: monospace 11 px, padded
-      // flex row, theme-tuned inputs and buttons, accent-coloured
-      // focus ring, and a less garish search-match highlight than
-      // the default flat yellow / cyan.
-      ".cm-panels": {
-        backgroundColor: panelBg,
-        color: fg,
-      },
-      ".cm-panels-top": {
-        borderBottom: `1px solid ${panelBorder}`,
-      },
-      ".cm-panel.cm-search": {
-        padding: "8px 36px 8px 10px",
-        display: "flex",
-        alignItems: "center",
-        gap: "6px",
-        flexWrap: "wrap",
-        fontFamily:
-          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
-        fontSize: "11px",
-        position: "relative",
-      },
-      ".cm-panel.cm-search input": {
-        margin: "0",
-        padding: "4px 8px",
-        border: `1px solid ${panelBorder}`,
-        borderRadius: "4px",
-        backgroundColor: bg,
-        color: fg,
-        fontFamily: "inherit",
-        fontSize: "11px",
-        outline: "none",
-        minWidth: "200px",
-      },
-      ".cm-panel.cm-search input:focus": {
-        borderColor: panelAccent,
-        boxShadow: `0 0 0 1px ${panelAccent}`,
-      },
-      ".cm-panel.cm-search input[type=checkbox]": {
-        minWidth: "auto",
-        margin: "0 4px 0 0",
-        accentColor: panelAccent,
-        cursor: "pointer",
-      },
-      ".cm-panel.cm-search button": {
-        margin: "0",
-        padding: "4px 10px",
-        border: `1px solid ${panelBorder}`,
-        borderRadius: "4px",
-        backgroundColor: bg,
-        color: fg,
-        fontFamily: "inherit",
-        fontSize: "11px",
-        cursor: "pointer",
-        transition: "background-color 80ms, border-color 80ms",
-      },
-      ".cm-panel.cm-search button:hover": {
-        backgroundColor: lineHighlightBg,
-        borderColor: panelAccent,
-      },
-      ".cm-panel.cm-search label": {
-        display: "inline-flex",
-        alignItems: "center",
-        margin: "0",
-        fontSize: "11px",
-        color: gutterFg,
-        cursor: "pointer",
-        whiteSpace: "nowrap",
-      },
-      ".cm-panel.cm-search br": { display: "none" },
-      ".cm-panel.cm-search [name=close]": {
-        position: "absolute",
-        top: "6px",
-        right: "8px",
-        background: "transparent",
-        border: "none",
-        color: gutterFg,
-        cursor: "pointer",
-        fontSize: "16px",
-        lineHeight: "1",
-        padding: "4px 6px",
-        borderRadius: "4px",
-        minWidth: "auto",
-      },
-      ".cm-panel.cm-search [name=close]:hover": {
-        color: fg,
-        backgroundColor: lineHighlightBg,
-      },
-
-      // Search-match highlights. Defaults are flat yellow (light)
-      // and cyan (dark), both of which are unreadable on top of
-      // Shiki tokens. Amber/orange give clear contrast in either
-      // theme without competing with the selection's blue.
-      ".cm-searchMatch": {
-        backgroundColor:
-          theme === "dark" ? "rgba(250, 204, 21, 0.22)" : "rgba(250, 204, 21, 0.4)",
-        outline:
-          theme === "dark"
-            ? "1px solid rgba(250, 204, 21, 0.55)"
-            : "1px solid rgba(202, 138, 4, 0.55)",
-      },
-      ".cm-searchMatch-selected": {
-        backgroundColor:
-          theme === "dark" ? "rgba(251, 146, 60, 0.45)" : "rgba(251, 146, 60, 0.55)",
-        outline:
-          theme === "dark"
-            ? "1px solid rgba(251, 146, 60, 1)"
-            : "1px solid rgba(194, 65, 12, 1)",
-      },
-    },
-    { dark: theme === "dark" },
-  );
-}
-
-// ─── extra keymap ────────────────────────────────────────────────
-
-// Returns a key binding array that wires up modern-editor commands
-// not covered by `defaultKeymap`. Built per-mount so the Mod-s
-// binding can close over `onSaveRef`.
-function buildExtraKeymap(onSaveRef: React.RefObject<() => Promise<void>>) {
-  return [
-    indentWithTab,
-    { key: "Alt-ArrowUp", run: moveLineUp, shift: copyLineUp },
-    { key: "Alt-ArrowDown", run: moveLineDown, shift: copyLineDown },
-    { key: "Mod-d", run: selectNextOccurrence },
-    { key: "Mod-Shift-l", run: selectMatches },
-    { key: "Mod-/", run: toggleLineComment },
-    { key: "Shift-Alt-a", run: toggleBlockComment },
-    { key: "Mod-g", run: gotoLine },
-    {
-      key: "Mod-s",
-      preventDefault: true,
-      run: () => {
-        const fn = onSaveRef.current;
-        if (fn) void fn();
-        return true;
-      },
-    },
-  ];
-}
 
 // ─── component ───────────────────────────────────────────────────
 

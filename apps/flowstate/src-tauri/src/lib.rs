@@ -1313,6 +1313,160 @@ fn write_project_file(path: String, file: String, contents: String) -> Result<()
     std::fs::write(&final_path, contents.as_bytes()).map_err(|e| format!("write: {e}"))
 }
 
+/// Generic binary-write sibling of `write_project_file`. Used by:
+///   * the Excalidraw editor when saving `.excalidraw.png` (which is
+///     a binary PNG with the scene encoded into a `tEXt` chunk), and
+///   * any future flow that needs to round-trip raw bytes inside the
+///     project root (e.g. dragged-in screenshots saved verbatim).
+///
+/// Same path-escape defense as `write_project_file`: canonicalise the
+/// **parent** directory and re-join the basename, then check the
+/// final path lies inside the canonical project root.
+#[tauri::command]
+fn write_project_file_bytes(
+    path: String,
+    file: String,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let project_path = Path::new(&path);
+    let abs = project_path.join(&file);
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let parent = abs.parent().ok_or("no parent directory")?;
+    // Create the parent on demand — pasted images land in `pasted/`
+    // which usually doesn't exist yet on a fresh project.
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| format!("parent path: {e}"))?;
+    let basename = abs.file_name().ok_or("no filename")?;
+    let final_path = parent_canon.join(basename);
+    if !final_path.starts_with(&project_canon) {
+        return Err("file is outside the project root".into());
+    }
+    std::fs::write(&final_path, &bytes).map_err(|e| format!("write: {e}"))
+}
+
+/// Save a clipboard-pasted image into a `pasted/` subfolder of
+/// `targetDir` (the directory of the open `.md`). Creates the subfolder
+/// if missing and dedupes the filename when collisions occur.
+///
+/// Returns the **path the editor should embed in `![…](…)`** — that's
+/// always relative to `targetDir`, e.g. `pasted/foo-123.png`.
+///
+/// Sandbox: refuses any `targetDir` whose canonical form does not lie
+/// inside the canonical `projectPath`.
+#[tauri::command]
+fn markdown_save_pasted_image(
+    project_path: String,
+    target_dir: String,
+    file_name: String,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    const PASTED_SUBDIR: &str = "pasted";
+    let project = Path::new(&project_path)
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let dir = Path::new(&target_dir);
+    if !dir.exists() {
+        return Err(format!(
+            "target directory does not exist: {}",
+            dir.display()
+        ));
+    }
+    let dir_canon = dir
+        .canonicalize()
+        .map_err(|e| format!("target dir: {e}"))?;
+    if !dir_canon.starts_with(&project) {
+        return Err("target directory is outside the project root".into());
+    }
+    let pasted_dir = dir_canon.join(PASTED_SUBDIR);
+    std::fs::create_dir_all(&pasted_dir).map_err(|e| format!("mkdir pasted/: {e}"))?;
+    let stem = Path::new(&file_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image")
+        .to_string();
+    let ext = Path::new(&file_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("png")
+        .to_string();
+    let mut candidate = file_name.clone();
+    let mut counter = 1u32;
+    loop {
+        let path = pasted_dir.join(&candidate);
+        if !path.exists() {
+            std::fs::write(&path, &bytes).map_err(|e| format!("write image: {e}"))?;
+            return Ok(format!("{PASTED_SUBDIR}/{candidate}"));
+        }
+        candidate = format!("{stem}-{counter}.{ext}");
+        counter += 1;
+        if counter > 9999 {
+            return Err("could not find a unique filename after 9999 attempts".into());
+        }
+    }
+}
+
+/// Rasterise `svg` to RGBA at `scale`× and put the resulting bitmap on
+/// the OS clipboard via `tauri-plugin-clipboard-manager`.
+///
+/// Why Rust-side: WKWebView taints any `<canvas>` an SVG `<img>` is
+/// drawn into (`getImageData` / `toBlob` throw `SecurityError`). resvg
+/// has no such hang-up — it parses the SVG and renders to pixels via
+/// tiny-skia, then we hand those bytes to the clipboard plugin.
+#[tauri::command]
+async fn markdown_copy_svg_as_png(
+    app: tauri::AppHandle,
+    svg: String,
+    scale: f32,
+) -> Result<(), String> {
+    use tauri::image::Image as TauriImage;
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let rgba = tokio::task::spawn_blocking(move || rasterise_svg(&svg, scale))
+        .await
+        .map_err(|e| format!("rasterise task panicked: {e}"))??;
+    let image = TauriImage::new(&rgba.rgba, rgba.width, rgba.height);
+    app.clipboard()
+        .write_image(&image)
+        .map_err(|e| format!("clipboard write_image: {e}"))?;
+    Ok(())
+}
+
+struct RasterisedImage {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+fn rasterise_svg(svg: &str, scale: f32) -> Result<RasterisedImage, String> {
+    let mut opts = resvg::usvg::Options::default();
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    opts.fontdb = std::sync::Arc::new(fontdb);
+
+    let tree = resvg::usvg::Tree::from_str(svg, &opts)
+        .map_err(|e| format!("parse svg: {e}"))?;
+    let size = tree.size();
+    let scale = scale.max(0.1);
+    let width = ((size.width() as f32) * scale).ceil().max(1.0) as u32;
+    let height = ((size.height() as f32) * scale).ceil().max(1.0) as u32;
+
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| format!("tiny_skia pixmap {width}x{height} alloc failed"))?;
+    pixmap.fill(resvg::tiny_skia::Color::WHITE);
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    Ok(RasterisedImage {
+        rgba: pixmap.take(),
+        width,
+        height,
+    })
+}
+
 /// A single entry returned by `list_directory`. `is_ignored` is true
 /// when the entry would be excluded by `.gitignore` / `.git/info/exclude`
 /// / the global gitignore — the frontend still receives the entry, but
@@ -2663,6 +2817,13 @@ pub fn run() {
         // the accelerator itself happens in the `.setup()` block below
         // once we have an `AppHandle` to clone into the callback.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // Clipboard image / text writes — used by the markdown editor
+        // mermaid widget's "Copy as PNG" action, which rasterises an
+        // SVG via `resvg` on the Rust side and pushes the bitmap
+        // straight onto the OS clipboard.  Webview-side `<canvas>`
+        // taints when an SVG is drawn into it on WKWebView, so going
+        // through the native plugin is the only reliable path.
+        .plugin(tauri_plugin_clipboard_manager::init())
         // ⌘Q on macOS routes through our custom "Close Window" menu
         // item (id `FLOWSTATE_CLOSE_WINDOW_MENU_ID`) installed in the
         // setup block below. Translate that menu click into
@@ -3736,6 +3897,9 @@ pub fn run() {
                         list_directory,
                         read_project_file,
                         write_project_file,
+                        write_project_file_bytes,
+                        markdown_save_pasted_image,
+                        markdown_copy_svg_as_png,
                         create_project_file,
                         create_project_dir,
                         rename_project_path,

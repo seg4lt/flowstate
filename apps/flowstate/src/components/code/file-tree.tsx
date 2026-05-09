@@ -83,6 +83,22 @@ const TREE_DRAG_MIME = "application/x-flowstate-tree";
 let draggedSourcePath: string | null = null;
 
 /**
+ * Pointer coords at `dragstart`, used by the root drop zone to gate
+ * "click + release without moving" sequences. WebKit will fire a
+ * dragstart → dragend pair from a tiny mousedown/up that the user
+ * intended as a click; without a movement check the bubbled drop
+ * lands at the project root and silently moves the file there.
+ *
+ * Cleared on `dragend` together with `draggedSourcePath`.
+ */
+let dragStartCoords: { x: number; y: number } | null = null;
+
+/** Squared minimum-movement threshold (px²) before the root drop
+ *  zone considers a drag "real". 6 px in any direction. Keeps a
+ *  no-intent click + release from accidentally moving a file. */
+const ROOT_DROP_MIN_MOVE_PX_SQ = 6 * 6;
+
+/**
  * Predicate: would moving `source` into `targetDir` be a meaningful,
  * legal operation? Used to gate the drop-target highlight so the user
  * only sees a glow on rows where letting go will actually do
@@ -268,18 +284,137 @@ export function FileTree({
     onPathRenamed,
   };
 
+  // Mount the auto-scroll behaviour against whatever scroll container
+  // hosts this tree. The hook walks up from the wrapper to find the
+  // nearest scrollable ancestor on each drag — letting any layout
+  // (e.g. a future fullscreen or popout) work without wiring.
+  const wrapperRef = React.useRef<HTMLDivElement | null>(null);
+  useDragAutoScroll(wrapperRef);
+
   return (
-    <FileTreeContext.Provider value={ctx}>
-      <RootDropZone>
-        <ul role="tree" className="py-1">
-          {editing?.kind === "create" && editing.parentDir === "" ? (
-            <CreatePlaceholder parentDir="" indentDepth={0} />
-          ) : null}
-          <DirectoryChildren parentPath="" depth={0} />
-        </ul>
-      </RootDropZone>
-    </FileTreeContext.Provider>
+    <div ref={wrapperRef} className="contents">
+      <FileTreeContext.Provider value={ctx}>
+        <RootDropZone>
+          <ul role="tree" className="py-1">
+            {editing?.kind === "create" && editing.parentDir === "" ? (
+              <CreatePlaceholder parentDir="" indentDepth={0} />
+            ) : null}
+            <DirectoryChildren parentPath="" depth={0} />
+          </ul>
+        </RootDropZone>
+      </FileTreeContext.Provider>
+    </div>
   );
+}
+
+/**
+ * While a tree drag is in flight, scroll the tree's nearest scrollable
+ * ancestor when the cursor approaches the top or bottom edge. Without
+ * this, large trees become un-droppable past the viewport — the user
+ * can see the destination folder above the fold but has no way to
+ * bring it into the viewport with a held drag.
+ *
+ * Implementation:
+ *   - Listen for `dragover` on `window`. The event fires on whatever
+ *     element the cursor is currently over, including non-droppable
+ *     ones, which is exactly what we want for edge detection.
+ *   - Compute the cursor's distance from the scroller's top/bottom.
+ *     Inside an `EDGE` band, set a target velocity proportional to
+ *     how deep the cursor is into the band; outside, velocity is 0.
+ *   - rAF loop applies the velocity until either the cursor leaves
+ *     the band or the drag ends. Velocity is clamped at `MAX_SPEED`
+ *     so reaching the bottom of a 50k-file tree is fast but not
+ *     teleport-fast.
+ *
+ * Only fires while `draggedSourcePath` is non-null so external drags
+ * (e.g. dragging a file from Finder) don't twitch the tree.
+ */
+function useDragAutoScroll(wrapperRef: React.RefObject<HTMLDivElement | null>) {
+  React.useEffect(() => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    let scroller: HTMLElement | null = null;
+    let raf: number | null = null;
+    let velocityY = 0;
+    const EDGE = 36;
+    const MAX_SPEED = 14;
+
+    const findScroller = (): HTMLElement | null => {
+      // Walk up from the wrapper. The first element that has a
+      // scrollable overflow setting and a clipped height wins.
+      let node: HTMLElement | null = wrapper.parentElement;
+      while (node && node !== document.body) {
+        const style = window.getComputedStyle(node);
+        const overflowY = style.overflowY;
+        if (
+          (overflowY === "auto" || overflowY === "scroll") &&
+          node.scrollHeight > node.clientHeight
+        ) {
+          return node;
+        }
+        node = node.parentElement;
+      }
+      return null;
+    };
+
+    const tick = () => {
+      raf = null;
+      if (!draggedSourcePath || velocityY === 0 || !scroller) return;
+      scroller.scrollTop += velocityY;
+      raf = requestAnimationFrame(tick);
+    };
+
+    const onMove = (e: DragEvent) => {
+      if (!draggedSourcePath) {
+        velocityY = 0;
+        return;
+      }
+      // Resolve the scroller lazily — the parent layout can change
+      // between the FileTree's mount and the first drag (e.g. tree
+      // collapse / expand).
+      if (!scroller || !scroller.isConnected) {
+        scroller = findScroller();
+        if (!scroller) return;
+      }
+      const rect = scroller.getBoundingClientRect();
+      const fromTop = e.clientY - rect.top;
+      const fromBottom = rect.bottom - e.clientY;
+      let next = 0;
+      if (fromTop >= 0 && fromTop < EDGE) {
+        next = -Math.round(((EDGE - fromTop) / EDGE) * MAX_SPEED);
+      } else if (fromBottom >= 0 && fromBottom < EDGE) {
+        next = Math.round(((EDGE - fromBottom) / EDGE) * MAX_SPEED);
+      }
+      velocityY = next;
+      if (velocityY !== 0 && raf === null) {
+        raf = requestAnimationFrame(tick);
+      }
+    };
+
+    const stop = () => {
+      velocityY = 0;
+      if (raf !== null) {
+        cancelAnimationFrame(raf);
+        raf = null;
+      }
+    };
+
+    // CAPTURE PHASE is critical here. The folder/file row handlers
+    // call `stopPropagation()` on dragover (so the root drop zone
+    // doesn't double-highlight), which kills bubble-phase listeners.
+    // Capture-phase listeners run BEFORE any element handler can
+    // intervene, so we always see the cursor regardless of how the
+    // tree's own row handlers route the event.
+    window.addEventListener("dragover", onMove, { capture: true });
+    window.addEventListener("dragend", stop, { capture: true });
+    window.addEventListener("drop", stop, { capture: true });
+    return () => {
+      window.removeEventListener("dragover", onMove, { capture: true });
+      window.removeEventListener("dragend", stop, { capture: true });
+      window.removeEventListener("drop", stop, { capture: true });
+      if (raf !== null) cancelAnimationFrame(raf);
+    };
+  }, [wrapperRef]);
 }
 
 /**
@@ -315,6 +450,18 @@ function RootDropZone({ children }: { children: React.ReactNode }) {
     const src =
       draggedSourcePath ?? e.dataTransfer.getData(TREE_DRAG_MIME) ?? "";
     if (!src || !canDropInto(src, "")) return;
+    // Movement gate: a click + release without dragging produces a
+    // dragstart → dragend pair where the cursor never moved. Without
+    // this guard the drop bubbles up to the root and the file gets
+    // silently relocated to the project root. Require a few pixels
+    // of movement before the root accepts the drop. Folder rows
+    // don't need this guard — they only fire `drop` after the user
+    // actively crossed onto them, so we can trust that signal.
+    if (dragStartCoords) {
+      const dx = e.clientX - dragStartCoords.x;
+      const dy = e.clientY - dragStartCoords.y;
+      if (dx * dx + dy * dy < ROOT_DROP_MIN_MOVE_PX_SQ) return;
+    }
     try {
       const newPath = await moveProjectPath(ctx.projectPath, src, "");
       ctx.invalidateDir("");
@@ -475,6 +622,10 @@ const TreeRow = React.memo(function TreeRow({
     if (isRenaming) return;
     e.stopPropagation();
     draggedSourcePath = fullPath;
+    // Record the pointer's start coords so the root drop zone can
+    // tell "user dragged across the tree" from "user clicked and
+    // released without moving" (the latter must be a no-op).
+    dragStartCoords = { x: e.clientX, y: e.clientY };
     e.dataTransfer.effectAllowed = "move";
     try {
       e.dataTransfer.setData(TREE_DRAG_MIME, fullPath);
@@ -488,6 +639,7 @@ const TreeRow = React.memo(function TreeRow({
   };
   const onDragEnd = () => {
     draggedSourcePath = null;
+    dragStartCoords = null;
   };
 
   // ─── Drop target (folders only) ───────────────────────────────
@@ -501,31 +653,61 @@ const TreeRow = React.memo(function TreeRow({
   const targetDir = entry.isDir ? fullPath : null;
 
   const onDragEnter = (e: React.DragEvent) => {
-    if (!targetDir) return;
+    // File rows: accept the dragover so the drop event fires HERE
+    // instead of bubbling up to RootDropZone (which would otherwise
+    // treat any drop near the source as "move to root"). The drop
+    // handler below treats file-row drops as no-ops + stopPropagation.
+    if (!targetDir) {
+      if (!draggedSourcePath) return;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (!draggedSourcePath || !canDropInto(draggedSourcePath, targetDir)) {
       return;
     }
     e.preventDefault();
+    // Stop the enter event from bubbling to RootDropZone — otherwise
+    // both this folder row AND the root highlight light up at once,
+    // making it ambiguous where the drop will actually land.
+    e.stopPropagation();
     dragDepth.current += 1;
     setDragOver(true);
   };
   const onDragOver = (e: React.DragEvent) => {
-    if (!targetDir) return;
+    if (!targetDir) {
+      if (!draggedSourcePath) return;
+      // Same swallow contract as onDragEnter: keep the drop here so
+      // it doesn't bubble to root.
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer.dropEffect = "none";
+      return;
+    }
     if (!draggedSourcePath || !canDropInto(draggedSourcePath, targetDir)) {
       return;
     }
     e.preventDefault();
+    e.stopPropagation();
     e.dataTransfer.dropEffect = "move";
   };
-  const onDragLeave = () => {
+  const onDragLeave = (e: React.DragEvent) => {
     if (!targetDir) return;
+    e.stopPropagation();
     dragDepth.current = Math.max(0, dragDepth.current - 1);
     if (dragDepth.current === 0) setDragOver(false);
   };
   const onDrop = async (e: React.DragEvent) => {
-    if (!targetDir) return;
+    // Always swallow drops landing on a row — even non-folder rows —
+    // so RootDropZone never sees a drop it shouldn't act on. Without
+    // this swallow, dropping back onto the source row bubbles up and
+    // (for nested files) silently moves the file to the root.
     e.preventDefault();
     e.stopPropagation();
+    if (!targetDir) {
+      // File row: nothing to do.
+      return;
+    }
     dragDepth.current = 0;
     setDragOver(false);
     const src =

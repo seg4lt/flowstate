@@ -1214,6 +1214,22 @@ export function writeProjectFile(
   return invoke<void>("write_project_file", { path, file, contents });
 }
 
+// Binary-safe sibling of `writeProjectFile`. Used by the Excalidraw
+// editor when saving `.excalidraw.png` (the embedded scene + raster
+// pixel data is binary and would corrupt under UTF-8 round-trip).
+// Same parent-canonicalisation guard as the text version.
+export function writeProjectFileBytes(
+  path: string,
+  file: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  return invoke<void>("write_project_file_bytes", {
+    path,
+    file,
+    bytes: Array.from(bytes),
+  });
+}
+
 export interface BlockLine {
   // 1-based line number, matching ripgrep / editor convention.
   line: number;

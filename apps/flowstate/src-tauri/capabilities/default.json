@@ -9,6 +9,8 @@
     "core:path:default",
     "core:webview:default",
     "core:webview:allow-set-webview-zoom",
+    "clipboard-manager:allow-write-text",
+    "clipboard-manager:allow-write-image",
     "core:window:default",
     "core:window:allow-set-badge-count",
     "core:window:allow-start-dragging",

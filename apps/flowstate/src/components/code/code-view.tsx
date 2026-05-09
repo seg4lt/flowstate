@@ -36,10 +36,17 @@ import {
   searchFileContents,
   stopContentSearch,
   writeProjectFile,
+  writeProjectFileBytes,
   type ContentBlock,
   type ContentSearchOptions,
 } from "@/lib/api";
-import { projectFilesQueryOptions } from "@/lib/queries";
+import {
+  directoryQueryOptions,
+  projectFilesQueryOptions,
+} from "@/lib/queries";
+import { getEditorKind } from "@/lib/language-from-path";
+import { dirname, normalizePath } from "@/lib/paths";
+import { openUrl as openExternal } from "@tauri-apps/plugin-opener";
 import {
   matchesPickerQuery,
   parsePickerQuery,
@@ -68,6 +75,18 @@ import { useEnsurePierrePoolActive } from "@/lib/pierre-pool-controller";
 // in the bundle on first file open. The `Suspense` fallback in
 // `CodeViewBody` covers the brief load gap.
 const LazyCodeEditor = React.lazy(() => import("./code-editor"));
+// Sibling rich-edit chunks for `.md*` and `.excalidraw.*` files. Each
+// is loaded lazily on first encounter — markdown pulls in mermaid
+// (~few MB) the first time the user opens a `.md`, and the
+// excalidraw editor pulls in `@excalidraw/excalidraw` (~3 MB) on the
+// first drawing open. Files that never trigger these chunks pay zero
+// bundle cost.
+const LazyMarkdownEditor = React.lazy(
+  () => import("../markdown/markdown-editor"),
+);
+const LazyExcalidrawEditor = React.lazy(
+  () => import("../markdown/excalidraw-editor"),
+);
 
 // Frontend-side max size for inline editing. The Rust read API
 // caps at 4 MiB (CODE_VIEW_MAX_FILE_BYTES) so files above that
@@ -1042,12 +1061,20 @@ export function CodeView(props: CodeViewProps) {
   // is a cheap dispatch on every keystroke that crosses the
   // saved/unsaved boundary.
   const handleSaveFile = React.useCallback(
-    async (path: string, pane: PaneIndex, contents: string): Promise<void> => {
+    async (
+      path: string,
+      pane: PaneIndex,
+      contents: string | Uint8Array,
+    ): Promise<void> => {
       if (!projectPath) {
         throw new Error("no project");
       }
       try {
-        await writeProjectFile(projectPath, path, contents);
+        if (typeof contents === "string") {
+          await writeProjectFile(projectPath, path, contents);
+        } else {
+          await writeProjectFileBytes(projectPath, path, contents);
+        }
       } catch (err) {
         toast({
           title: "Save failed",
@@ -1057,14 +1084,20 @@ export function CodeView(props: CodeViewProps) {
         throw err;
       }
       // Re-baseline the file cache so reopening this tab uses the
-      // new content (no re-fetch, no flash of stale text). Bump the
-      // cacheKey via hashContent so any future @pierre/diffs LRU
-      // (still used for diffs) re-keys cleanly.
-      fileCacheRef.current.set(path, {
-        path,
-        contents,
-        cacheKey: `${path}::${hashContent(contents)}`,
-      });
+      // new content (no re-fetch, no flash of stale text). For
+      // binary saves we don't keep the bytes in the text cache —
+      // the next open re-reads via the asset protocol.
+      if (typeof contents === "string") {
+        fileCacheRef.current.set(path, {
+          path,
+          contents,
+          cacheKey: `${path}::${hashContent(contents)}`,
+        });
+      } else {
+        // Binary: invalidate any stale text cache entry so the next
+        // open re-fetches via the excalidraw asset-protocol path.
+        fileCacheRef.current.delete(path);
+      }
       tabs.setTabDirty(path, pane, false);
       setCacheVersion((v) => v + 1);
     },
@@ -1076,6 +1109,85 @@ export function CodeView(props: CodeViewProps) {
       tabs.setTabDirty(path, pane, dirty);
     },
     [tabs],
+  );
+
+  // ── markdown editor: link follow + image-paste cache invalidation ──
+  //
+  // Cmd+click on a `[label](./README.md)` calls `onLinkOpen(url)`,
+  // which routes here. We resolve the URL into either:
+  //   - an external open via `tauri-plugin-opener` (http/https), or
+  //   - a project-relative path that we re-open as a tab.
+  //
+  // Wikilinks (`[[Note]]`) are intentionally NOT routed here — per the
+  // locked decision, they're a visual-only decoration. Cmd+click on
+  // a wikilink is a no-op.
+  const handleOpenLink = React.useCallback(
+    (url: string) => {
+      const trimmed = url.trim();
+      if (!trimmed) return;
+      if (/^(https?|mailto):/i.test(trimmed)) {
+        void openExternal(trimmed).catch((err: unknown) => {
+          console.warn("[markdown] open external failed", err);
+        });
+        return;
+      }
+      if (!projectPath) return;
+      // Compute the project-relative path. Anchor against the
+      // currently-focused tab's directory so `./foo.md` resolves
+      // sensibly.
+      const focused = layout.panes[layout.focusedPaneIndex] ?? layout.panes[0];
+      const activePath = focused?.activePath ?? null;
+      const docDir = activePath ? dirname(activePath) : "";
+      let relPath: string;
+      if (trimmed.startsWith("/")) {
+        // Absolute — strip projectPath if it's a prefix.
+        if (trimmed.startsWith(projectPath)) {
+          relPath = trimmed.slice(projectPath.length).replace(/^\/+/, "");
+        } else {
+          // Not in this project — bail.
+          return;
+        }
+      } else {
+        relPath = normalizePath(docDir ? `${docDir}/${trimmed}` : trimmed);
+      }
+      tabs.openFile(relPath);
+    },
+    [projectPath, layout, tabs],
+  );
+
+  // After the markdown editor saves a pasted image, invalidate the
+  // queries that drive the file tree and the link autocomplete so
+  // the new file shows up immediately. We invalidate three keys:
+  //   1. The doc's parent directory (so a freshly-created `pasted/`
+  //      subfolder appears).
+  //   2. The `pasted/` listing under the doc dir (so the new file
+  //      shows up if the user already has it expanded).
+  //   3. The whole project file index (autocomplete + Cmd+P).
+  const handleImageSaved = React.useCallback(
+    (relPath: string) => {
+      if (!projectPath) return;
+      const focused = layout.panes[layout.focusedPaneIndex] ?? layout.panes[0];
+      const activePath = focused?.activePath ?? null;
+      const docDir = activePath ? dirname(activePath) : "";
+      const pastedDir = relPath.includes("/")
+        ? relPath.slice(0, relPath.lastIndexOf("/"))
+        : "";
+      const pastedSubpath = docDir
+        ? pastedDir
+          ? `${docDir}/${pastedDir}`
+          : docDir
+        : pastedDir;
+      void queryClient.invalidateQueries(
+        directoryQueryOptions(projectPath, docDir),
+      );
+      void queryClient.invalidateQueries(
+        directoryQueryOptions(projectPath, pastedSubpath),
+      );
+      void queryClient.invalidateQueries(
+        projectFilesQueryOptions(projectPath),
+      );
+    },
+    [projectPath, layout, queryClient],
   );
 
   // Wrap close-tab to gate on dirty state. In the steady state this
@@ -1574,6 +1686,9 @@ export function CodeView(props: CodeViewProps) {
                     gitModeEnabled={gitModeEnabled}
                     onSaveFile={handleSaveFile}
                     onDirtyChangeFile={handleDirtyChange}
+                    projectFiles={files}
+                    onOpenFile={handleOpenLink}
+                    onImageSaved={handleImageSaved}
                   />
                 }
                 second={
@@ -1603,6 +1718,9 @@ export function CodeView(props: CodeViewProps) {
                       gitModeEnabled={gitModeEnabled}
                       onSaveFile={handleSaveFile}
                       onDirtyChangeFile={handleDirtyChange}
+                      projectFiles={files}
+                      onOpenFile={handleOpenLink}
+                      onImageSaved={handleImageSaved}
                     />
                   ) : undefined
                 }
@@ -2086,10 +2204,25 @@ interface TabPaneViewProps {
   gitModeEnabled: boolean;
   /** Save handler — bubbles all the way up to CodeView's
    *  `handleSaveFile` which writes the file via Tauri and updates
-   *  the file cache + tab dirty bit. */
-  onSaveFile: (path: string, pane: PaneIndex, contents: string) => Promise<void>;
+   *  the file cache + tab dirty bit. Accepts string for the regular
+   *  editors and `Uint8Array` for the excalidraw binary path. */
+  onSaveFile: (
+    path: string,
+    pane: PaneIndex,
+    contents: string | Uint8Array,
+  ) => Promise<void>;
   /** Dirty-bit handler — bubbles up to `tabs.setTabDirty`. */
   onDirtyChangeFile: (path: string, pane: PaneIndex, dirty: boolean) => void;
+  /** Project file index, surfaced into the markdown editor's link
+   *  autocomplete. */
+  projectFiles: readonly string[];
+  /** Open a project-relative file in a new tab in this pane. Used by
+   *  Cmd+click on `[label](./README.md)` inside the markdown editor. */
+  onOpenFile: (relPath: string) => void;
+  /** Fired after an image was just pasted + saved next to the open
+   *  document. The host invalidates the file-tree query so the new
+   *  file shows up immediately in the sidebar. */
+  onImageSaved?: (relPath: string) => void;
 }
 
 function TabPaneView({
@@ -2114,6 +2247,9 @@ function TabPaneView({
   gitModeEnabled,
   onSaveFile,
   onDirtyChangeFile,
+  projectFiles,
+  onOpenFile,
+  onImageSaved,
 }: TabPaneViewProps) {
   const activePath = pane.activePath;
   const loadedFile =
@@ -2127,7 +2263,8 @@ function TabPaneView({
   // Bind the save / dirty callbacks to this pane's index so the
   // editor can stay generic (it doesn't know which pane it lives in).
   const handleSave = React.useCallback(
-    (contents: string) => onSaveFile(activePath ?? "", paneIndex, contents),
+    (contents: string | Uint8Array) =>
+      onSaveFile(activePath ?? "", paneIndex, contents),
     [onSaveFile, activePath, paneIndex],
   );
   const handleDirty = React.useCallback(
@@ -2178,8 +2315,11 @@ function TabPaneView({
           sessionId={sessionId}
           vimEnabled={vimEnabled}
           gitModeEnabled={gitModeEnabled}
+          projectFiles={projectFiles}
           onSave={handleSave}
           onDirtyChange={handleDirty}
+          onOpenFile={onOpenFile}
+          onImageSaved={onImageSaved}
         />
       </div>
     </div>
@@ -2201,8 +2341,22 @@ interface CodeViewBodyProps {
   sessionId: string | null;
   vimEnabled: boolean;
   gitModeEnabled: boolean;
-  onSave: (contents: string) => Promise<void>;
+  /** Project file index — fed into the markdown editor's link-path
+   *  autocomplete so suggestions come from the same source the
+   *  Cmd+P picker uses. */
+  projectFiles: readonly string[];
+  /** Save handler. Accepts a string for the code/markdown editors
+   *  and a `Uint8Array` for the excalidraw binary `.png` path. The
+   *  host (`handleSaveFile`) dispatches to `writeProjectFile` or
+   *  `writeProjectFileBytes` based on which arm comes through. */
+  onSave: (contents: string | Uint8Array) => Promise<void>;
   onDirtyChange: (dirty: boolean) => void;
+  /** Markdown-specific: open a project-relative file in a new tab.
+   *  Used by Cmd+click on `[label](./README.md)` and similar. */
+  onOpenFile: (relPath: string) => void;
+  /** Markdown-specific: invalidate caches after a clipboard image
+   *  was just saved next to the open document. */
+  onImageSaved?: (relPath: string) => void;
 }
 
 const CodeViewBody = React.memo(function CodeViewBody({
@@ -2216,10 +2370,17 @@ const CodeViewBody = React.memo(function CodeViewBody({
   sessionId,
   vimEnabled,
   gitModeEnabled,
+  projectFiles,
   onSave,
   onDirtyChange,
+  onOpenFile,
+  onImageSaved,
 }: CodeViewBodyProps) {
   const { resolvedTheme } = useTheme();
+  // Editor-kind dispatch is keyed off the *current* path so a tab
+  // switch from `notes.md` → `foo.ts` flips between the markdown and
+  // code editors via the Suspense + key remount below.
+  const editorKind = path ? getEditorKind(path) : "code";
   if (!hasProject) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-muted-foreground">
@@ -2264,10 +2425,13 @@ const CodeViewBody = React.memo(function CodeViewBody({
     );
   }
   // Files larger than the editable cap get a static banner instead
-  // of CM6. The 4 MiB Rust read cap is the binding constraint today,
-  // but this protects against future code paths that might surface
-  // larger buffers.
-  if (loadedFile.contents.length > MAX_EDITABLE_BYTES) {
+  // of CM6 — but excalidraw `.png` files routinely exceed the cap
+  // (the embedded scene + raster bytes adds up fast) and we still
+  // want them editable. Skip the cap for that arm.
+  if (
+    editorKind !== "excalidraw" &&
+    loadedFile.contents.length > MAX_EDITABLE_BYTES
+  ) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-muted-foreground">
         File is too large to edit inline (
@@ -2313,18 +2477,52 @@ const CodeViewBody = React.memo(function CodeViewBody({
             </div>
           }
         >
-          <LazyCodeEditor
-            key={loadedFile.path}
-            path={loadedFile.path}
-            initialContent={loadedFile.contents}
-            theme={resolvedTheme}
-            vimEnabled={vimEnabled}
-            gitModeEnabled={gitModeEnabled}
-            projectPath={projectPath}
-            sessionId={sessionId}
-            onSave={onSave}
-            onDirtyChange={onDirtyChange}
-          />
+          {editorKind === "markdown" ? (
+            <LazyMarkdownEditor
+              key={loadedFile.path}
+              path={loadedFile.path}
+              projectPath={projectPath}
+              initialContent={loadedFile.contents}
+              theme={resolvedTheme}
+              vimEnabled={vimEnabled}
+              projectFiles={projectFiles}
+              onSave={onSave}
+              onDirtyChange={onDirtyChange}
+              onLinkOpen={onOpenFile}
+              onImageSaved={onImageSaved}
+            />
+          ) : editorKind === "excalidraw" ? (
+            <LazyExcalidrawEditor
+              key={loadedFile.path}
+              path={
+                projectPath
+                  ? `${projectPath}/${loadedFile.path}`
+                  : loadedFile.path
+              }
+              theme={resolvedTheme}
+              onSave={(data) => {
+                // Both arms route through the unified `onSave`;
+                // host-side `handleSaveFile` dispatches `string` to
+                // `writeProjectFile` and `Uint8Array` to
+                // `writeProjectFileBytes`.
+                void onSave(data);
+              }}
+              onDirty={() => onDirtyChange(true)}
+            />
+          ) : (
+            <LazyCodeEditor
+              key={loadedFile.path}
+              path={loadedFile.path}
+              initialContent={loadedFile.contents}
+              theme={resolvedTheme}
+              vimEnabled={vimEnabled}
+              gitModeEnabled={gitModeEnabled}
+              projectPath={projectPath}
+              sessionId={sessionId}
+              onSave={onSave}
+              onDirtyChange={onDirtyChange}
+            />
+          )}
         </React.Suspense>
       </DiffCommentOverlay>
     </div>
