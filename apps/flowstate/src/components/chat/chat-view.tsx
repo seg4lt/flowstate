@@ -310,40 +310,76 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     return q ?? null;
   }, [state.pendingQuestionBySession, sessionId]);
   const effortStorageKey = `flowstate:effort:${sessionId}`;
-  const [effort, setEffortState] = React.useState<ReasoningEffort>(
-    () =>
-      (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high",
+  const thinkingModeStorageKey = `flowstate:thinkingMode:${sessionId}`;
+  const permissionStorageKey = `flowstate:permissionMode:${sessionId}`;
+
+  // Per-session composer state lives in Maps keyed by sessionId
+  // rather than scalar useStates with a layout-effect reset on
+  // sessionId change. Why:
+  //
+  //   * The previous design held three scalar useStates and a
+  //     `useLayoutEffect(... [sessionId, ...])` that synchronously
+  //     read three sessionStorage keys, fired three setStates, and
+  //     dispatched into the app store *before paint* on every
+  //     thread click. On big threads the cascade those setStates
+  //     trigger (TurnView / MessageList / Virtuoso re-evaluations
+  //     under the layout effect) was the dominant warm-cache lag.
+  //
+  //   * With Maps, the rendered value is `map.get(sessionId) ??
+  //     fallback` — derived inline, no reset effect, no extra paint.
+  //     Switching threads is a pure React-Query cache lookup plus a
+  //     Map.get on the composer state.
+  //
+  // First-read fallback: when a sessionId hasn't been written to the
+  // map yet (never-visited-this-mount), we fall back to
+  // sessionStorage and then to the hard-coded default. sessionStorage
+  // is a synchronous in-memory map — the lookup is essentially free.
+  // The "never visited" signal that downstream effects (defaults
+  // hydration, turn-history restore) rely on remains intact: those
+  // effects still probe `sessionStorage.getItem(...)` directly, and
+  // the map-write only happens when the user (or one of those
+  // effects) explicitly commits a value via `setPermissionMode` /
+  // `setEffort` / `setThinkingMode`.
+  type EffortMap = Map<string, ReasoningEffort>;
+  type ThinkingModeMap = Map<string, ThinkingMode>;
+  type PermissionModeMap = Map<string, PermissionMode>;
+  const [localEffortMap, setLocalEffortMap] = React.useState<EffortMap>(
+    () => new Map(),
   );
+  const [localThinkingModeMap, setLocalThinkingModeMap] =
+    React.useState<ThinkingModeMap>(() => new Map());
+  const [localPermissionModeMap, setLocalPermissionModeMap] =
+    React.useState<PermissionModeMap>(() => new Map());
+
+  const effort: ReasoningEffort =
+    localEffortMap.get(sessionId) ??
+    ((sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high");
   // Per-thread thinking-mode toggle. Default = "always" mirrors the
   // bridge default: restores the pre-`11232b3` deterministic reasoning
   // behaviour. Users who prefer the SDK's adaptive non-determinism can
   // flip this per thread in the composer toolbar.
-  const thinkingModeStorageKey = `flowstate:thinkingMode:${sessionId}`;
-  const [thinkingMode, setThinkingModeState] = React.useState<ThinkingMode>(
-    () =>
-      (sessionStorage.getItem(thinkingModeStorageKey) as ThinkingMode) ??
-      "always",
-  );
-  const permissionStorageKey = `flowstate:permissionMode:${sessionId}`;
-  const [permissionMode, setPermissionModeState] =
-    React.useState<PermissionMode>(
-      () =>
-        (sessionStorage.getItem(permissionStorageKey) as PermissionMode) ??
-        "accept_edits",
-    );
+  const thinkingMode: ThinkingMode =
+    localThinkingModeMap.get(sessionId) ??
+    ((sessionStorage.getItem(thinkingModeStorageKey) as ThinkingMode) ??
+      "always");
+  const permissionMode: PermissionMode =
+    localPermissionModeMap.get(sessionId) ??
+    ((sessionStorage.getItem(permissionStorageKey) as PermissionMode) ??
+      "accept_edits");
 
-  // Committed setters — every explicit `setPermissionMode` /
-  // `setEffort` call persists to sessionStorage and (for mode) mirrors
-  // to the app-store so the sidebar stays in sync. The raw useState
-  // setters `setPermissionModeState` / `setEffortState` are reserved
-  // for the session-switch reset below: that re-initializes React
-  // state from the NEW session's sessionStorage, and must not write
-  // (writing would clobber the "never visited" signal that the
-  // fresh-thread-defaults and turn-history-restore effects rely on
-  // via their `if (sessionStorage.getItem(...)) return` guards).
+  // Committed setters — every explicit call persists to sessionStorage
+  // (cross-reload durability), updates the in-memory Map (drives the
+  // current render), and (for permissionMode) mirrors to the app-store
+  // + cross-window sync so the sidebar tint and the popout/main
+  // companion stay aligned.
   const setPermissionMode = React.useCallback(
     (mode: PermissionMode) => {
-      setPermissionModeState(mode);
+      setLocalPermissionModeMap((m) => {
+        if (m.get(sessionId) === mode) return m;
+        const next = new Map(m);
+        next.set(sessionId, mode);
+        return next;
+      });
       sessionStorage.setItem(permissionStorageKey, mode);
       dispatch({
         type: "set_session_permission_mode",
@@ -361,59 +397,47 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   );
   const setEffort = React.useCallback(
     (eff: ReasoningEffort) => {
-      setEffortState(eff);
+      setLocalEffortMap((m) => {
+        if (m.get(sessionId) === eff) return m;
+        const next = new Map(m);
+        next.set(sessionId, eff);
+        return next;
+      });
       sessionStorage.setItem(effortStorageKey, eff);
     },
-    [effortStorageKey],
+    [effortStorageKey, sessionId],
   );
   const setThinkingMode = React.useCallback(
-    (m: ThinkingMode) => {
-      setThinkingModeState(m);
-      sessionStorage.setItem(thinkingModeStorageKey, m);
+    (mode: ThinkingMode) => {
+      setLocalThinkingModeMap((m) => {
+        if (m.get(sessionId) === mode) return m;
+        const next = new Map(m);
+        next.set(sessionId, mode);
+        return next;
+      });
+      sessionStorage.setItem(thinkingModeStorageKey, mode);
     },
-    [thinkingModeStorageKey],
+    [thinkingModeStorageKey, sessionId],
   );
 
-  // Reset composer state when switching threads. `ChatView` doesn't
-  // remount on session-id change (see the sibling reset effect
-  // further down), so without this the `permissionMode` / `effort`
-  // React state leaks from the thread we just left — e.g. leaving
-  // thread A in `plan` mode and clicking into thread B would render
-  // thread B's composer badge as `plan` even though B had nothing to
-  // do with that choice. Re-reading sessionStorage here is
-  // equivalent to what the lazy useState initializer did on first
-  // mount; using the raw setters (not the committed ones) keeps
-  // sessionStorage untouched for the new session so the
-  // fresh-thread-defaults and turn-history-restore effects below can
-  // still detect a never-visited thread. `useLayoutEffect` runs
-  // synchronously before paint so there's no one-frame flash of the
-  // stale badge. The `dispatch` mirrors the resolved mode to the
-  // app-store so the sidebar tint matches the composer on every
-  // thread switch.
-  React.useLayoutEffect(() => {
-    const storedMode =
-      (sessionStorage.getItem(permissionStorageKey) as PermissionMode) ??
-      "accept_edits";
-    const storedEffort =
-      (sessionStorage.getItem(effortStorageKey) as ReasoningEffort) ?? "high";
-    const storedThinkingMode =
-      (sessionStorage.getItem(thinkingModeStorageKey) as ThinkingMode) ??
-      "always";
-    setPermissionModeState(storedMode);
-    setEffortState(storedEffort);
-    setThinkingModeState(storedThinkingMode);
+  // Mirror the resolved permissionMode for the active session into
+  // the app store so the sidebar tint always matches what the
+  // composer will display on the very next paint. Replaces the
+  // previous `useLayoutEffect`'s blocking dispatch — this runs
+  // *after* paint (regular `useEffect`), which means the new thread
+  // visibly lands first and the sidebar tint settles a frame later
+  // (imperceptible). Skipping the dispatch when the store already
+  // matches keeps re-renders out of the steady-state.
+  React.useEffect(() => {
+    if (state.permissionModeBySession.get(sessionId) === permissionMode) {
+      return;
+    }
     dispatch({
       type: "set_session_permission_mode",
       sessionId,
-      mode: storedMode,
+      mode: permissionMode,
     });
-  }, [
-    sessionId,
-    permissionStorageKey,
-    effortStorageKey,
-    thinkingModeStorageKey,
-    dispatch,
-  ]);
+  }, [sessionId, permissionMode, state.permissionModeBySession, dispatch]);
 
   // Load user-configured defaults from Settings for freshly-created
   // threads only. "Fresh" = session has loaded AND has zero turns yet
@@ -1831,6 +1855,15 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               onOpenAttachment={handleOpenPersistedAttachment}
               providerKind={sessionQuery.data?.detail.summary.provider}
               sessionModel={sessionQuery.data?.detail.summary.model}
+              // Cached last-turn snippet from the app store (loaded at
+              // boot, kept fresh by stream events). MessageList shows
+              // this in place of the spinner while `load_session` is
+              // in flight so cold-cache thread switches feel instant
+              // — the user sees content from the thread they clicked
+              // immediately, then the full transcript hydrates over it.
+              coldPreview={
+                state.sessionDisplay.get(sessionId)?.lastTurnPreview ?? null
+              }
             />
           </SessionProvider>
 

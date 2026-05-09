@@ -21,8 +21,16 @@ import type { SessionDetail } from "./types";
 // Pagination page size for session loads. Requesting the most
 // recent N turns on open keeps the round-trip small for long
 // threads; older turns load on demand when the user scrolls up.
-// Tuned to comfortably fill the viewport on a laptop display.
-export const SESSION_PAGE_SIZE = 50;
+//
+// Sized small enough that the cold-cache `load_session` round-trip
+// stays cheap even on threads with rich turn payloads (long
+// reasoning, big tool-call traces, many file changes). The "Load
+// older" affordance covers anything beyond the initial window in a
+// single follow-up RPC, so this is purely a first-paint budget — not
+// a cap on history. 20 fills a viewport on a laptop display while
+// roughly halving wire payload + Rust JSON deserialization cost vs.
+// the previous 50.
+export const SESSION_PAGE_SIZE = 20;
 
 export interface SessionPage {
   detail: SessionDetail;

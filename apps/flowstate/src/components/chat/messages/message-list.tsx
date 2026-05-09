@@ -42,6 +42,13 @@ interface MessageListProps {
    *  fallback when `turn.usage.model` hasn't been populated yet
    *  (happens mid-stream and on very old rows). */
   sessionModel?: string;
+  /** Cached preview of the most recent turn's output (from the app
+   *  store's `sessionDisplay` map). When the cold-cache load is in
+   *  flight we render this in place of the spinner so the user sees
+   *  *something* familiar from the thread the moment they click,
+   *  instead of a blank pane. Optional — old/empty threads have no
+   *  preview, in which case the loader falls back to the spinner. */
+  coldPreview?: string | null;
 }
 
 const PENDING_KEY = "__pending__";
@@ -106,6 +113,7 @@ export function MessageList({
   userSendTick,
   providerKind,
   sessionModel,
+  coldPreview,
 }: MessageListProps) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
@@ -163,17 +171,27 @@ export function MessageList({
     });
   }, [displayItems.length]);
 
-  // Jump to the latest message whenever the user navigates to a
-  // new thread. MessageList doesn't remount between sessions (that
-  // design decision is what makes re-visits render instantly), so
-  // Virtuoso's `initialTopMostItemIndex` — which only applies on
-  // mount — can't do this on its own. A ref-tracked sessionId
-  // drives the imperative scroll once the target session's items
-  // are actually in the list; without the length check the first
-  // render after a click would try to scroll an empty virtuoso
-  // and the call silently no-ops.
+  // Jump to the latest message on the *first* visit to each thread
+  // per app session. MessageList doesn't remount between sessions
+  // (that design decision is what makes re-visits render instantly),
+  // so Virtuoso's `initialTopMostItemIndex` — which only applies on
+  // mount — can't do this on its own. A Set-tracked sessionId drives
+  // the imperative scroll once the target session's items are
+  // actually in the list; without the length check the first render
+  // after a click would try to scroll an empty virtuoso and the call
+  // silently no-ops.
   //
-  // The ref is stamped with `sessionId` BEFORE the rAF (not inside
+  // Why a Set instead of a single "last sessionId" ref: with a single
+  // slot, A → B → A re-fired the scroll on A's revisit, forcing
+  // Virtuoso to re-measure the entire (potentially huge) list — the
+  // dominant warm-cache lag on big threads. A Set makes the scroll
+  // a one-shot per session: revisits keep whatever scroll position
+  // Virtuoso already has, which is what re-renders intend anyway
+  // (the active session's cache already grew via setQueryData while
+  // the user was on another thread; we don't need to nudge them
+  // anywhere).
+  //
+  // The Set is stamped with `sessionId` BEFORE the rAF (not inside
   // its callback). Stamping after meant any unrelated re-render
   // landing in the same frame — `welcome` / `hydrate_display`
   // arriving mid-boot, an `useApp()` context value change, the
@@ -182,14 +200,14 @@ export function MessageList({
   // next pass would re-schedule it, and a long enough cancel/
   // reschedule chain meant the scroll never actually landed and
   // the user was stranded with the "Jump to latest" pill visible.
-  // Marking up front bails subsequent re-runs at the ref check;
+  // Marking up front bails subsequent re-runs at the Set check;
   // the rAF still runs against the live Virtuoso and the cleanup
   // only matters when the session itself changes between frames.
-  const scrolledForSessionRef = React.useRef<string | null>(null);
+  const scrolledSessionsRef = React.useRef<Set<string>>(new Set());
   React.useEffect(() => {
     if (displayItems.length === 0) return;
-    if (scrolledForSessionRef.current === sessionId) return;
-    scrolledForSessionRef.current = sessionId;
+    if (scrolledSessionsRef.current.has(sessionId)) return;
+    scrolledSessionsRef.current.add(sessionId);
     // Defer one frame so Virtuoso has a chance to measure the
     // items that just arrived. Without the frame the scrollToIndex
     // call fires before layout and gets dropped.
@@ -240,9 +258,32 @@ export function MessageList({
   return (
     <div className="relative min-h-0 min-w-0 flex-1">
       {showColdLoader && (
-        <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center text-xs text-muted-foreground">
-          <Loader2 className="mr-2 h-3 w-3 animate-spin" />
-          Loading thread…
+        // Anchored to the bottom (where the latest turn will appear)
+        // so the preview occupies roughly the same screen position the
+        // real content will when it lands — minimises perceived layout
+        // jump. `coldPreview` comes from the app-store's
+        // `sessionDisplay.lastTurnPreview` cache that's already loaded
+        // at app boot; rendering it instead of a centred spinner makes
+        // the click *feel* immediate even when `load_session` is still
+        // in flight. Old/empty threads with no preview fall back to
+        // the centred spinner unchanged.
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex flex-col items-center px-6 pb-6">
+          {coldPreview ? (
+            <div className="w-full max-w-3xl rounded-md border border-dashed border-border/60 bg-background/40 px-4 py-3 text-sm text-muted-foreground">
+              <div className="mb-1 flex items-center gap-2 text-[11px] uppercase tracking-wide text-muted-foreground/70">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                Loading thread…
+              </div>
+              <p className="line-clamp-3 whitespace-pre-wrap break-words">
+                {coldPreview}
+              </p>
+            </div>
+          ) : (
+            <div className="flex items-center text-xs text-muted-foreground">
+              <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+              Loading thread…
+            </div>
+          )}
         </div>
       )}
       {hiddenOlderCount > 0 && !showColdLoader && (

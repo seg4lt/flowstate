@@ -99,14 +99,24 @@ export function ThreadItem({
   // baseline for default / accept_edits), which matches what the
   // WorkingIndicator would show.
   const spinnerTone = toneForMode(state.permissionModeBySession.get(sessionId));
-  // Hover prefetch: warm the session cache the moment the pointer
-  // enters this row so the click itself only has to consume cached
-  // data. A few hundred ms of hover — normal human targeting time —
-  // is usually enough to cover the full `load_session` round-trip.
+  // Prefetch the session cache on the *earliest* signal the user is
+  // about to land here:
+  //   - onMouseEnter:   pointer hover is the most common case; a
+  //                     few hundred ms of hover usually covers the
+  //                     `load_session` round-trip.
+  //   - onFocus:        keyboard nav (Tab / arrow keys through the
+  //                     sidebar) never fires mouseenter, so without
+  //                     this branch keyboard users always pay full
+  //                     cold-cache cost on Enter.
+  //   - onPointerDown:  fast clicks where the cursor enters the row
+  //                     and presses inside one frame — mouseenter
+  //                     and mousedown can fire in the same tick, so
+  //                     a worst-case pointer-down still gives the
+  //                     prefetch a head start over the click itself.
   // tanstack query dedupes repeated prefetches and skips entirely
-  // when the cache is already warm, so this is a no-op on
-  // re-entry or on the active thread.
-  const handleMouseEnter = React.useCallback(() => {
+  // when the cache is already warm, so this is a no-op on re-entry
+  // or on the active thread.
+  const handlePrefetch = React.useCallback(() => {
     prefetchSession(queryClient, sessionId);
   }, [queryClient, sessionId]);
 
@@ -132,7 +142,9 @@ export function ThreadItem({
   return (
     <SidebarMenuSubItem
       className="group/thread -mr-6"
-      onMouseEnter={handleMouseEnter}
+      onMouseEnter={handlePrefetch}
+      onFocus={handlePrefetch}
+      onPointerDown={handlePrefetch}
     >
       {editing ? (
         <input
