@@ -581,58 +581,63 @@ impl RuntimeCore {
     ///
     /// Safe to call concurrently for multiple background tasks — there is no
     /// bridge interaction so no `pendingTurn` races occur.
+    ///
+    /// ## Why `append_turn` instead of `get_session` + `upsert_session`
+    ///
+    /// `upsert_session` does a full DELETE-then-INSERT of all turns. If called
+    /// while `send_turn` has the session loaded in memory (which it does for
+    /// the entire duration of a turn), the two writes race: whoever saves last
+    /// wins and the loser's turns are silently dropped. The symptoms are lost
+    /// turns or the user's new message appearing at the wrong position in the
+    /// list. `append_turn` atomically inserts exactly one row and increments
+    /// `turn_count`, so it cannot clobber concurrent updates.
     async fn deliver_spontaneous_turn(&self, session_id: String, output: String) {
-        // Load the session. If it no longer exists (session deleted between
-        // background task start and completion), log and bail gracefully.
-        let Some(mut session) = self.persistence.get_session(&session_id).await else {
+        // Build the turn record directly — no `start_turn`/`finish_turn` needed
+        // because we're not going through the normal send_turn pipeline.
+        let now = chrono::Utc::now().to_rfc3339();
+        let turn = zenui_provider_api::TurnRecord {
+            turn_id: uuid::Uuid::new_v4().to_string(),
+            // Empty input: the model responded autonomously, not to a user message.
+            // The frontend's turn-view hides the user-bubble when input is "".
+            input: String::new(),
+            output: output.clone(),
+            status: TurnStatus::Completed,
+            created_at: now.clone(),
+            updated_at: now,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            file_changes: Vec::new(),
+            subagents: Vec::new(),
+            plan: None,
+            permission_mode: None,
+            reasoning_effort: None,
+            // Populate the text block so the frontend renders the response.
+            // The chat UI reads `turn.blocks`, not `turn.output` directly.
+            blocks: vec![ContentBlock::Text { text: output }],
+            input_attachments: Vec::new(),
+            usage: None,
+        };
+
+        // Atomically append the turn without touching any other turn rows.
+        // This is safe to call concurrently with an in-flight send_turn.
+        self.persistence.append_turn(&session_id, &turn).await;
+
+        // Load just the session summary (limit=0 skips turn rows) so we can
+        // publish an accurate SessionSummary in TurnCompleted. Do this AFTER
+        // append_turn so the summary reflects the incremented turn_count.
+        let Some(session) = self.persistence.get_session_limited(&session_id, Some(0)).await else {
             tracing::warn!(
                 session_id = %session_id,
-                "deliver_spontaneous_turn: session not found; dropping spontaneous response"
+                "deliver_spontaneous_turn: session not found after append; skipping publish"
             );
             return;
         };
-
-        // Create a turn with empty input — the model responded autonomously,
-        // not in reaction to a user message.
-        let turn = self.orchestration.start_turn(&mut session, String::new(), None, None);
-
-        // Finalize with the spontaneous output.
-        let Some(finished) = self
-            .orchestration
-            .finish_turn(&mut session, &turn.turn_id, output.clone(), TurnStatus::Completed)
-        else {
-            tracing::warn!(
-                session_id = %session_id,
-                turn_id = %turn.turn_id,
-                "deliver_spontaneous_turn: finish_turn returned None (turn not found in session)"
-            );
-            return;
-        };
-
-        // Merge a Text block into the turn so the frontend has content to render.
-        // The chat UI renders from `turn.blocks`, not `turn.output` — without this
-        // the turn would be a silent gap (empty user bubble, no assistant message).
-        // Mirrors the blocks-merge step at the tail of `send_turn`.
-        let merged_turn = if let Some(t) = session
-            .turns
-            .iter_mut()
-            .find(|t| t.turn_id == finished.turn_id)
-        {
-            t.blocks = vec![ContentBlock::Text { text: output }];
-            t.clone()
-        } else {
-            finished
-        };
-
-        // Persist before publishing so the turn is durable even if the
-        // broadcast fails (same ordering guarantee as send_turn).
-        self.persistence.upsert_session(session.clone()).await;
 
         // Broadcast to all connected frontends.
         self.publish(RuntimeEvent::TurnCompleted {
-            session_id: session.summary.session_id.clone(),
-            session: session.summary.clone(),
-            turn: merged_turn,
+            session_id: session_id.clone(),
+            session: session.summary,
+            turn,
         });
 
         // Drain one queued mailbox message if any are pending, mirroring

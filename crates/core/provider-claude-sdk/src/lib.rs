@@ -582,6 +582,14 @@ impl ClaudeSdkAdapter {
         let _activity = cached.activity_guard();
         let mut process = cached.inner().lock().await;
 
+        // Discard any stream events (text_delta, turn_usage, …) that were
+        // buffered in the channel while no run_turn was active — they belong
+        // to a now-delivered spontaneous background-task turn and must not
+        // leak into this user turn's event stream. Must happen BEFORE the
+        // sendPrompt write below so we only discard between-turn leftovers,
+        // not events from the new turn itself.
+        process.drain_stale_events();
+
         let mode_str = permission_mode_to_str(permission_mode);
         let bridge_images: Vec<BridgeImageAttachment> = input
             .images

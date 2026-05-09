@@ -352,6 +352,90 @@ impl PersistenceService {
         let _ = transaction.commit();
     }
 
+    /// Atomically append a single completed turn to an existing session.
+    ///
+    /// Unlike `upsert_session`, this does NOT delete-and-reinsert all turns.
+    /// It executes two SQL statements in a transaction:
+    ///
+    /// 1. `INSERT INTO turns …` — inserts exactly the one new turn
+    /// 2. `UPDATE sessions SET turn_count = turn_count + 1, … WHERE session_id = ?`
+    ///
+    /// This makes it safe to call concurrently with an in-flight `upsert_session`
+    /// (e.g. from `send_turn`) because each call only touches the rows it owns.
+    /// The primary use-case is `deliver_spontaneous_turn`, which fires outside a
+    /// `send_turn` context and must not race-overwrite turns the active turn added.
+    pub async fn append_turn(&self, session_id: &str, turn: &zenui_provider_api::TurnRecord) {
+        let mut connection = self.connection.lock();
+        let Ok(transaction) = connection.transaction() else {
+            return;
+        };
+        let reasoning_json: Option<String> = turn.reasoning.clone();
+        let tool_calls_json: Option<String> = if turn.tool_calls.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&turn.tool_calls).ok()
+        };
+        let file_changes_json: Option<String> = if turn.file_changes.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&turn.file_changes).ok()
+        };
+        let subagents_json: Option<String> = if turn.subagents.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&turn.subagents).ok()
+        };
+        let plan_json: Option<String> = turn
+            .plan
+            .as_ref()
+            .and_then(|p| serde_json::to_string(p).ok());
+        let permission_mode_str: Option<String> =
+            turn.permission_mode.map(permission_mode_to_str);
+        let reasoning_effort_str: Option<String> =
+            turn.reasoning_effort.map(|e| e.as_str().to_string());
+        let blocks_json: Option<String> = if turn.blocks.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&turn.blocks).ok()
+        };
+        if transaction
+            .execute(
+                "INSERT INTO turns (
+                    turn_id, session_id, input, output, status, created_at, updated_at,
+                    reasoning_json, tool_calls_json, file_changes_json, subagents_json,
+                    plan_json, permission_mode, reasoning_effort, blocks_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    turn.turn_id,
+                    session_id,
+                    turn.input,
+                    turn.output,
+                    turn_status_to_str(turn.status),
+                    turn.created_at,
+                    turn.updated_at,
+                    reasoning_json,
+                    tool_calls_json,
+                    file_changes_json,
+                    subagents_json,
+                    plan_json,
+                    permission_mode_str,
+                    reasoning_effort_str,
+                    blocks_json,
+                ],
+            )
+            .is_err()
+        {
+            return;
+        }
+        // Increment the session's turn_count and bump updated_at so callers
+        // querying the summary see an accurate count without a full reload.
+        let _ = transaction.execute(
+            "UPDATE sessions SET turn_count = turn_count + 1, status = 'ready', updated_at = ?1 WHERE session_id = ?2",
+            params![turn.updated_at, session_id],
+        );
+        let _ = transaction.commit();
+    }
+
     pub async fn get_session(&self, session_id: &str) -> Option<SessionDetail> {
         let connection = self.connection.lock();
         load_session(&connection, session_id, None).ok().flatten()

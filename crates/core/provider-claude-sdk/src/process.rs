@@ -105,6 +105,33 @@ impl ClaudeBridgeProcess {
         }
     }
 
+    /// Discard every event already buffered in the channel.
+    ///
+    /// Called at the very start of `run_turn`, before `sendPrompt` is written
+    /// to the bridge stdin, to prevent between-turn leftovers from leaking
+    /// into the new user turn.
+    ///
+    /// Background: when a background Bash task completes, the bridge emits
+    /// a sequence of `stream` events (`text_delta`, `turn_usage`, …) followed
+    /// by the final `spontaneous_turn` event. The background reader intercepts
+    /// `spontaneous_turn` and routes it to `deliver_spontaneous_turn`, but it
+    /// forwards all the *preceding* stream events to `line_tx`. Those stream
+    /// events buffer in `line_rx`. If a new user turn starts before they are
+    /// consumed, `run_turn`'s main loop reads them first and the content
+    /// appears *again* inside the new turn's response.
+    ///
+    /// Discarding them here is safe because they already contributed to the
+    /// spontaneous turn's `output` field (the `spontaneous_turn` event carries
+    /// the full final text). The preceding `text_delta` events are redundant.
+    ///
+    /// No-op in `Direct` mode (ephemeral bridges like `fetch_models` have no
+    /// channel buffer).
+    pub(crate) fn drain_stale_events(&mut self) {
+        if let BridgeStdout::Channel(ref mut rx) = self.stdout {
+            while rx.try_recv().is_ok() {}
+        }
+    }
+
     /// Promote from direct-stdout mode to channel mode.
     ///
     /// Takes ownership of the raw ChildStdout and spawns the persistent
