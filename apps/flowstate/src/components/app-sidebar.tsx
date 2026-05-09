@@ -9,8 +9,10 @@ import {
   EllipsisVertical,
   FolderIcon,
   FolderMinus,
+  MoreHorizontal,
   Plus,
   Settings,
+  Sparkles,
   MessageSquare,
   Trash2,
 } from "lucide-react";
@@ -958,49 +960,116 @@ function AppSidebarBody() {
 
       <SidebarFooter className="border-t border-sidebar-border">
         <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              tooltip="Usage"
-              onClick={() => {
-                navigate({ to: "/usage" });
-                closeIfMobile();
-              }}
-            >
-              <BarChart3 />
-              <span>Usage</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              tooltip={
-                hasProvisionFailures
-                  ? `Settings (${provisionFailures.length} provisioning issue${provisionFailures.length === 1 ? "" : "s"})`
-                  : "Settings"
-              }
-              onClick={() => {
-                navigate({ to: "/settings" });
-                closeIfMobile();
-              }}
-            >
-              {/* Wrap the icon in a relative span so the absolute
-                  red dot is positioned to the icon's top-right rather
-                  than the SidebarMenuButton's. Purely decorative —
-                  Settings itself shows the actionable banner. */}
-              <span className="relative inline-flex">
-                <Settings />
-                {hasProvisionFailures ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute -right-0.5 -top-0.5 inline-block h-2 w-2 rounded-full bg-red-500 ring-1 ring-background"
-                  />
-                ) : null}
-              </span>
-              <span>Settings</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
+          <MoreMenu
+            hasProvisionFailures={hasProvisionFailures}
+            provisionFailureCount={provisionFailures.length}
+            onNavigate={(to) => {
+              navigate({ to });
+              closeIfMobile();
+            }}
+          />
         </SidebarMenu>
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>
+  );
+}
+
+/**
+ * Footer "More" entry. Renders a single sidebar row that on hover
+ * (or focus) reveals a side-aligned popover with the full menu —
+ * Usage, Settings, Features. We use a controlled DropdownMenu rather
+ * than a hover-card so keyboard users still get the menu role +
+ * arrow-key navigation; mouse users get the hover affordance the
+ * user asked for via onMouseEnter / onMouseLeave on both the trigger
+ * and the content (a small close-delay keeps the menu open while
+ * the cursor crosses the gap from trigger → menu).
+ */
+function MoreMenu({
+  hasProvisionFailures,
+  provisionFailureCount,
+  onNavigate,
+}: {
+  hasProvisionFailures: boolean;
+  provisionFailureCount: number;
+  onNavigate: (
+    to: "/usage" | "/settings" | "/features",
+  ) => void;
+}) {
+  const [open, setOpen] = React.useState(false);
+
+  const ariaLabel = hasProvisionFailures
+    ? `More (${provisionFailureCount} provisioning issue${provisionFailureCount === 1 ? "" : "s"})`
+    : "More";
+
+  // Click + keyboard are owned by Radix's DropdownMenuTrigger
+  // (composed onPointerDown / onKeyDown route through our controlled
+  // `open` via onOpenChange). We layer onMouseEnter on top so hover
+  // also opens, per the original UX request. Close is purely Radix's
+  // job — outside click, Escape, or per-item onClick all funnel
+  // through onOpenChange.
+  return (
+    <SidebarMenuItem>
+      <DropdownMenu open={open} onOpenChange={setOpen}>
+        <DropdownMenuTrigger asChild>
+          <SidebarMenuButton
+            aria-label={ariaLabel}
+            onMouseEnter={() => setOpen(true)}
+          >
+            <span className="relative inline-flex">
+              <MoreHorizontal />
+              {hasProvisionFailures ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute -right-0.5 -top-0.5 inline-block h-2 w-2 rounded-full bg-red-500 ring-1 ring-background"
+                />
+              ) : null}
+            </span>
+            <span>More</span>
+          </SidebarMenuButton>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          side="top"
+          align="start"
+          sideOffset={8}
+          // Width matches the sidebar's footer width well at the
+          // default sidebar width (256px). Items get larger hit
+          // targets via py-2 + bigger gap so the menu reads as
+          // peer-weight to the items in the sidebar above it,
+          // instead of the cramped default.
+          className="w-56 p-1.5"
+        >
+          <DropdownMenuItem
+            onClick={() => onNavigate("/usage")}
+            className="gap-2.5 px-2.5 py-2 text-sm"
+          >
+            <BarChart3 className="h-4 w-4" />
+            <span>Usage</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={() => onNavigate("/settings")}
+            className="gap-2.5 px-2.5 py-2 text-sm"
+          >
+            <span className="relative inline-flex">
+              <Settings className="h-4 w-4" />
+              {hasProvisionFailures ? (
+                <span
+                  aria-hidden="true"
+                  className="absolute -right-0.5 -top-0.5 inline-block h-1.5 w-1.5 rounded-full bg-red-500 ring-1 ring-popover"
+                />
+              ) : null}
+            </span>
+            <span>Settings</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onClick={() => onNavigate("/features")}
+            className="gap-2.5 px-2.5 py-2 text-sm"
+          >
+            <Sparkles className="h-4 w-4" />
+            <span>Features</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </SidebarMenuItem>
   );
 }

@@ -27,6 +27,7 @@ import { CodeView } from "@/components/code/code-view";
 import { ProjectHomeView } from "@/components/project/project-home-view";
 import { SettingsView } from "@/components/settings/settings-view";
 import { UsageView } from "@/components/usage/usage-view";
+import { FeaturesView } from "@/components/features/features-view";
 import { Toaster } from "@/components/ui/toaster";
 import { UpdateBanner } from "@/components/update-banner";
 import { ProvisioningSplash } from "@/components/provisioning-splash";
@@ -588,6 +589,12 @@ const usageRoute = createRoute({
   component: UsageView,
 });
 
+const featuresRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/features",
+  component: FeaturesView,
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
@@ -596,6 +603,7 @@ const routeTree = rootRoute.addChildren([
   projectRoute,
   settingsRoute,
   usageRoute,
+  featuresRoute,
 ]);
 
 export const router = createRouter({ routeTree });

@@ -550,24 +550,44 @@ const sidebarMenuButtonVariants = cva(
   }
 )
 
-function SidebarMenuButton({
-  asChild = false,
-  isActive = false,
-  variant = "default",
-  size = "default",
-  tooltip,
-  className,
-  ...props
-}: React.ComponentProps<"button"> & {
-  asChild?: boolean
-  isActive?: boolean
-  tooltip?: string | React.ComponentProps<typeof TooltipContent>
-} & VariantProps<typeof sidebarMenuButtonVariants>) {
+// `React.forwardRef` is load-bearing here. When a Radix primitive that
+// uses `asChild` (e.g. `<DropdownMenuTrigger asChild>` or
+// `<TooltipTrigger asChild>`) wraps a `SidebarMenuButton`, Radix's
+// internal `Slot.Root` calls `React.cloneElement(child, { ...props, ref })`
+// to merge its props and ref into the child. In React 18, refs on
+// regular function components are silently dropped — only `forwardRef`
+// (or React 19's ref-as-prop) actually delivers them. Dropping the ref
+// breaks Radix's `Anchor` positioning: `floating-ui` reads
+// `useFloating({ elements: { reference: anchorRef.current } })` and
+// without a real DOM node it can't measure the trigger's rect, so the
+// content portal renders at (0,0) and looks like "click does nothing"
+// to the user. This is also the upstream shadcn/ui shape — the project's
+// previous copy was an earlier rewrite that lost the forwardRef wrapper.
+const SidebarMenuButton = React.forwardRef<
+  HTMLButtonElement,
+  React.ComponentProps<"button"> & {
+    asChild?: boolean
+    isActive?: boolean
+    tooltip?: string | React.ComponentProps<typeof TooltipContent>
+  } & VariantProps<typeof sidebarMenuButtonVariants>
+>(function SidebarMenuButton(
+  {
+    asChild = false,
+    isActive = false,
+    variant = "default",
+    size = "default",
+    tooltip,
+    className,
+    ...props
+  },
+  ref,
+) {
   const Comp = asChild ? Slot.Root : "button"
   const { isMobile, state } = useSidebar()
 
   const button = (
     <Comp
+      ref={ref}
       data-slot="sidebar-menu-button"
       data-sidebar="menu-button"
       data-size={size}
@@ -598,7 +618,8 @@ function SidebarMenuButton({
       />
     </Tooltip>
   )
-}
+})
+SidebarMenuButton.displayName = "SidebarMenuButton"
 
 function SidebarMenuAction({
   className,

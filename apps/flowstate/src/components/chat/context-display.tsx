@@ -17,6 +17,7 @@ import type {
   TokenUsage,
   TurnRecord,
 } from "@/lib/types";
+import type { ProviderKind } from "@/lib/generated/types";
 
 interface ContextDisplayProps {
   sessionId: string;
@@ -71,6 +72,50 @@ function formatResetIn(resetsAt: number | undefined): string | null {
   return `${days}d`;
 }
 
+// Classify a rate-limit bucket id by the provider that emits it.
+// `state.rateLimits` is a flat map keyed by bucket id with no
+// provider tag (the runtime event RuntimeEvent::RateLimitUpdated
+// doesn't carry one), so when a user has run turns under more than
+// one provider — say a Copilot thread last week and a Claude
+// thread today — both providers' rows pile up in the same map and
+// the popover naively renders all of them.
+//
+// Concretely: the Claude SDK only ever emits these bucket ids:
+// `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`,
+// `overage` (verified against the `claude` binary's strings table
+// for SDK 0.2.138). The GitHub Copilot bridge emits whatever ids
+// the Copilot SDK's `quotaSnapshots` map carries — currently
+// `chat`, `completions`, `premium_interactions`, `session`,
+// `weekly`. Without scoping, a Claude session's popover ends up
+// showing four Copilot rows ("Premium interactions / Session /
+// Weekly") all stuck at 0% because the user isn't using Copilot
+// right now, while the actual Claude usage (e.g. "Current session
+// 48% used" on claude.ai) is missing.
+//
+// Returns `null` for bucket ids we don't recognize — those go in
+// the popover regardless of provider, so a future Anthropic /
+// Copilot bucket id rename doesn't silently drop everything until
+// this list is updated.
+const CLAUDE_BUCKETS = new Set([
+  "five_hour",
+  "seven_day",
+  "seven_day_opus",
+  "seven_day_sonnet",
+  "overage",
+]);
+const COPILOT_BUCKETS = new Set([
+  "chat",
+  "completions",
+  "premium_interactions",
+  "session",
+  "weekly",
+]);
+function bucketProvider(bucket: string): ProviderKind | null {
+  if (CLAUDE_BUCKETS.has(bucket)) return "claude";
+  if (COPILOT_BUCKETS.has(bucket)) return "github_copilot";
+  return null;
+}
+
 function findLatestUsage(turns: TurnRecord[] | undefined): TokenUsage | null {
   if (!turns) return null;
   for (let i = turns.length - 1; i >= 0; i--) {
@@ -112,90 +157,6 @@ function RateLimitRow({ info }: { info: RateLimitInfo }) {
         />
       </div>
     </div>
-  );
-}
-
-/**
- * Compact inline rate-limit indicator shown next to the context-window
- * chip in the chat toolbar — the user-facing answer to "am I about to
- * hit my 5-hour or weekly limit?" without forcing a popover open.
- *
- * Renders only the single highest-utilization bucket within the given
- * label prefix; the popover ("Plan usage" section) remains the place
- * to inspect every bucket. Hidden entirely when no bucket has been
- * reported yet (fresh install, API-key user, non-Claude provider) so
- * the toolbar doesn't show a misleading "0%" placeholder.
- *
- * Reuses `barClassForStatus` and `formatResetIn` so the inline chip
- * and the popover row stay color- and copy-aligned.
- */
-function InlineRateLimitChip({
-  info,
-  shortLabel,
-}: {
-  info: RateLimitInfo;
-  shortLabel: string;
-}) {
-  const pct = Math.min(100, Math.round(info.utilization * 100));
-  const resetIn = formatResetIn(info.resetsAt);
-  const barClass = barClassForStatus(info.status, pct);
-  return (
-    <span
-      className="inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 text-xs text-muted-foreground"
-      title={`${info.label} — ${pct}% used${
-        resetIn ? `, resets ${resetIn}` : ""
-      }`}
-    >
-      <span className="text-[11px] uppercase tracking-wide text-muted-foreground/70">
-        {shortLabel}
-      </span>
-      <span className="h-0.5 w-10 overflow-hidden rounded-full bg-muted/40">
-        <span
-          className={`block h-full ${barClass}`}
-          style={{ width: `${pct}%` }}
-        />
-      </span>
-      <span className="tabular-nums">{pct}%</span>
-      {resetIn && (
-        <span className="tabular-nums text-muted-foreground/70">
-          · {resetIn}
-        </span>
-      )}
-    </span>
-  );
-}
-
-/**
- * Pick the bucket to surface for a given short label. Strategy:
- *
- *  - "5h"  → the `five_hour` bucket exactly. There's only one.
- *  - "Wk"  → highest-utilization of the weekly buckets
- *           (`seven_day` / `seven_day_opus` / `seven_day_sonnet`).
- *           A user with high Opus utilization still wants to see
- *           that bar before they hit a hard cap, even if the
- *           "all models" bucket is comfortably below.
- *
- * Returns `null` when none of the candidate buckets has been
- * reported yet — the inline chip then renders nothing rather than
- * a bogus 0% indicator.
- */
-function pickFiveHourBucket(
-  rateLimits: Record<string, RateLimitInfo>,
-): RateLimitInfo | null {
-  return rateLimits["five_hour"] ?? null;
-}
-
-function pickWeeklyBucket(
-  rateLimits: Record<string, RateLimitInfo>,
-): RateLimitInfo | null {
-  const candidates = [
-    rateLimits["seven_day"],
-    rateLimits["seven_day_opus"],
-    rateLimits["seven_day_sonnet"],
-  ].filter((b): b is RateLimitInfo => !!b);
-  if (candidates.length === 0) return null;
-  return candidates.reduce((max, cur) =>
-    cur.utilization > max.utilization ? cur : max,
   );
 }
 
@@ -323,29 +284,50 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
   );
   const showBreakdown = !!features.contextBreakdown && hasRunningTurn;
 
+  // Drop entries whose `resetsAt` is in the past — once the reset
+  // moment has come the bucket has refilled to 0% on Anthropic's
+  // side, but the SDK only re-reports a bucket as a side-effect of
+  // an inference response. Without this filter, an old `seven_day`
+  // ("Weekly · all models") row that hit 100% before Anthropic's
+  // bucket-key rename keeps showing 100% / "resets now" forever
+  // even though the user's website dashboard reads 0%. A 60s grace
+  // window absorbs clock skew between client and server clocks so
+  // we don't briefly drop a still-current bucket on the dot.
+  //
+  // Buckets without a `resetsAt` (hard caps) survive the filter —
+  // they have no expiry by definition.
+  //
+  // `expiryTick` re-runs the filter once per minute so a bucket
+  // crossing its reset moment while the popover stays open
+  // disappears on the next tick rather than waiting for the next
+  // event from the daemon.
+  const [expiryTick, setExpiryTick] = React.useState(0);
+  React.useEffect(() => {
+    const id = window.setInterval(() => setExpiryTick((n) => n + 1), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
   const rateLimitEntries = React.useMemo(() => {
-    const all = Object.values(state.rateLimits);
-    return all.sort((a, b) => a.label.localeCompare(b.label));
-  }, [state.rateLimits]);
+    const cutoff = Date.now() - 60_000;
+    return Object.values(state.rateLimits)
+      .filter((r) => r.resetsAt == null || r.resetsAt > cutoff)
+      .filter((r) => {
+        // Provider scope: a thread on Claude shouldn't see leftover
+        // Copilot quota rows (and vice versa). Buckets whose
+        // provider we can't classify pass through unchanged so a
+        // newly-added bucket id doesn't disappear until this file
+        // is updated.
+        if (!provider) return true;
+        const owner = bucketProvider(r.bucket);
+        return owner == null || owner === provider;
+      })
+      .sort((a, b) => a.label.localeCompare(b.label));
+    // expiryTick is a render-only dep — its value isn't read inside
+    // the memo body, but bumping it forces recomputation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.rateLimits, expiryTick, provider]);
 
   const hasWarning = rateLimitEntries.some(
     (r) => r.status === "allowed_warning" || r.status === "rejected",
-  );
-
-  // Surface the 5-hour and weekly buckets inline next to the
-  // context-window chip so users can glance at "am I about to hit a
-  // limit?" without opening the popover. The popover stays as the
-  // detailed-breakdown affordance for every bucket. Both can be null
-  // (fresh install / API-key user / non-Claude provider) — the chips
-  // hide entirely in that case so the toolbar doesn't show a stale
-  // 0% placeholder.
-  const fiveHour = React.useMemo(
-    () => pickFiveHourBucket(state.rateLimits),
-    [state.rateLimits],
-  );
-  const weekly = React.useMemo(
-    () => pickWeeklyBucket(state.rateLimits),
-    [state.rateLimits],
   );
 
   // Current context-window occupancy. We prefer the bridge-supplied
@@ -551,8 +533,6 @@ export function ContextDisplay({ sessionId }: ContextDisplayProps) {
         </div>
       </PopoverContent>
       </Popover>
-      {fiveHour && <InlineRateLimitChip info={fiveHour} shortLabel="5h" />}
-      {weekly && <InlineRateLimitChip info={weekly} shortLabel="Wk" />}
     </div>
   );
 }
