@@ -23,6 +23,7 @@ import {
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -69,31 +70,75 @@ import { basename } from "@/lib/worktree-utils";
 import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
+import { SortableThread } from "@/components/sidebar/sortable-thread";
 import {
   SidebarDragSuppressionProvider,
   useSidebarDragSuppressed,
 } from "@/components/sidebar/drag-suppression";
 import { ADD_PROJECT_EVENT } from "@/lib/keyboard-shortcuts";
 import type { SessionSummary } from "@/lib/types";
+import type { SessionDisplay } from "@/lib/api/display";
+
+/** Sentinel groupId for the unassigned ("General") thread bucket. A
+ *  literal string can't collide with a real project_id (those are
+ *  UUIDs). Used by SortableThread + the top-level onDragEnd handler
+ *  to scope thread drags to within one visual group. */
+const GENERAL_GROUP_ID = "__general__";
+
+/** Comparator for sessions inside one visual group.
+ *  - Threads with sortOrder == null are "unordered" — they float to
+ *    the top, sorted by createdAt DESC. Matches the existing reflex
+ *    of "the most recent activity is at the top of the list."
+ *  - Threads with sortOrder != null are "ordered" — they sit below
+ *    the unordered ones, in fixed sortOrder ASC.
+ *  - Tie-break by createdAt DESC then sessionId so the order is
+ *    stable even if two sessions race to the same sortOrder via
+ *    concurrent reorderSessions writes. */
+function compareSessionsForGroup(
+  a: SessionSummary,
+  b: SessionSummary,
+  sessionDisplay: Map<string, SessionDisplay>,
+): number {
+  const oa = sessionDisplay.get(a.sessionId)?.sortOrder ?? null;
+  const ob = sessionDisplay.get(b.sessionId)?.sortOrder ?? null;
+  if (oa == null && ob == null) {
+    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  }
+  if (oa == null) return -1;
+  if (ob == null) return 1;
+  if (oa !== ob) return oa - ob;
+  const t = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  return t !== 0 ? t : a.sessionId.localeCompare(b.sessionId);
+}
 
 /**
- * Wraps a single active-project row with dnd-kit's useSortable so
- * the whole Collapsible can be picked up and moved. The wrapper div
- * also owns the Collapsible — we don't apply the sortable ref
- * directly on <Collapsible> because the shared `ui/collapsible.tsx`
- * wrapper is a plain function component (no forwardRef in React 18)
- * so refs don't propagate through it.
+ * Wraps a single active-project row with dnd-kit's useSortable. The
+ * wrapper div owns the visual transform (so the whole Collapsible
+ * translates as one block during a drag), but exposes
+ * `attributes`/`listeners` to the call site via a render prop so the
+ * call site can spread them onto the project NAME row only — not
+ * onto the entire wrapper. Putting listeners on the wrapper would
+ * mean a click anywhere inside the expanded thread list starts a
+ * project drag; threads inside the project need to be independently
+ * draggable, so the project hitbox shrinks to just the
+ * `SidebarMenuButton`.
  *
- * `defaultOpen` + `group/collapsible` that used to live on the
- * per-project <Collapsible> are now owned by this component so the
- * call site stays declarative.
+ * `defaultOpen` + `group/collapsible` stay on the per-project
+ * <Collapsible> so the call site stays declarative.
+ *
+ * `data: { type: "project" }` is read by the top-level onDragEnd
+ * handler to route the drag to handleProjectDragEnd vs. the thread
+ * reorder path.
  */
 function SortableProject({
   id,
   children,
 }: {
   id: string;
-  children: React.ReactNode;
+  children: (handle: {
+    attributes: ReturnType<typeof useSortable>["attributes"];
+    listeners: ReturnType<typeof useSortable>["listeners"];
+  }) => React.ReactNode;
 }) {
   const {
     attributes,
@@ -102,7 +147,7 @@ function SortableProject({
     transform,
     transition,
     isDragging,
-  } = useSortable({ id });
+  } = useSortable({ id, data: { type: "project" } });
 
   const style: React.CSSProperties = {
     // Translate only — dropping the Scale component kills the text /
@@ -123,19 +168,20 @@ function SortableProject({
     <div
       ref={setNodeRef}
       style={style}
-      {...attributes}
-      {...listeners}
       className={cn(
         // touch-none stops the browser from claiming pointer events
         // for native scroll on touch devices — required by dnd-kit
-        // for touch-initiated drags.
-        "cursor-grab touch-none",
+        // for touch-initiated drags. Lives on the wrapper because the
+        // wrapper participates in dnd-kit's transform pipeline; the
+        // actual {...listeners} are spread onto the row via the
+        // render prop below.
+        "touch-none",
         isDragging &&
-          "cursor-grabbing rounded-md outline-dashed outline-2 outline-sidebar-accent-foreground/40",
+          "rounded-md outline-dashed outline-2 outline-sidebar-accent-foreground/40",
       )}
     >
       <Collapsible defaultOpen className="group/collapsible">
-        {children}
+        {children({ attributes, listeners })}
       </Collapsible>
     </div>
   );
@@ -153,7 +199,8 @@ export function AppSidebar() {
 }
 
 function AppSidebarBody() {
-  const { state, send, createProject, reorderProjects } = useApp();
+  const { state, send, createProject, reorderProjects, reorderSessions } =
+    useApp();
   const navigate = useNavigate();
   const location = useLocation();
   // Red dot on the footer Settings icon when one or more
@@ -229,10 +276,15 @@ function AppSidebarBody() {
     [sortedActiveProjects, reorderProjects],
   );
 
-  // Tracks which project is currently being dragged so <DragOverlay>
-  // can render a crisp, natural-size preview that follows the cursor
-  // while the in-place source stays dimmed as the "slot it came from".
+  // Tracks which project / thread is currently being dragged so
+  // <DragOverlay> can render a crisp, natural-size preview that
+  // follows the cursor while the in-place source stays dimmed as the
+  // "slot it came from". Only one of the two is non-null at a time —
+  // the dnd-kit drag lifecycle is single-active by construction.
   const [activeProjectId, setActiveProjectId] = React.useState<string | null>(
+    null,
+  );
+  const [activeThreadId, setActiveThreadId] = React.useState<string | null>(
     null,
   );
   // On a narrow window the sidebar renders as a full-screen Sheet
@@ -286,10 +338,7 @@ function AppSidebarBody() {
     sessionsByProject.set(key, list);
   }
   for (const list of sessionsByProject.values()) {
-    list.sort(
-      (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-    );
+    list.sort((a, b) => compareSessionsForGroup(a, b, state.sessionDisplay));
   }
 
   // Group archived sessions by project
@@ -318,10 +367,7 @@ function AppSidebarBody() {
     archivedByProject.set(key, list);
   }
   for (const list of archivedByProject.values()) {
-    list.sort(
-      (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-    );
+    list.sort((a, b) => compareSessionsForGroup(a, b, state.sessionDisplay));
   }
 
   // Build sorted groups: named projects alphabetically, then "General" last
@@ -413,6 +459,77 @@ function AppSidebarBody() {
 
   const unassigned = sessionsByProject.get(null) ?? [];
 
+  // Resolve the current visual session order for a thread group.
+  // groupId is one of:
+  //   - GENERAL_GROUP_ID         → unassigned threads
+  //   - "archived:<group.key>"   → an archived-project group
+  //   - any other string         → a project_id (active project)
+  // The returned ids match the order the JSX walks below; `arrayMove`
+  // applied to this array produces the post-drop sequence that
+  // reorderSessions writes 0..N-1 to.
+  function orderedSessionIdsForGroup(groupId: string): string[] {
+    if (groupId === GENERAL_GROUP_ID) {
+      return unassigned.map((s) => s.sessionId);
+    }
+    if (groupId.startsWith("archived:")) {
+      const key = groupId.slice("archived:".length);
+      const group = archivedGroups.find((g) => g.key === key);
+      return group ? group.sessions.map((s) => s.sessionId) : [];
+    }
+    return (sessionsByProject.get(groupId) ?? []).map((s) => s.sessionId);
+  }
+
+  // Unified drag handlers for the single top-level DndContext that
+  // wraps the whole sidebar. Routes by `active.data.current.type`
+  // (set on each useSortable call) to either the existing project
+  // reorder path or the new thread reorder path. Cross-group thread
+  // drops are silent no-ops via groupId equality on the data payload.
+  function handleDragStart(event: DragStartEvent) {
+    const type = event.active.data.current?.type;
+    if (type === "project") {
+      setActiveProjectId(String(event.active.id));
+    } else if (type === "thread") {
+      setActiveThreadId(String(event.active.id));
+    }
+  }
+
+  function handleDragCancel() {
+    setActiveProjectId(null);
+    setActiveThreadId(null);
+  }
+
+  function handleDragEnd(event: DragEndEvent) {
+    setActiveProjectId(null);
+    setActiveThreadId(null);
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const type = active.data.current?.type;
+    if (type === "project") {
+      handleProjectDragEnd(event);
+      return;
+    }
+    if (type === "thread") {
+      const fromGroup = active.data.current?.groupId as string | undefined;
+      const toGroup = over.data.current?.groupId as string | undefined;
+      // Within-group only — cross-group drops are silent no-ops.
+      // Comparing groupIds carried on the data payload is more
+      // reliable than DOM ancestry once dnd-kit has moved things
+      // mid-drag.
+      if (!fromGroup || fromGroup !== toGroup) return;
+
+      const groupOrder = orderedSessionIdsForGroup(fromGroup);
+      const from = groupOrder.indexOf(String(active.id));
+      const to = groupOrder.indexOf(String(over.id));
+      if (from < 0 || to < 0) return;
+      // Fire-and-forget — same fire-and-forget pattern as
+      // handleProjectDragEnd; per-session dispatches inside
+      // reorderSessions land synchronously so the visual reorder
+      // doesn't block on the Tauri writes.
+      void reorderSessions(arrayMove(groupOrder, from, to));
+    }
+  }
+
   return (
     <Sidebar collapsible="offcanvas">
       <SidebarHeader
@@ -460,6 +577,21 @@ function AppSidebarBody() {
           </SidebarGroupAction>
           <SidebarGroupContent>
             <SidebarMenu>
+              {/* One DndContext for the whole sidebar — projects,
+                  General (unassigned) threads, and each archived-
+                  project group share sensors so the suppression
+                  toggle in CreateWorktreeDialog still works
+                  uniformly. Drag routing is by `data.type` on each
+                  useSortable: the same `onDragEnd` dispatches
+                  to either handleProjectDragEnd or the thread
+                  reorder path inside `handleDragEnd`. */}
+              <DndContext
+                sensors={activeSensors}
+                collisionDetection={closestCenter}
+                onDragStart={handleDragStart}
+                onDragCancel={handleDragCancel}
+                onDragEnd={handleDragEnd}
+              >
               {/* Folder-less threads */}
               <Collapsible defaultOpen className="group/collapsible">
                 <SidebarMenuItem className="group/project">
@@ -475,120 +607,19 @@ function AppSidebarBody() {
                   </div>
                   <CollapsibleContent>
                     <SidebarMenuSub>
-                      {unassigned.map((session) => {
-                        const wt = worktreeInfo(session);
-                        return (
-                          <ThreadItem
-                            key={session.sessionId}
-                            sessionId={session.sessionId}
-                            title={sessionTitle(session.sessionId)}
-                            updatedAt={session.updatedAt}
-                            isActive={
-                              state.activeSessionId === session.sessionId
-                            }
-                            worktreeBranch={wt.branch}
-                            worktreePath={wt.path}
-                            running={session.status === "running"}
-                            awaitingInput={state.awaitingInputSessionIds.has(
-                              session.sessionId,
-                            )}
-                            pendingDone={state.doneSessionIds.has(
-                              session.sessionId,
-                            )}
-                            onClick={() =>
-                              handleThreadClick(session.sessionId)
-                            }
-                          />
-                        );
-                      })}
-                      {unassigned.length === 0 && (
-                        <SidebarMenuSubItem>
-                          <span className="px-2 py-1 text-xs text-muted-foreground">
-                            No threads yet
-                          </span>
-                        </SidebarMenuSubItem>
-                      )}
-                    </SidebarMenuSub>
-                  </CollapsibleContent>
-                </SidebarMenuItem>
-              </Collapsible>
-
-              <DndContext
-                sensors={activeSensors}
-                collisionDetection={closestCenter}
-                onDragStart={(event) =>
-                  setActiveProjectId(String(event.active.id))
-                }
-                onDragCancel={() => setActiveProjectId(null)}
-                onDragEnd={(event) => {
-                  setActiveProjectId(null);
-                  handleProjectDragEnd(event);
-                }}
-              >
-                <SortableContext
-                  items={sortedActiveProjects.map((p) => p.projectId)}
-                  strategy={verticalListSortingStrategy}
-                >
-                  {sortedActiveProjects.map((project) => {
-                    const threads =
-                      sessionsByProject.get(project.projectId) ?? [];
-                    const isActive =
-                      location.pathname === `/project/${project.projectId}`;
-                    return (
-                      <SortableProject
-                        key={project.projectId}
-                        id={project.projectId}
+                      <SortableContext
+                        items={unassigned.map((s) => s.sessionId)}
+                        strategy={verticalListSortingStrategy}
                       >
-                        <SidebarMenuItem className="group/project">
-                      <SidebarMenuButton
-                        tooltip={projectName(project.projectId)}
-                        isActive={isActive}
-                        onClick={() => handleProjectClick(project.projectId)}
-                        className="pl-7 pr-14"
-                      >
-                        <FolderIcon />
-                        <span className="flex-1 truncate">
-                          {projectName(project.projectId)}
-                        </span>
-                      </SidebarMenuButton>
-                      {/* The chevron is its own CollapsibleTrigger now so
-                          the rest of the row is free to navigate. Anchored
-                          to `top-1` (not `top-1/2`) because SidebarMenuItem
-                          is the li that also contains CollapsibleContent —
-                          "50%" of that expanded box is halfway down the
-                          thread list, not halfway down the header row.
-                          Same trick the right-side action cluster uses. */}
-                      <CollapsibleTrigger asChild>
-                        <button
-                          type="button"
-                          aria-label={`Toggle ${projectName(project.projectId)} threads`}
-                          onClick={(e) => e.stopPropagation()}
-                          className="absolute left-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground outline-none hover:text-foreground"
-                        >
-                          <ChevronRight className="h-4 w-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
-                        </button>
-                      </CollapsibleTrigger>
-                      <div className="absolute right-1 top-1 flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          title="Remove project"
-                          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/project:opacity-100"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleRemoveProject(project.projectId);
-                          }}
-                        >
-                          <FolderMinus className="h-3.5 w-3.5" />
-                        </button>
-                        <WorktreeAwareNewThread projectId={project.projectId} projectPath={project.path} />
-                      </div>
-                      <CollapsibleContent>
-                        <SidebarMenuSub>
-                          {threads.map((session) => {
-                            const wt = worktreeInfo(session);
-                            return (
+                        {unassigned.map((session) => {
+                          const wt = worktreeInfo(session);
+                          return (
+                            <SortableThread
+                              key={session.sessionId}
+                              id={session.sessionId}
+                              groupId={GENERAL_GROUP_ID}
+                            >
                               <ThreadItem
-                                key={session.sessionId}
                                 sessionId={session.sessionId}
                                 title={sessionTitle(session.sessionId)}
                                 updatedAt={session.updatedAt}
@@ -608,38 +639,156 @@ function AppSidebarBody() {
                                   handleThreadClick(session.sessionId)
                                 }
                               />
-                            );
-                          })}
-                          {threads.length === 0 && (
-                            <SidebarMenuSubItem>
-                              <span className="px-2 py-1 text-xs text-muted-foreground">
-                                No threads yet
-                              </span>
-                            </SidebarMenuSubItem>
-                          )}
-                        </SidebarMenuSub>
-                      </CollapsibleContent>
-                    </SidebarMenuItem>
-                      </SortableProject>
-                    );
-                  })}
-                </SortableContext>
-                {/* Portal preview of the dragged project. `dropAnimation={null}`
-                    skips the default spring-back — the real list already
-                    renders the new order at drop, so animating the overlay
-                    back onto it would feel laggy. */}
-                <DragOverlay dropAnimation={null}>
-                  {activeProjectId ? (
-                    <div className="pointer-events-none flex items-center gap-2 rounded-md border border-sidebar-border bg-sidebar px-3 py-2 text-sm font-medium shadow-lg">
-                      <FolderIcon className="h-4 w-4 shrink-0" />
-                      <span className="max-w-[180px] truncate">
-                        {state.projectDisplay.get(activeProjectId)?.name ??
-                          "Untitled project"}
-                      </span>
-                    </div>
-                  ) : null}
-                </DragOverlay>
-              </DndContext>
+                            </SortableThread>
+                          );
+                        })}
+                      </SortableContext>
+                      {unassigned.length === 0 && (
+                        <SidebarMenuSubItem>
+                          <span className="px-2 py-1 text-xs text-muted-foreground">
+                            No threads yet
+                          </span>
+                        </SidebarMenuSubItem>
+                      )}
+                    </SidebarMenuSub>
+                  </CollapsibleContent>
+                </SidebarMenuItem>
+              </Collapsible>
+
+              <SortableContext
+                items={sortedActiveProjects.map((p) => p.projectId)}
+                strategy={verticalListSortingStrategy}
+              >
+                {sortedActiveProjects.map((project) => {
+                  const threads =
+                    sessionsByProject.get(project.projectId) ?? [];
+                  const isActive =
+                    location.pathname === `/project/${project.projectId}`;
+                  return (
+                    <SortableProject
+                      key={project.projectId}
+                      id={project.projectId}
+                    >
+                      {({ attributes, listeners }) => (
+                        <SidebarMenuItem className="group/project">
+                          <SidebarMenuButton
+                            tooltip={projectName(project.projectId)}
+                            isActive={isActive}
+                            onClick={() =>
+                              handleProjectClick(project.projectId)
+                            }
+                            className="cursor-grab pl-7 pr-14"
+                            {...attributes}
+                            {...listeners}
+                          >
+                            <FolderIcon />
+                            <span className="flex-1 truncate">
+                              {projectName(project.projectId)}
+                            </span>
+                          </SidebarMenuButton>
+                          {/* The chevron is its own CollapsibleTrigger now so
+                              the rest of the row is free to navigate. Anchored
+                              to `top-1` (not `top-1/2`) because SidebarMenuItem
+                              is the li that also contains CollapsibleContent —
+                              "50%" of that expanded box is halfway down the
+                              thread list, not halfway down the header row.
+                              Same trick the right-side action cluster uses. */}
+                          <CollapsibleTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`Toggle ${projectName(project.projectId)} threads`}
+                              onClick={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              className="absolute left-1 top-1 z-10 flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground outline-none hover:text-foreground"
+                            >
+                              <ChevronRight className="h-4 w-4 transition-transform duration-200 group-data-[state=open]/collapsible:rotate-90" />
+                            </button>
+                          </CollapsibleTrigger>
+                          <div
+                            className="absolute right-1 top-1 flex items-center gap-1.5"
+                            onPointerDown={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              title="Remove project"
+                              className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover/project:opacity-100"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRemoveProject(project.projectId);
+                              }}
+                            >
+                              <FolderMinus className="h-3.5 w-3.5" />
+                            </button>
+                            <WorktreeAwareNewThread
+                              projectId={project.projectId}
+                              projectPath={project.path}
+                            />
+                          </div>
+                          <CollapsibleContent>
+                            <SidebarMenuSub>
+                              <SortableContext
+                                items={threads.map((s) => s.sessionId)}
+                                strategy={verticalListSortingStrategy}
+                              >
+                                {threads.map((session) => {
+                                  const wt = worktreeInfo(session);
+                                  // Worktree threads roll up under the
+                                  // PARENT project visually, so the
+                                  // groupId must be the parent id (what
+                                  // the rendering loop iterates) — not
+                                  // session.projectId, which would point
+                                  // at the worktree-sdk-id and cause
+                                  // same-group rejection to fire.
+                                  const groupId =
+                                    effectiveProjectId(
+                                      session.projectId ?? null,
+                                    ) ?? project.projectId;
+                                  return (
+                                    <SortableThread
+                                      key={session.sessionId}
+                                      id={session.sessionId}
+                                      groupId={groupId}
+                                    >
+                                      <ThreadItem
+                                        sessionId={session.sessionId}
+                                        title={sessionTitle(session.sessionId)}
+                                        updatedAt={session.updatedAt}
+                                        isActive={
+                                          state.activeSessionId ===
+                                          session.sessionId
+                                        }
+                                        worktreeBranch={wt.branch}
+                                        worktreePath={wt.path}
+                                        running={session.status === "running"}
+                                        awaitingInput={state.awaitingInputSessionIds.has(
+                                          session.sessionId,
+                                        )}
+                                        pendingDone={state.doneSessionIds.has(
+                                          session.sessionId,
+                                        )}
+                                        onClick={() =>
+                                          handleThreadClick(session.sessionId)
+                                        }
+                                      />
+                                    </SortableThread>
+                                  );
+                                })}
+                              </SortableContext>
+                              {threads.length === 0 && (
+                                <SidebarMenuSubItem>
+                                  <span className="px-2 py-1 text-xs text-muted-foreground">
+                                    No threads yet
+                                  </span>
+                                </SidebarMenuSubItem>
+                              )}
+                            </SidebarMenuSub>
+                          </CollapsibleContent>
+                        </SidebarMenuItem>
+                      )}
+                    </SortableProject>
+                  );
+                })}
+              </SortableContext>
               {/* Archived threads */}
               <Collapsible
                 className="group/collapsible"
@@ -678,71 +827,85 @@ function AppSidebarBody() {
                             </CollapsibleTrigger>
                             <CollapsibleContent>
                               <SidebarMenuSub className="mx-2 px-1.5">
-                                {group.sessions.map((session) => (
-                                  <SidebarMenuSubItem
-                                    key={session.sessionId}
-                                    className="group/thread -mr-6"
-                                  >
-                                    <SidebarMenuSubButton
-                                      className="h-7 w-full min-w-0 cursor-pointer rounded-r-none pr-12"
-                                      onClick={() =>
-                                        handleThreadClick(session.sessionId)
-                                      }
+                                <SortableContext
+                                  items={group.sessions.map((s) => s.sessionId)}
+                                  strategy={verticalListSortingStrategy}
+                                >
+                                  {group.sessions.map((session) => (
+                                    <SortableThread
+                                      key={session.sessionId}
+                                      id={session.sessionId}
+                                      groupId={`archived:${group.key}`}
                                     >
-                                      <span className="flex-1 truncate text-xs">
-                                        {sessionTitle(session.sessionId) ||
-                                          "New thread"}
-                                      </span>
-                                    </SidebarMenuSubButton>
-                                    <div
-                                      className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
-                                      onClick={(e) => e.stopPropagation()}
-                                      onKeyDown={(e) => e.stopPropagation()}
-                                    >
-                                      <button
-                                        type="button"
-                                        title="Unarchive"
-                                        aria-label="Unarchive thread"
-                                        className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
-                                        onClick={() =>
-                                          send({
-                                            type: "unarchive_session",
-                                            session_id: session.sessionId,
-                                          })
-                                        }
+                                      <SidebarMenuSubItem
+                                        className="group/thread -mr-6"
                                       >
-                                        <ArchiveRestore className="h-3 w-3" />
-                                      </button>
-                                      <DropdownMenu>
-                                        <DropdownMenuTrigger asChild>
+                                        <SidebarMenuSubButton
+                                          className="h-7 w-full min-w-0 cursor-pointer rounded-r-none pr-12"
+                                          onClick={() =>
+                                            handleThreadClick(session.sessionId)
+                                          }
+                                        >
+                                          <span className="flex-1 truncate text-xs">
+                                            {sessionTitle(session.sessionId) ||
+                                              "New thread"}
+                                          </span>
+                                        </SidebarMenuSubButton>
+                                        <div
+                                          className="absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 transition-opacity group-hover/thread:opacity-100 has-[[data-state=open]]:opacity-100"
+                                          onClick={(e) => e.stopPropagation()}
+                                          onKeyDown={(e) => e.stopPropagation()}
+                                          onPointerDown={(e) =>
+                                            e.stopPropagation()
+                                          }
+                                        >
                                           <button
                                             type="button"
+                                            title="Unarchive"
+                                            aria-label="Unarchive thread"
                                             className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
-                                          >
-                                            <EllipsisVertical className="h-3 w-3" />
-                                          </button>
-                                        </DropdownMenuTrigger>
-                                        <DropdownMenuContent
-                                          align="start"
-                                          className="min-w-32"
-                                        >
-                                          <DropdownMenuItem
-                                            variant="destructive"
                                             onClick={() =>
                                               send({
-                                                type: "delete_session",
+                                                type: "unarchive_session",
                                                 session_id: session.sessionId,
                                               })
                                             }
                                           >
-                                            <Trash2 className="mr-2 h-3.5 w-3.5" />
-                                            Delete
-                                          </DropdownMenuItem>
-                                        </DropdownMenuContent>
-                                      </DropdownMenu>
-                                    </div>
-                                  </SidebarMenuSubItem>
-                                ))}
+                                            <ArchiveRestore className="h-3 w-3" />
+                                          </button>
+                                          <DropdownMenu>
+                                            <DropdownMenuTrigger asChild>
+                                              <button
+                                                type="button"
+                                                className="inline-flex h-5 w-5 items-center justify-center rounded-md text-sidebar-foreground outline-none hover:bg-sidebar-accent"
+                                              >
+                                                <EllipsisVertical className="h-3 w-3" />
+                                              </button>
+                                            </DropdownMenuTrigger>
+                                            <DropdownMenuContent
+                                              align="start"
+                                              className="min-w-32"
+                                            >
+                                              <DropdownMenuItem
+                                                variant="destructive"
+                                                onClick={() =>
+                                                  send({
+                                                    type: "delete_session",
+                                                    session_id:
+                                                      session.sessionId,
+                                                  })
+                                                }
+                                              >
+                                                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                                Delete
+                                              </DropdownMenuItem>
+                                            </DropdownMenuContent>
+                                          </DropdownMenu>
+                                        </div>
+                                      </SidebarMenuSubItem>
+                                    </SortableThread>
+                                  ))}
+                                </SortableContext>
                               </SidebarMenuSub>
                             </CollapsibleContent>
                           </SidebarMenuSubItem>
@@ -759,6 +922,35 @@ function AppSidebarBody() {
                   </CollapsibleContent>
                 </SidebarMenuItem>
               </Collapsible>
+
+              {/* Portal preview that follows the cursor while a drag
+                  is in flight. `dropAnimation={null}` skips the
+                  default spring-back — the real list already renders
+                  the new order at drop, so animating the overlay
+                  back onto it would feel laggy. Renders the project
+                  preview if a project is being dragged, otherwise
+                  the thread preview if a thread is being dragged.
+                  Only one of the two state slots is non-null at a
+                  time. */}
+              <DragOverlay dropAnimation={null}>
+                {activeProjectId ? (
+                  <div className="pointer-events-none flex items-center gap-2 rounded-md border border-sidebar-border bg-sidebar px-3 py-2 text-sm font-medium shadow-lg">
+                    <FolderIcon className="h-4 w-4 shrink-0" />
+                    <span className="max-w-[180px] truncate">
+                      {state.projectDisplay.get(activeProjectId)?.name ??
+                        "Untitled project"}
+                    </span>
+                  </div>
+                ) : activeThreadId ? (
+                  <div className="pointer-events-none flex items-center gap-2 rounded-md border border-sidebar-border bg-sidebar px-3 py-1.5 text-xs shadow-lg">
+                    <span className="max-w-[200px] truncate">
+                      {state.sessionDisplay.get(activeThreadId)?.title ||
+                        "New thread"}
+                    </span>
+                  </div>
+                ) : null}
+              </DragOverlay>
+              </DndContext>
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

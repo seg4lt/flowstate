@@ -631,6 +631,7 @@ export function listBinarySearchPaths(): Promise<string[]> {
 export interface SessionDisplay {
   title: string | null;
   lastTurnPreview: string | null;
+  sortOrder: number | null;
 }
 
 export interface ProjectDisplay {

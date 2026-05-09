@@ -35,6 +35,14 @@ use serde::{Deserialize, Serialize};
 pub struct SessionDisplay {
     pub title: Option<String>,
     pub last_turn_preview: Option<String>,
+    /// Manual ordering inside the visual group (named project,
+    /// "General", or an archived-project group). Dense 0..N-1 across
+    /// the group's threads when set. `None` means the thread has
+    /// never been manually reordered — those float to the top of
+    /// their group sorted by createdAt DESC; manually-ordered ones
+    /// sit below in fixed sort_order ASC. Mirrors ProjectDisplay's
+    /// sort_order field.
+    pub sort_order: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,6 +109,7 @@ impl UserConfigStore {
                     session_id TEXT PRIMARY KEY,
                     title TEXT,
                     last_turn_preview TEXT,
+                    sort_order INTEGER,
                     updated_at TEXT NOT NULL
                 );
 
@@ -122,6 +131,25 @@ impl UserConfigStore {
                     ON project_worktree(parent_project_id);",
             )
             .map_err(|e| format!("create user_config schema: {e}"))?;
+
+        // Idempotent migration for upgraders: `CREATE TABLE IF NOT
+        // EXISTS` above won't add a column to an existing
+        // session_display table, so issue a defensive ALTER. SQLite
+        // returns `duplicate column name` on the second boot — we
+        // swallow that one error class and propagate everything else.
+        // This is the de-facto SQLite single-column-add idiom.
+        match connection.execute(
+            "ALTER TABLE session_display ADD COLUMN sort_order INTEGER",
+            [],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(msg)))
+                if msg.contains("duplicate column name") => {}
+            Err(e) => {
+                return Err(format!("alter session_display add sort_order: {e}"));
+            }
+        }
+
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -174,13 +202,20 @@ impl UserConfigStore {
         connection
             .execute(
                 "INSERT INTO session_display
-                    (session_id, title, last_turn_preview, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                    (session_id, title, last_turn_preview, sort_order, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(session_id) DO UPDATE SET
                     title = excluded.title,
                     last_turn_preview = excluded.last_turn_preview,
+                    sort_order = excluded.sort_order,
                     updated_at = excluded.updated_at",
-                params![session_id, display.title, display.last_turn_preview, now],
+                params![
+                    session_id,
+                    display.title,
+                    display.last_turn_preview,
+                    display.sort_order,
+                    now,
+                ],
             )
             .map_err(|e| format!("set session_display: {e}"))?;
         Ok(())
@@ -193,12 +228,13 @@ impl UserConfigStore {
         };
         connection
             .query_row(
-                "SELECT title, last_turn_preview FROM session_display WHERE session_id = ?1",
+                "SELECT title, last_turn_preview, sort_order FROM session_display WHERE session_id = ?1",
                 params![session_id],
                 |row| {
                     Ok(SessionDisplay {
                         title: row.get(0)?,
                         last_turn_preview: row.get(1)?,
+                        sort_order: row.get(2)?,
                     })
                 },
             )
@@ -212,7 +248,7 @@ impl UserConfigStore {
             Err(poisoned) => poisoned.into_inner(),
         };
         let mut stmt = connection
-            .prepare("SELECT session_id, title, last_turn_preview FROM session_display")
+            .prepare("SELECT session_id, title, last_turn_preview, sort_order FROM session_display")
             .map_err(|e| format!("prepare list session_display: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
@@ -222,6 +258,7 @@ impl UserConfigStore {
                     SessionDisplay {
                         title: row.get(1)?,
                         last_turn_preview: row.get(2)?,
+                        sort_order: row.get(3)?,
                     },
                 ))
             })

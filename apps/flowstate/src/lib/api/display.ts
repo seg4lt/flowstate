@@ -10,6 +10,14 @@ import { invoke } from "@tauri-apps/api/core";
 export interface SessionDisplay {
   title: string | null;
   lastTurnPreview: string | null;
+  /** Manual ordering inside the visual group (one named project,
+   *  the unassigned "General" bucket, or one archived-project group).
+   *  Dense 0..N-1 across the group's threads when set. `null` means
+   *  the thread has never been manually reordered — those float to
+   *  the top of their group sorted by createdAt DESC; manually-
+   *  ordered ones sit below in fixed sortOrder ASC. Mirrors the
+   *  ProjectDisplay.sortOrder field. */
+  sortOrder: number | null;
 }
 
 export interface ProjectDisplay {

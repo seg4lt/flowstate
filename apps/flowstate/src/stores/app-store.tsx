@@ -576,7 +576,9 @@ function projectRecordsEqual(a: ProjectRecord, b: ProjectRecord): boolean {
 function sessionDisplaysEqual(a: SessionDisplay, b: SessionDisplay): boolean {
   return (
     a === b ||
-    (a.title === b.title && a.lastTurnPreview === b.lastTurnPreview)
+    (a.title === b.title &&
+      a.lastTurnPreview === b.lastTurnPreview &&
+      a.sortOrder === b.sortOrder)
   );
 }
 
@@ -1282,6 +1284,15 @@ interface AppContextValue {
    *  = index for each, both to SQLite (via set_project_display) and
    *  to the in-memory store. */
   reorderProjects: (orderedProjectIds: string[]) => Promise<void>;
+  /** Persist a new ordering for sessions inside one visual group (one
+   *  named project, the unassigned "General" bucket, or one archived-
+   *  project group). The caller passes the full ordered list of
+   *  session_ids in that group; sort_order is written 0..N-1 across
+   *  every id, both to SQLite (via set_session_display) and to the
+   *  in-memory store. The function is group-blind — it doesn't know
+   *  or care which group the ids belong to; the caller is responsible
+   *  for not mixing groups in a single call. */
+  reorderSessions: (orderedSessionIds: string[]) => Promise<void>;
   /** Create a project via the SDK (path only) and immediately write
    *  the display name into the app-side store. Resolves once both
    *  the SDK row and the app-side display row exist; returns the
@@ -1659,6 +1670,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
               const newDisplay: SessionDisplay = {
                 title: auto,
                 lastTurnPreview: display?.lastTurnPreview ?? null,
+                sortOrder: display?.sortOrder ?? null,
               };
               setSessionDisplay(sid, newDisplay)
                 .then(() => {
@@ -1914,6 +1926,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const display: SessionDisplay = {
         title: trimmed.length > 0 ? trimmed : null,
         lastTurnPreview: existing?.lastTurnPreview ?? null,
+        sortOrder: existing?.sortOrder ?? null,
       };
       await setSessionDisplay(sessionId, display);
       dispatchRef.current({
@@ -1962,6 +1975,38 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
           dispatchRef.current({
             type: "set_project_display",
             projectId,
+            display,
+          });
+        }),
+      );
+    },
+    [],
+  );
+
+  // Reorder sessions inside a single visual group (one named project,
+  // the unassigned "General" bucket, or one archived-project group).
+  // The caller passes the full ordered list of session_ids in that
+  // group AFTER the user's drop; we rewrite sort_order = 0..N-1 across
+  // every passed id. By passing the full visual order (including
+  // previously-unordered threads) the caller "promotes" the whole
+  // group to manual ordering on first drag — matching the user's
+  // mental model of "I touched this list, it's manual now."
+  // Title + lastTurnPreview are preserved.
+  const reorderSessions = React.useCallback(
+    async (orderedSessionIds: string[]) => {
+      await Promise.all(
+        orderedSessionIds.map(async (sessionId, index) => {
+          const existing = stateRef.current.sessionDisplay.get(sessionId);
+          if (existing?.sortOrder === index) return;
+          const display: SessionDisplay = {
+            title: existing?.title ?? null,
+            lastTurnPreview: existing?.lastTurnPreview ?? null,
+            sortOrder: index,
+          };
+          await setSessionDisplay(sessionId, display);
+          dispatchRef.current({
+            type: "set_session_display",
+            sessionId,
             display,
           });
         }),
@@ -2224,6 +2269,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       const display: SessionDisplay = {
         title: existing?.title ?? null,
         lastTurnPreview: preview.slice(0, 140),
+        sortOrder: existing?.sortOrder ?? null,
       };
       await setSessionDisplay(sessionId, display);
       dispatchRef.current({
@@ -2314,6 +2360,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       renameSession,
       renameProject,
       reorderProjects,
+      reorderSessions,
       createProject,
       updateSessionPreview,
       deleteSessionDisplayLocal,
@@ -2328,6 +2375,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       renameSession,
       renameProject,
       reorderProjects,
+      reorderSessions,
       createProject,
       updateSessionPreview,
       deleteSessionDisplayLocal,
