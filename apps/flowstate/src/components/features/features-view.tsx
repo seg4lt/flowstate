@@ -4,10 +4,15 @@ import {
   Copy,
   ExternalLink,
   FileText,
+  GitBranch,
   GitCompare,
   Globe,
+  History,
+  Keyboard,
+  MessageSquare,
   Search,
   Sparkles,
+  TerminalSquare,
   Wand2,
   Zap,
 } from "lucide-react";
@@ -267,6 +272,18 @@ const FEATURES: FeatureCardProps[] = [
     accent: "oklch(0.72 0.16 250 / 0.45)",
   },
   {
+    icon: <Keyboard className="h-5 w-5" />,
+    title: "Vim Mode",
+    blurb:
+      "Full Vim keybindings inside the editor — Normal, Insert, Visual, the works — toggled on with one click.",
+    bullets: [
+      "Flip on in Settings → Appearance, applies to every open tab",
+      "Live --VISUAL-- / --INSERT-- mode indicator at the bottom",
+      "Survives reloads and coexists with the app's own shortcuts",
+    ],
+    accent: "oklch(0.74 0.14 140 / 0.45)",
+  },
+  {
     icon: <GitCompare className="h-5 w-5" />,
     title: "Diff View",
     blurb:
@@ -277,6 +294,54 @@ const FEATURES: FeatureCardProps[] = [
       "Stays in sync with the worktree as the agent iterates",
     ],
     accent: "oklch(0.78 0.16 150 / 0.45)",
+  },
+  {
+    icon: <MessageSquare className="h-5 w-5" />,
+    title: "Inline Comments",
+    blurb:
+      "Hover any line in a diff or an open file and drop a comment — anchored to the exact path and range — before sending to the agent.",
+    bullets: [
+      "Hover gutter for a + affordance, or ⌥⌘C on a selection",
+      "Single-line or multi-line ranges, with the source captured",
+      "Stacks as chips above the composer until you actually send",
+    ],
+    accent: "oklch(0.78 0.14 100 / 0.45)",
+  },
+  {
+    icon: <History className="h-5 w-5" />,
+    title: "Checkpoints",
+    blurb:
+      "Every turn snapshots the files the agent touched, so you can rewind the workspace to any prior message in the thread.",
+    bullets: [
+      "Dry-run preview shows exactly what restore / delete / skip will do",
+      "Detects out-of-band edits and asks before overwriting",
+      "Rewind to any message — the conversation stays put, the files snap back",
+    ],
+    accent: "oklch(0.78 0.15 50 / 0.45)",
+  },
+  {
+    icon: <GitBranch className="h-5 w-5" />,
+    title: "Worktrees",
+    blurb:
+      "First-class git worktrees: spin one up from the new-thread dropdown and run an agent against an isolated branch in seconds.",
+    bullets: [
+      "Create a fresh branch or check out an existing one inline",
+      "Each worktree shows up as its own project, with its own sessions",
+      "Pairs with the MCP so peer agents can work in parallel branches",
+    ],
+    accent: "oklch(0.74 0.16 170 / 0.45)",
+  },
+  {
+    icon: <TerminalSquare className="h-5 w-5" />,
+    title: "Terminal",
+    blurb:
+      "An embedded xterm.js terminal docked under the chat, so you can run a build or tail logs without leaving the thread.",
+    bullets: [
+      "Multiple tabs per project, each with its own live PTY",
+      "Resizable dock that remembers its height per session",
+      "Shells stay alive across thread switches and minimizes",
+    ],
+    accent: "oklch(0.72 0.13 260 / 0.45)",
   },
   {
     icon: <FileText className="h-5 w-5" />,
