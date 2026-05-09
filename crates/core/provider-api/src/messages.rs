@@ -357,6 +357,18 @@ pub enum RuntimeEvent {
         session_id: String,
         wakeup_id: String,
     },
+    /// A persisted thread goal was created, updated, or transitioned to a
+    /// new status. Frontend stores one goal per session_id and replaces
+    /// the prior value on each event. Gated on
+    /// `ProviderFeatures.goal_tracking`; only providers that surface a
+    /// goal-tracking primitive (Codex's `/goal` today) ever emit this.
+    ThreadGoalUpdated {
+        session_id: String,
+        goal: ThreadGoal,
+    },
+    /// The active goal for the session was cleared. Frontend drops its
+    /// per-session goal entry on receipt.
+    ThreadGoalCleared { session_id: String },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -591,6 +603,28 @@ pub enum ClientMessage {
     /// this for explicit re-syncs (e.g. after a settings dialog reopens
     /// and the app wants to confirm its cache is still accurate).
     GetCheckpointSettings,
+    /// Create or update the active goal for `session_id`. The runtime
+    /// dispatches to `ProviderAdapter::set_goal`. Adapters whose
+    /// provider doesn't support goals respond with an error so the UI
+    /// can fail loudly rather than silently drop. Frontend gates the
+    /// affordance on `ProviderFeatures.goal_tracking`.
+    SetGoal {
+        session_id: String,
+        objective: String,
+        /// Optional hard cap on tokens. `None` means "no budget"
+        /// (unbounded; useful for indefinite goals).
+        #[serde(default)]
+        token_budget: Option<i64>,
+        /// Optional new status for the goal — primarily used to pause
+        /// or resume an existing goal without changing its objective.
+        /// `None` means "leave status alone" on update / `Active` on
+        /// create.
+        #[serde(default)]
+        status: Option<ThreadGoalStatus>,
+    },
+    /// Clear the active goal for `session_id`. Idempotent — clearing
+    /// when no goal is active responds with `Ack`.
+    ClearGoal { session_id: String },
 }
 
 /// The checkpoint-settings snapshot the daemon ships on

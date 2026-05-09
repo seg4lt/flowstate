@@ -17,6 +17,7 @@ import {
   createProjectFile,
   moveProjectPath,
   renameProjectPath,
+  revealInFileManager,
   trashProjectPath,
   type DirEntry,
 } from "@/lib/api";
@@ -28,6 +29,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { cn } from "@/lib/utils";
+import { basename } from "@/lib/worktree-utils";
 
 // Lazy, per-directory file tree. Each folder fetches its immediate
 // children on first expansion via the `list_directory` Tauri command,
@@ -296,6 +298,7 @@ export function FileTree({
       <FileTreeContext.Provider value={ctx}>
         <RootDropZone>
           <ul role="tree" className="py-1">
+            <RootHeaderRow />
             {editing?.kind === "create" && editing.parentDir === "" ? (
               <CreatePlaceholder parentDir="" indentDepth={0} />
             ) : null}
@@ -819,6 +822,111 @@ const TreeRow = React.memo(function TreeRow({
     </li>
   );
 });
+
+/**
+ * Sticky header row representing the project root. Sits above every
+ * other tree row so users always have a target to right-click for
+ * "create at root" actions; without it the only way to create a top-
+ * level entry was via the (currently absent) shortcut. Carries no
+ * chevron (root has no collapse state — its children are always
+ * rendered) and no drag handlers (root-into-root is meaningless).
+ *
+ * The header lives *inside* `RootDropZone` so dragging an entry
+ * onto it still falls through to the existing root-move logic.
+ */
+function RootHeaderRow() {
+  const ctx = useTreeCtx();
+  const name = basename(ctx.projectPath) || ctx.projectPath;
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <li
+          role="treeitem"
+          className="sticky top-0 z-10 flex items-center gap-1 border-b border-border/40 bg-background/95 px-2 py-1 text-[11px] font-semibold text-foreground/90 backdrop-blur select-none cursor-default"
+          title={ctx.projectPath}
+        >
+          <Folder className="h-3 w-3 shrink-0 opacity-70" />
+          <span className="truncate font-mono">{name}</span>
+        </li>
+      </ContextMenuTrigger>
+      <RootContextMenu />
+    </ContextMenu>
+  );
+}
+
+/**
+ * Context menu for the project-root header row. Shares the inline-
+ * create pipeline with `RowContextMenu` (`setEditing` with
+ * `parentDir = ""`), so the existing `CreatePlaceholder` at the top
+ * of `<ul role="tree">` handles rendering. Rename and trash are
+ * intentionally absent — neither is meaningful for the project root
+ * itself, and exposing them here would invite accidental destruction.
+ */
+function RootContextMenu() {
+  const ctx = useTreeCtx();
+  return (
+    <ContextMenuContent
+      // Mirror `RowContextMenu` — keep focus with the inline create
+      // input rather than letting Radix snap it back to the trigger.
+      onCloseAutoFocus={(e) => e.preventDefault()}
+    >
+      <ContextMenuItem
+        onSelect={() =>
+          ctx.setEditing({
+            kind: "create",
+            parentDir: "",
+            childKind: "file",
+          })
+        }
+      >
+        <FilePlus />
+        <span>New file</span>
+      </ContextMenuItem>
+      <ContextMenuItem
+        onSelect={() =>
+          ctx.setEditing({
+            kind: "create",
+            parentDir: "",
+            childKind: "folder",
+          })
+        }
+      >
+        <FolderPlus />
+        <span>New folder</span>
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem onSelect={() => void copyToClipboard(ctx.projectPath)}>
+        <Copy />
+        <span>Copy path</span>
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onSelect={() => {
+          void revealInFileManager(ctx.projectPath).catch((err) => {
+            console.error("[file-tree] reveal in file manager failed", err);
+          });
+        }}
+      >
+        <Folder />
+        <span>Reveal in {revealInFileManagerLabel()}</span>
+      </ContextMenuItem>
+    </ContextMenuContent>
+  );
+}
+
+/**
+ * Best-effort label for the OS file manager. Uses `navigator.platform`
+ * (deprecated but still widely supported and good enough for a label
+ * heuristic — we don't branch behavior on it). Falls back to a
+ * generic name for unknown platforms / non-browser contexts.
+ */
+function revealInFileManagerLabel(): string {
+  if (typeof navigator === "undefined") return "file manager";
+  const ua = navigator.platform || "";
+  if (/Mac/i.test(ua)) return "Finder";
+  if (/Win/i.test(ua)) return "Explorer";
+  return "file manager";
+}
 
 /**
  * Per-row context menu. Branches on `entry.isDir` so we don't show

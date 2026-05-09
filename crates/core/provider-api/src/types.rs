@@ -808,6 +808,14 @@ pub struct ProviderFeatures {
     /// only flushes on `TurnStatus::Completed` — that's the bug this
     /// flag exists to gate around for everyone else.
     pub live_message_injection: bool,
+    /// Adapter surfaces a persisted thread-level objective with token /
+    /// time budget tracking, and accepts `set_goal` / `clear_goal`
+    /// from the runtime. Today only Codex's `/goal` feature meets this
+    /// contract (added in codex 0.128, marked experimental in 0.129).
+    /// Frontend hides the goal-management UI when this flag is `false`,
+    /// so adapters that haven't wired the RPCs don't expose a
+    /// non-functional affordance.
+    pub goal_tracking: bool,
 }
 
 /// Central registry mapping every `ProviderKind` to the capability
@@ -880,14 +888,30 @@ pub fn features_for_kind(kind: ProviderKind) -> ProviderFeatures {
             // ticks) instead of stalling in the mailbox until the
             // turn ends.
             live_message_injection: true,
+
+            // Claude's bridge doesn't surface `/goal` style goal-
+            // tracking events today — Codex's app-server JSON-RPC has
+            // `thread/goal/*` notifications, but the Claude SDK has no
+            // equivalent first-class affordance. Off until we either
+            // wire a synthetic goal channel (e.g. from a tool call) or
+            // the SDK adds one.
+            goal_tracking: false,
         },
 
         // Codex CLI adapter has native `reasoning_effort` on its
         // turn API. None of the other cross-provider features (tool
         // heartbeats, compact summaries, file checkpoints, etc.) map
         // to anything the Codex protocol surfaces today.
+        //
+        // `goal_tracking` is on: codex's `/goal` feature (added in
+        // 0.128, experimental in 0.129) exposes `thread/goal/set`,
+        // `thread/goal/clear`, and `thread/goal/updated` notifications
+        // over app-server JSON-RPC. The codex adapter wires these
+        // through `set_goal`/`clear_goal` and the
+        // `ThreadGoalUpdated`/`ThreadGoalCleared` ProviderTurnEvents.
         ProviderKind::Codex => ProviderFeatures {
             thinking_effort: true,
+            goal_tracking: true,
             ..ProviderFeatures::default()
         },
 
@@ -1224,6 +1248,56 @@ pub struct RateLimitInfo {
     /// credit rather than the primary bucket allowance.
     #[serde(default)]
     pub is_using_overage: bool,
+}
+
+/// Persisted thread-level objective with token/time budget tracking.
+///
+/// Mirrors codex's `ThreadGoal` (see
+/// `codex-rs/app-server-protocol/src/protocol/v2/thread.rs:553` at
+/// `rust-v0.130.0`). Codex's `/goal` feature lets a thread carry a
+/// long-running objective across turns; the agent can also create or
+/// update goals on its own via the `set_goal` model tool. Adapters
+/// that don't support goal tracking never produce this — the field
+/// is gated by `ProviderFeatures.goal_tracking`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadGoal {
+    /// Provider-side thread id this goal is attached to. Carried verbatim
+    /// from codex; opaque to the runtime and the UI.
+    pub thread_id: String,
+    /// Free-text "what we're trying to do" string. Set by the user (via
+    /// `ClientMessage::SetGoal`) or by the agent (via codex's `set_goal`
+    /// model tool).
+    pub objective: String,
+    pub status: ThreadGoalStatus,
+    /// Optional hard cap on tokens the agent will spend pursuing this
+    /// goal. When `tokens_used >= token_budget` codex transitions the
+    /// goal to `BudgetLimited` and the agent stops on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<i64>,
+    pub tokens_used: i64,
+    pub time_used_seconds: i64,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadGoalStatus {
+    /// Agent is actively working on the goal.
+    Active,
+    /// Explicitly paused by the user. Stays paused across thread resume
+    /// unless the user opts back in (codex 0.129+ behaviour).
+    Paused,
+    /// Hit `token_budget`; the agent stopped on its own.
+    BudgetLimited,
+    /// Agent declared the goal complete via the `set_goal` model tool.
+    Complete,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

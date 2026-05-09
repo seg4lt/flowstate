@@ -241,6 +241,12 @@ the one with better error handling.`}</CodeBlock>
 find the one working on the migration script,
 send it "switch to a transactional approach and
 re-run the dry run", then poll for its reply.`}</CodeBlock>
+          <CodeBlock language="prompt">{`Use the flowstate mcp to spawn an agent on the
+acme-web project and discuss how their feature-flag
+system is implemented. Once you understand it,
+coordinate with the peer on how we can reuse the
+same pattern here — agree on an interface, then
+have it draft the port while you review.`}</CodeBlock>
         </div>
       </div>
     </section>

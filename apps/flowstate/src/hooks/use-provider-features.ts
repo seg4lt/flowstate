@@ -23,6 +23,11 @@ const EMPTY_PROVIDER_FEATURES: ProviderFeatures = {
   // assumed to lack live-injection, so callers fall through to the
   // mailbox-drain path on the next TurnCompleted.
   liveMessageInjection: false,
+  // Adapter exposes the persisted-thread-goal RPCs (Codex's `/goal`
+  // today). Default-false hides the goal chip + dialog; flipping it
+  // on per-provider lets the UI render the affordance without any
+  // frontend change beyond the chat-toolbar gate.
+  goalTracking: false,
 };
 
 /**

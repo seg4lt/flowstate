@@ -548,42 +548,13 @@ impl ProviderAdapter for CodexAdapter {
         let result = {
             let mut process = cached.inner().lock().await;
             let provider_thread_id = process.provider_thread_id.clone();
-            let effort_str = reasoning_effort.unwrap_or(ReasoningEffort::Medium).as_str();
-            let mut turn_params = json!({
-                "input": [{
-                    "text": input.text.as_str(),
-                    "text_elements": [],
-                    "type": "text",
-                }],
-                "threadId": provider_thread_id,
-            });
-            // Codex accepts reasoning_effort as a turn-level hint on every turn.
-            // Unknown fields are ignored by the server, so this is safe on older CLIs.
-            if let Some(obj) = turn_params.as_object_mut() {
-                obj.insert("reasoning_effort".to_string(), json!(effort_str));
-            }
-            if permission_mode == PermissionMode::Plan {
-                if let Some(obj) = turn_params.as_object_mut() {
-                    let model = session.summary.model.clone().unwrap_or_default();
-                    // Do NOT set `developer_instructions` — when it's absent/null,
-                    // codex's `normalize_turn_start_collaboration_mode` fills in the
-                    // Plan preset's system prompt (see codex-rs/models-manager/src/
-                    // collaboration_mode_presets.rs::plan_preset), which is what tells
-                    // the model to use `request_user_input` for clarifying questions.
-                    // Sending `""` counts as `Some("")` in serde and suppresses the
-                    // preset, causing the model to fall back to plaintext selection.
-                    obj.insert(
-                        "collaborationMode".to_string(),
-                        json!({
-                            "mode": "plan",
-                            "settings": {
-                                "model": model,
-                                "reasoning_effort": effort_str,
-                            },
-                        }),
-                    );
-                }
-            }
+            let turn_params = build_turn_start_params(
+                &input.text,
+                &provider_thread_id,
+                reasoning_effort,
+                permission_mode,
+                session.summary.model.as_deref(),
+            );
             let response = process.send_request("turn/start", turn_params).await?;
             let turn_id = extract_turn_id(&response)
                 .ok_or_else(|| "Codex turn start did not return a turn id.".to_string())?;
@@ -662,6 +633,84 @@ impl ProviderAdapter for CodexAdapter {
             "Codex interrupt requested for session `{}`.",
             session.summary.session_id
         ))
+    }
+
+    /// Set or update the codex thread's persisted goal.
+    ///
+    /// Sends `thread/goal/set` with the user's `objective`, `tokenBudget`,
+    /// and (optionally) `status` to the per-session `codex app-server`
+    /// bridge. Codex returns the resulting `ThreadGoal`; we decode it and
+    /// hand it back to the runtime, which publishes
+    /// `RuntimeEvent::ThreadGoalUpdated` from the response so the UI
+    /// updates immediately rather than waiting for the
+    /// `thread/goal/updated` notification round-trip.
+    ///
+    /// The session bridge is started lazily — the first call here will
+    /// spawn `codex app-server` and run the `thread/start` handshake under
+    /// `PermissionMode::Default`, mirroring the lazy-spawn behaviour of
+    /// `execute_turn`. The next `execute_turn` rebuilds the bridge under
+    /// the user-selected permission mode (existing teardown logic in
+    /// `execute_turn` already handles mode mismatches).
+    async fn set_goal(
+        &self,
+        session: &SessionDetail,
+        objective: String,
+        token_budget: Option<i64>,
+        status: Option<zenui_provider_api::ThreadGoalStatus>,
+    ) -> Result<zenui_provider_api::ThreadGoal, String> {
+        let cached = self
+            .ensure_session_process(session, PermissionMode::Default)
+            .await?;
+        let _activity = cached.activity_guard();
+        let mut process = cached.inner().lock().await;
+        let provider_thread_id = process.provider_thread_id.clone();
+
+        let mut params = json!({
+            "threadId": provider_thread_id,
+            "objective": objective,
+        });
+        if let Some(obj) = params.as_object_mut() {
+            // tokenBudget is double-Option in the codex protocol:
+            // `Some(Some(x))` to set, `Some(None)` to clear, omit to leave
+            // alone. Our caller's `Option<i64>` semantically maps to "set
+            // or unset"; we send `null` to clear and skip the key on
+            // None-from-runtime callers (they'd never reach here, but
+            // belt-and-suspenders).
+            if let Some(budget) = token_budget {
+                obj.insert("tokenBudget".to_string(), json!(budget));
+            }
+            if let Some(s) = status {
+                obj.insert(
+                    "status".to_string(),
+                    json!(codex_thread_goal_status_str(s)),
+                );
+            }
+        }
+
+        let response = process.send_request("thread/goal/set", params).await?;
+        let goal_value = response
+            .get("goal")
+            .ok_or_else(|| "Codex thread/goal/set response missing `goal`.".to_string())?;
+        parse_codex_thread_goal(goal_value)
+            .ok_or_else(|| "Codex returned an unparseable ThreadGoal.".to_string())
+    }
+
+    async fn clear_goal(&self, session: &SessionDetail) -> Result<(), String> {
+        // If no bridge exists yet there's nothing to clear — codex never
+        // saw a goal for this session. Treat as success (idempotent).
+        let Some(cached) = self.sessions.get(&session.summary.session_id).await else {
+            return Ok(());
+        };
+        let _activity = cached.activity_guard();
+        let mut process = cached.inner().lock().await;
+        let provider_thread_id = process.provider_thread_id.clone();
+        process
+            .send_request(
+                "thread/goal/clear",
+                json!({ "threadId": provider_thread_id }),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Daemon-shutdown hook: kill every per-session `codex` CLI child
@@ -1090,6 +1139,58 @@ fn codex_models() -> Vec<ProviderModel> {
     ]
 }
 
+/// Build the `turn/start` JSON-RPC params payload.
+///
+/// Codex 0.130.0's `TurnStartParams` is `#[serde(rename_all = "camelCase")]`
+/// (see `codex-rs/app-server-protocol/src/protocol/v2/turn.rs`), so the
+/// top-level reasoning hint is `effort` (NOT `reasoning_effort`). Older
+/// flowstate revs sent `reasoning_effort`, which serde silently dropped —
+/// the user's selected effort was ignored on every turn.
+///
+/// Inside `collaborationMode.settings`, however, the nested `Settings`
+/// struct (`codex-rs/protocol/src/config_types.rs`) has no `rename_all`,
+/// so `reasoning_effort` is still snake_case there. Don't "fix" it.
+///
+/// Plan mode is gated behind `experimentalApi: true` (already negotiated
+/// in `initialize_params()`); leaving `developer_instructions` absent
+/// makes codex fill in the plan-preset prompt that drives the
+/// `request_user_input` tool.
+fn build_turn_start_params(
+    input_text: &str,
+    provider_thread_id: &str,
+    reasoning_effort: Option<ReasoningEffort>,
+    permission_mode: PermissionMode,
+    session_model: Option<&str>,
+) -> Value {
+    let effort_str = reasoning_effort.unwrap_or(ReasoningEffort::Medium).as_str();
+    let mut turn_params = json!({
+        "input": [{
+            "text": input_text,
+            "text_elements": [],
+            "type": "text",
+        }],
+        "threadId": provider_thread_id,
+        "effort": effort_str,
+    });
+    if permission_mode == PermissionMode::Plan
+        && let Some(obj) = turn_params.as_object_mut()
+    {
+        let model = session_model.unwrap_or("").to_string();
+        obj.insert(
+            "collaborationMode".to_string(),
+            json!({
+                "mode": "plan",
+                "settings": {
+                    "model": model,
+                    // Nested Settings uses snake_case (no serde rename).
+                    "reasoning_effort": effort_str,
+                },
+            }),
+        );
+    }
+    turn_params
+}
+
 fn initialize_params() -> Value {
     json!({
         "capabilities": {
@@ -1380,6 +1481,284 @@ mod codex_mcp_tests {
     }
 }
 
+/// Regression tests pinned to the codex 0.130.0 app-server JSON-RPC protocol
+/// (verified against `codex app-server generate-json-schema`). Each one
+/// guards a specific shape change that previously broke the adapter
+/// silently — see /Users/babal/.claude/plans/splendid-watching-zephyr.md
+/// for the full incident.
+#[cfg(test)]
+mod codex_protocol_compat_tests {
+    use super::*;
+
+    #[test]
+    fn turn_start_uses_effort_field_not_reasoning_effort() {
+        // codex 0.130.0's TurnStartParams is `#[serde(rename_all = "camelCase")]`
+        // so the top-level field is `effort`, not `reasoning_effort`. Sending
+        // the snake_case name silently dropped the user's choice.
+        let params = build_turn_start_params(
+            "hello",
+            "thread-1",
+            Some(ReasoningEffort::High),
+            PermissionMode::Default,
+            Some("gpt-5"),
+        );
+        assert_eq!(
+            params.get("effort").and_then(Value::as_str),
+            Some("high"),
+            "expected top-level `effort` field"
+        );
+        assert!(
+            params.get("reasoning_effort").is_none(),
+            "snake_case `reasoning_effort` was renamed away in codex 0.130.0"
+        );
+        assert_eq!(
+            params.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert!(params.get("collaborationMode").is_none());
+    }
+
+    #[test]
+    fn turn_start_plan_mode_keeps_collaboration_mode_with_snake_case_settings() {
+        // Inside collaborationMode.settings the nested `Settings` struct in
+        // codex (`codex-rs/protocol/src/config_types.rs`) has no
+        // rename_all, so `reasoning_effort` is still snake_case there. Don't
+        // "fix" it.
+        let params = build_turn_start_params(
+            "plan it",
+            "thread-2",
+            Some(ReasoningEffort::Low),
+            PermissionMode::Plan,
+            Some("gpt-5"),
+        );
+        let cm = params
+            .get("collaborationMode")
+            .expect("plan mode must include collaborationMode");
+        assert_eq!(cm.get("mode").and_then(Value::as_str), Some("plan"));
+        let settings = cm.get("settings").expect("settings");
+        assert_eq!(
+            settings.get("reasoning_effort").and_then(Value::as_str),
+            Some("low"),
+            "nested Settings.reasoning_effort stays snake_case"
+        );
+        assert_eq!(
+            settings.get("model").and_then(Value::as_str),
+            Some("gpt-5")
+        );
+        // developer_instructions must be ABSENT so codex auto-fills the
+        // plan preset prompt that drives request_user_input.
+        assert!(settings.get("developer_instructions").is_none());
+    }
+
+    #[test]
+    fn file_change_item_emits_one_event_per_change() {
+        // codex 0.130.0+ groups multi-file edits into a single `fileChange`
+        // item with a `changes: [{path, kind: {type}, diff}]` array.
+        let item = json!({
+            "id": "fc1",
+            "type": "fileChange",
+            "status": "applied",
+            "changes": [
+                {
+                    "path": "src/a.rs",
+                    "kind": { "type": "update" },
+                    "diff": "@@ -1 +1 @@\n-foo\n+bar\n"
+                },
+                {
+                    "path": "src/b.rs",
+                    "kind": { "type": "add" },
+                    "diff": "@@ -0,0 +1 @@\n+new\n"
+                },
+                {
+                    "path": "src/c.rs",
+                    "kind": { "type": "delete" },
+                    "diff": "@@ -1 +0,0 @@\n-gone\n"
+                }
+            ]
+        });
+        let events = extract_file_changes(&item);
+        assert_eq!(events.len(), 3, "one event per change entry");
+
+        let paths: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderTurnEvent::FileChange { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, ["src/a.rs", "src/b.rs", "src/c.rs"]);
+
+        let ops: Vec<zenui_provider_api::FileOperation> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderTurnEvent::FileChange { operation, .. } => Some(*operation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                zenui_provider_api::FileOperation::Edit,
+                zenui_provider_api::FileOperation::Write,
+                zenui_provider_api::FileOperation::Delete,
+            ]
+        );
+
+        // Per-change call_id must be `<itemId>#<idx>` so the UI dedupes
+        // multi-edit items into separate rows.
+        let ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderTurnEvent::FileChange { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["fc1#0", "fc1#1", "fc1#2"]);
+
+        // The unified diff lands in `after` for the UI's diff renderer.
+        if let ProviderTurnEvent::FileChange { after, before, .. } = &events[0] {
+            assert!(after.as_deref().unwrap_or("").contains("+bar"));
+            assert!(before.is_none());
+        } else {
+            panic!("expected FileChange variant");
+        }
+    }
+
+    #[test]
+    fn file_change_legacy_shape_still_parses() {
+        // Pinned-to-old-codex fallback path: single-change `{path, kind,
+        // before, after}` directly on the item. Drop after one release.
+        let item = json!({
+            "id": "fc-legacy",
+            "type": "fileChange",
+            "path": "old/file.rs",
+            "kind": "write",
+            "before": "old",
+            "after": "new"
+        });
+        let events = extract_file_changes(&item);
+        assert_eq!(events.len(), 1);
+        if let ProviderTurnEvent::FileChange {
+            call_id,
+            path,
+            operation,
+            before,
+            after,
+        } = &events[0]
+        {
+            assert_eq!(call_id, "fc-legacy");
+            assert_eq!(path, "old/file.rs");
+            assert_eq!(*operation, zenui_provider_api::FileOperation::Write);
+            assert_eq!(before.as_deref(), Some("old"));
+            assert_eq!(after.as_deref(), Some("new"));
+        } else {
+            panic!("expected FileChange variant");
+        }
+    }
+
+    #[test]
+    fn parse_codex_thread_goal_round_trip() {
+        // Mirrors codex's `ThreadGoalUpdatedNotification.goal` payload
+        // (verified against codex 0.130.0's generated JSON Schema).
+        let value = json!({
+            "threadId": "th_abc",
+            "objective": "ship the codex 0.130 fix",
+            "status": "active",
+            "tokenBudget": 50_000,
+            "tokensUsed": 1234,
+            "timeUsedSeconds": 90,
+            "createdAt": 1_715_000_000_000_i64,
+            "updatedAt": 1_715_000_001_000_i64
+        });
+        let goal = parse_codex_thread_goal(&value).expect("parses");
+        assert_eq!(goal.thread_id, "th_abc");
+        assert_eq!(goal.objective, "ship the codex 0.130 fix");
+        assert_eq!(
+            goal.status,
+            zenui_provider_api::ThreadGoalStatus::Active
+        );
+        assert_eq!(goal.token_budget, Some(50_000));
+        assert_eq!(goal.tokens_used, 1234);
+        assert_eq!(goal.time_used_seconds, 90);
+        assert_eq!(goal.created_at, 1_715_000_000_000);
+        assert_eq!(goal.updated_at, 1_715_000_001_000);
+    }
+
+    #[test]
+    fn parse_codex_thread_goal_status_covers_all_variants() {
+        // Codex's wire vocabulary is `active|paused|budgetLimited|complete`
+        // (camelCase for the multi-word one — confirmed in
+        // ThreadGoalUpdatedNotification.json). A typo here silently maps
+        // statuses to None which collapses goal events into a no-op
+        // `parse_codex_thread_goal` failure — pin every variant.
+        assert_eq!(
+            parse_codex_thread_goal_status("active"),
+            Some(zenui_provider_api::ThreadGoalStatus::Active)
+        );
+        assert_eq!(
+            parse_codex_thread_goal_status("paused"),
+            Some(zenui_provider_api::ThreadGoalStatus::Paused)
+        );
+        assert_eq!(
+            parse_codex_thread_goal_status("budgetLimited"),
+            Some(zenui_provider_api::ThreadGoalStatus::BudgetLimited)
+        );
+        assert_eq!(
+            parse_codex_thread_goal_status("complete"),
+            Some(zenui_provider_api::ThreadGoalStatus::Complete)
+        );
+        assert_eq!(parse_codex_thread_goal_status("unknown"), None);
+        // And the inverse direction matches verbatim.
+        assert_eq!(
+            codex_thread_goal_status_str(zenui_provider_api::ThreadGoalStatus::BudgetLimited),
+            "budgetLimited"
+        );
+    }
+
+    #[test]
+    fn parse_codex_thread_goal_drops_malformed_payloads() {
+        // Missing required `objective` → drop instead of building a half
+        // goal. The notification handler relies on this returning None
+        // so it can suppress the forward.
+        let value = json!({
+            "threadId": "th_x",
+            "status": "active"
+        });
+        assert!(parse_codex_thread_goal(&value).is_none());
+
+        // Unknown status string → drop.
+        let value = json!({
+            "threadId": "th_x",
+            "objective": "do a thing",
+            "status": "frozen"
+        });
+        assert!(parse_codex_thread_goal(&value).is_none());
+    }
+
+    #[test]
+    fn collab_agent_tool_call_is_tool_like() {
+        // codex 0.130.0 renamed `collabToolCall` → `collabAgentToolCall`.
+        // Both must be accepted; display name must come from `tool` (the
+        // CollabAgentToolCallThreadItem field) with `toolName` / `name` as
+        // fallbacks for older shapes.
+        assert!(is_tool_like_item_type("collabAgentToolCall"));
+        assert!(is_tool_like_item_type("collabToolCall")); // legacy alias
+
+        let item = json!({
+            "id": "c1",
+            "type": "collabAgentToolCall",
+            "tool": "spawn_subagent",
+            "senderThreadId": "t1",
+            "receiverThreadIds": ["t2"],
+            "status": { "type": "completed" }
+        });
+        assert_eq!(
+            tool_item_display_name(&item, "collabAgentToolCall"),
+            "spawn_subagent"
+        );
+    }
+}
+
 fn spawn_stderr_drain(stderr: ChildStderr) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut stderr = BufReader::new(stderr).lines();
@@ -1522,7 +1901,7 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
             }
 
             if item_type == "fileChange" {
-                if let Some(fc) = extract_file_change(item) {
+                for fc in extract_file_changes(item) {
                     events.send(fc).await;
                 }
             }
@@ -1569,12 +1948,93 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
                 .await;
         }
 
+        // codex `/goal`: persisted thread-level objective with budget
+        // tracking. Codex emits `thread/goal/updated` whenever the user
+        // sets/pauses/resumes a goal OR the agent calls its `set_goal`
+        // model tool, and `thread/goal/cleared` when the goal is
+        // dropped. We forward both verbatim so the UI replaces or
+        // removes its per-session goal entry.
+        //
+        // The `goal` payload shape mirrors codex's `ThreadGoal` (see
+        // `codex-rs/app-server-protocol/src/protocol/v2/thread.rs:553`
+        // at rust-v0.130.0). `parse_codex_thread_goal` returns `None`
+        // on malformed payloads — we drop instead of forwarding a
+        // half-built event so the UI never renders a partial goal.
+        "thread/goal/updated" => {
+            if let Some(goal) = params.get("goal").and_then(parse_codex_thread_goal) {
+                events
+                    .send(ProviderTurnEvent::ThreadGoalUpdated { goal })
+                    .await;
+            }
+        }
+        "thread/goal/cleared" => {
+            events.send(ProviderTurnEvent::ThreadGoalCleared).await;
+        }
+
         _ => {}
+    }
+}
+
+/// Decode codex's `ThreadGoal` JSON shape into the cross-provider
+/// [`zenui_provider_api::ThreadGoal`]. Returns `None` if any required
+/// field is missing — we drop malformed payloads instead of rendering
+/// half-built goals.
+fn parse_codex_thread_goal(value: &Value) -> Option<zenui_provider_api::ThreadGoal> {
+    let obj = value.as_object()?;
+    let thread_id = obj.get("threadId").and_then(Value::as_str)?.to_string();
+    let objective = obj.get("objective").and_then(Value::as_str)?.to_string();
+    let status = obj
+        .get("status")
+        .and_then(Value::as_str)
+        .and_then(parse_codex_thread_goal_status)?;
+    let token_budget = obj.get("tokenBudget").and_then(Value::as_i64);
+    let tokens_used = obj.get("tokensUsed").and_then(Value::as_i64).unwrap_or(0);
+    let time_used_seconds = obj
+        .get("timeUsedSeconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let created_at = obj.get("createdAt").and_then(Value::as_i64).unwrap_or(0);
+    let updated_at = obj.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+    Some(zenui_provider_api::ThreadGoal {
+        thread_id,
+        objective,
+        status,
+        token_budget,
+        tokens_used,
+        time_used_seconds,
+        created_at,
+        updated_at,
+    })
+}
+
+fn parse_codex_thread_goal_status(s: &str) -> Option<zenui_provider_api::ThreadGoalStatus> {
+    match s {
+        "active" => Some(zenui_provider_api::ThreadGoalStatus::Active),
+        "paused" => Some(zenui_provider_api::ThreadGoalStatus::Paused),
+        "budgetLimited" => Some(zenui_provider_api::ThreadGoalStatus::BudgetLimited),
+        "complete" => Some(zenui_provider_api::ThreadGoalStatus::Complete),
+        _ => None,
+    }
+}
+
+/// Render a [`zenui_provider_api::ThreadGoalStatus`] as the codex
+/// `ThreadGoalStatus` wire string. Inverse of
+/// [`parse_codex_thread_goal_status`].
+fn codex_thread_goal_status_str(status: zenui_provider_api::ThreadGoalStatus) -> &'static str {
+    match status {
+        zenui_provider_api::ThreadGoalStatus::Active => "active",
+        zenui_provider_api::ThreadGoalStatus::Paused => "paused",
+        zenui_provider_api::ThreadGoalStatus::BudgetLimited => "budgetLimited",
+        zenui_provider_api::ThreadGoalStatus::Complete => "complete",
     }
 }
 
 /// Returns true for Codex item types that map to a tool-call-style entry
 /// in the UI's work log (commands, file changes, MCP tool invocations, etc).
+///
+/// `collabAgentToolCall` is the codex 0.130.0+ name for what older CLIs
+/// emitted as `collabToolCall`; both are accepted so a user pinned to an
+/// older codex isn't broken.
 fn is_tool_like_item_type(item_type: &str) -> bool {
     matches!(
         item_type,
@@ -1583,6 +2043,7 @@ fn is_tool_like_item_type(item_type: &str) -> bool {
             | "mcpToolCall"
             | "dynamicToolCall"
             | "collabToolCall"
+            | "collabAgentToolCall"
             | "webSearch"
     )
 }
@@ -1593,8 +2054,9 @@ fn tool_item_display_name(item: &Value, item_type: &str) -> String {
     match item_type {
         "commandExecution" => "Bash".to_string(),
         "fileChange" => "File change".to_string(),
-        "mcpToolCall" | "dynamicToolCall" | "collabToolCall" => item
+        "mcpToolCall" | "dynamicToolCall" | "collabToolCall" | "collabAgentToolCall" => item
             .get("toolName")
+            .or_else(|| item.get("tool"))
             .or_else(|| item.get("name"))
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -1623,15 +2085,76 @@ fn tool_item_args(item: &Value) -> Option<Value> {
     }
 }
 
-/// Translate a Codex `fileChange` item into a zenui FileChange event. Codex
-/// file change items carry `path`, an operation kind, and before/after text.
-fn extract_file_change(item: &Value) -> Option<ProviderTurnEvent> {
+/// Translate a Codex `fileChange` item into one or more zenui `FileChange`
+/// events.
+///
+/// Codex 0.130.0+ groups all file edits from a single apply-patch into one
+/// `fileChange` item with a `changes: [{ path, kind: { type }, diff }]`
+/// array (see `FileChangeThreadItem` in the v2 schema; introduced by codex
+/// PR #20540). We emit one `ProviderTurnEvent::FileChange` per entry so the
+/// UI's existing per-file renderer keeps working.
+///
+/// Older codex CLIs (< 0.128) put `path`, `operation`, `before`/`after`
+/// directly on the item. We retain a fallback parse for that legacy shape
+/// so a user pinned to an older codex isn't broken — drop after one
+/// release.
+///
+/// For each change we fan out:
+///  - `kind.type` is one of `add` / `delete` / `update`. Unknown values
+///    fall through to `Edit` (the conservative default).
+///  - The `after` slot carries the unified `diff` payload (the new
+///    protocol no longer ships separate before/after text). The UI's diff
+///    renderer accepts a unified diff, so this is the right place for it.
+///  - `call_id` becomes `<itemId>#<idx>` so multi-edit items dedupe in
+///    the UI rather than collapsing onto one row.
+fn extract_file_changes(item: &Value) -> Vec<ProviderTurnEvent> {
     let call_id = item
         .get("id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let path = item.get("path").and_then(Value::as_str)?.to_string();
+
+    if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+        let mut out = Vec::with_capacity(changes.len());
+        for (idx, change) in changes.iter().enumerate() {
+            let Some(path) = change.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            // `kind` is an enum-tagged object: `{ "type": "add" | "delete" | "update" }`.
+            // Tolerate the legacy bare-string spelling too.
+            let kind_str = change
+                .get("kind")
+                .and_then(|k| k.get("type").and_then(Value::as_str).or_else(|| k.as_str()))
+                .unwrap_or("");
+            let operation = match kind_str {
+                "add" => zenui_provider_api::FileOperation::Write,
+                "delete" => zenui_provider_api::FileOperation::Delete,
+                _ => zenui_provider_api::FileOperation::Edit,
+            };
+            let after = change
+                .get("diff")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let scoped_id = if call_id.is_empty() {
+                format!("fileChange#{idx}")
+            } else {
+                format!("{call_id}#{idx}")
+            };
+            out.push(ProviderTurnEvent::FileChange {
+                call_id: scoped_id,
+                path: path.to_string(),
+                operation,
+                before: None,
+                after,
+            });
+        }
+        return out;
+    }
+
+    // Legacy single-change shape (codex < 0.128). Drop after one release.
+    let Some(path) = item.get("path").and_then(Value::as_str).map(str::to_string) else {
+        return Vec::new();
+    };
     let operation = match item
         .get("operation")
         .or_else(|| item.get("kind"))
@@ -1651,11 +2174,11 @@ fn extract_file_change(item: &Value) -> Option<ProviderTurnEvent> {
         .or_else(|| item.get("newContent"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    Some(ProviderTurnEvent::FileChange {
+    vec![ProviderTurnEvent::FileChange {
         call_id,
         path,
         operation,
         before,
         after,
-    })
+    }]
 }

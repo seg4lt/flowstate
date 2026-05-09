@@ -1919,6 +1919,45 @@ fn open_in_editor(editor: String, path: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Reveal a path in the OS file manager. On macOS this uses
+/// `open -R` to highlight the entry in Finder; on Windows
+/// `explorer /select,` to highlight in Explorer; on other Unix
+/// systems we fall back to `xdg-open` against the parent directory
+/// (Linux file managers have no portable "select-in-folder" verb).
+#[tauri::command]
+async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.exists() {
+        return Err(format!("path does not exist: {path}"));
+    }
+    let status = {
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open").arg("-R").arg(&p).status()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Command::new("explorer")
+                .arg(format!("/select,{}", p.display()))
+                .status()
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let dir = if p.is_dir() {
+                p.clone()
+            } else {
+                p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.clone())
+            };
+            Command::new("xdg-open").arg(&dir).status()
+        }
+    };
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("file manager exited with {s}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Live content search across the project, backed by fff-search's
 /// mmap-mounted file index (see `file_index::search_file_contents`).
 /// Supports literal / regex / fuzzy modes via `ContentSearchOptions`,
@@ -3908,6 +3947,7 @@ pub fn run() {
                         search_file_contents,
                         stop_content_search,
                         open_in_editor,
+                        reveal_in_file_manager,
                         pty_open,
                         pty_write,
                         pty_resize,

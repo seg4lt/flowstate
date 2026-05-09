@@ -221,6 +221,16 @@ pub enum ProviderTurnEvent {
         request_id: String,
         call: crate::RuntimeCall,
     },
+    /// Persisted thread-level objective with a token/time budget.
+    /// Codex's `/goal` feature emits this when the agent (via the
+    /// `set_goal` model tool) or the user sets, updates, or
+    /// transitions a goal. Adapters that don't support goal tracking
+    /// never emit this. Gated by `ProviderFeatures.goal_tracking`.
+    ThreadGoalUpdated { goal: ThreadGoal },
+    /// The active goal for the current thread was cleared. Emitted by
+    /// codex on `thread/goal/cleared`. Adapters that don't support
+    /// goal tracking never emit this.
+    ThreadGoalCleared,
 }
 
 /// Phase of a turn between streams. Deliberately coarse — only

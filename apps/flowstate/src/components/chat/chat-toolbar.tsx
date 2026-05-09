@@ -3,6 +3,7 @@ import { EffortSelector } from "./effort-selector";
 import { ThinkingModeSelector } from "./thinking-mode-selector";
 import { ModeSelector } from "./mode-selector";
 import { ContextDisplay } from "./context-display";
+import { GoalChip } from "./goal-chip";
 import { useApp } from "@/stores/app-store";
 import { useContextDisplaySetting } from "@/hooks/use-context-display-setting";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
@@ -116,6 +117,12 @@ export function ChatToolbar({
         onChange={onPermissionModeChange}
         features={features}
       />
+      {/* Goal chip: display + create/pause/resume/clear controls. Gated
+          on `goalTracking` so providers without a goal-tracking primitive
+          (everyone but Codex today) don't expose a non-functional
+          affordance — the chip stays absent rather than rendering a
+          control that would error on click. */}
+      {features.goalTracking && <GoalChip sessionId={sessionId} />}
       {providerLabel && (
         <span className="text-xs text-muted-foreground">{providerLabel}</span>
       )}

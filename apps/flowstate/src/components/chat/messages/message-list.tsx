@@ -150,78 +150,97 @@ export function MessageList({
   //   2. Suppress the "Jump to latest" affordance for 400ms so the
   //      button doesn't flash while Virtuoso's atBottomStateChange
   //      settles, and a double-click is a no-op.
-  //   3. Defer the scroll one frame so Virtuoso has a layout pass —
-  //      without the rAF the scrollToIndex fires before measurement
-  //      and silently no-ops.
+  //   3. Retry the scroll across several frames. On a session switch
+  //      (or any case where Virtuoso just received a new `data` prop),
+  //      Virtuoso renders/measures asynchronously — a single rAF often
+  //      fires before measurement, the scrollToIndex resolves against
+  //      stale layout and silently no-ops, and Virtuoso stays parked
+  //      at the previous scroll offset. With the new dataset that
+  //      offset is usually past the end of content, so the viewport
+  //      virtualises nothing → blank pane until the user scrolls.
+  //      scrollToIndex with index: "LAST" is idempotent, so retrying
+  //      across ~6 frames (~100 ms) is safe: the call lands as soon
+  //      as Virtuoso is ready, and subsequent attempts are no-ops at
+  //      the same offset (no flicker).
   //   4. `behavior: "auto"` (instant). Smooth scroll across Virtuoso's
   //      virtualized list leaves the in-between items unrendered
   //      during the animation, which is what made "Jump to latest"
   //      look like it was dumping users at the top.
+  const scrollAttemptRef = React.useRef<{
+    cancelled: boolean;
+    frame: number;
+  } | null>(null);
   const scrollToLatest = React.useCallback(() => {
     if (displayItems.length === 0) return;
     setSuppressJump(true);
     if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
     suppressTimerRef.current = setTimeout(() => setSuppressJump(false), 400);
-    requestAnimationFrame(() => {
-      virtuosoRef.current?.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: "auto",
-      });
-    });
+
+    // Cancel any in-flight retry chain from a previous call so we don't
+    // pile up duplicate rAF loops on rapid thread switches.
+    if (scrollAttemptRef.current) {
+      scrollAttemptRef.current.cancelled = true;
+      cancelAnimationFrame(scrollAttemptRef.current.frame);
+    }
+    const handle: { cancelled: boolean; frame: number } = {
+      cancelled: false,
+      frame: 0,
+    };
+    scrollAttemptRef.current = handle;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 6;
+    const tick = () => {
+      if (handle.cancelled) return;
+      const v = virtuosoRef.current;
+      if (v) {
+        v.scrollToIndex({
+          index: "LAST",
+          align: "end",
+          behavior: "auto",
+        });
+      }
+      attempts += 1;
+      if (attempts < MAX_ATTEMPTS) {
+        handle.frame = requestAnimationFrame(tick);
+      }
+    };
+    handle.frame = requestAnimationFrame(tick);
   }, [displayItems.length]);
 
-  // Jump to the latest message on the *first* visit to each thread
-  // per app session. MessageList doesn't remount between sessions
-  // (that design decision is what makes re-visits render instantly),
-  // so Virtuoso's `initialTopMostItemIndex` — which only applies on
-  // mount — can't do this on its own. A Set-tracked sessionId drives
-  // the imperative scroll once the target session's items are
-  // actually in the list; without the length check the first render
-  // after a click would try to scroll an empty virtuoso and the call
-  // silently no-ops.
+  // Always jump to the latest message when the user clicks a thread.
+  // MessageList doesn't remount between sessions (that design choice is
+  // what makes re-visits render instantly), so Virtuoso's
+  // `initialTopMostItemIndex` — which only applies on mount — can't
+  // drive this on its own.
   //
-  // Why a Set instead of a single "last sessionId" ref: with a single
-  // slot, A → B → A re-fired the scroll on A's revisit, forcing
-  // Virtuoso to re-measure the entire (potentially huge) list — the
-  // dominant warm-cache lag on big threads. A Set makes the scroll
-  // a one-shot per session: revisits keep whatever scroll position
-  // Virtuoso already has, which is what re-renders intend anyway
-  // (the active session's cache already grew via setQueryData while
-  // the user was on another thread; we don't need to nudge them
-  // anywhere).
+  // We re-scroll on every `sessionId` change rather than gating to
+  // first-visit-only. Earlier code used a `Set<sessionId>` to dedup
+  // the scroll, citing "huge thread re-measure lag" on revisits, but
+  // Virtuoso virtualises by viewport — `scrollToIndex({index: "LAST"})`
+  // is bounded by what's visible, not by total list length. The dedup
+  // produced a worse UX (revisits could land mid-history at whatever
+  // offset Virtuoso happened to be at, sometimes blank because the new
+  // dataset's height didn't reach the parked offset) and contradicted
+  // the natural user expectation that clicking a thread shows the
+  // newest message.
   //
-  // The Set is stamped with `sessionId` BEFORE the rAF (not inside
-  // its callback). Stamping after meant any unrelated re-render
-  // landing in the same frame — `welcome` / `hydrate_display`
-  // arriving mid-boot, an `useApp()` context value change, the
-  // session-detail query resolving — would re-fire this effect, the
-  // cleanup would `cancelAnimationFrame` the in-flight scroll, the
-  // next pass would re-schedule it, and a long enough cancel/
-  // reschedule chain meant the scroll never actually landed and
-  // the user was stranded with the "Jump to latest" pill visible.
-  // Marking up front bails subsequent re-runs at the Set check;
-  // the rAF still runs against the live Virtuoso and the cleanup
-  // only matters when the session itself changes between frames.
-  const scrolledSessionsRef = React.useRef<Set<string>>(new Set());
+  // Cold-cache handling: the session may be selected before its turns
+  // arrive, so we can't unconditionally fire on `sessionId` change —
+  // an empty list resolves `index: "LAST"` to nothing useful. We track
+  // the last sessionId we *successfully* drove a scroll for in a single-
+  // slot ref. When sessionId changes, the slot mismatches; when items
+  // arrive (length 0 → N) we stamp and scroll. Length changes within
+  // the same session (streaming tokens, new turns) DON'T re-fire,
+  // because the slot already matches — `followOutput` handles the
+  // "you were at bottom, stay at bottom" case, and `userSendTick`
+  // handles "user sent, force-jump".
+  const lastScrolledSessionRef = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (displayItems.length === 0) return;
-    if (scrolledSessionsRef.current.has(sessionId)) return;
-    scrolledSessionsRef.current.add(sessionId);
-    // Defer one frame so Virtuoso has a chance to measure the
-    // items that just arrived. Without the frame the scrollToIndex
-    // call fires before layout and gets dropped.
-    const raf = requestAnimationFrame(() => {
-      const v = virtuosoRef.current;
-      if (!v) return;
-      v.scrollToIndex({
-        index: "LAST",
-        align: "end",
-        behavior: "auto",
-      });
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [sessionId, displayItems.length]);
+    if (lastScrolledSessionRef.current === sessionId) return;
+    lastScrolledSessionRef.current = sessionId;
+    scrollToLatest();
+  }, [sessionId, displayItems.length, scrollToLatest]);
 
   // Force a scroll to the latest message every time the user dispatches
   // a new message. Unlike Virtuoso's `followOutput`, this fires even

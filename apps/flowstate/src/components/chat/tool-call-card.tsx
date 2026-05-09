@@ -34,25 +34,60 @@ function toolPreview(name: string, args: unknown): string | null {
 
   switch (name) {
     case "Bash":
+    // OpenCode emits the same tool lowercase, with the same `command` /
+    // `description` arg shape. Share the preview path.
+    case "bash":
       // Description only -- the raw command can be hundreds of chars.
       return str("description") ?? null;
     case "Read":
     case "Write":
     case "Edit":
     case "NotebookEdit":
-      return basename(str("file_path") ?? str("notebook_path")) ?? null;
+    // OpenCode lowercase (Claude-compatible args).
+    case "read":
+    case "write":
+    case "edit":
+    // Copilot built-ins (`view` = read, `create` = new file, `insert` =
+    // line insert). They use `path` rather than `file_path`; basename()
+    // accepts whichever resolves first.
+    case "view":
+    case "create":
+    case "insert":
+      return (
+        basename(
+          str("file_path") ?? str("path") ?? str("filePath") ?? str("notebook_path"),
+        ) ?? null
+      );
     case "Glob":
     case "Grep":
+    case "glob":
+    case "grep":
       return str("pattern") ?? null;
     case "Task":
     case "Agent":
+    case "task":
       return str("description") ?? null;
     case "WebSearch":
+    case "websearch":
+    // Codex emits "Web search" (with a space) as the display name.
+    case "Web search":
       return str("query") ?? null;
     case "Skill":
+    case "skill":
       return str("skill") ?? null;
     case "ScheduleWakeup":
       return str("reason") ?? null;
+    case "File change": {
+      // Codex multi-file change item. Show the first affected path's
+      // basename so the collapsed header is still informative.
+      const changes = Array.isArray(a.changes) ? a.changes : null;
+      const first = changes?.[0];
+      const path =
+        first && typeof first === "object"
+          ? (first as Record<string, unknown>).path
+          : undefined;
+      return basename(typeof path === "string" ? path : undefined) ?? null;
+    }
     case "ExitPlanMode": {
       const plan = str("plan");
       if (!plan) return null;
@@ -63,6 +98,16 @@ function toolPreview(name: string, args: unknown): string | null {
     }
     case "EnterPlanMode":
       return "Switching to plan mode";
+    case "apply_patch": {
+      // Copilot/Codex: pull the first file path out of the V4A patch so
+      // the collapsed header shows e.g. "foo.ts" instead of nothing.
+      const input = str("input") ?? str("patch");
+      if (!input) return null;
+      const m = input.match(
+        /^\*\*\* (?:Update|Add|Delete) File:\s*(.+)$/m,
+      );
+      return basename(m?.[1]?.trim()) ?? null;
+    }
     default:
       return null;
   }
@@ -173,7 +218,20 @@ export function ToolCallCard({
   const isFileWriteTool =
     toolCall.name === "Edit" ||
     toolCall.name === "MultiEdit" ||
-    toolCall.name === "Write";
+    toolCall.name === "Write" ||
+    // Copilot/Codex apply_patch — same story: the diff IS the result, so
+    // hide the boilerplate "patch applied" output on success.
+    toolCall.name === "apply_patch" ||
+    // OpenCode lowercase variants.
+    toolCall.name === "edit" ||
+    toolCall.name === "write" ||
+    // Copilot built-ins: create/insert produce the same kind of "file
+    // updated" boilerplate output we already suppress for Write/Edit.
+    toolCall.name === "create" ||
+    toolCall.name === "insert" ||
+    // Codex multi-file change item. The diff fans out via separate
+    // FileChange events; the tool card's own `output` is redundant.
+    toolCall.name === "File change";
   const hideOutputForFileWrite =
     isFileWriteTool && toolCall.status === "completed";
 

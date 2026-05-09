@@ -62,6 +62,7 @@ fn export_ts_bindings() {
     push(&mut out, RateLimitStatus::decl(&cfg));
     push(&mut out, TurnPhase::decl(&cfg));
     push(&mut out, SessionLinkReason::decl(&cfg));
+    push(&mut out, ThreadGoalStatus::decl(&cfg));
 
     // ---- leaf structs ---------------------------------------------
     push(&mut out, PlanStep::decl(&cfg));
@@ -75,6 +76,7 @@ fn export_ts_bindings() {
     push(&mut out, AgentUsage::decl(&cfg));
     push(&mut out, TokenUsage::decl(&cfg));
     push(&mut out, RateLimitInfo::decl(&cfg));
+    push(&mut out, ThreadGoal::decl(&cfg));
 
     // ---- user-input -----------------------------------------------
     push(&mut out, UserInputOption::decl(&cfg));

@@ -35,6 +35,7 @@ import type {
   ServerMessage,
   SessionLinkReason,
   SessionSummary,
+  ThreadGoal,
   UserInputQuestion,
 } from "@/lib/types";
 import {
@@ -141,6 +142,13 @@ interface AppState {
    *  any session — providers report these whenever they update.
    *  Flowstate surfaces them in the Context Display popover. */
   rateLimits: Record<string, RateLimitInfo>;
+  /** Active per-session goal, keyed by session_id. Populated by
+   *  `thread_goal_updated` events (from Codex's `/goal` feature today)
+   *  and dropped by `thread_goal_cleared`. Adapters that don't surface
+   *  goal tracking never write here, so the absence of an entry means
+   *  "no goal set" — which is the same UI state as "provider doesn't
+   *  support goals" (gated upstream by `ProviderFeatures.goalTracking`). */
+  threadGoalBySession: Map<string, ThreadGoal>;
   /** Per-session command catalog (slash commands + sub-agents + MCP
    *  servers). Populated by `session_command_catalog_updated` events,
    *  which fire on session start, session load, and explicit refresh.
@@ -382,8 +390,18 @@ function appReducer(state: AppState, action: AppAction): AppState {
       // is fresher than the cached one by definition, so existing
       // bucket entries win over the seed.
       if (action.rateLimits.length === 0) return state;
+      // Drop cached buckets whose `resetsAt` has already passed —
+      // those rows reflect a window that's since refilled on
+      // Anthropic's side, but the SDK only re-reports a bucket as a
+      // side-effect of an inference response. Re-seeding them would
+      // resurrect a stale 100% / "resets now" entry on every boot
+      // (e.g. an old `seven_day` row from before Anthropic's bucket
+      // rename to `weekly`). A 60s grace window absorbs clock skew.
+      // Buckets without a `resetsAt` are hard caps and survive.
+      const cutoff = Date.now() - 60_000;
       const merged: Record<string, RateLimitInfo> = {};
       for (const info of action.rateLimits) {
+        if (info.resetsAt != null && info.resetsAt <= cutoff) continue;
         merged[info.bucket] = info;
       }
       // Live entries (already in state.rateLimits) override the seed.
@@ -833,6 +851,11 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
         permissionModeBySession = new Map(permissionModeBySession);
         permissionModeBySession.delete(event.session_id);
       }
+      let threadGoalBySession = state.threadGoalBySession;
+      if (threadGoalBySession.has(event.session_id)) {
+        threadGoalBySession = new Map(threadGoalBySession);
+        threadGoalBySession.delete(event.session_id);
+      }
       return {
         ...state,
         sessions,
@@ -848,6 +871,7 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
         pendingPermissionsBySession,
         pendingQuestionBySession,
         permissionModeBySession,
+        threadGoalBySession,
       };
     }
 
@@ -1118,6 +1142,25 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       };
     }
 
+    case "thread_goal_updated": {
+      // One goal per session; replace on every event. Codex emits this
+      // both for user-initiated set/pause/resume (synthesized by the
+      // runtime from set_goal's response) and for agent-initiated goal
+      // changes via codex's set_goal model tool (forwarded from the
+      // codex notification path).
+      const threadGoalBySession = new Map(state.threadGoalBySession);
+      threadGoalBySession.set(event.session_id, event.goal);
+      return { ...state, threadGoalBySession };
+    }
+    case "thread_goal_cleared": {
+      if (!state.threadGoalBySession.has(event.session_id)) {
+        return state;
+      }
+      const threadGoalBySession = new Map(state.threadGoalBySession);
+      threadGoalBySession.delete(event.session_id);
+      return { ...state, threadGoalBySession };
+    }
+
     case "session_model_updated": {
       const sessions = new Map(state.sessions);
       const s = sessions.get(event.session_id);
@@ -1248,6 +1291,7 @@ const initialState: AppState = {
   pendingQuestionBySession: new Map(),
   permissionModeBySession: new Map(),
   rateLimits: {},
+  threadGoalBySession: new Map(),
   sessionCommands: new Map(),
   sessionLinks: new Map(),
   // Default to focused: the first focus event only fires on the NEXT
@@ -2461,6 +2505,19 @@ export function useSessionSlice() {
     isWindowFocused: state.isWindowFocused,
     ready: state.ready,
   };
+}
+
+/** Goal lookup for a single session. Returns `undefined` when no goal
+ *  is set on this session OR when the provider doesn't support goal
+ *  tracking — same UI state from the consumer's perspective ("no goal
+ *  active"). Components that render goal-management affordances should
+ *  also gate on `useProviderFeatures(provider).goalTracking` so the
+ *  set/clear buttons only appear for providers that actually accept
+ *  the calls. */
+export function useThreadGoal(sessionId: string | null | undefined) {
+  const { state } = useApp();
+  if (!sessionId) return undefined;
+  return state.threadGoalBySession.get(sessionId);
 }
 
 /** Pending-prompt slice: permission queues, in-flight questions,

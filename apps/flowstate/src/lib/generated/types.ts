@@ -42,6 +42,8 @@ export type TurnPhase = "idle" | "requesting" | "streaming" | "compacting" | "aw
 
 export type SessionLinkReason = "spawn" | "send";
 
+export type ThreadGoalStatus = "active" | "paused" | "budgetLimited" | "complete";
+
 export type PlanStep = { title: string, detail?: string, };
 
 export type PlanRecord = { planId: string, title: string, steps: Array<PlanStep>, raw: string, status: PlanStatus, };
@@ -199,6 +201,33 @@ resetsAt?: number,
  */
 isUsingOverage: boolean, };
 
+export type ThreadGoal = { 
+/**
+ * Provider-side thread id this goal is attached to. Carried verbatim
+ * from codex; opaque to the runtime and the UI.
+ */
+threadId: string, 
+/**
+ * Free-text "what we're trying to do" string. Set by the user (via
+ * `ClientMessage::SetGoal`) or by the agent (via codex's `set_goal`
+ * model tool).
+ */
+objective: string, status: ThreadGoalStatus, 
+/**
+ * Optional hard cap on tokens the agent will spend pursuing this
+ * goal. When `tokens_used >= token_budget` codex transitions the
+ * goal to `BudgetLimited` and the agent stops on its own.
+ */
+tokenBudget?: number, tokensUsed: number, timeUsedSeconds: number, 
+/**
+ * Unix milliseconds.
+ */
+createdAt: number, 
+/**
+ * Unix milliseconds.
+ */
+updatedAt: number, };
+
 export type UserInputOption = { id: string, label: string, description?: string, };
 
 export type UserInputQuestion = { id: string, text: string, header?: string, options: Array<UserInputOption>, multiSelect: boolean, allowFreeform: boolean, isSecret: boolean, };
@@ -349,7 +378,17 @@ supportsAutoPermissionMode: boolean,
  * only flushes on `TurnStatus::Completed` — that's the bug this
  * flag exists to gate around for everyone else.
  */
-liveMessageInjection: boolean, };
+liveMessageInjection: boolean, 
+/**
+ * Adapter surfaces a persisted thread-level objective with token /
+ * time budget tracking, and accepts `set_goal` / `clear_goal`
+ * from the runtime. Today only Codex's `/goal` feature meets this
+ * contract (added in codex 0.128, marked experimental in 0.129).
+ * Frontend hides the goal-management UI when this flag is `false`,
+ * so adapters that haven't wired the RPCs don't expose a
+ * non-functional affordance.
+ */
+goalTracking: boolean, };
 
 export type ProviderStatus = { kind: ProviderKind, label: string, installed: boolean, authenticated: boolean, version?: string, status: ProviderStatusLevel, message?: string, models: Array<ProviderModel>, 
 /**
@@ -459,7 +498,7 @@ export type RewindOutcomeWire = { "kind": "applied", paths_restored: Array<strin
 
 export type CheckpointSettings = { globalEnabled: boolean, };
 
-export type RuntimeEvent = { "type": "runtime_ready", message: string, } | { "type": "daemon_shutting_down", reason: string, } | { "type": "session_started", session: SessionSummary, } | { "type": "turn_started", session_id: string, turn: TurnRecord, } | { "type": "content_delta", session_id: string, turn_id: string, delta: string, accumulated_output: string, } | { "type": "reasoning_delta", session_id: string, turn_id: string, delta: string, } | { "type": "tool_call_started", session_id: string, turn_id: string, call_id: string, name: string, args: JsonValue, parent_call_id?: string, } | { "type": "tool_call_completed", session_id: string, turn_id: string, call_id: string, output: string, error?: string, } | { "type": "tool_progress", session_id: string, turn_id: string, call_id: string, tool_name: string, parent_call_id?: string, occurred_at: string, } | { "type": "turn_completed", session_id: string, session: SessionSummary, turn: TurnRecord, } | { "type": "session_interrupted", session: SessionSummary, message: string, } | { "type": "session_deleted", session_id: string, } | { "type": "permission_requested", session_id: string, turn_id: string, request_id: string, tool_name: string, input: JsonValue, suggested: PermissionDecision, } | { "type": "user_question_asked", session_id: string, turn_id: string, request_id: string, questions: Array<UserInputQuestion>, } | { "type": "file_changed", session_id: string, turn_id: string, call_id: string, path: string, operation: FileOperation, before?: string, after?: string, } | { "type": "checkpoint_captured", session_id: string, turn_id: string, } | { "type": "checkpoint_enablement_changed", settings: CheckpointSettings, } | { "type": "subagent_started", session_id: string, turn_id: string, parent_call_id: string, agent_id: string, agent_type: string, prompt: string, model?: string, } | { "type": "subagent_event", session_id: string, turn_id: string, agent_id: string, event: JsonValue, } | { "type": "subagent_completed", session_id: string, turn_id: string, agent_id: string, output: string, error?: string, } | { "type": "subagent_model_observed", session_id: string, turn_id: string, agent_id: string, model: string, } | { "type": "plan_proposed", session_id: string, turn_id: string, plan_id: string, title: string, steps: Array<PlanStep>, raw: string, } | { "type": "compact_updated", session_id: string, turn_id: string, trigger: CompactTrigger, pre_tokens?: number, post_tokens?: number, duration_ms?: number, summary?: string, } | { "type": "memory_recalled", session_id: string, turn_id: string, mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, } | { "type": "tool_use_summary", session_id: string, turn_id: string, summary: string, call_ids: Array<string>, } | { "type": "turn_status_changed", session_id: string, turn_id: string, phase: TurnPhase, } | { "type": "turn_usage_updated", session_id: string, turn_id: string, usage: TokenUsage, } | { "type": "turn_retrying", session_id: string, turn_id: string, attempt: number, max_retries: number, retry_delay_ms: number, error_status?: number, error: string, } | { "type": "prompt_suggested", session_id: string, turn_id: string, suggestion: string, } | { "type": "error", message: string, } | { "type": "info", message: string, } | { "type": "provider_models_updated", provider: ProviderKind, models: Array<ProviderModel>, } | { "type": "provider_health_updated", status: ProviderStatus, } | { "type": "rate_limit_updated", info: RateLimitInfo, } | { "type": "project_created", project: ProjectRecord, } | { "type": "project_deleted", project_id: string, reassigned_session_ids: Array<string>, } | { "type": "session_project_assigned", session_id: string, project_id?: string, } | { "type": "session_model_updated", session_id: string, model: string, } | { "type": "session_archived", session_id: string, } | { "type": "session_unarchived", session: SessionSummary, } | { "type": "session_command_catalog_updated", session_id: string, catalog: CommandCatalog, } | { "type": "session_linked", from_session_id: string, to_session_id: string, reason: SessionLinkReason, } | { "type": "peer_message_injected", session_id: string, from_session_id: string, message: string, } | { "type": "wakeup_scheduled", session_id: string, wakeup_id: string, fire_at_unix: number, reason?: string, } | { "type": "wakeup_fired", session_id: string, wakeup_id: string, };
+export type RuntimeEvent = { "type": "runtime_ready", message: string, } | { "type": "daemon_shutting_down", reason: string, } | { "type": "session_started", session: SessionSummary, } | { "type": "turn_started", session_id: string, turn: TurnRecord, } | { "type": "content_delta", session_id: string, turn_id: string, delta: string, accumulated_output: string, } | { "type": "reasoning_delta", session_id: string, turn_id: string, delta: string, } | { "type": "tool_call_started", session_id: string, turn_id: string, call_id: string, name: string, args: JsonValue, parent_call_id?: string, } | { "type": "tool_call_completed", session_id: string, turn_id: string, call_id: string, output: string, error?: string, } | { "type": "tool_progress", session_id: string, turn_id: string, call_id: string, tool_name: string, parent_call_id?: string, occurred_at: string, } | { "type": "turn_completed", session_id: string, session: SessionSummary, turn: TurnRecord, } | { "type": "session_interrupted", session: SessionSummary, message: string, } | { "type": "session_deleted", session_id: string, } | { "type": "permission_requested", session_id: string, turn_id: string, request_id: string, tool_name: string, input: JsonValue, suggested: PermissionDecision, } | { "type": "user_question_asked", session_id: string, turn_id: string, request_id: string, questions: Array<UserInputQuestion>, } | { "type": "file_changed", session_id: string, turn_id: string, call_id: string, path: string, operation: FileOperation, before?: string, after?: string, } | { "type": "checkpoint_captured", session_id: string, turn_id: string, } | { "type": "checkpoint_enablement_changed", settings: CheckpointSettings, } | { "type": "subagent_started", session_id: string, turn_id: string, parent_call_id: string, agent_id: string, agent_type: string, prompt: string, model?: string, } | { "type": "subagent_event", session_id: string, turn_id: string, agent_id: string, event: JsonValue, } | { "type": "subagent_completed", session_id: string, turn_id: string, agent_id: string, output: string, error?: string, } | { "type": "subagent_model_observed", session_id: string, turn_id: string, agent_id: string, model: string, } | { "type": "plan_proposed", session_id: string, turn_id: string, plan_id: string, title: string, steps: Array<PlanStep>, raw: string, } | { "type": "compact_updated", session_id: string, turn_id: string, trigger: CompactTrigger, pre_tokens?: number, post_tokens?: number, duration_ms?: number, summary?: string, } | { "type": "memory_recalled", session_id: string, turn_id: string, mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, } | { "type": "tool_use_summary", session_id: string, turn_id: string, summary: string, call_ids: Array<string>, } | { "type": "turn_status_changed", session_id: string, turn_id: string, phase: TurnPhase, } | { "type": "turn_usage_updated", session_id: string, turn_id: string, usage: TokenUsage, } | { "type": "turn_retrying", session_id: string, turn_id: string, attempt: number, max_retries: number, retry_delay_ms: number, error_status?: number, error: string, } | { "type": "prompt_suggested", session_id: string, turn_id: string, suggestion: string, } | { "type": "error", message: string, } | { "type": "info", message: string, } | { "type": "provider_models_updated", provider: ProviderKind, models: Array<ProviderModel>, } | { "type": "provider_health_updated", status: ProviderStatus, } | { "type": "rate_limit_updated", info: RateLimitInfo, } | { "type": "project_created", project: ProjectRecord, } | { "type": "project_deleted", project_id: string, reassigned_session_ids: Array<string>, } | { "type": "session_project_assigned", session_id: string, project_id?: string, } | { "type": "session_model_updated", session_id: string, model: string, } | { "type": "session_archived", session_id: string, } | { "type": "session_unarchived", session: SessionSummary, } | { "type": "session_command_catalog_updated", session_id: string, catalog: CommandCatalog, } | { "type": "session_linked", from_session_id: string, to_session_id: string, reason: SessionLinkReason, } | { "type": "peer_message_injected", session_id: string, from_session_id: string, message: string, } | { "type": "wakeup_scheduled", session_id: string, wakeup_id: string, fire_at_unix: number, reason?: string, } | { "type": "wakeup_fired", session_id: string, wakeup_id: string, } | { "type": "thread_goal_updated", session_id: string, goal: ThreadGoal, } | { "type": "thread_goal_cleared", session_id: string, };
 
 export type ClientMessage = { "type": "ping" } | { "type": "load_snapshot" } | { "type": "load_session", session_id: string, 
 /**
@@ -504,7 +543,19 @@ permission_mode_override?: PermissionMode,
  * turn. Primarily intended for `ExitPlanMode` rejections where
  * the user wants to steer the plan without restarting the turn.
  */
-reason?: string, } | { "type": "answer_question", session_id: string, request_id: string, answers: Array<UserInputAnswer>, } | { "type": "cancel_question", session_id: string, request_id: string, } | { "type": "accept_plan", session_id: string, plan_id: string, } | { "type": "reject_plan", session_id: string, plan_id: string, } | { "type": "refresh_models", provider: ProviderKind, } | { "type": "set_provider_enabled", provider: ProviderKind, enabled: boolean, } | { "type": "upgrade_provider_cli", provider: ProviderKind, } | { "type": "create_project", path?: string, } | { "type": "delete_project", project_id: string, } | { "type": "assign_session_to_project", session_id: string, project_id?: string, } | { "type": "update_session_model", session_id: string, model: string, } | { "type": "archive_session", session_id: string, } | { "type": "unarchive_session", session_id: string, } | { "type": "list_archived_sessions" } | { "type": "refresh_session_commands", session_id: string, } | { "type": "get_context_usage", session_id: string, } | { "type": "rewind_files", session_id: string, turn_id: string, dry_run: boolean, confirm_conflicts: boolean, } | { "type": "set_checkpoints_enabled", enabled: boolean, } | { "type": "get_checkpoint_settings" };
+reason?: string, } | { "type": "answer_question", session_id: string, request_id: string, answers: Array<UserInputAnswer>, } | { "type": "cancel_question", session_id: string, request_id: string, } | { "type": "accept_plan", session_id: string, plan_id: string, } | { "type": "reject_plan", session_id: string, plan_id: string, } | { "type": "refresh_models", provider: ProviderKind, } | { "type": "set_provider_enabled", provider: ProviderKind, enabled: boolean, } | { "type": "upgrade_provider_cli", provider: ProviderKind, } | { "type": "create_project", path?: string, } | { "type": "delete_project", project_id: string, } | { "type": "assign_session_to_project", session_id: string, project_id?: string, } | { "type": "update_session_model", session_id: string, model: string, } | { "type": "archive_session", session_id: string, } | { "type": "unarchive_session", session_id: string, } | { "type": "list_archived_sessions" } | { "type": "refresh_session_commands", session_id: string, } | { "type": "get_context_usage", session_id: string, } | { "type": "rewind_files", session_id: string, turn_id: string, dry_run: boolean, confirm_conflicts: boolean, } | { "type": "set_checkpoints_enabled", enabled: boolean, } | { "type": "get_checkpoint_settings" } | { "type": "set_goal", session_id: string, objective: string, 
+/**
+ * Optional hard cap on tokens. `None` means "no budget"
+ * (unbounded; useful for indefinite goals).
+ */
+token_budget?: number, 
+/**
+ * Optional new status for the goal — primarily used to pause
+ * or resume an existing goal without changing its objective.
+ * `None` means "leave status alone" on update / `Active` on
+ * create.
+ */
+status?: ThreadGoalStatus, } | { "type": "clear_goal", session_id: string, };
 
 export type ServerMessage = { "type": "welcome", bootstrap: BootstrapPayload, } | { "type": "snapshot", snapshot: AppSnapshot, } | { "type": "session_loaded", session: SessionDetail, } | { "type": "session_created", session: SessionSummary, } | { "type": "pong" } | { "type": "ack", message: string, } | { "type": "event", event: RuntimeEvent, } | { "type": "error", message: string, } | { "type": "archived_sessions_list", sessions: Array<SessionSummary>, } | { "type": "attachment", data: AttachmentData, } | { "type": "context_usage", session_id: string, breakdown?: ContextBreakdown, } | { "type": "rewind_files_result", session_id: string, turn_id: string, outcome: RewindOutcomeWire, } | { "type": "checkpoint_settings_snapshot", settings: CheckpointSettings, };
 

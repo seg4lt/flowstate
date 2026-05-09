@@ -1294,6 +1294,15 @@ export function openInEditor(editor: string, path: string): Promise<void> {
   return invoke<void>("open_in_editor", { editor, path });
 }
 
+// Reveal a path in the OS file manager (Finder on macOS, Explorer on
+// Windows, file manager via `xdg-open` on other Unix). The path
+// should be absolute. On macOS / Windows the entry is highlighted in
+// its parent directory; on Linux we open the parent directory itself
+// since there's no portable "select" verb.
+export function revealInFileManager(absolutePath: string): Promise<void> {
+  return invoke<void>("reveal_in_file_manager", { path: absolutePath });
+}
+
 // Integrated terminal — PTY control plane. Frontend pairs this
 // with @xterm/xterm on the render side. `openPty` creates a shell
 // child and returns a numeric id; the provided onEvent channel

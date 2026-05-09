@@ -251,6 +251,43 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Create or update the session's persisted goal. Forwarded by the
+    /// runtime when the user submits the goal dialog.
+    ///
+    /// `objective` is the free-text "what we're trying to do" string.
+    /// `token_budget` is an optional hard cap (None = unbounded).
+    /// `status` lets the caller pause/resume an existing goal without
+    /// changing its objective; `None` means "leave alone on update,
+    /// `Active` on create".
+    ///
+    /// Returns the resulting goal as the provider has it post-call so
+    /// the runtime can synthesize a `RuntimeEvent::ThreadGoalUpdated`
+    /// without waiting for a separate notification round-trip.
+    /// Agent-initiated mid-turn updates still flow through the
+    /// `ProviderTurnEvent::ThreadGoalUpdated` notification path.
+    ///
+    /// Default `Err` so adapters that haven't wired the surface fail
+    /// loudly rather than silently drop the user's intent. Runtime
+    /// gates calls on `ProviderFeatures.goal_tracking` first, so this
+    /// arm is hit only on misuse / wire churn.
+    async fn set_goal(
+        &self,
+        _session: &SessionDetail,
+        _objective: String,
+        _token_budget: Option<i64>,
+        _status: Option<ThreadGoalStatus>,
+    ) -> Result<ThreadGoal, String> {
+        Err("This provider does not support goal tracking.".to_string())
+    }
+
+    /// Clear the session's active goal. Idempotent — clearing when no
+    /// goal is active should respond `Ok(())`. Same gating contract as
+    /// `set_goal`: runtime checks `ProviderFeatures.goal_tracking`
+    /// first, so the default `Err` only fires on misuse.
+    async fn clear_goal(&self, _session: &SessionDetail) -> Result<(), String> {
+        Err("This provider does not support goal tracking.".to_string())
+    }
+
     /// Per-provider disk directories the default
     /// [`session_command_catalog`] implementation scans for user-authored
     /// `SKILL.md` files.

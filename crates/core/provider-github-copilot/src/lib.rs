@@ -790,6 +790,52 @@ impl ProviderAdapter for GitHubCopilotAdapter {
         }
     }
 
+    /// Upgrade the locally-installed `@github/copilot` package via
+    /// npm. Unlike Claude / Codex / opencode — all of which ship a
+    /// CLI-native `update` subcommand — the Copilot CLI has no in-
+    /// place self-update flow, so the official upgrade path is
+    /// `npm install -g @github/copilot@latest` (see the trait doc on
+    /// `ProviderAdapter::upgrade` and the install hint at lib.rs:153).
+    ///
+    /// We resolve `npm` via the same cross-platform helper we use for
+    /// `copilot` itself (walks `$PATH`, `%APPDATA%\npm`, Volta, nvm,
+    /// Homebrew, etc.) so a Tauri-launched daemon — which doesn't
+    /// inherit the user's shell rc — still finds it.
+    ///
+    /// Idempotent: re-running when already at latest is a successful
+    /// npm no-op.
+    async fn upgrade(&self) -> Result<String, String> {
+        let npm_path = zenui_provider_api::find_cli_binary("npm").ok_or_else(|| {
+            "npm is not on PATH; install Node.js (which ships npm) and retry, \
+             or run `npm install -g @github/copilot@latest` manually."
+                .to_string()
+        })?;
+        let mut cmd = tokio::process::Command::new(&npm_path);
+        zenui_provider_api::hide_console_window_tokio(&mut cmd);
+        cmd.env("PATH", zenui_provider_api::path_with_extras(&[]));
+        let output = cmd
+            .args(["install", "-g", "@github/copilot@latest"])
+            .output()
+            .await
+            .map_err(|err| format!("failed to invoke npm install: {err}"))?;
+        if output.status.success() {
+            Ok("GitHub Copilot CLI upgraded.".to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Err(if !stderr.is_empty() {
+                format!("npm install -g @github/copilot@latest failed: {stderr}")
+            } else if !stdout.is_empty() {
+                format!("npm install -g @github/copilot@latest failed: {stdout}")
+            } else {
+                format!(
+                    "npm install -g @github/copilot@latest exited with status {:?}",
+                    output.status.code()
+                )
+            })
+        }
+    }
+
     async fn start_session(
         &self,
         _session: &SessionDetail,
