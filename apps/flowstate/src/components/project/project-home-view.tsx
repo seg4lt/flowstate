@@ -23,7 +23,6 @@ import {
   DiffPanel,
   type DiffStyle,
 } from "@/components/chat/diff-panel";
-import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -50,7 +49,7 @@ import { normPath } from "@/lib/worktree-utils";
 import type {
   AggregatedFileDiff,
 } from "@/lib/git-diff-stream";
-import type { ProviderKind, SessionSummary } from "@/lib/types";
+import type { SessionSummary } from "@/lib/types";
 
 interface EditorChoice {
   id: string;
@@ -90,8 +89,7 @@ interface ProjectHomeViewProps {
 }
 
 export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
-  const { state, dispatch, send, createProject, linkProjectWorktree } =
-    useApp();
+  const { state, dispatch, createProject, linkProjectWorktree } = useApp();
   const { dispatch: terminalDispatch } = useTerminal();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -288,8 +286,13 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   // The send() below goes through the app-store wrapper so the
   // resulting session_created lands in state.sessions before the
   // navigate fires.
-  const startThreadOnWorktree = React.useCallback(
-    async (wt: GitWorktree, provider: ProviderKind, model?: string) => {
+  // Open a draft chat on the given worktree. Provisions the
+  // worktree-as-project record if one doesn't exist yet (so future
+  // turns run with cwd = worktree folder), then navigates to the
+  // draft route on that project. Provider/model are picked in the
+  // chat toolbar — no `start_session` fires here.
+  const openDraftOnWorktree = React.useCallback(
+    async (wt: GitWorktree) => {
       if (!projectPath) return;
       setOpeningWtPath(wt.path);
       try {
@@ -324,27 +327,13 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           await linkProjectWorktree(wtProjectId, projectId, wt.branch);
         }
 
-        const res = await send({
-          type: "start_session",
-          provider,
-          model,
-          project_id: wtProjectId,
+        navigate({
+          to: "/chat/draft/$projectId",
+          params: { projectId: wtProjectId },
         });
-        if (res?.type === "session_created") {
-          navigate({
-            to: "/chat/$sessionId",
-            params: { sessionId: res.session.sessionId },
-          });
-        } else if (res?.type === "error") {
-          toast({
-            title: "Failed to start thread",
-            description: res.message,
-            duration: 4000,
-          });
-        }
       } catch (err) {
         toast({
-          title: "Failed to start thread",
+          title: "Failed to open new thread",
           description: String(err),
           duration: 4000,
         });
@@ -360,7 +349,6 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       state.projectWorktrees,
       createProject,
       linkProjectWorktree,
-      send,
       navigate,
     ],
   );
@@ -474,19 +462,21 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           className="ml-auto flex items-center gap-1"
           data-tauri-drag-region={false}
         >
-          <ProviderDropdown
-            projectId={projectId}
-            projectPath={gitRoot ?? projectPath}
-            trigger={
-              <button
-                type="button"
-                className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
-              >
-                <MessageSquarePlus className="h-3 w-3" />
-                New thread
-              </button>
-            }
-          />
+          {/* Direct navigation to the draft route — provider /
+              model are picked in the chat toolbar, not here. */}
+          <button
+            type="button"
+            onClick={() => {
+              navigate({
+                to: "/chat/draft/$projectId",
+                params: { projectId },
+              });
+            }}
+            className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
+          >
+            <MessageSquarePlus className="h-3 w-3" />
+            New thread
+          </button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -679,27 +669,24 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
                       >
                         <Terminal className="h-3.5 w-3.5" />
                       </button>
-                      <ProviderDropdown
-                        projectPath={wt.path}
-                        onSelect={(provider, model) =>
-                          void startThreadOnWorktree(wt, provider, model)
-                        }
-                        trigger={
-                          <button
-                            type="button"
-                            disabled={isOpening || isRemoving}
-                            title={`Start a new thread in ${label}`}
-                            className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium outline-none hover:bg-muted hover:text-foreground disabled:opacity-50 dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
-                          >
-                            {isOpening ? (
-                              <Loader2 className="h-3 w-3 animate-spin" />
-                            ) : (
-                              <MessageSquarePlus className="h-3 w-3" />
-                            )}
-                            New thread
-                          </button>
-                        }
-                      />
+                      {/* Worktree-row "New thread" button. Goes
+                          straight to the draft route on this
+                          worktree's project — provider/model are
+                          picked in the chat toolbar. */}
+                      <button
+                        type="button"
+                        disabled={isOpening || isRemoving}
+                        onClick={() => void openDraftOnWorktree(wt)}
+                        title={`Start a new thread in ${label}`}
+                        className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium outline-none hover:bg-muted hover:text-foreground disabled:opacity-50 dark:border-input dark:bg-input/30 dark:hover:bg-input/50"
+                      >
+                        {isOpening ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <MessageSquarePlus className="h-3 w-3" />
+                        )}
+                        New thread
+                      </button>
                       <button
                         type="button"
                         aria-label={
@@ -763,7 +750,7 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
         currentBranch={currentBranch}
         onCreated={(wt) => {
           void worktreeQuery.refetch();
-          void startThreadOnWorktree(wt, defaultProvider);
+          void openDraftOnWorktree(wt);
         }}
       />
     </div>

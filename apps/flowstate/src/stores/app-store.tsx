@@ -1168,6 +1168,29 @@ function handleRuntimeEvent(state: AppState, event: RuntimeEvent): AppState {
       return { ...state, sessions };
     }
 
+    case "session_provider_updated": {
+      // Mid-session provider swap (the runtime broadcasts this after
+      // `update_session_provider` swaps the adapter). Update both
+      // `provider` and `model` so the toolbar repaints in lockstep —
+      // the model field is included because the runtime resolves a
+      // default for the new provider whenever the caller passed
+      // `model: None`, and we want the picker chip to read the
+      // resolved value rather than going briefly stale.
+      const sessions = new Map(state.sessions);
+      const s = sessions.get(event.session_id);
+      if (s) {
+        sessions.set(event.session_id, {
+          ...s,
+          provider: event.provider,
+          // `model: undefined` is meaningful (= "let the adapter
+          // pick") so we preserve the field rather than coalescing
+          // to the previous value.
+          model: event.model ?? undefined,
+        });
+      }
+      return { ...state, sessions };
+    }
+
     case "session_archived": {
       const sessions = new Map(state.sessions);
       const archived = state.sessions.get(event.session_id);

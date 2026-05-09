@@ -572,10 +572,15 @@ export function trashProjectPath(
 // action) and read from many places, so a JS-side cache is safe
 // and dramatically reduces IPC pressure during boot.
 //
-// Why this matters: during a fresh launch, `provider-dropdown.tsx`
-// and `worktree-new-thread-dropdown.tsx` each run an effect with a
-// `[state.providers]` dep that calls `readDefaultModel(p.kind)` for
-// every ready provider. As providers transition to `ready` one by
+// Why this matters: in earlier shipping versions the per-project
+// `provider-dropdown` and `worktree-new-thread-dropdown` each ran
+// an effect with a `[state.providers]` dep that called
+// `readDefaultModel(p.kind)` for every ready provider. (The dropdown
+// has since been replaced by the in-toolbar `ProviderSelector`,
+// which only resolves the model on user pick, but the cache is
+// still load-bearing for `useDefaultProvider` and the
+// `DraftChatView` per-provider effect that picks an initial model.)
+// As providers transition to `ready` one by
 // one (one `state.providers` identity change per transition), the
 // effect re-fires; multiplied across multiple sidebar instances and
 // 4–5 providers, a real recording from a user's machine showed

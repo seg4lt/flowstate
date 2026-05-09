@@ -288,6 +288,17 @@ pub enum RuntimeEvent {
         session_id: String,
         model: String,
     },
+    /// The session's provider has been swapped via
+    /// `ClientMessage::UpdateSessionProvider`. The new model that took
+    /// effect alongside the swap is included so the frontend can update
+    /// the toolbar without an extra round trip — runtime-core may have
+    /// resolved a fresh default for the new provider when the caller
+    /// passed `model: None`.
+    SessionProviderUpdated {
+        session_id: String,
+        provider: ProviderKind,
+        model: Option<String>,
+    },
     SessionArchived {
         session_id: String,
     },
@@ -548,6 +559,18 @@ pub enum ClientMessage {
     UpdateSessionModel {
         session_id: String,
         model: String,
+    },
+    /// Swap the session's provider while preserving its turn history.
+    /// Mirrors `UpdateSessionModel` but additionally tears down the old
+    /// adapter's per-session state and lets the new adapter
+    /// (re-)initialize from the existing `SessionDetail`. `model` is
+    /// optional — when absent, the runtime resolves a default for the
+    /// new provider (first entry in its catalog) before persisting.
+    UpdateSessionProvider {
+        session_id: String,
+        provider: ProviderKind,
+        #[serde(default)]
+        model: Option<String>,
     },
     ArchiveSession {
         session_id: String,

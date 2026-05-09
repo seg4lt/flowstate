@@ -8,19 +8,10 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { SearchableModelSubMenu } from "./searchable-model-submenu";
 import { useApp } from "@/stores/app-store";
-import type { ProviderKind } from "@/lib/types";
 import type { GitWorktree } from "@/lib/api";
-import { readDefaultModel } from "@/lib/defaults-settings";
-import { rememberPickedModel } from "@/lib/model-settings";
-import { useProviderEnabled } from "@/hooks/use-provider-enabled";
-import { useDefaultProvider } from "@/hooks/use-default-provider";
 import {
   gitWorktreeListQueryOptions,
   gitBranchQueryOptions,
@@ -28,8 +19,6 @@ import {
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import { samePath } from "@/lib/worktree-utils";
 import { toast } from "@/hooks/use-toast";
-import { ALL_PROVIDERS, PROVIDER_COLORS, statusBadge } from "./provider-constants";
-import { ProviderDropdown } from "./provider-dropdown";
 import { useSuppressSidebarDrag } from "./drag-suppression";
 
 interface WorktreeAwareNewThreadProps {
@@ -38,26 +27,53 @@ interface WorktreeAwareNewThreadProps {
 }
 
 /**
- * Sidebar "new thread" button that, for projects with multiple git
- * worktrees, adds a worktree selection step before the provider
- * picker. For projects without worktrees (or with only the main one)
- * it falls through to the standard ProviderDropdown behavior.
+ * Sidebar "new thread" pencil button. Provider selection has been
+ * deferred to the chat view's toolbar, so this dropdown's only job
+ * now is to pick *where* the new thread runs:
+ *
+ *   - On the main project's directory (the default).
+ *   - On a specific git worktree (when the project has more than one).
+ *   - On a brand-new worktree (via the create-worktree dialog).
+ *
+ * After the pick we provision the worktree-as-project if needed and
+ * navigate straight to `/chat/draft/$projectId` — no `start_session`
+ * RPC fires here. The chat view materializes the real session on the
+ * user's first message send.
  */
 export function WorktreeAwareNewThread({
   projectId,
   projectPath,
 }: WorktreeAwareNewThreadProps) {
-  // If the project has no filesystem path we can't query worktrees —
-  // fall back to the plain provider dropdown.
+  // Without a project path we can't enumerate worktrees; navigate to
+  // the draft route directly with no dropdown.
   if (!projectPath) {
-    return <ProviderDropdown projectId={projectId} />;
+    return <DirectDraftButton projectId={projectId} />;
   }
 
   return (
-    <WorktreeDropdownInner
-      projectId={projectId}
-      projectPath={projectPath}
-    />
+    <WorktreeDropdownInner projectId={projectId} projectPath={projectPath} />
+  );
+}
+
+// ── No-path projects: bare button straight to draft route ──────────
+
+function DirectDraftButton({ projectId }: { projectId: string }) {
+  const navigate = useNavigate();
+  return (
+    <button
+      type="button"
+      className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
+      onClick={(e) => {
+        e.stopPropagation();
+        void navigate({
+          to: "/chat/draft/$projectId",
+          params: { projectId },
+        });
+      }}
+      aria-label="New thread"
+    >
+      <SquarePen className="h-3.5 w-3.5" />
+    </button>
   );
 }
 
@@ -77,8 +93,7 @@ function WorktreeDropdownInner({
   // focused sortable project row and start a keyboard drag.
   useSuppressSidebarDrag(createWtOpen);
 
-  const { state, send, createProject, linkProjectWorktree } = useApp();
-  const { isProviderEnabled } = useProviderEnabled();
+  const { state, createProject, linkProjectWorktree } = useApp();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -110,81 +125,12 @@ function WorktreeDropdownInner({
   });
   const currentBranch = branchQuery.data ?? "";
 
-  // ── Provider readiness ────────────────────────────────────────
-  const providerMap = new Map(state.providers.map((p) => [p.kind, p]));
-  const stillLoading = !state.ready;
-
-  const [defaultModels, setDefaultModels] = React.useState<
-    Map<ProviderKind, string>
-  >(new Map());
-
-  React.useEffect(() => {
-    let cancelled = false;
-    const readyProviders = state.providers.filter(
-      (p) => isProviderEnabled(p.kind) && p.status === "ready",
-    );
-    Promise.all(
-      readyProviders.map(async (p) => {
-        const model = await readDefaultModel(p.kind);
-        return [p.kind, model] as const;
-      }),
-    ).then((entries) => {
-      if (cancelled) return;
-      const map = new Map<ProviderKind, string>();
-      for (const [kind, model] of entries) {
-        if (model) map.set(kind, model);
-      }
-      setDefaultModels(map);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [state.providers, isProviderEnabled]);
-
-  // Resolution priority for the session's starting model:
-  //   1. explicit pick from the submenu,
-  //   2. user's saved default for this provider (`readDefaultModel`),
-  //   3. the provider catalog's first entry — which, for the Claude
-  //      SDK bridge, is exactly what `q.supportedModels()` returns
-  //      first and therefore the SDK's own default.
-  //
-  // Step 3 is what fixes the "model chip shows 'Default' until the
-  // first message" bug: passing an explicit value here means
-  // `session.summary.model` is populated at spawn time, so the
-  // toolbar renders the real model label on first paint instead of
-  // waiting for the `model_resolved` event on turn 1.
-  //
-  // Plain function (not useCallback) because `providerMap` is
-  // recreated on every render — a memoised callback wouldn't give a
-  // stable identity anyway, and no consumer depends on reference
-  // equality here.
-  function resolveStartModel(
-    provider: ProviderKind,
-    explicit?: string,
-  ): string | undefined {
-    return (
-      explicit ??
-      defaultModels.get(provider) ??
-      providerMap.get(provider)?.models[0]?.value
-    );
-  }
-
-  // User's configured default provider (Settings → Defaults → Default
-  // provider). Used when starting a thread on a freshly-created
-  // worktree where we have no ambient session/provider to inherit.
-  // Falls back to the first ready enabled provider, then to
-  // `DEFAULT_PROVIDER` — see `useDefaultProvider` for the full chain.
-  // `loaded` gates the create-worktree menu item so a fast click
-  // during the async SQLite read can't silently fall back to a
-  // non-preferred provider (see project-home-view for the same
-  // pattern).
-  const { defaultProvider, loaded: defaultProviderLoaded } =
-    useDefaultProvider();
-
-  // ── Thread creation (mirrors project-home-view startThreadOnWorktree) ──
-
-  const startThreadOnWorktree = React.useCallback(
-    async (wt: GitWorktree, provider: ProviderKind, model?: string) => {
+  // ── Navigate to draft on a specific worktree ──────────────────
+  // Provisions the worktree-as-project record if needed (so its
+  // threads run with cwd = worktree folder) and then navigates to
+  // the draft route on that project.
+  const startDraftOnWorktree = React.useCallback(
+    async (wt: GitWorktree) => {
       try {
         refreshBranchAsync(wt.path);
         // Normalize trailing slashes when deciding whether this is the
@@ -207,7 +153,9 @@ function WorktreeDropdownInner({
           wtProjectId = await createProject(
             wt.path,
             name,
-            isMain ? undefined : { parentProjectId: projectId, branch: wt.branch },
+            isMain
+              ? undefined
+              : { parentProjectId: projectId, branch: wt.branch },
           );
         } else if (
           !isMain &&
@@ -220,33 +168,13 @@ function WorktreeDropdownInner({
           await linkProjectWorktree(wtProjectId, projectId, wt.branch);
         }
 
-        const res = await send({
-          type: "start_session",
-          provider,
-          model,
-          project_id: wtProjectId,
+        navigate({
+          to: "/chat/draft/$projectId",
+          params: { projectId: wtProjectId },
         });
-        if (res?.type === "session_created") {
-          // Remember the spawn alias so capability lookups in the
-          // toolbar survive the SDK's `model_resolved` overwrite —
-          // see `lib/model-settings.ts`.
-          if (model) {
-            rememberPickedModel(res.session.sessionId, model);
-          }
-          navigate({
-            to: "/chat/$sessionId",
-            params: { sessionId: res.session.sessionId },
-          });
-        } else if (res?.type === "error") {
-          toast({
-            title: "Failed to start thread",
-            description: res.message,
-            duration: 4000,
-          });
-        }
       } catch (err) {
         toast({
-          title: "Failed to start thread",
+          title: "Failed to open new thread",
           description: String(err),
           duration: 4000,
         });
@@ -259,88 +187,18 @@ function WorktreeDropdownInner({
       state.projectWorktrees,
       createProject,
       linkProjectWorktree,
-      send,
       navigate,
       refreshBranchAsync,
     ],
   );
 
-  // Direct thread on the main project (no worktree provisioning).
-  async function createThreadDirect(provider: ProviderKind, model?: string) {
+  // Direct draft on the main project (no worktree provisioning).
+  function startDraftDirect() {
     refreshBranchAsync(projectPath);
-    const resolvedModel = resolveStartModel(provider, model);
-    const res = await send({
-      type: "start_session",
-      provider,
-      model: resolvedModel,
-      project_id: projectId,
+    navigate({
+      to: "/chat/draft/$projectId",
+      params: { projectId },
     });
-    if (res && res.type === "session_created") {
-      if (resolvedModel) {
-        rememberPickedModel(res.session.sessionId, resolvedModel);
-      }
-      navigate({
-        to: "/chat/$sessionId",
-        params: { sessionId: res.session.sessionId },
-      });
-    }
-  }
-
-  // ── Provider items renderer (reused in both modes) ────────────
-
-  function renderProviderItems(
-    onPick: (provider: ProviderKind, model?: string) => void,
-  ) {
-    return (
-      <>
-        {stillLoading && (
-          <>
-            <DropdownMenuLabel className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Loader2 className="h-3 w-3 animate-spin" />
-              Checking providers...
-            </DropdownMenuLabel>
-            <DropdownMenuSeparator />
-          </>
-        )}
-        {ALL_PROVIDERS.map(({ kind, label }) => {
-          const info = providerMap.get(kind);
-          if (!isProviderEnabled(kind)) return null;
-          const isReady = info?.status === "ready";
-          const hasModels = info && info.models.length > 0;
-
-          if (hasModels && isReady) {
-            return (
-              <DropdownMenuSub key={kind}>
-                <DropdownMenuSubTrigger>
-                  <span
-                    className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[kind]}`}
-                  />
-                  New {label} thread
-                </DropdownMenuSubTrigger>
-                <SearchableModelSubMenu
-                  models={info.models}
-                  onSelect={(modelValue) => onPick(kind, modelValue)}
-                />
-              </DropdownMenuSub>
-            );
-          }
-
-          return (
-            <DropdownMenuItem
-              key={kind}
-              disabled={!isReady}
-              onClick={() => isReady && onPick(kind)}
-            >
-              <span
-                className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${isReady ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"}`}
-              />
-              New {label} thread
-              {statusBadge(info)}
-            </DropdownMenuItem>
-          );
-        })}
-      </>
-    );
   }
 
   // ── Render ─────────────────────────────────────────────────────
@@ -357,8 +215,7 @@ function WorktreeDropdownInner({
             <SquarePen className="h-3.5 w-3.5" />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-64">
-          {/* Loading worktrees */}
+        <DropdownMenuContent align="end" className="w-56">
           {worktreeQuery.isLoading && (
             <DropdownMenuLabel className="flex items-center gap-2 text-xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
@@ -366,32 +223,44 @@ function WorktreeDropdownInner({
             </DropdownMenuLabel>
           )}
 
-          {/* Error loading worktrees — show error + fallback to direct provider items */}
+          {/* Error loading worktrees — show error and let the user at
+              least open a draft on the main project. The new-thread
+              button must never be a dead end. */}
           {worktreeQuery.isError && (
             <>
               <DropdownMenuLabel className="text-xs text-destructive">
                 {(worktreeQuery.error as Error).message}
               </DropdownMenuLabel>
               <DropdownMenuSeparator />
-              {renderProviderItems((provider, model) => {
-                const resolvedModel = resolveStartModel(provider, model);
-                void createThreadDirect(provider, resolvedModel);
-              })}
+              <DropdownMenuItem
+                onClick={() => {
+                  setOpen(false);
+                  startDraftDirect();
+                }}
+              >
+                <SquarePen className="mr-2 h-3.5 w-3.5" />
+                New thread on main
+              </DropdownMenuItem>
             </>
           )}
 
-          {/* Loaded but no multiple worktrees — direct provider list + create worktree */}
+          {/* Loaded with no extra worktrees — single "new thread"
+              entry plus the create-worktree affordance. */}
           {!worktreeQuery.isLoading &&
             !worktreeQuery.isError &&
             !hasMultipleWorktrees && (
               <>
-                {renderProviderItems((provider, model) => {
-                  const resolvedModel = resolveStartModel(provider, model);
-                  void createThreadDirect(provider, resolvedModel);
-                })}
+                <DropdownMenuItem
+                  onClick={() => {
+                    setOpen(false);
+                    startDraftDirect();
+                  }}
+                >
+                  <SquarePen className="mr-2 h-3.5 w-3.5" />
+                  New thread
+                </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
-                  disabled={!defaultProviderLoaded}
                   onClick={() => {
                     setOpen(false);
                     setCreateWtOpen(true);
@@ -403,7 +272,9 @@ function WorktreeDropdownInner({
               </>
             )}
 
-          {/* Loaded with multiple worktrees — two-level menu */}
+          {/* Multiple worktrees — single-level menu, one row per
+              worktree. The branch that matches `projectPath` is
+              labeled "main"; everything else shows its branch name. */}
           {!worktreeQuery.isLoading &&
             !worktreeQuery.isError &&
             hasMultipleWorktrees && (
@@ -412,39 +283,28 @@ function WorktreeDropdownInner({
                   Pick a worktree
                 </DropdownMenuLabel>
                 {worktrees.map((wt) => {
-                  const isMain = wt.path === projectPath;
+                  const isMain = samePath(wt.path, projectPath);
                   const label = wt.branch ?? "(detached)";
                   return (
-                    <DropdownMenuSub key={wt.path}>
-                      <DropdownMenuSubTrigger>
-                        <GitBranch className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                        <span className="flex-1 truncate">{label}</span>
-                        {isMain && (
-                          <span className="ml-1.5 rounded bg-muted px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-muted-foreground">
-                            main
-                          </span>
-                        )}
-                      </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent className="w-56">
-                        {renderProviderItems((provider, model) => {
-                          const resolvedModel = resolveStartModel(
-                            provider,
-                            model,
-                          );
-                          setOpen(false);
-                          void startThreadOnWorktree(
-                            wt,
-                            provider,
-                            resolvedModel,
-                          );
-                        })}
-                      </DropdownMenuSubContent>
-                    </DropdownMenuSub>
+                    <DropdownMenuItem
+                      key={wt.path}
+                      onClick={() => {
+                        setOpen(false);
+                        void startDraftOnWorktree(wt);
+                      }}
+                    >
+                      <GitBranch className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                      <span className="flex-1 truncate">{label}</span>
+                      {isMain && (
+                        <span className="ml-1.5 rounded bg-muted px-1 py-0.5 text-[9px] font-normal uppercase tracking-wide text-muted-foreground">
+                          main
+                        </span>
+                      )}
+                    </DropdownMenuItem>
                   );
                 })}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
-                  disabled={!defaultProviderLoaded}
                   onClick={() => {
                     setOpen(false);
                     setCreateWtOpen(true);
@@ -464,14 +324,9 @@ function WorktreeDropdownInner({
         projectPath={projectPath}
         currentBranch={currentBranch}
         onCreated={(wt) => {
-          // Respect the user's configured default provider (with
-          // ready/enabled fallbacks handled by the `defaultProvider`
-          // memo above). `resolveStartModel` additionally falls back
-          // to the provider catalog's first entry when the user has no
-          // saved default, so the spawned session always carries an
-          // explicit model id.
-          const model = resolveStartModel(defaultProvider);
-          void startThreadOnWorktree(wt, defaultProvider, model);
+          // Newly-created worktree → straight into a draft on it. The
+          // user picks their provider in the chat toolbar.
+          void startDraftOnWorktree(wt);
         }}
       />
     </>

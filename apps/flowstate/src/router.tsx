@@ -22,6 +22,7 @@ import { ProviderEnabledProvider } from "@/hooks/use-provider-enabled";
 import { TerminalProvider, useTerminal } from "@/stores/terminal-store";
 import { TerminalDock } from "@/components/terminal/TerminalDock";
 import { ChatView } from "@/components/chat/chat-view";
+import { DraftChatView } from "@/components/chat/draft-chat-view";
 import { RoutePromptOverlay } from "@/components/chat/route-prompt-overlay";
 import { CodeView } from "@/components/code/code-view";
 import { ProjectHomeView } from "@/components/project/project-home-view";
@@ -35,7 +36,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { isMacOS, isPopoutWindow } from "@/lib/popout";
 import { useGlobalShortcuts } from "@/hooks/useGlobalShortcuts";
 import { ShortcutsDialog } from "@/lib/keyboard-shortcuts";
-import { ProjectProviderPicker } from "@/components/project/project-provider-picker";
+import { ProjectPicker } from "@/components/project/project-picker";
 
 const SIDEBAR_WIDTH_KEY = "flowstate:sidebar-width";
 const SIDEBAR_MIN_WIDTH = 200;
@@ -452,7 +453,7 @@ function AppShell() {
         open={shortcutsHelpOpen}
         onOpenChange={setShortcutsHelpOpen}
       />
-      <ProjectProviderPicker
+      <ProjectPicker
         open={projectPickerOpen}
         onOpenChange={setProjectPickerOpen}
       />
@@ -520,6 +521,38 @@ const chatRoute = createRoute({
   component: function ChatPage() {
     const { sessionId } = useParams({ from: "/chat/$sessionId" });
     return <ChatView sessionId={sessionId} />;
+  },
+});
+
+// Draft chat route — rendered immediately when the user picks a
+// project / worktree from the sidebar pencil or the ⌘⇧N picker. No
+// backend session has been spawned yet; provider/model live in local
+// state and the first send synchronously calls `start_session` then
+// `send_turn` and `replace`-navigates to the real `/chat/$sessionId`.
+//
+// Path placement matters: TanStack Router matches longest prefix
+// first, so `/chat/draft/<id>` correctly routes here rather than
+// being interpreted as a session id literal `"draft"` against
+// `/chat/$sessionId`. See the routeTree array below — both routes
+// are siblings and both work.
+const chatDraftRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/chat/draft/$projectId",
+  component: function ChatDraftPage() {
+    const { projectId } = useParams({ from: "/chat/draft/$projectId" });
+    return <DraftChatView projectId={projectId} />;
+  },
+});
+
+// Project-less draft — sibling of `/chat/draft/$projectId` for the
+// "General" sidebar section. The resulting session is created with
+// `project_id: null`, so it lands under the General header in the
+// sidebar's thread list.
+const chatDraftRootRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/chat/draft",
+  component: function ChatDraftRootPage() {
+    return <DraftChatView />;
   },
 });
 
@@ -598,6 +631,8 @@ const featuresRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
+  chatDraftRoute,
+  chatDraftRootRoute,
   codeRoute,
   browseRoute,
   projectRoute,

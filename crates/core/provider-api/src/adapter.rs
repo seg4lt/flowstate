@@ -171,6 +171,79 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Build a transcript handoff for the **outgoing** adapter when
+    /// the user swaps this session onto a different provider. The
+    /// returned `Vec<HandoffMessage>` describes the prior conversation
+    /// in role/content form so the incoming adapter (or the runtime's
+    /// fallback) can seed the new provider's context.
+    ///
+    /// Default impl walks `session.turns` and emits a `user` then
+    /// `assistant` message per completed turn, using the turn's
+    /// `input` and `output` fields directly. This is correct for
+    /// every adapter today — input/output are the canonical string
+    /// pair the runtime already tracks regardless of provider — but
+    /// adapters can override to filter (e.g. drop turns with empty
+    /// output, omit interrupted turns, etc.) or to flatten
+    /// reasoning/tool-use blocks into the assistant content.
+    ///
+    /// Returning `Err` aborts the swap. Reserve for genuinely
+    /// catastrophic states (database corruption, panics in transcript
+    /// readers) — a per-turn formatting glitch should yield a
+    /// best-effort empty assistant entry, not an error.
+    async fn prepare_for_handoff(
+        &self,
+        session: &SessionDetail,
+    ) -> Result<Vec<HandoffMessage>, String> {
+        let mut messages = Vec::with_capacity(session.turns.len() * 2);
+        for turn in &session.turns {
+            // Skip turns that never produced anything (interrupted
+            // before first delta) — they'd appear as empty
+            // assistant messages and waste context. Same with any
+            // turn whose input got swallowed by an early-cancel race.
+            if !turn.input.trim().is_empty() {
+                messages.push(HandoffMessage {
+                    role: "user".to_string(),
+                    content: turn.input.clone(),
+                });
+            }
+            if matches!(turn.status, TurnStatus::Completed) && !turn.output.trim().is_empty() {
+                messages.push(HandoffMessage {
+                    role: "assistant".to_string(),
+                    content: turn.output.clone(),
+                });
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Receive a transcript handoff on the **incoming** adapter. The
+    /// adapter has already had `start_session` called when this
+    /// fires, so any bridge / native session is in place — this
+    /// method's job is to seed that session's conversation log with
+    /// the prior turns.
+    ///
+    /// Returns `Ok(true)` to signal "I consumed the handoff
+    /// natively; runtime should NOT inject a context block". Returns
+    /// `Ok(false)` to signal "I left the conversation log empty;
+    /// runtime should fall back to prepending a textual context
+    /// summary to the user's next turn input". Returning `Err`
+    /// aborts the swap.
+    ///
+    /// Default returns `Ok(false)` — every adapter today opts into
+    /// the runtime's textual-prepend fallback, which works
+    /// regardless of provider transport. Adapters with a native
+    /// transcript-replay primitive (e.g. Codex's `thread/start
+    /// messages: [...]`, the Claude SDK's input-queue
+    /// `shouldQuery: false` push) should override this to do the
+    /// native work and return `Ok(true)`.
+    async fn accept_handoff(
+        &self,
+        _session: &SessionDetail,
+        _handoff: &[HandoffMessage],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Tear down any long-lived resources held for this session (subprocesses, connections).
     async fn end_session(&self, _session: &SessionDetail) -> Result<(), String> {
         Ok(())

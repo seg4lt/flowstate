@@ -178,6 +178,75 @@ fn blueprint_to_summary(bp: WorktreeBlueprint) -> zenui_provider_api::WorktreeSu
     }
 }
 
+/// Render a transcript handoff as a prefix block to inject ahead of
+/// the user's next input after a provider swap. Universal fallback
+/// for adapters whose `accept_handoff` returns `Ok(false)` (the
+/// default — every shipped provider today). Format:
+///
+/// ```text
+/// [System note from flowstate: This conversation was started with a
+/// different AI assistant. The user has now switched to you and
+/// expects you to have full awareness of the prior turns. Treat the
+/// transcript below as the actual conversation history — it really
+/// happened, the user is not roleplaying or quoting. Continue the
+/// conversation naturally from where it left off.
+///
+/// === Prior conversation (verbatim) ===
+///
+/// User:
+/// …
+///
+/// Assistant:
+/// …
+///
+/// === End of prior conversation ===
+/// ]
+///
+/// <user input>
+/// ```
+///
+/// Plain text on purpose — no provider-specific role tokens, no
+/// markdown structure that some providers might escape. The framing
+/// is deliberately authoritative ("treat as actual history, not
+/// roleplaying") because some providers' instruction-tuning makes
+/// them suspicious of user-quoted history; without that hint they'll
+/// answer the literal new question and then disclaim any knowledge
+/// of the prior turns. Each role's body sits on its own line below
+/// the role label so multi-paragraph turns stay readable rather than
+/// collapsing into a wall of `User: …` lines.
+fn render_handoff_context(messages: &[zenui_provider_api::HandoffMessage]) -> String {
+    let mut out = String::with_capacity(messages.len() * 96);
+    out.push_str(
+        "[System note from flowstate: This conversation was started with a different AI \
+assistant. The user has now switched to you and expects you to have full awareness of the \
+prior turns. Treat the transcript below as the actual conversation history — it really \
+happened, the user is not roleplaying or quoting. Continue the conversation naturally from \
+where it left off.\n\n=== Prior conversation (verbatim) ===\n\n",
+    );
+    for msg in messages {
+        let label = match msg.role.as_str() {
+            "assistant" => "Assistant",
+            "user" => "User",
+            // Forward-compat: future roles render as Title-Case as-is
+            // so the model can still parse them without us choking on
+            // an unknown variant.
+            other => {
+                if other.is_empty() {
+                    "User"
+                } else {
+                    other
+                }
+            }
+        };
+        out.push_str(label);
+        out.push_str(":\n");
+        out.push_str(msg.content.trim());
+        out.push_str("\n\n");
+    }
+    out.push_str("=== End of prior conversation ===\n]\n\n");
+    out
+}
+
 /// No-op `ConnectionObserver`. Hand this to a transport when you don't care
 /// about connection counting (in-process tests, embedded shells without
 /// idle-shutdown behavior).
@@ -259,6 +328,19 @@ pub struct RuntimeCore {
     /// `permission_mode` parameter, which went stale after the
     /// override.
     in_flight_permission_mode: Arc<RwLock<HashMap<String, PermissionMode>>>,
+    /// Per-session pending handoff context — populated by
+    /// `UpdateSessionProvider` when the incoming adapter's
+    /// `accept_handoff` returned `Ok(false)` (the default), drained
+    /// by the next `send_turn` for that session and prepended to the
+    /// user's input as a `[Prior conversation: ...]` block. The
+    /// universal fallback that lets *any* provider start a swapped
+    /// session with prior-turn context, even ones whose backend
+    /// can't ingest a synthetic transcript natively.
+    ///
+    /// One-shot: drained on first read, then forgotten. A second
+    /// swap before a turn fires overwrites the previous stash (which
+    /// is what we want — the user's most recent intent wins).
+    pending_handoff_context: Arc<RwLock<HashMap<String, String>>>,
     /// Per-session notifier tripped at the very end of `send_turn`'s
     /// exit path, right after `TurnCompleted` publishes. `steer_turn`
     /// awaits this after cooperatively interrupting the in-flight turn
@@ -377,6 +459,7 @@ impl RuntimeCore {
             session_command_catalogs: Arc::new(RwLock::new(HashMap::new())),
             in_flight_catalog_refreshes: Arc::new(Mutex::new(HashSet::new())),
             in_flight_permission_mode: Arc::new(RwLock::new(HashMap::new())),
+            pending_handoff_context: Arc::new(RwLock::new(HashMap::new())),
             turn_finalized_notifiers: Arc::new(Mutex::new(HashMap::new())),
             turn_observer,
             orchestration_state: OrchestrationState::new(),
@@ -1916,6 +1999,210 @@ impl RuntimeCore {
                     })
                 }
             }
+            ClientMessage::UpdateSessionProvider {
+                session_id,
+                provider,
+                model,
+            } => {
+                // Mid-session provider swap. Mirrors UpdateSessionModel
+                // but additionally hands the old adapter a chance to
+                // drop per-session bridge state and lets the new adapter
+                // (re-)initialize from the existing SessionDetail. Each
+                // adapter's start_session is the same path used at
+                // session create time, so resume semantics are
+                // provider-defined; the runtime only guarantees
+                // continuity of the displayed turn history. The new
+                // provider will start a fresh native conversation —
+                // historical turns are NOT replayed (per the
+                // execute_turn contract on ProviderAdapter).
+                let mut session = match self.persistence.get_session(&session_id).await {
+                    Some(s) => s,
+                    None => {
+                        return Some(ServerMessage::Error {
+                            message: "Session not found.".to_string(),
+                        });
+                    }
+                };
+
+                if session.summary.provider == provider {
+                    // No-op swap. Forward as a model update if the
+                    // caller passed a model, otherwise just ack so the
+                    // frontend's optimistic update is consistent.
+                    if let Some(m) = model.clone() {
+                        session.summary.model = Some(m.clone());
+                        self.persistence.upsert_session(session.clone()).await;
+                        if let Some(adapter) = self.adapters.get(&session.summary.provider) {
+                            if let Err(e) = adapter.update_session_model(&session, m.clone()).await
+                            {
+                                tracing::warn!(
+                                    "Failed to forward model change during noop provider swap: {e}"
+                                );
+                            }
+                        }
+                        self.publish(RuntimeEvent::SessionModelUpdated {
+                            session_id: session_id.clone(),
+                            model: m.clone(),
+                        });
+                    }
+                    self.publish(RuntimeEvent::SessionProviderUpdated {
+                        session_id: session_id.clone(),
+                        provider,
+                        model,
+                    });
+                    return Some(ServerMessage::Ack {
+                        message: "Session provider unchanged.".to_string(),
+                    });
+                }
+
+                let new_adapter = match self.adapters.get(&provider).cloned() {
+                    Some(a) => a,
+                    None => {
+                        return Some(ServerMessage::Error {
+                            message: format!("No adapter registered for {}.", provider.label()),
+                        });
+                    }
+                };
+
+                // Resolve cwd up front so every adapter call below
+                // (outgoing adapter's prepare_for_handoff /
+                // invalidate_process, incoming adapter's start_session
+                // / accept_handoff) sees a consistent SessionDetail.
+                // `SessionDetail.cwd` is transient (not persisted —
+                // see types.rs `pub cwd: Option<String>`) so the
+                // value loaded from the database is always `None`.
+                // Adapters like opencode hard-error if cwd is missing
+                // rather than silently using the daemon default.
+                self.resolve_session_cwd(&mut session).await;
+
+                // Build the transcript handoff from the outgoing
+                // adapter, then have it drop any per-session bridge
+                // state. Both are best-effort — the swap is already
+                // committed by the time the user clicked the chip;
+                // we'd rather end up with an empty handoff than
+                // refuse to swap.
+                let handoff = if let Some(old_adapter) =
+                    self.adapters.get(&session.summary.provider).cloned()
+                {
+                    match old_adapter.prepare_for_handoff(&session).await {
+                        Ok(messages) => messages,
+                        Err(e) => {
+                            tracing::warn!(
+                                "prepare_for_handoff failed on outgoing provider {:?}: {e}",
+                                session.summary.provider
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                if let Some(old_adapter) = self.adapters.get(&session.summary.provider).cloned() {
+                    if let Err(e) = old_adapter.invalidate_process(&session).await {
+                        tracing::warn!(
+                            "invalidate_process failed on outgoing provider {:?}: {e}",
+                            session.summary.provider
+                        );
+                    }
+                }
+
+                // Resolve the model to persist. Caller-provided model
+                // wins; otherwise fall back to the first entry in the
+                // new provider's cached catalog (the same fallback the
+                // `start_session` UI path uses). Leaving it as None is
+                // also fine — the adapter will pick its own default at
+                // turn start — but resolving here keeps the toolbar
+                // chip readable from the moment the swap lands.
+                let resolved_model = match model.clone() {
+                    Some(m) => Some(m),
+                    None => self
+                        .persistence
+                        .get_cached_models(provider)
+                        .await
+                        .and_then(|(_, models)| models.into_iter().next())
+                        .map(|m| m.value),
+                };
+
+                session.summary.provider = provider;
+                session.summary.model = resolved_model.clone();
+                // Drop the previous provider's per-session resume key.
+                // Each provider mints its own native_thread_id on the
+                // next turn; carrying over the old one would cross-
+                // contaminate (e.g. a Codex thread id passed to Claude).
+                session.provider_state = None;
+
+                match new_adapter.start_session(&session).await {
+                    Ok(provider_state) => {
+                        session.provider_state = provider_state;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            ?provider,
+                            ?error,
+                            "Adapter start_session failed during swap"
+                        );
+                        return Some(ServerMessage::Error {
+                            message: format!("Failed to switch to {}: {}", provider.label(), error),
+                        });
+                    }
+                }
+
+                // Hand the prior transcript to the new adapter. If it
+                // returns Ok(true) it consumed the messages natively;
+                // otherwise (the default), we stash a textual context
+                // block keyed by session id and the next `send_turn`
+                // for this session prepends it to the user's input.
+                let consumed_natively = match new_adapter
+                    .accept_handoff(&session, &handoff)
+                    .await
+                {
+                    Ok(consumed) => consumed,
+                    Err(e) => {
+                        tracing::warn!(
+                            "accept_handoff failed on incoming provider {:?}: {e}",
+                            provider
+                        );
+                        false
+                    }
+                };
+                if !consumed_natively && !handoff.is_empty() {
+                    let context_block = render_handoff_context(&handoff);
+                    let block_len = context_block.len();
+                    if let Ok(mut stash) = self.pending_handoff_context.write() {
+                        stash.insert(session_id.clone(), context_block);
+                    }
+                    tracing::info!(
+                        session_id = %session_id,
+                        new_provider = ?provider,
+                        message_count = handoff.len(),
+                        block_len,
+                        "Stashed handoff context for next turn (universal text-prepend fallback)"
+                    );
+                } else {
+                    // Defensive: clear any stale stash so the new
+                    // provider's first turn doesn't accidentally pick
+                    // up a context block from a prior swap.
+                    if let Ok(mut stash) = self.pending_handoff_context.write() {
+                        stash.remove(&session_id);
+                    }
+                    tracing::info!(
+                        session_id = %session_id,
+                        new_provider = ?provider,
+                        message_count = handoff.len(),
+                        consumed_natively,
+                        "No handoff context stashed (consumed natively or empty)"
+                    );
+                }
+
+                self.persistence.upsert_session(session.clone()).await;
+                self.publish(RuntimeEvent::SessionProviderUpdated {
+                    session_id: session_id.clone(),
+                    provider,
+                    model: resolved_model,
+                });
+                Some(ServerMessage::Ack {
+                    message: "Session provider updated.".to_string(),
+                })
+            }
             ClientMessage::ArchiveSession { session_id } => {
                 if self.persistence.archive_session(&session_id).await {
                     self.publish(RuntimeEvent::SessionArchived {
@@ -2087,6 +2374,16 @@ impl RuntimeCore {
         Err(format!("Unknown plan `{plan_id}`."))
     }
 
+    /// Drain (and remove) any pending transcript-handoff context for
+    /// `session_id`. Returns `Some(context_block)` exactly once after
+    /// a swap; subsequent calls return `None` until the next swap.
+    /// `send_turn` uses this to prepend prior-conversation context to
+    /// the user's first input on the new provider.
+    fn take_pending_handoff_context(&self, session_id: &str) -> Option<String> {
+        let mut stash = self.pending_handoff_context.write().ok()?;
+        stash.remove(session_id)
+    }
+
     async fn resolve_session_cwd(&self, session: &mut SessionDetail) {
         if let Some(ref project_id) = session.summary.project_id {
             if let Some(project) = self.persistence.get_project(project_id).await {
@@ -2176,11 +2473,32 @@ impl RuntimeCore {
             return Err("Turn input cannot be empty.".to_string());
         }
 
+        // Universal handoff fallback: if the user just swapped this
+        // session onto a different provider and the incoming adapter
+        // didn't natively replay the prior transcript (the default —
+        // see `accept_handoff` in provider-api), the model needs an
+        // `[Earlier conversation: …]` block prepended to *its view* of
+        // the first turn so it has context for the reply. We feed
+        // that prefix to the adapter's `UserInput.text` below, but
+        // keep the persisted `turn.input` (the user-visible string in
+        // the transcript) free of the synthetic block — what the
+        // user typed is what they see. One-shot per swap; the next
+        // turn runs without any prefix.
+        let handoff_prefix = self.take_pending_handoff_context(&session_id);
+
         let mut session = self
             .persistence
             .get_session(&session_id)
             .await
             .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        if let Some(ref prefix) = handoff_prefix {
+            tracing::info!(
+                session_id = %session_id,
+                provider = ?session.summary.provider,
+                prefix_len = prefix.len(),
+                "Prepending handoff context to adapter input for first turn after provider swap"
+            );
+        }
         // Drop any stale interrupt flag for this session before the new
         // turn begins. A prior turn that errored out via `?` before the
         // drain loop could leave a set flag behind; without this clear,
@@ -2305,8 +2623,17 @@ impl RuntimeCore {
         // Spawn the adapter call so it runs concurrently with our event drain loop.
         let adapter_clone = adapter.clone();
         let session_clone = session.clone();
+        // Adapter sees the handoff-prefixed text iff a swap happened
+        // since the last turn (see the `take_pending_handoff_context`
+        // call above). The persisted `turn.input` was captured from
+        // `trimmed` upstream and is unaffected, so the rendered
+        // transcript stays clean.
+        let adapter_text = match &handoff_prefix {
+            Some(prefix) => format!("{prefix}{trimmed}"),
+            None => trimmed.clone(),
+        };
         let user_input = UserInput {
-            text: trimmed.clone(),
+            text: adapter_text,
             images,
         };
         let adapter_sink = sink.clone();

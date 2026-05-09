@@ -1454,3 +1454,21 @@ pub struct ProviderTurnOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_state: Option<ProviderSessionState>,
 }
+
+/// One leg of a transcript handoff — a user or assistant message in
+/// the session's prior conversation. Synthesized from the session's
+/// turn history when the user swaps providers mid-thread; the new
+/// adapter (or runtime fallback) uses these to seed the new
+/// provider's context.
+///
+/// Rust-side only — frontends never see these directly. Skipping
+/// the `ts_rs::TS` derive keeps `apps/.../generated/types.ts` lean.
+#[derive(Debug, Clone)]
+pub struct HandoffMessage {
+    /// `"user"` or `"assistant"`. We deliberately keep this as a
+    /// string rather than an enum so adapters that need richer roles
+    /// (e.g. a `system` or `tool` channel) can extend without a
+    /// breaking change.
+    pub role: String,
+    pub content: String,
+}

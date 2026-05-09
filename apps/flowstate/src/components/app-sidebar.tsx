@@ -13,6 +13,7 @@ import {
   Plus,
   Settings,
   Sparkles,
+  SquarePen,
   MessageSquare,
   Trash2,
 } from "lucide-react";
@@ -69,7 +70,6 @@ import { useAttentionTone } from "@/hooks/use-attention-tone";
 import { cn } from "@/lib/utils";
 import { isMacOS } from "@/lib/popout";
 import { basename } from "@/lib/worktree-utils";
-import { ProviderDropdown } from "@/components/sidebar/provider-dropdown";
 import { WorktreeAwareNewThread } from "@/components/sidebar/worktree-new-thread-dropdown";
 import { ThreadItem } from "@/components/sidebar/thread-item";
 import { SortableThread } from "@/components/sidebar/sortable-thread";
@@ -605,7 +605,23 @@ function AppSidebarBody() {
                     </SidebarMenuButton>
                   </CollapsibleTrigger>
                   <div className="absolute right-1 top-1">
-                    <ProviderDropdown />
+                    {/* Project-less new-thread button. Goes to the
+                        /chat/draft route (no projectId param), which
+                        renders DraftChatView with projectId=undefined
+                        and creates a session with project_id: null on
+                        first send. Provider/model are picked in the
+                        chat toolbar. */}
+                    <button
+                      type="button"
+                      className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void navigate({ to: "/chat/draft" });
+                      }}
+                      aria-label="New thread"
+                    >
+                      <SquarePen className="h-3.5 w-3.5" />
+                    </button>
                   </div>
                   <CollapsibleContent>
                     <SidebarMenuSub>
