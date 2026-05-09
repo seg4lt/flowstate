@@ -33,3 +33,12 @@ libc = "0.2"
 # back the `opencode.json` writer's smoke tests. Workspace-pinned
 # version stays in sync with the rest of the codebase.
 tempfile = "3"
+
+# Build-time codegen: parse the committed `/doc` snapshot
+# (`tests/fixtures/openapi-<ver>.json`) and emit `spec_types.rs` into
+# OUT_DIR. Keeps the Rust types mechanically derived from the spec, so
+# any drift surfaces as a regenerated diff rather than as a runtime
+# JSON shape mismatch. See `build.rs` and `src/spec_types.rs` (the
+# `include!` site).
+[build-dependencies]
+serde_json = "1"

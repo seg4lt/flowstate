@@ -109,7 +109,7 @@ impl OpenCodeClient {
     /// (when reachable) or the underlying transport error.
     pub async fn health(&self) -> Result<(), String> {
         let response = self
-            .request_get("/app")
+            .request_get("/app", None)
             .await
             .map_err(|e| format!("opencode health probe failed to dispatch: {e}"))?;
 
@@ -146,8 +146,13 @@ impl OpenCodeClient {
             }
         }
 
+        // Send the directory both ways: as the body field (session
+        // metadata) AND as the `x-opencode-directory` header (the
+        // per-request scoping that actually drives tool dispatch).
+        // The body field alone isn't enough — see
+        // `OPENCODE_DIRECTORY_HEADER`.
         let response = self
-            .request_post("/session", &body)
+            .request_post("/session", &body, Some(directory))
             .await
             .map_err(|e| format!("opencode session create failed: {e}"))?;
 
@@ -207,6 +212,7 @@ impl OpenCodeClient {
         model: Option<&str>,
         reasoning_effort: Option<ReasoningEffort>,
         permission_mode: PermissionMode,
+        directory: &str,
     ) -> Result<(), String> {
         let mut body = json!({
             "parts": [{ "type": "text", "text": text }],
@@ -223,9 +229,13 @@ impl OpenCodeClient {
             body["agent"] = Value::String(agent.to_string());
         }
 
+        // `directory` MUST go on the header (or `?directory=` query)
+        // — without it, every tool call this prompt dispatches runs
+        // in `process.cwd()` of the opencode server. See
+        // `OPENCODE_DIRECTORY_HEADER` for the resolver.
         let path = format!("/session/{session_id}/prompt_async");
         let response = self
-            .request_post(&path, &body)
+            .request_post(&path, &body, Some(directory))
             .await
             .map_err(|e| format!("opencode prompt dispatch failed: {e}"))?;
 
@@ -244,10 +254,14 @@ impl OpenCodeClient {
     /// Abort an in-flight turn. Idempotent — calling `abort` on a
     /// session that isn't actively running succeeds as a no-op from
     /// the caller's perspective.
-    pub async fn abort_session(&self, session_id: &str) -> Result<(), String> {
+    pub async fn abort_session(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<(), String> {
         let path = format!("/session/{session_id}/abort");
         let response = self
-            .request_post(&path, &json!({}))
+            .request_post(&path, &json!({}), directory)
             .await
             .map_err(|e| format!("opencode abort dispatch failed: {e}"))?;
         if response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
@@ -272,11 +286,15 @@ impl OpenCodeClient {
         &self,
         request_id: &str,
         answers: Vec<Vec<String>>,
+        directory: Option<&str>,
     ) -> Result<(), String> {
         let path = format!("/question/{request_id}/reply");
         let body = json!({ "requestID": request_id, "answers": answers });
+        // `/question/...` is session-agnostic on the wire, but the
+        // resolver still scopes by directory. If the caller knows the
+        // originating session's cwd, pass it through.
         let response = self
-            .request_post(&path, &body)
+            .request_post(&path, &body, directory)
             .await
             .map_err(|e| format!("opencode question.reply failed: {e}"))?;
         if response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
@@ -290,10 +308,23 @@ impl OpenCodeClient {
 
     /// Answer a pending permission prompt.
     ///
-    /// Opencode accepts `reply` ∈ `{"once", "always", "reject"}`:
+    /// Wire shape: `POST /session/{id}/permissions/{permission_id}`
+    /// with body `{ "response": "once" | "always" | "reject" }`.
     /// - `once` — approve this single invocation
     /// - `always` — approve now and remember for the session
     /// - `reject` — deny this invocation
+    ///
+    /// **Body field is `response`, not `reply`.** Opencode 1.14.41
+    /// schema-validates against this exact key — sending `{"reply":
+    /// "once"}` returns 400 with
+    /// `path: ["response"], expected "once" | "always" | "reject"`,
+    /// the tool that was waiting on the prompt stays wedged at
+    /// `pending` forever, and the user observes "I clicked Allow
+    /// and nothing happened". Older opencode builds (and our older
+    /// PROTOCOL.md / inline doc text) used `reply`; the rename is
+    /// post-1.4.x. Don't conflate this with `PermissionReply` the
+    /// Rust type — that's our internal vocabulary, only the wire
+    /// field changed.
     ///
     /// There is no separate "deny forever" reply — a `reject` is
     /// always scoped to the current request. Our [`crate::events`]
@@ -306,11 +337,22 @@ impl OpenCodeClient {
         session_id: &str,
         permission_id: &str,
         reply: PermissionReply,
+        directory: Option<&str>,
     ) -> Result<(), String> {
         let path = format!("/session/{session_id}/permissions/{permission_id}");
-        let body = json!({ "reply": reply.as_wire_str() });
+        // Body field is `response`, not `reply`. Opencode 1.14.41
+        // schema-validates against this exact key — sending `reply`
+        // returns 400 with `path: ["response"], expected "once" |
+        // "always" | "reject"`. The whole tool flow then wedges
+        // because the reply never lands on the server (verified by
+        // probe; the next event in the SSE stream is silence). The
+        // older docs and earlier opencode builds did accept `reply`,
+        // hence the lingering name on `PermissionReply` — keep that
+        // type alone (it's the flowstate-side vocabulary) and only
+        // rename the wire field here.
+        let body = json!({ "response": reply.as_wire_str() });
         let response = self
-            .request_post(&path, &body)
+            .request_post(&path, &body, directory)
             .await
             .map_err(|e| format!("opencode permission response failed: {e}"))?;
         if response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
@@ -333,7 +375,7 @@ impl OpenCodeClient {
     /// as the stable id so users see which upstream is being called.
     pub async fn list_models(&self) -> Result<Vec<ProviderModel>, String> {
         let response = self
-            .request_get("/config/providers")
+            .request_get("/config/providers", None)
             .await
             .map_err(|e| format!("opencode list_models dispatch failed: {e}"))?;
         if !response.status().is_success() {
@@ -404,25 +446,183 @@ impl OpenCodeClient {
         Ok(models)
     }
 
-    // ── internal helpers ────────────────────────────────────────────
-
-    async fn request_get(&self, path: &str) -> reqwest::Result<reqwest::Response> {
-        let url = format!("{}{}", self.base_url, path);
-        self.http
-            .get(url)
-            .basic_auth(&self.username, Some(&self.password))
-            .send()
+    /// Update an existing session's permission ruleset to match the
+    /// caller's current `PermissionMode`. This is the
+    /// per-turn fix-up for sessions minted at `start_session` time
+    /// (when the runtime hadn't yet decided on a mode) or sessions
+    /// that resumed across a mode change in the UI.
+    ///
+    /// Opencode persists the permission ruleset on the session row
+    /// and consults it for every subsequent tool invocation — so a
+    /// stale ruleset means stale prompting behaviour. Verified live
+    /// against opencode 1.14.41:
+    ///
+    /// ```text
+    /// 1. POST /session  with permission=[{bash:ask}]   → session created
+    /// 2. PATCH /session/{id} with permission=[{*:allow}] → 200
+    /// 3. POST /session/{id}/prompt_async (bash tool)   → no permission.asked,
+    ///                                                    runs to completion
+    /// ```
+    ///
+    /// The endpoint isn't documented in opencode's `/doc` (the partial
+    /// OpenAPI), discovered by probe. Other paths that look plausible
+    /// (`POST /session/{id}/permission`, `PUT /session/{id}/permission`,
+    /// `POST /session/{id}/permissions` for bulk update) all fall
+    /// through to opencode's SPA HTML 404 — `PATCH /session/{id}` is
+    /// the only one that actually rewrites the rules.
+    ///
+    /// **`permission` is the only PATCH-able field.** Live probe shows
+    /// opencode silently ignores `model`, `variant`, and `agent` in
+    /// the PATCH body (200 OK, session row unchanged). Don't extend
+    /// this method to set them — `prompt_async` carries them per-turn,
+    /// and the session row's `model` copy isn't even consulted by
+    /// `prompt_async` (it falls back to the global server default if
+    /// the prompt body omits the model field). See `PROTOCOL.md`,
+    /// "What PATCH does *not* do" for the full table.
+    pub async fn update_permission(
+        &self,
+        session_id: &str,
+        permission_mode: PermissionMode,
+        directory: &str,
+    ) -> Result<(), String> {
+        let path = format!("/session/{session_id}");
+        let body = json!({ "permission": permission_rules_for(permission_mode) });
+        let response = self
+            .request_patch(&path, &body, Some(directory))
             .await
+            .map_err(|e| format!("opencode permission update dispatch failed: {e}"))?;
+        let status = response.status();
+        if status.is_success() {
+            debug!(%session_id, ?permission_mode, "opencode permission updated");
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(format!(
+                "opencode permission update returned {status}: {body}"
+            ))
+        }
     }
 
-    async fn request_post(&self, path: &str, body: &Value) -> reqwest::Result<reqwest::Response> {
+    // ── internal helpers ────────────────────────────────────────────
+
+    async fn request_get(
+        &self,
+        path: &str,
+        directory: Option<&str>,
+    ) -> reqwest::Result<reqwest::Response> {
         let url = format!("{}{}", self.base_url, path);
-        self.http
+        let mut req = self
+            .http
+            .get(url)
+            .basic_auth(&self.username, Some(&self.password));
+        if let Some(dir) = directory {
+            req = req.header(OPENCODE_DIRECTORY_HEADER, urlencode_path(dir));
+        }
+        req.send().await
+    }
+
+    async fn request_post(
+        &self,
+        path: &str,
+        body: &Value,
+        directory: Option<&str>,
+    ) -> reqwest::Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self
+            .http
             .post(url)
             .basic_auth(&self.username, Some(&self.password))
-            .json(body)
-            .send()
-            .await
+            .json(body);
+        if let Some(dir) = directory {
+            req = req.header(OPENCODE_DIRECTORY_HEADER, urlencode_path(dir));
+        }
+        req.send().await
+    }
+
+    async fn request_patch(
+        &self,
+        path: &str,
+        body: &Value,
+        directory: Option<&str>,
+    ) -> reqwest::Result<reqwest::Response> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self
+            .http
+            .patch(url)
+            .basic_auth(&self.username, Some(&self.password))
+            .json(body);
+        if let Some(dir) = directory {
+            req = req.header(OPENCODE_DIRECTORY_HEADER, urlencode_path(dir));
+        }
+        req.send().await
+    }
+}
+
+/// HTTP header opencode 1.14.41 reads to scope a request's working
+/// directory. The server-side resolver inside `opencode serve`:
+///
+/// ```js
+/// let o = req.query("directory")
+///      || req.header("x-opencode-directory")
+///      || process.cwd();
+/// let t = path.resolve(decodeURIComponent(o));
+/// // tool dispatch then runs inside `t`
+/// ```
+///
+/// Without this header (and without the `?directory=` query equivalent),
+/// every tool call falls through to `process.cwd()` of the opencode
+/// server process — which on flowstate's macOS Tauri shell is the
+/// daemon's app-data-dir. That fallback is the smoking-gun for the
+/// "tools always run in `~/Library/Application Support/...`" bug we
+/// hit. The body's `directory` field on `POST /session` is a separate
+/// metadata path that does NOT feed tool dispatch.
+///
+/// The official `@opencode-ai/sdk` injects this header automatically
+/// when constructed with `{ directory: "..." }`. We hand-roll the
+/// equivalent here.
+pub(crate) const OPENCODE_DIRECTORY_HEADER: &str = "x-opencode-directory";
+
+/// URL-encode a filesystem path for the `x-opencode-directory` header
+/// (or `?directory=` query param). Opencode's resolver decodes the
+/// value via `decodeURIComponent` — i.e. RFC 3986 percent-encoding
+/// where every byte outside the unreserved set
+/// `[A-Za-z0-9-._~]` is `%XX`-escaped. This matches `encodeURIComponent`
+/// in JS, which is what the SDK uses.
+///
+/// Slashes ARE encoded (`/` → `%2F`); opencode reassembles the path
+/// after decoding. Verified live: a header value of
+/// `%2FUsers%2Fbabal%2Fseg4ltcode%2Fcleaner` yields `pwd ==
+/// "/Users/babal/seg4ltcode/cleaner"` from the bash tool, even when
+/// the opencode server's own CWD is `/tmp`.
+/// Crate-visible re-export of `urlencode_path` for the SSE reader in
+/// `events.rs`. Same encoding, just a public alias so other modules
+/// don't reach into the private function directly.
+pub(crate) fn urlencode_path_for_header(path: &str) -> String {
+    urlencode_path(path)
+}
+
+fn urlencode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(hex_upper(byte >> 4));
+                out.push(hex_upper(byte & 0x0F));
+            }
+        }
+    }
+    out
+}
+
+fn hex_upper(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'A' + nibble - 10) as char,
+        _ => unreachable!("nibble outside 0..=15"),
     }
 }
 
@@ -607,13 +807,32 @@ fn is_free_model(provider_id: &str, model: &Value) -> bool {
 }
 
 /// Translate flowstate's `"provider/model"` slug into opencode's
-/// `{ providerID, modelID }` object.
+/// `{ id, providerID, modelID }` object.
 ///
 /// Opencode's REST server rejects a bare `"model": "openai/gpt-5"`
 /// string field with a 400; the schema demands the split object form.
 /// We keep the flat slug as the canonical representation inside
 /// flowstate (one column in the session row, one dropdown value in
 /// the UI) and only materialise the object at the wire boundary.
+///
+/// **Why all three keys.** Opencode 1.14.41 schema-validates the two
+/// model-bearing endpoints against *different* shapes:
+///
+/// - `POST /session` requires `{ id, providerID }` (the `id` field is
+///   new — older builds didn't have it). `modelID` is optional here.
+/// - `POST /session/{id}/prompt_async` requires `{ providerID, modelID }`.
+///   `id` is optional here.
+///
+/// Both endpoints silently accept the union `{ id, providerID, modelID }`,
+/// so we emit all three keys and let one helper feed both call sites.
+/// Opencode's session response normalises back to `{ id, providerID }`,
+/// confirming `modelID` is consumed but not retained on the session
+/// record.
+///
+/// `id` carries the flat slug (`"provider/model"`); `providerID` and
+/// `modelID` carry the split halves. Live probe (opencode 1.14.41)
+/// shows opencode treats `id` as opaque and routes on `providerID`,
+/// but the validator still demands the field be present.
 ///
 /// Returns `None` when the input doesn't contain a `/` — callers
 /// should omit the field in that case so opencode falls back to its
@@ -624,6 +843,7 @@ fn parse_model_slug(slug: &str) -> Option<Value> {
         return None;
     }
     Some(json!({
+        "id": slug,
         "providerID": provider_id,
         "modelID": model_id,
     }))
@@ -636,6 +856,7 @@ mod tests {
     #[test]
     fn parse_model_slug_splits_provider_and_model() {
         let parsed = parse_model_slug("openai/gpt-5").unwrap();
+        assert_eq!(parsed["id"], "openai/gpt-5");
         assert_eq!(parsed["providerID"], "openai");
         assert_eq!(parsed["modelID"], "gpt-5");
     }
@@ -646,6 +867,7 @@ mod tests {
         // providers proxying HuggingFace paths). `split_once` only
         // splits on the first `/`, so the tail stays intact.
         let parsed = parse_model_slug("vendor/family/variant").unwrap();
+        assert_eq!(parsed["id"], "vendor/family/variant");
         assert_eq!(parsed["providerID"], "vendor");
         assert_eq!(parsed["modelID"], "family/variant");
     }
@@ -653,6 +875,57 @@ mod tests {
     #[test]
     fn parse_model_slug_returns_none_without_separator() {
         assert!(parse_model_slug("gpt-5").is_none());
+    }
+
+    #[test]
+    fn permission_reply_wire_strs_match_opencode_schema() {
+        // Live probe (opencode 1.14.41): the permission-reply endpoint
+        // schema-validates `response` against exactly these three
+        // strings. Any drift here returns 400 + `expected one of
+        // "once"|"always"|"reject"` — the tool that asked for the
+        // permission then wedges at `pending` forever because the
+        // reply never lands. Lock the strings so a typo or rename
+        // can't ship without a test fail.
+        assert_eq!(PermissionReply::Once.as_wire_str(), "once");
+        assert_eq!(PermissionReply::Always.as_wire_str(), "always");
+        assert_eq!(PermissionReply::Reject.as_wire_str(), "reject");
+    }
+
+    #[test]
+    fn urlencode_path_matches_js_encode_uri_component() {
+        // The opencode server decodes via `decodeURIComponent`, which
+        // expects the JS `encodeURIComponent` encoding: every byte
+        // outside the unreserved set `[A-Za-z0-9-._~]` becomes `%XX`,
+        // including slashes. Spot-check a few realistic paths.
+        assert_eq!(
+            urlencode_path("/Users/babal/seg4ltcode/cleaner"),
+            "%2FUsers%2Fbabal%2Fseg4ltcode%2Fcleaner"
+        );
+        assert_eq!(
+            urlencode_path("/path with spaces/file.rs"),
+            "%2Fpath%20with%20spaces%2Ffile.rs"
+        );
+        // Unreserved set passes through unchanged.
+        assert_eq!(urlencode_path("aZ09-._~"), "aZ09-._~");
+        // Multibyte UTF-8: each byte percent-encoded individually
+        // (matches `encodeURIComponent("é")` → `%C3%A9`).
+        assert_eq!(urlencode_path("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn permission_reply_body_uses_response_key_not_reply() {
+        // The body field is `response`, not `reply`. Opencode 1.14.41
+        // returns 400 if the wrong key is used — see
+        // `respond_to_permission` for the failure-mode write-up. This
+        // test reaches into the body construction by re-running the
+        // exact json! the call site uses.
+        let body = json!({ "response": PermissionReply::Once.as_wire_str() });
+        assert!(body.get("response").is_some(), "must use `response` key");
+        assert!(
+            body.get("reply").is_none(),
+            "must NOT use legacy `reply` key — opencode 1.14.41 rejects it with 400"
+        );
+        assert_eq!(body["response"], "once");
     }
 
     #[test]

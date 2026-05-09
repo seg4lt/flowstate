@@ -24,6 +24,7 @@
 mod events;
 mod http;
 mod server;
+pub mod spec;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -118,6 +119,24 @@ const OPENCODE_SHARED_SESSION_ID: &str = "opencode-shared";
 /// matching — forcing all existing sessions to recreate on upgrade
 /// would needlessly churn conversation state.
 const GENERATION_METADATA_KEY: &str = "opencode_generation";
+
+/// Metadata key under `provider_state.metadata` that records the
+/// `directory` we passed to `POST /session` when the native session
+/// was minted. Opencode persists that directory on the session row
+/// and uses it as the cwd for every tool invocation in that session,
+/// for the lifetime of the session — there's no PATCH endpoint that
+/// rewrites it (verified live against 1.14.41: `directory` in a PATCH
+/// body is silently ignored).
+///
+/// We stamp it here so [`OpenCodeAdapter::native_id_if_current_generation_and_cwd`]
+/// can detect when a session was minted against a stale directory
+/// (e.g. before the user picked a project, or by an earlier daemon
+/// build whose `resolve_session_cwd` had a bug) and abandon it in
+/// favour of a fresh mint with the right cwd. Without this stamp,
+/// wrongly-minted sessions live forever — `execute_turn` reuses the
+/// native id by default and the tools keep running in the original
+/// directory.
+const DIRECTORY_METADATA_KEY: &str = "opencode_directory";
 
 /// Default idle TTL baked into the adapter. 30 minutes — long enough
 /// to absorb long pauses between turns without a cold start while
@@ -646,13 +665,19 @@ impl OpenCodeAdapter {
         .await?;
         let server = Arc::new(server);
 
-        // Kick the SSE reader once the server is live so the first
-        // turn's events land in the router the moment opencode starts
-        // streaming. The reader holds a `Weak<OpenCodeServer>` — when
-        // Phase B's idle-kill drops the last strong Arc, the reader
-        // self-exits on its next iteration (see `read_forever`).
-        self.event_router
-            .spawn_reader(server.clone(), server.client());
+        // SSE readers used to be spawned once per server here. They
+        // now spawn lazily in `start_session` / `execute_turn` —
+        // opencode 1.14.41 scopes `/event` by `x-opencode-directory`
+        // so we need one reader per project directory, not one per
+        // server. Reset the per-directory bookkeeping in case this
+        // is a respawn after idle-kill (the previous readers will
+        // self-exit when their `Weak<OpenCodeServer>` upgrade fails,
+        // but the router's "already-spawned" set must be cleared so
+        // the next subscribe re-mints them).
+        let router = self.event_router.clone();
+        tokio::spawn(async move {
+            router.reset_directory_readers().await;
+        });
 
         // Mint the generation AFTER the server is up. `fetch_add(1)`
         // returns the pre-increment value, so the first server gets
@@ -670,6 +695,20 @@ impl OpenCodeAdapter {
     async fn client(&self) -> Result<(Arc<OpenCodeClient>, Lease), String> {
         let (server, lease) = self.ensure_server().await?;
         Ok((server.client(), lease))
+    }
+
+    /// Same as [`Self::client`] but also returns the live
+    /// `Arc<OpenCodeServer>`. Needed by `start_session` /
+    /// `execute_turn` to spawn a directory-scoped SSE reader against
+    /// the current server. The reader needs `Weak<OpenCodeServer>`
+    /// to know when the server is gone (idle-killed → respawn) so
+    /// it can self-exit; we get that from a strong arc here.
+    async fn client_and_server(
+        &self,
+    ) -> Result<(Arc<OpenCodeClient>, Arc<OpenCodeServer>, Lease), String> {
+        let (server, lease) = self.ensure_server().await?;
+        let client = server.client();
+        Ok((client, server, lease))
     }
 
     /// Non-spawning variant: returns `Some((client, lease))` only if
@@ -706,19 +745,46 @@ impl OpenCodeAdapter {
     }
 
     /// Return a cached native session id iff it was minted against
-    /// the currently-running server generation. Returns `None` if
-    /// the session has no native id, the server isn't running, or
-    /// the recorded generation doesn't match — all three cases
-    /// resolve to "create a fresh native session".
+    /// the currently-running server generation **and** with a
+    /// directory matching `expected_cwd`. Returns `None` if any of:
+    /// - the session has no native id;
+    /// - the server isn't running;
+    /// - the recorded generation doesn't match (the server was
+    ///   idle-killed and respawned; old native ids are gone);
+    /// - the recorded `directory` doesn't match the cwd we'd send
+    ///   today (the session was minted in a different working
+    ///   directory, e.g. before the user picked a project, or by
+    ///   an earlier daemon build with a buggy `resolve_session_cwd`).
     ///
-    /// Sessions that pre-date the generation tag (no metadata, or
-    /// metadata missing `GENERATION_METADATA_KEY`) are treated as
-    /// matching the current generation. Rationale: at Phase A
-    /// rollout time the server has never respawned, so every
-    /// existing session's cached native id is valid. Invalidating
-    /// them all would force every opencode session to lose its
-    /// conversation history on upgrade, for no correctness benefit.
-    async fn native_id_if_current_generation(&self, session: &SessionDetail) -> Option<String> {
+    /// All four cases resolve to "mint a fresh native session" — the
+    /// caller (`execute_turn`) handles the re-mint. The old native
+    /// session is left orphaned on the opencode server; the next
+    /// idle-kill cycle reaps it along with the rest.
+    ///
+    /// **Why we strict-match cwd**: opencode persists the session's
+    /// `directory` field on the session row and consults it for every
+    /// tool invocation. There's no PATCH endpoint that updates it
+    /// (verified live against 1.14.41 — see
+    /// [`DIRECTORY_METADATA_KEY`]). So if we reuse a native session
+    /// minted against the wrong directory, every tool call runs in
+    /// that wrong directory forever, and the user sees `pwd` /
+    /// `<env>cwd</env>` reporting the daemon's app-data-dir or
+    /// whatever stale value got baked in.
+    ///
+    /// **Backwards compat**: sessions that pre-date the generation
+    /// tag (no metadata) are treated as matching the current
+    /// generation — the server has never respawned at upgrade time,
+    /// so the cached id is valid. Sessions that pre-date the
+    /// directory tag are treated as a cwd MISMATCH (force re-mint),
+    /// because we can't tell what directory they were minted with
+    /// and conservative re-minting is the safe default — it costs
+    /// one extra `POST /session` per stale session, after which the
+    /// new directory is stamped and reuse works again.
+    async fn native_id_if_current_generation_and_cwd(
+        &self,
+        session: &SessionDetail,
+        expected_cwd: &str,
+    ) -> Option<String> {
         let state = session.provider_state.as_ref()?;
         let native = state.native_thread_id.as_deref()?;
         let current = self.current_generation().await?;
@@ -729,27 +795,147 @@ impl OpenCodeAdapter {
             .and_then(|v| v.as_u64())
             .map(|g| g == current)
             .unwrap_or(true);
-        if gen_ok {
-            Some(native.to_string())
-        } else {
+        if !gen_ok {
             debug!(
                 session_id = %session.summary.session_id,
                 native = %native,
                 "opencode: discarding native id from stale server generation"
             );
-            None
+            return None;
+        }
+        // Recorded directory → must match what we'd send today.
+        // Missing entry counts as a mismatch (see backwards-compat
+        // note above — pre-tag sessions force re-mint once).
+        let recorded_cwd = state
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(DIRECTORY_METADATA_KEY))
+            .and_then(|v| v.as_str());
+        match recorded_cwd {
+            Some(stamped) if stamped == expected_cwd => Some(native.to_string()),
+            Some(stamped) => {
+                debug!(
+                    session_id = %session.summary.session_id,
+                    native = %native,
+                    stamped = %stamped,
+                    expected = %expected_cwd,
+                    "opencode: discarding native id minted against a different directory"
+                );
+                None
+            }
+            None => {
+                debug!(
+                    session_id = %session.summary.session_id,
+                    native = %native,
+                    "opencode: discarding native id without directory tag (re-mint once to stamp)"
+                );
+                None
+            }
         }
     }
 
+    /// Validate the per-turn cwd we're about to send to opencode.
+    ///
+    /// Two failure modes, both treated as hard errors rather than
+    /// silent fallbacks:
+    ///
+    /// 1. **`session.cwd` is `None` or empty.** Means
+    ///    `RuntimeCore::resolve_session_cwd` either didn't run for
+    ///    this code path or returned without populating the field.
+    ///    The historical behaviour was to fall back to
+    ///    `self.working_directory` (= the daemon's app-data-dir) via
+    ///    `helpers::session_cwd`, which silently put every tool call
+    ///    into `~/Library/Application Support/com.seg4lt.flowstate`
+    ///    on macOS. That bug is what this method exists to prevent.
+    ///
+    /// 2. **`session.cwd` literally equals `self.working_directory`.**
+    ///    Belt-and-braces: even if some upstream bug ever stamps the
+    ///    daemon's app-data-dir into `session.cwd` (test fixture
+    ///    leak, future regression in `resolve_session_cwd`, etc.),
+    ///    we refuse to forward that value to opencode. Tools running
+    ///    inside the daemon's data dir is decisively never what the
+    ///    user wants — it's the smoking-gun signal that the lenient
+    ///    fallback was hit somewhere. Returning an error surfaces
+    ///    the upstream bug at the API boundary instead of letting
+    ///    the user spend hours debugging "why does pwd return the
+    ///    app data dir".
+    ///
+    /// Both branches log via `tracing::error!` with full session +
+    /// project context so the daemon log carries an unambiguous
+    /// breadcrumb for the next debug session.
+    ///
+    /// `call_site` is a short label ("start_session" /
+    /// "execute_turn") woven into the log line so the same diagnostic
+    /// helper can serve both entry points without losing the call
+    /// context.
+    fn validate_session_cwd(
+        &self,
+        session: &SessionDetail,
+        call_site: &'static str,
+    ) -> Result<String, String> {
+        let cwd_str = match session.cwd.as_deref() {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                tracing::error!(
+                    call_site,
+                    session_id = %session.summary.session_id,
+                    project_id = ?session.summary.project_id,
+                    "opencode: session.cwd is unset — refusing to mint with a fallback"
+                );
+                return Err(format!(
+                    "opencode adapter ({call_site}): session `{}` has no resolved \
+                     working directory (project_id = {:?}). \
+                     Upstream bug — `resolve_session_cwd` should have populated this.",
+                    session.summary.session_id, session.summary.project_id
+                ));
+            }
+        };
+
+        // Belt-and-braces equality guard. The adapter's
+        // `working_directory` is the daemon's app-data-dir on macOS
+        // (`~/Library/Application Support/com.seg4lt.flowstate`).
+        // If `session.cwd` somehow holds that exact string, treat it
+        // as the same bug as the `None` case — never legitimate.
+        let working_dir_str = self.working_directory.to_string_lossy();
+        if cwd_str == working_dir_str {
+            tracing::error!(
+                call_site,
+                session_id = %session.summary.session_id,
+                project_id = ?session.summary.project_id,
+                cwd = %cwd_str,
+                "opencode: session.cwd equals daemon's working_directory — \
+                 this is the silent-fallback footgun, refusing to mint"
+            );
+            return Err(format!(
+                "opencode adapter ({call_site}): session `{}` cwd equals the \
+                 daemon's working_directory `{}` — this is the silent-fallback \
+                 footgun (project_id = {:?}). Upstream bug.",
+                session.summary.session_id, working_dir_str, session.summary.project_id
+            ));
+        }
+
+        Ok(cwd_str)
+    }
+
     /// Build a [`ProviderSessionState`] tagged with the current
-    /// server generation. Use this whenever a fresh native id is
-    /// minted so that a later Phase-B respawn can detect the
-    /// staleness via [`Self::native_id_if_current_generation`].
-    fn provider_state_for(native_id: String, generation: u64) -> ProviderSessionState {
+    /// server generation **and** the `directory` we passed to
+    /// `POST /session` when minting `native_id`.
+    ///
+    /// Both tags travel with the session through persistence; on the
+    /// next turn [`Self::native_id_if_current_generation_and_cwd`]
+    /// reads them to decide whether the cached native id is still
+    /// usable or needs a fresh mint. See that method's docstring
+    /// for the failure modes each tag catches.
+    fn provider_state_for(
+        native_id: String,
+        generation: u64,
+        directory: &str,
+    ) -> ProviderSessionState {
         ProviderSessionState {
             native_thread_id: Some(native_id),
             metadata: Some(serde_json::json!({
                 GENERATION_METADATA_KEY: generation,
+                DIRECTORY_METADATA_KEY: directory,
             })),
         }
     }
@@ -1218,20 +1404,47 @@ impl ProviderAdapter for OpenCodeAdapter {
         &self,
         session: &SessionDetail,
     ) -> Result<Option<ProviderSessionState>, String> {
-        // Acquire the lease up-front — if we need to mint a native
-        // id below, the server must stay alive across the HTTP call;
-        // and if we reuse an existing id, we still briefly touched
-        // the server state via `native_id_if_current_generation`,
-        // which is cheap but wants a lease anyway for consistency.
-        let (client, _lease) = self.client().await?;
+        // Acquire the lease + server arc up-front. The server arc
+        // is needed to spawn a per-directory SSE reader (see
+        // `ensure_directory_reader` below); the lease keeps the
+        // server alive across the HTTP call.
+        let (client, server, _lease) = self.client_and_server().await?;
 
-        // If a native session id is already persisted AND it was
-        // minted against the currently-running server generation,
-        // reuse it — opencode's server keeps the conversation alive
-        // across daemon restarts as long as the session row hasn't
-        // been deleted. If the generation is stale (Phase B: after a
-        // respawn), fall through to the mint path.
-        if let Some(existing) = self.native_id_if_current_generation(session).await {
+        // Resolve the cwd we'd send today. We need it both as the
+        // `directory` field for a fresh mint AND as the comparison
+        // value when deciding whether an existing native id is still
+        // usable — opencode bakes `directory` into the session row
+        // and won't let us PATCH it later, so any drift means
+        // "abandon and re-mint". `validate_session_cwd` rejects
+        // both `None` and the daemon's `working_directory` (the
+        // silent-fallback bug); see its docstring for why.
+        let cwd_str = self.validate_session_cwd(session, "start_session")?;
+        tracing::info!(
+            session_id = %session.summary.session_id,
+            cwd = %cwd_str,
+            "opencode: start_session cwd resolved"
+        );
+
+        // Make sure an SSE reader is up for this cwd before we mint
+        // the native session. Opencode 1.14.41 scopes `/event` by
+        // `x-opencode-directory`; without a directory-scoped reader,
+        // events from this session never reach our dispatcher.
+        self.event_router
+            .ensure_directory_reader(server.clone(), client.clone(), cwd_str.clone())
+            .await;
+
+        // If a native session id is already persisted, the server is
+        // running with the matching generation, AND it was minted
+        // against the same directory we'd send today, reuse it —
+        // opencode's server keeps the conversation alive across
+        // daemon restarts as long as the session row hasn't been
+        // deleted. Generation mismatch (server respawn) or directory
+        // mismatch (project changed, or older buggy mint) fall
+        // through to the mint path.
+        if let Some(existing) = self
+            .native_id_if_current_generation_and_cwd(session, &cwd_str)
+            .await
+        {
             debug!(
                 session_id = %session.summary.session_id,
                 native = %existing,
@@ -1240,15 +1453,15 @@ impl ProviderAdapter for OpenCodeAdapter {
             return Ok(None);
         }
 
-        let cwd = zenui_provider_api::helpers::session_cwd(session, &self.working_directory);
         // On `start_session` we don't yet know which permission mode
         // the user will run with — the runtime only hands it through
-        // on `execute_turn`. Default here to the conservative "ask"
-        // ruleset; `execute_turn` recreates the session with the
-        // caller's chosen mode if it's different.
+        // on `execute_turn`. Mint with the conservative "ask" ruleset;
+        // `execute_turn` reconciles via `PATCH /session/{id}` against
+        // the caller's actual mode before each prompt, so any rule
+        // we set here is overwritten before tools can run.
         let native_id = client
             .create_session(
-                cwd.to_string_lossy().as_ref(),
+                &cwd_str,
                 session.summary.model.as_deref(),
                 PermissionMode::Default,
             )
@@ -1262,7 +1475,9 @@ impl ProviderAdapter for OpenCodeAdapter {
         // between the ensure_server and this call (shouldn't happen
         // while the lease is held, but defensive).
         let generation = self.current_generation().await.unwrap_or(0);
-        Ok(Some(Self::provider_state_for(native_id, generation)))
+        Ok(Some(Self::provider_state_for(
+            native_id, generation, &cwd_str,
+        )))
     }
 
     async fn execute_turn(
@@ -1282,33 +1497,76 @@ impl ProviderAdapter for OpenCodeAdapter {
             );
         }
 
-        // Lease held across the entire turn — including the up-to-600s
-        // `wait_for_completion`. Phase B's idle timer is keyed on
-        // "time since last release", not "time since last acquire",
-        // so a long turn doesn't starve the watcher: the watcher just
-        // can't fire until this lease drops.
-        let (client, _lease) = self.client().await?;
+        // Lease + server arc held across the entire turn — including
+        // the up-to-600s `wait_for_completion`. Phase B's idle timer
+        // is keyed on "time since last release", not "time since
+        // last acquire", so a long turn doesn't starve the watcher:
+        // the watcher just can't fire until this lease drops. The
+        // server arc is needed so we can spawn a per-cwd SSE reader
+        // below if one isn't already running for this directory.
+        let (client, server, _lease) = self.client_and_server().await?;
         // Snapshot the current server generation so we can stamp it
         // onto the output `ProviderSessionState`. Safe to read once
         // here: the lease keeps the current generation alive until
         // this turn returns.
         let generation = self.current_generation().await.unwrap_or(0);
 
+        // Resolve the directory we'd send to opencode for a fresh
+        // mint. We compute this up-front because we need it for two
+        // different purposes:
+        //   1. As the comparison value when checking whether an
+        //      existing native id is still usable — opencode bakes
+        //      `directory` into the session row at mint time and
+        //      won't let us PATCH it later, so any drift between the
+        //      stamped value and what we'd send today means the
+        //      cached native session is wedged in a stale cwd and
+        //      must be abandoned.
+        //   2. As the actual `directory` field on a fresh `POST
+        //      /session` if we end up minting.
+        //
+        // `validate_session_cwd` rejects both the `None` case and
+        // the case where session.cwd literally equals the daemon's
+        // `working_directory` (the silent-fallback bug). See that
+        // method's docstring for the failure-mode write-up.
+        let cwd_str = self.validate_session_cwd(session, "execute_turn")?;
+        tracing::info!(
+            session_id = %session.summary.session_id,
+            cwd = %cwd_str,
+            "opencode: execute_turn cwd resolved"
+        );
+
+        // Make sure an SSE reader is up for this cwd before we send
+        // the prompt. Opencode 1.14.41 scopes `/event` by
+        // `x-opencode-directory`; without a directory-scoped reader,
+        // the assistant text deltas + `session.idle` for this turn
+        // never reach the dispatcher and `wait_for_completion`
+        // hangs until the timeout fires. Idempotent — repeat calls
+        // for the same cwd are no-ops, so this is safe to run on
+        // every turn.
+        self.event_router
+            .ensure_directory_reader(server.clone(), client.clone(), cwd_str.clone())
+            .await;
+
         // Resolve / create the native opencode session id. Sessions
         // created by a prior `start_session` carry it through
-        // `provider_state` AND must be for the current server
-        // generation (Phase B: after a respawn, stale ids return
-        // `None` here and we mint a fresh one). Sessions created
-        // elsewhere (e.g. REPL flows that skip `start_session`) also
-        // fall through to the mint path.
-        let native_id = match self.native_id_if_current_generation(session).await {
+        // `provider_state` AND must satisfy *both* invariants:
+        //   - generation matches (Phase B: after a respawn, stale
+        //     ids return `None` here and we mint a fresh one);
+        //   - directory matches (the user moved projects, or an
+        //     older daemon build minted with the wrong cwd —
+        //     either way, the existing native session would run
+        //     tools in the wrong directory, so we re-mint).
+        // Sessions created elsewhere (e.g. REPL flows that skip
+        // `start_session`) also fall through to the mint path.
+        let native_id = match self
+            .native_id_if_current_generation_and_cwd(session, &cwd_str)
+            .await
+        {
             Some(id) => id,
             None => {
-                let cwd =
-                    zenui_provider_api::helpers::session_cwd(session, &self.working_directory);
                 client
                     .create_session(
-                        cwd.to_string_lossy().as_ref(),
+                        &cwd_str,
                         session.summary.model.as_deref(),
                         permission_mode,
                     )
@@ -1316,11 +1574,52 @@ impl ProviderAdapter for OpenCodeAdapter {
             }
         };
 
+        // Reconcile the session's persistent permission ruleset with
+        // the caller's current mode before sending the prompt.
+        //
+        // Why this is required, not just defensive:
+        //
+        // - `start_session` mints sessions with `PermissionMode::Default`
+        //   (ask-mode) because the runtime hasn't yet decided which mode
+        //   the user will run in.
+        // - The user can switch mode in the UI between turns (e.g.
+        //   AcceptEdits → Bypass) without spawning a new session.
+        // - Sessions resumed across daemon restarts inherit whatever
+        //   ruleset was last on the row.
+        //
+        // Without this PATCH, a Bypass-mode turn on a session that
+        // was minted in Default mode silently runs with ask rules:
+        // opencode fires `permission.asked` for every tool, the
+        // adapter forwards it as `PermissionRequest`, and the runtime
+        // bypass-mode safety net (in `runtime-core`) auto-allows —
+        // but only AFTER a round-trip to the runtime, during which
+        // the tool is wedged in `pending` from the user's perspective.
+        // Worse, if the runtime safety net ever drops, the user sees
+        // no prompt and the turn hangs indefinitely.
+        //
+        // Conversely, an ask-mode turn on a session that was last
+        // patched into bypass would skip permission asking entirely —
+        // a real security issue. So treat this as a hard precondition:
+        // if the PATCH fails we abort the turn before sending the
+        // prompt rather than running with stale rules.
+        if let Err(err) = client
+            .update_permission(&native_id, permission_mode, &cwd_str)
+            .await
+        {
+            return Err(format!(
+                "opencode: failed to apply permission mode {permission_mode:?} \
+                 to session {native_id}: {err}"
+            ));
+        }
+
         // Register this session's sink with the router *before*
         // firing the prompt so we can't miss the first SSE event.
+        // Stash the per-session cwd inside the router so that any
+        // permission/question replies fired off the SSE stream carry
+        // the same `x-opencode-directory` we used on the prompt.
         let subscription = self
             .event_router
-            .subscribe(native_id.clone(), events.clone())
+            .subscribe(native_id.clone(), events.clone(), cwd_str.clone())
             .await;
 
         let prompt_result = client
@@ -1330,6 +1629,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 session.summary.model.as_deref(),
                 reasoning_effort,
                 permission_mode,
+                &cwd_str,
             )
             .await;
         if let Err(err) = prompt_result {
@@ -1351,7 +1651,9 @@ impl ProviderAdapter for OpenCodeAdapter {
 
         Ok(ProviderTurnOutput {
             output,
-            provider_state: Some(Self::provider_state_for(native_id, generation)),
+            provider_state: Some(Self::provider_state_for(
+                native_id, generation, &cwd_str,
+            )),
         })
     }
 
@@ -1367,9 +1669,16 @@ impl ProviderAdapter for OpenCodeAdapter {
             return Ok("No opencode session to interrupt.".to_string());
         };
 
-        // Lease held for the abort round-trip.
+        // Lease held for the abort round-trip. Pass `session.cwd` if
+        // it's been resolved (it usually is — runtime-core calls
+        // `resolve_session_cwd` before any adapter method), otherwise
+        // fall through with `None`. Abort is benign enough that
+        // running it without the directory header just falls back to
+        // server cwd, which is fine for an interrupt — no tools run.
         let (client, _lease) = self.client().await?;
-        client.abort_session(native_id).await?;
+        client
+            .abort_session(native_id, session.cwd.as_deref())
+            .await?;
         Ok("Interrupt sent to opencode.".to_string())
     }
 
@@ -1553,15 +1862,21 @@ mod tests {
     }
 
     #[test]
-    fn provider_state_for_tags_generation_metadata() {
-        let state = OpenCodeAdapter::provider_state_for("ses_abc".into(), 7);
+    fn provider_state_for_tags_generation_and_directory_metadata() {
+        let state =
+            OpenCodeAdapter::provider_state_for("ses_abc".into(), 7, "/Users/me/proj");
         assert_eq!(state.native_thread_id.as_deref(), Some("ses_abc"));
-        let tag = state
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get(GENERATION_METADATA_KEY))
-            .and_then(|v| v.as_u64());
-        assert_eq!(tag, Some(7), "generation tag missing from metadata");
+        let metadata = state.metadata.as_ref().expect("metadata present");
+        assert_eq!(
+            metadata.get(GENERATION_METADATA_KEY).and_then(|v| v.as_u64()),
+            Some(7),
+            "generation tag missing from metadata"
+        );
+        assert_eq!(
+            metadata.get(DIRECTORY_METADATA_KEY).and_then(|v| v.as_str()),
+            Some("/Users/me/proj"),
+            "directory tag missing from metadata"
+        );
     }
 
     #[tokio::test]
@@ -1742,11 +2057,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_id_accepted_when_generation_not_running() {
+    async fn native_id_rejected_when_server_stopped() {
         // When the server is Stopped, `current_generation()` returns
-        // `None`, which forces `native_id_if_current_generation` to
-        // return None as well — a fresh native id must be minted at
-        // the next ensure_server. This protects against a respawn
+        // `None`, which forces `native_id_if_current_generation_and_cwd`
+        // to return None — a fresh native id must be minted at the
+        // next ensure_server. This protects against a respawn
         // invalidating every cached id.
         let adapter = OpenCodeAdapter::new_with_orchestration_and_idle_ttl(
             std::env::temp_dir(),
@@ -1766,16 +2081,42 @@ mod tests {
                 project_id: None,
             },
             turns: vec![],
-            provider_state: Some(OpenCodeAdapter::provider_state_for("ses_xyz".into(), 0)),
+            provider_state: Some(OpenCodeAdapter::provider_state_for(
+                "ses_xyz".into(),
+                0,
+                "/proj",
+            )),
             cwd: None,
         };
 
         // Server is Stopped — no current generation, cached id must
         // NOT be returned.
-        let resolved = adapter.native_id_if_current_generation(&session).await;
+        let resolved = adapter
+            .native_id_if_current_generation_and_cwd(&session, "/proj")
+            .await;
         assert_eq!(
             resolved, None,
             "stale id must not be reused when server is down"
+        );
+    }
+
+    #[test]
+    fn directory_tag_round_trips_through_provider_state() {
+        // Belt-and-braces: the metadata produced by `provider_state_for`
+        // must carry both the generation and directory tags in a shape
+        // `native_id_if_current_generation_and_cwd` can read back.
+        // Catches regressions where the metadata key constants drift
+        // between writer and reader.
+        let state =
+            OpenCodeAdapter::provider_state_for("ses_abc".into(), 3, "/Users/me/work");
+        let metadata = state.metadata.as_ref().expect("metadata present");
+        assert_eq!(
+            metadata.get(DIRECTORY_METADATA_KEY).and_then(|v| v.as_str()),
+            Some("/Users/me/work")
+        );
+        assert_eq!(
+            metadata.get(GENERATION_METADATA_KEY).and_then(|v| v.as_u64()),
+            Some(3)
         );
     }
 }

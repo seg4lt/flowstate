@@ -1516,6 +1516,30 @@ impl RuntimeCore {
                     Err(error) => Some(ServerMessage::Error { message: error }),
                 }
             }
+            ClientMessage::SetGoal {
+                session_id,
+                objective,
+                token_budget,
+                status,
+            } => {
+                match self
+                    .set_goal_for_session(session_id, objective, token_budget, status)
+                    .await
+                {
+                    Ok(()) => Some(ServerMessage::Ack {
+                        message: "Goal updated.".to_string(),
+                    }),
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
+            ClientMessage::ClearGoal { session_id } => {
+                match self.clear_goal_for_session(session_id).await {
+                    Ok(()) => Some(ServerMessage::Ack {
+                        message: "Goal cleared.".to_string(),
+                    }),
+                    Err(error) => Some(ServerMessage::Error { message: error }),
+                }
+            }
             ClientMessage::DeleteSession { session_id } => {
                 match self.delete_session(session_id).await {
                     Ok(message) => Some(ServerMessage::Ack { message }),
@@ -1924,6 +1948,20 @@ impl RuntimeCore {
                 let sessions = self.persistence.list_archived_session_summaries().await;
                 Some(ServerMessage::ArchivedSessionsList { sessions })
             }
+
+            // Goal-tracking is half-wired today (codex adapter emits
+            // `ThreadGoalUpdated`/`ThreadGoalCleared`; ClientMessage
+            // exposes Set/Clear; runtime-core hasn't picked which
+            // adapter call to forward through yet). Drop with a debug
+            // log so the build passes; replace with the actual
+            // dispatch once the runtime side of the feature lands.
+            other @ (ClientMessage::SetGoal { .. } | ClientMessage::ClearGoal { .. }) => {
+                tracing::debug!(
+                    ?other,
+                    "goal-tracking client message arrived before runtime wiring; ignoring"
+                );
+                None
+            }
         }
     }
 
@@ -2053,11 +2091,27 @@ impl RuntimeCore {
         if let Some(ref project_id) = session.summary.project_id {
             if let Some(project) = self.persistence.get_project(project_id).await {
                 if let Some(path) = project.path {
+                    tracing::info!(
+                        session_id = %session.summary.session_id,
+                        project_id = %project_id,
+                        cwd = %path,
+                        "session cwd resolved from project.path"
+                    );
                     session.cwd = Some(path);
                     return;
                 }
             }
         }
+        // No project_id (or the project lookup / path was empty).
+        // Fall back to the per-daemon threads dir. Logged at info
+        // so the daemon log carries an unambiguous breadcrumb when
+        // an adapter later complains about cwd resolution.
+        tracing::info!(
+            session_id = %session.summary.session_id,
+            project_id = ?session.summary.project_id,
+            cwd = %self.default_threads_dir,
+            "session cwd resolved to default_threads_dir (no project bound)"
+        );
         session.cwd = Some(self.default_threads_dir.clone());
     }
 
@@ -2859,6 +2913,23 @@ impl RuntimeCore {
                         session_id: sid.clone(),
                         turn_id: tid.clone(),
                         suggestion,
+                    });
+                }
+                ProviderTurnEvent::ThreadGoalUpdated { goal } => {
+                    // Codex `/goal`: the agent (via its `set_goal` model
+                    // tool) created or updated the session's persisted
+                    // objective. Forward verbatim — the frontend stores
+                    // one goal per session_id and replaces on each
+                    // update. Account-wide-ish (per-session, not per-
+                    // turn), so don't touch any turn-local state.
+                    self.publish(RuntimeEvent::ThreadGoalUpdated {
+                        session_id: sid.clone(),
+                        goal,
+                    });
+                }
+                ProviderTurnEvent::ThreadGoalCleared => {
+                    self.publish(RuntimeEvent::ThreadGoalCleared {
+                        session_id: sid.clone(),
                     });
                 }
                 ProviderTurnEvent::RuntimeCall { request_id, call } => {
@@ -4240,6 +4311,82 @@ impl RuntimeCore {
             }
         }
         adapter.update_permission_mode(&session, mode).await
+    }
+
+    /// Set or update a session's persisted goal. Synthesizes a
+    /// `RuntimeEvent::ThreadGoalUpdated` from the adapter's response so
+    /// the UI sees the new goal immediately, without waiting for the
+    /// provider's notification round-trip. Agent-initiated mid-turn
+    /// goal updates still flow through the
+    /// `ProviderTurnEvent::ThreadGoalUpdated` path in the drain loop.
+    async fn set_goal_for_session(
+        &self,
+        session_id: String,
+        objective: String,
+        token_budget: Option<i64>,
+        status: Option<zenui_provider_api::ThreadGoalStatus>,
+    ) -> Result<(), String> {
+        let session = self
+            .live_session_detail(&session_id)
+            .await
+            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        // Hard gate on the feature flag — runtime side belt to the
+        // frontend's suspenders. Adapters without the surface return
+        // an `Err` from the default trait impl too, but failing here
+        // produces a clearer message and avoids spinning up the
+        // provider subprocess unnecessarily.
+        if !zenui_provider_api::features_for_kind(session.summary.provider).goal_tracking {
+            return Err(format!(
+                "{} does not support goal tracking.",
+                session.summary.provider.label()
+            ));
+        }
+        let adapter = self
+            .adapters
+            .get(&session.summary.provider)
+            .ok_or_else(|| {
+                format!(
+                    "No adapter registered for {}.",
+                    session.summary.provider.label()
+                )
+            })?
+            .clone();
+        let goal = adapter
+            .set_goal(&session, objective, token_budget, status)
+            .await?;
+        self.publish(RuntimeEvent::ThreadGoalUpdated {
+            session_id: session_id.clone(),
+            goal,
+        });
+        Ok(())
+    }
+
+    async fn clear_goal_for_session(&self, session_id: String) -> Result<(), String> {
+        let session = self
+            .live_session_detail(&session_id)
+            .await
+            .ok_or_else(|| format!("Unknown session `{session_id}`."))?;
+        if !zenui_provider_api::features_for_kind(session.summary.provider).goal_tracking {
+            return Err(format!(
+                "{} does not support goal tracking.",
+                session.summary.provider.label()
+            ));
+        }
+        let adapter = self
+            .adapters
+            .get(&session.summary.provider)
+            .ok_or_else(|| {
+                format!(
+                    "No adapter registered for {}.",
+                    session.summary.provider.label()
+                )
+            })?
+            .clone();
+        adapter.clear_goal(&session).await?;
+        self.publish(RuntimeEvent::ThreadGoalCleared {
+            session_id: session_id.clone(),
+        });
+        Ok(())
     }
 
     async fn interrupt_turn(&self, session_id: String) -> Result<String, String> {

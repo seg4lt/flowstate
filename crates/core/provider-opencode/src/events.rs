@@ -103,6 +103,14 @@ struct SessionState {
     /// in the UI. Entries are removed when the tool transitions to
     /// `completed` or `error`.
     open_tool_calls: HashSet<String>,
+    /// Per-session working directory passed at `subscribe` time.
+    /// Forwarded into `respond_to_permission` / `respond_to_question`
+    /// so opencode's per-request directory resolver scopes the
+    /// reply to the same project the prompt ran under. Without this,
+    /// the reply hits `process.cwd()` of the opencode server — which
+    /// happens to work today (the reply doesn't run tools), but
+    /// matching the SDK's behaviour is the safe default.
+    directory: String,
     /// Oneshot fired by the SSE reader on turn completion (success
     /// or error) — the subscriber awaits this inside
     /// `wait_for_completion`. Wrapped in `Option` so the reader can
@@ -121,27 +129,59 @@ pub struct EventRouter {
     /// a single HashMap can demux events from every running server
     /// without key collisions.
     sessions: Mutex<HashMap<String, SessionState>>,
+    /// Working directories we've already spawned an SSE reader for,
+    /// against the current opencode server. Opencode 1.14.41 scopes
+    /// the `/event` stream by the request's `x-opencode-directory`
+    /// header (or `?directory=` query) — without it, the SSE
+    /// subscriber receives only events whose session directory
+    /// matches `process.cwd()` of the opencode server. So a single
+    /// SSE reader can't cover sessions across multiple project
+    /// directories; we have to spawn one reader per unique cwd. This
+    /// set records which cwds already have a reader so a second
+    /// `subscribe(...)` for the same dir doesn't double-spawn.
+    ///
+    /// Reset by [`reset_directory_readers`] when the server respawns
+    /// (idle-kill → fresh server → fresh readers required).
+    directory_readers: Mutex<HashSet<String>>,
 }
 
 impl EventRouter {
     pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            directory_readers: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Forget every directory-scoped SSE reader we've spawned. Called
+    /// when the underlying `OpenCodeServer` respawns — the previous
+    /// readers are about to exit because their `Weak<OpenCodeServer>`
+    /// upgrade fails — so the next `subscribe(...)` call must mint
+    /// fresh readers against the new server.
+    pub async fn reset_directory_readers(&self) {
+        self.directory_readers.lock().await.clear();
     }
 
     /// Register a sink for a given opencode session id and receive a
     /// [`Subscription`] that resolves when the turn finishes.
+    ///
+    /// `directory` is the per-session working directory the adapter
+    /// resolved for the turn. Stashed inside `SessionState` so that
+    /// the permission and question reply handlers can attach it to
+    /// their HTTP requests (matching the SDK's behaviour of scoping
+    /// every per-session call by directory).
     pub async fn subscribe(
         self: &Arc<Self>,
         native_session_id: String,
         sink: TurnEventSink,
+        directory: String,
     ) -> Subscription {
         let (tx, rx) = oneshot::channel();
         let state = SessionState {
             sink,
             accumulated_output: String::new(),
             open_tool_calls: HashSet::new(),
+            directory,
             completion: Some(tx),
         };
         self.sessions
@@ -201,23 +241,36 @@ impl EventRouter {
         }
     }
 
-    /// Spawn an SSE reader bound to one specific `opencode serve`
-    /// child. In the per-flowstate-session architecture there is one
-    /// reader per server — every server mints its own URL, and each
-    /// reader drives only that URL's `/event` stream. The reader
-    /// exits automatically when its `OpenCodeServer` is dropped (see
-    /// [`read_forever`] — a `Weak<OpenCodeServer>` lets it detect
-    /// shutdown without an explicit cancel channel).
+    /// Spawn an SSE reader for `directory` against the current
+    /// opencode server, if one isn't already running for that dir.
     ///
-    /// NOT idempotent per server — callers must only spawn one
-    /// reader per server, which `ensure_session_server` already
-    /// guarantees by spawning the reader inside the same
-    /// lock-guarded initialisation path.
-    pub fn spawn_reader(
+    /// Why per-directory: opencode 1.14.41 scopes its `/event` stream
+    /// by the request's `x-opencode-directory` header. A reader
+    /// without that header (or with the wrong value) only receives
+    /// events from sessions whose directory matches `process.cwd()`
+    /// of the opencode server — so when our adapter hosts sessions
+    /// across multiple project directories, one shared reader misses
+    /// every event from every project except the one matching the
+    /// server's CWD. The fix is one reader per directory; opencode
+    /// supports many concurrent SSE clients on a single server.
+    ///
+    /// Called from `subscribe(...)` so the reader is guaranteed to be
+    /// up by the time the adapter fires a prompt for that session.
+    /// Idempotent per directory — duplicate calls for the same dir
+    /// are no-ops (the existing reader keeps running).
+    pub async fn ensure_directory_reader(
         self: &Arc<Self>,
         server: Arc<OpenCodeServer>,
         client: Arc<OpenCodeClient>,
+        directory: String,
     ) {
+        {
+            let mut guard = self.directory_readers.lock().await;
+            if !guard.insert(directory.clone()) {
+                // Already running for this dir.
+                return;
+            }
+        }
         let router = self.clone();
         let weak_server = Arc::downgrade(&server);
         // Drop our Arc before spawning — the reader holds a `Weak` so
@@ -225,26 +278,36 @@ impl EventRouter {
         // `end_session`.
         drop(server);
         tokio::spawn(async move {
-            read_forever(router, client, weak_server).await;
+            read_forever(router, client, weak_server, directory).await;
         });
     }
 }
 
-/// SSE reader bound to one `opencode serve` child. Reconnects on
-/// transient failures with a short backoff so a momentary byte-stream
-/// blip doesn't orphan an in-flight turn. Exits cleanly the moment
-/// the `Weak<OpenCodeServer>` fails to upgrade — i.e. when
+/// SSE reader bound to one `opencode serve` child AND scoped to one
+/// project directory. Reconnects on transient failures with a short
+/// backoff so a momentary byte-stream blip doesn't orphan an
+/// in-flight turn. Exits cleanly the moment the
+/// `Weak<OpenCodeServer>` fails to upgrade — i.e. when
 /// `shutdown_session_server` drops the last strong ref — so we don't
 /// leak a retry loop hammering a dead port after `end_session`.
+///
+/// The `directory` parameter is sent on every connect as the
+/// `x-opencode-directory` header. Without it, opencode falls back to
+/// `process.cwd()` and only delivers events from sessions whose
+/// directory matches the server's own CWD — see
+/// [`crate::http::OPENCODE_DIRECTORY_HEADER`] (live-probed against
+/// 1.14.41) for the resolver behaviour.
 async fn read_forever(
     router: Arc<EventRouter>,
     client: Arc<OpenCodeClient>,
     server: Weak<OpenCodeServer>,
+    directory: String,
 ) {
     let (user, pass) = client.credentials();
     let user = user.to_string();
     let pass = pass.to_string();
     let url = format!("{}/event", client.base_url());
+    let directory_header_value = crate::http::urlencode_path_for_header(&directory);
 
     // The SSE client wants no read timeout — events arrive at their
     // own pace. We still time out the initial connect so a wedged
@@ -260,7 +323,7 @@ async fn read_forever(
         // above the actual connect so a server that dies mid-retry
         // loop doesn't generate a storm of connect-refused logs.
         if server.upgrade().is_none() {
-            debug!(%url, "opencode server dropped; SSE reader exiting");
+            debug!(%url, %directory, "opencode server dropped; SSE reader exiting");
             return;
         }
 
@@ -268,6 +331,7 @@ async fn read_forever(
             .get(&url)
             .basic_auth(&user, Some(&pass))
             .header("accept", "text/event-stream")
+            .header(crate::http::OPENCODE_DIRECTORY_HEADER, &directory_header_value)
             .send()
             .await
         {
@@ -370,11 +434,16 @@ async fn dispatch_frame(
             .get("properties")
             .cloned()
             .unwrap_or(Value::Object(Default::default()));
-        let sink_clone = {
+        // Snapshot both the sink and the per-session directory in a
+        // single lock acquire so the spawned reply task carries the
+        // exact directory that was associated with the running turn.
+        let session_snapshot = {
             let sessions = router.sessions.lock().await;
-            sessions.get(&session_id).map(|s| s.sink.clone())
+            sessions
+                .get(&session_id)
+                .map(|s| (s.sink.clone(), s.directory.clone()))
         };
-        let Some(sink) = sink_clone else {
+        let Some((sink, directory)) = session_snapshot else {
             debug!(
                 %session_id,
                 event_type,
@@ -389,9 +458,15 @@ async fn dispatch_frame(
                 sink,
                 session_id,
                 props,
+                directory,
             ));
         } else {
-            tokio::spawn(handle_question_asked(client.clone(), sink, props));
+            tokio::spawn(handle_question_asked(
+                client.clone(),
+                sink,
+                props,
+                directory,
+            ));
         }
         return Ok(());
     }
@@ -480,35 +555,95 @@ async fn dispatch_frame(
                         .get("status")
                         .and_then(Value::as_str)
                         .unwrap_or("pending");
+                    let input = tool_state
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(Value::Object(Default::default()));
+                    let input_is_populated = match &input {
+                        Value::Object(map) => !map.is_empty(),
+                        Value::Null => false,
+                        // Anything else (string, number, array) — treat
+                        // as populated. Opencode normalises tool input
+                        // to an object in practice, but we don't want
+                        // to drop a non-object payload on the floor.
+                        _ => true,
+                    };
 
                     match status {
                         "pending" | "running" => {
-                            // De-dupe: a single tool call fires
-                            // multiple `updated` events as it
-                            // progresses (args arriving, state
-                            // changing). Only emit `ToolCallStarted`
-                            // the first time we see the id; skip
-                            // subsequent in-progress updates so the
-                            // runtime doesn't log a fresh tool card
-                            // per heartbeat.
-                            if !call_id.is_empty() && state.open_tool_calls.insert(call_id.clone())
+                            // Opencode fires `message.part.updated`
+                            // multiple times for one tool call as it
+                            // accretes:
+                            //
+                            //   1. status=pending, input={}
+                            //   2. status=running, input={...args...}
+                            //   3. status=running, input={...args...}  (heartbeats)
+                            //   N. status=completed, input={...args...}, output=…
+                            //
+                            // Verified live against opencode 1.14.41 — the
+                            // initial `pending` event always carries an
+                            // empty input, because the model hasn't
+                            // finished generating the tool-call JSON
+                            // yet. Emitting `ToolCallStarted` on that
+                            // event then dedup-dropping every later
+                            // update means the UI sees `args: {}` and
+                            // renders "no args" forever.
+                            //
+                            // Fix: defer the started emission until we
+                            // see a status=running event *or* an event
+                            // with non-empty input. Either signal
+                            // means the args have landed. The first
+                            // such event wins; later updates are
+                            // dropped via `open_tool_calls` dedup.
+                            //
+                            // Tools with genuinely empty args (none
+                            // observed in the wild on 1.14.41 but
+                            // possible on custom MCP tools) still
+                            // surface — `running` is enough on its
+                            // own. And as a final defence, the
+                            // `completed`/`error` arms below
+                            // re-emit `ToolCallStarted` if we never
+                            // saw a started-eligible event so the
+                            // card is never silently absent.
+                            let ready = status == "running" || input_is_populated;
+                            if ready
+                                && !call_id.is_empty()
+                                && state.open_tool_calls.insert(call_id.clone())
                             {
-                                let args = tool_state
-                                    .get("input")
-                                    .cloned()
-                                    .unwrap_or(Value::Object(Default::default()));
                                 state
                                     .sink
                                     .send(ProviderTurnEvent::ToolCallStarted {
                                         call_id,
                                         name,
-                                        args,
+                                        args: input,
                                         parent_call_id: None,
                                     })
                                     .await;
                             }
                         }
                         "completed" => {
+                            // Defensive started-emission: if every
+                            // pending/running update arrived with empty
+                            // args (or the started arm dedup-dropped
+                            // them), emit `ToolCallStarted` now using
+                            // the args from this completion event.
+                            // Opencode's `completed` event still
+                            // carries the final `input`, so this is
+                            // the last chance to put real args on the
+                            // tool card before the completion lands.
+                            if !call_id.is_empty()
+                                && state.open_tool_calls.insert(call_id.clone())
+                            {
+                                state
+                                    .sink
+                                    .send(ProviderTurnEvent::ToolCallStarted {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: input,
+                                        parent_call_id: None,
+                                    })
+                                    .await;
+                            }
                             let output = tool_state
                                 .get("output")
                                 .and_then(Value::as_str)
@@ -525,6 +660,21 @@ async fn dispatch_frame(
                                 .await;
                         }
                         "error" => {
+                            // Same defensive started-emission as the
+                            // completed arm — see comment there.
+                            if !call_id.is_empty()
+                                && state.open_tool_calls.insert(call_id.clone())
+                            {
+                                state
+                                    .sink
+                                    .send(ProviderTurnEvent::ToolCallStarted {
+                                        call_id: call_id.clone(),
+                                        name: name.clone(),
+                                        args: input,
+                                        parent_call_id: None,
+                                    })
+                                    .await;
+                            }
                             let error = tool_state
                                 .get("error")
                                 .and_then(Value::as_str)
@@ -646,6 +796,7 @@ async fn handle_permission_asked(
     sink: TurnEventSink,
     session_id: String,
     props: Value,
+    directory: String,
 ) {
     let permission_id = props
         .get("id")
@@ -695,7 +846,7 @@ async fn handle_permission_asked(
 
     let reply = PermissionReply::from_decision(decision);
     if let Err(err) = client
-        .respond_to_permission(&session_id, &permission_id, reply)
+        .respond_to_permission(&session_id, &permission_id, reply, Some(&directory))
         .await
     {
         warn!(
@@ -732,7 +883,12 @@ async fn handle_permission_asked(
 /// Body: `{ "requestID": id, "answers": [ ["Yes"], ... ] }` — one
 /// inner array per question. Each inner array is the selected option
 /// labels (multi-select aware).
-async fn handle_question_asked(client: Arc<OpenCodeClient>, sink: TurnEventSink, props: Value) {
+async fn handle_question_asked(
+    client: Arc<OpenCodeClient>,
+    sink: TurnEventSink,
+    props: Value,
+    directory: String,
+) {
     let request_id = props
         .get("id")
         .and_then(Value::as_str)
@@ -810,7 +966,10 @@ async fn handle_question_asked(client: Arc<OpenCodeClient>, sink: TurnEventSink,
             // hang the agent forever.
             warn!(%request_id, "user dismissed question; replying empty");
             let empty: Vec<Vec<String>> = questions.iter().map(|_| Vec::new()).collect();
-            if let Err(err) = client.respond_to_question(&request_id, empty).await {
+            if let Err(err) = client
+                .respond_to_question(&request_id, empty, Some(&directory))
+                .await
+            {
                 warn!(%request_id, %err, "dismissal reply to opencode failed");
             }
             return;
@@ -833,7 +992,10 @@ async fn handle_question_asked(client: Arc<OpenCodeClient>, sink: TurnEventSink,
         reply.push(values);
     }
 
-    if let Err(err) = client.respond_to_question(&request_id, reply).await {
+    if let Err(err) = client
+        .respond_to_question(&request_id, reply, Some(&directory))
+        .await
+    {
         warn!(%request_id, %err, "failed to deliver question reply to opencode");
     }
 }
@@ -910,7 +1072,9 @@ mod tests {
         let client = dummy_client();
         let (tx, mut rx) = mpsc::channel(256);
         let sink = TurnEventSink::new(tx);
-        let _sub = router.subscribe(SESSION_ID.to_string(), sink).await;
+        let _sub = router
+            .subscribe(SESSION_ID.to_string(), sink, "/test-cwd".to_string())
+            .await;
 
         for payload in frames {
             let raw = serde_json::to_string(payload).unwrap();
@@ -1072,6 +1236,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_args_arrive_on_running_event_after_empty_pending() {
+        // Live-probe shape (opencode 1.14.41): the very first `pending`
+        // event for a tool call carries `input: {}` because the model
+        // hasn't finished generating the tool-call JSON yet. Args first
+        // appear on the subsequent `running` event. The dispatcher
+        // must therefore wait for the running update before emitting
+        // `ToolCallStarted`, otherwise the UI shows "no args" forever.
+        let pending_empty = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": SESSION_ID,
+                "part": {
+                    "type": "tool",
+                    "callID": "functions.bash:0",
+                    "tool": "bash",
+                    "sessionID": SESSION_ID,
+                    "state": { "status": "pending", "input": {} }
+                }
+            }
+        });
+        let running_with_args = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": SESSION_ID,
+                "part": {
+                    "type": "tool",
+                    "callID": "functions.bash:0",
+                    "tool": "bash",
+                    "sessionID": SESSION_ID,
+                    "state": {
+                        "status": "running",
+                        "input": { "command": "ls /tmp", "description": "list /tmp" }
+                    }
+                }
+            }
+        });
+        let events = drive(&[pending_empty, running_with_args]).await;
+        let started = events.iter().find_map(|e| match e {
+            ProviderTurnEvent::ToolCallStarted { args, name, .. } => Some((args.clone(), name.clone())),
+            _ => None,
+        });
+        let (args, name) = started.expect("expected exactly one ToolCallStarted");
+        assert_eq!(name, "bash");
+        assert_eq!(args["command"], "ls /tmp");
+        assert_eq!(args["description"], "list /tmp");
+        let started_count = events
+            .iter()
+            .filter(|e| matches!(e, ProviderTurnEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(started_count, 1, "should emit exactly once, got {started_count}");
+    }
+
+    #[tokio::test]
+    async fn tool_args_emit_immediately_on_pending_with_populated_input() {
+        // Custom MCP tools sometimes ship the args on the very first
+        // pending event (no separate running step). The dispatcher
+        // should still emit on that first event — the gating rule is
+        // "ready = status==running OR input populated", so a
+        // populated-input pending qualifies on its own.
+        let pending_with_args = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": SESSION_ID,
+                "part": {
+                    "type": "tool",
+                    "callID": "call_1",
+                    "tool": "glob",
+                    "sessionID": SESSION_ID,
+                    "state": { "status": "pending", "input": { "pattern": "**/*.rs" } }
+                }
+            }
+        });
+        let events = drive(&[pending_with_args]).await;
+        let started = events.iter().find_map(|e| match e {
+            ProviderTurnEvent::ToolCallStarted { args, .. } => Some(args.clone()),
+            _ => None,
+        });
+        let args = started.expect("expected ToolCallStarted on populated pending");
+        assert_eq!(args["pattern"], "**/*.rs");
+    }
+
+    #[tokio::test]
+    async fn tool_completion_synthesises_started_when_pending_was_skipped() {
+        // Pathological / fast-path case: only the `completed` event
+        // ever reaches us (e.g. we subscribed mid-turn and missed the
+        // earlier updates, or opencode coalesces). The dispatcher must
+        // emit `ToolCallStarted` synthesised from the completion's
+        // `input` so the UI never sees a `ToolCallCompleted` for a
+        // tool that was never started.
+        let completed = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": SESSION_ID,
+                "part": {
+                    "type": "tool",
+                    "callID": "call_late",
+                    "tool": "bash",
+                    "sessionID": SESSION_ID,
+                    "state": {
+                        "status": "completed",
+                        "input": { "command": "echo hi" },
+                        "output": "hi"
+                    }
+                }
+            }
+        });
+        let events = drive(&[completed]).await;
+        let started = events.iter().find_map(|e| match e {
+            ProviderTurnEvent::ToolCallStarted { args, call_id, .. } if call_id == "call_late" =>
+                Some(args.clone()),
+            _ => None,
+        });
+        let args = started.expect("expected synthesised ToolCallStarted on bare completion");
+        assert_eq!(args["command"], "echo hi");
+        let saw_completion = events
+            .iter()
+            .any(|e| matches!(e, ProviderTurnEvent::ToolCallCompleted { call_id, .. } if call_id == "call_late"));
+        assert!(saw_completion, "completion event should still be emitted");
+    }
+
+    #[tokio::test]
+    async fn tool_pending_with_empty_args_alone_emits_nothing() {
+        // The first pending event with empty args carries no useful
+        // information (status nor args). On its own it must not emit
+        // `ToolCallStarted` — that would lock in `args: {}` and the
+        // dedup would suppress the real running event.
+        let pending_empty = json!({
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": SESSION_ID,
+                "part": {
+                    "type": "tool",
+                    "callID": "call_1",
+                    "tool": "bash",
+                    "sessionID": SESSION_ID,
+                    "state": { "status": "pending", "input": {} }
+                }
+            }
+        });
+        let events = drive(&[pending_empty]).await;
+        assert!(
+            events.is_empty(),
+            "empty-pending should not emit any sink events; got {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_part_completed_emits_completion() {
         // Start then complete in one session.
         let start = json!({
@@ -1138,7 +1449,9 @@ mod tests {
         let client = dummy_client();
         let (tx, _rx) = mpsc::channel(8);
         let sink = TurnEventSink::new(tx);
-        let sub = router.subscribe(SESSION_ID.to_string(), sink).await;
+        let sub = router
+            .subscribe(SESSION_ID.to_string(), sink, "/test-cwd".to_string())
+            .await;
 
         let frame = json!({
             "type": "session.idle",
@@ -1161,7 +1474,9 @@ mod tests {
         let client = dummy_client();
         let (tx, _rx) = mpsc::channel(8);
         let sink = TurnEventSink::new(tx);
-        let sub = router.subscribe(SESSION_ID.to_string(), sink).await;
+        let sub = router
+            .subscribe(SESSION_ID.to_string(), sink, "/test-cwd".to_string())
+            .await;
 
         let frame = json!({
             "type": "session.error",
@@ -1256,7 +1571,9 @@ mod tests {
         let router = Arc::new(EventRouter::new());
         let (tx, _rx) = mpsc::channel(8);
         let sink = TurnEventSink::new(tx);
-        let sub = router.subscribe(SESSION_ID.to_string(), sink).await;
+        let sub = router
+            .subscribe(SESSION_ID.to_string(), sink, "/test-cwd".to_string())
+            .await;
 
         router
             .fail_all_in_flight("opencode server idle-killed; respawning on next use")
