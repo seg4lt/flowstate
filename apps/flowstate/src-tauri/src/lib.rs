@@ -1,5 +1,5 @@
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1436,6 +1436,289 @@ fn list_directory(path: String, sub_path: String) -> Result<Vec<DirEntry>, Strin
         }
     });
     Ok(entries)
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// /code file-tree mutations: create / rename / move / trash
+// ────────────────────────────────────────────────────────────────────────
+//
+// Every command below operates on **forward-slash, project-relative**
+// paths so the frontend never has to think about absolute paths. The
+// sandbox pattern matches `read_project_file` / `write_project_file`:
+//   1. Canonicalise the project root.
+//   2. Canonicalise the parent directory of the target (canonicalising
+//      the target itself fails when it doesn't exist yet — fine for
+//      reads, but creates and renames need a forward-looking path).
+//   3. Re-join the basename onto the canonical parent.
+//   4. Verify the final path is still inside the canonical root.
+//
+// The frontend mirrors the legality checks (`canDropInto`, name-has-
+// no-slash, no-op rename) for prompt UI feedback, but the backend is
+// the source of truth — every check above is enforced here too.
+
+/// Validate that `name` is a usable basename: non-empty after trim,
+/// no path separators, no `..`, no NUL.
+fn validate_basename(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("name cannot be empty".into());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err("name must not contain path separators".into());
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("name cannot be `.` or `..`".into());
+    }
+    if trimmed.contains('\0') {
+        return Err("name contains a NUL byte".into());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Resolve a project-relative `sub_path` against `path` and verify the
+/// result lives inside the canonical project root. Returns the
+/// canonicalised absolute path. Used for inputs that must already
+/// exist (rename/move/trash sources).
+fn resolve_existing_subpath(path: &str, sub_path: &str) -> Result<PathBuf, String> {
+    let project_path = Path::new(path);
+    if !project_path.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let target = project_canon.join(sub_path);
+    let target_canon = target
+        .canonicalize()
+        .map_err(|e| format!("sub path: {e}"))?;
+    if !target_canon.starts_with(&project_canon) {
+        return Err("sub path is outside the project root".into());
+    }
+    Ok(target_canon)
+}
+
+/// Resolve a project-relative parent directory + basename into a
+/// forward-looking absolute path (the basename does not need to
+/// exist yet). Verifies the canonical parent is inside the canonical
+/// project root. Used for creates and the destination side of moves
+/// and renames.
+fn resolve_new_path_in_dir(
+    path: &str,
+    parent_sub: &str,
+    basename: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    let project_path = Path::new(path);
+    if !project_path.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let parent_abs = if parent_sub.is_empty() {
+        project_canon.clone()
+    } else {
+        project_canon.join(parent_sub)
+    };
+    let parent_canon = parent_abs
+        .canonicalize()
+        .map_err(|e| format!("parent path: {e}"))?;
+    if !parent_canon.starts_with(&project_canon) {
+        return Err("parent path is outside the project root".into());
+    }
+    if !parent_canon.is_dir() {
+        return Err("parent path is not a directory".into());
+    }
+    let final_path = parent_canon.join(basename);
+    if !final_path.starts_with(&project_canon) {
+        return Err("target path is outside the project root".into());
+    }
+    Ok((project_canon, final_path))
+}
+
+/// Convert an absolute path back into the forward-slash project-
+/// relative sub-path the frontend expects. The caller has already
+/// verified `abs` lies under `project_canon`, so `strip_prefix`
+/// can't fail in practice — but we still surface a readable error
+/// rather than panic if it ever does.
+fn to_sub_path(project_canon: &Path, abs: &Path) -> Result<String, String> {
+    let rel = abs
+        .strip_prefix(project_canon)
+        .map_err(|_| "path outside project root".to_string())?;
+    let mut s = String::new();
+    for (i, comp) in rel.components().enumerate() {
+        if i > 0 {
+            s.push('/');
+        }
+        s.push_str(&comp.as_os_str().to_string_lossy());
+    }
+    Ok(s)
+}
+
+/// Create an empty file at `<path>/<sub_path>/<name>`. Errors if a
+/// sibling with the same name already exists (no silent overwrite).
+/// Returns the new file's project-relative sub-path.
+#[tauri::command]
+fn create_project_file(
+    path: String,
+    sub_path: String,
+    name: String,
+) -> Result<String, String> {
+    let basename = validate_basename(&name)?;
+    let (project_canon, final_path) =
+        resolve_new_path_in_dir(&path, &sub_path, &basename)?;
+    if final_path.exists() {
+        return Err(format!("`{basename}` already exists"));
+    }
+    std::fs::write(&final_path, b"").map_err(|e| format!("create file: {e}"))?;
+    to_sub_path(&project_canon, &final_path)
+}
+
+/// Create an empty directory at `<path>/<sub_path>/<name>`. Errors
+/// if a sibling with the same name already exists. Returns the new
+/// directory's project-relative sub-path.
+#[tauri::command]
+fn create_project_dir(
+    path: String,
+    sub_path: String,
+    name: String,
+) -> Result<String, String> {
+    let basename = validate_basename(&name)?;
+    let (project_canon, final_path) =
+        resolve_new_path_in_dir(&path, &sub_path, &basename)?;
+    if final_path.exists() {
+        return Err(format!("`{basename}` already exists"));
+    }
+    std::fs::create_dir(&final_path).map_err(|e| format!("create dir: {e}"))?;
+    to_sub_path(&project_canon, &final_path)
+}
+
+/// Rename a file or directory in place. `new_name` is the **basename
+/// only** — callers pass `Untitled.txt` or `daily-notes`, not a full
+/// path. For files, preserves the original extension if the new name
+/// has none (so renaming `foo.md` → `bar` produces `bar.md`).
+/// Returns the new project-relative sub-path.
+#[tauri::command]
+fn rename_project_path(
+    path: String,
+    sub_path: String,
+    new_name: String,
+) -> Result<String, String> {
+    let new_basename = validate_basename(&new_name)?;
+    let project_path = Path::new(&path);
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let src = resolve_existing_subpath(&path, &sub_path)?;
+    let parent = src
+        .parent()
+        .ok_or_else(|| "source has no parent".to_string())?;
+    if !parent.starts_with(&project_canon) {
+        return Err("cannot rename the project root".into());
+    }
+
+    // Preserve extension on files when the new name has none.
+    let final_name = if src.is_file() && Path::new(&new_basename).extension().is_none() {
+        match src.extension().and_then(|e| e.to_str()) {
+            Some(ext) => format!("{new_basename}.{ext}"),
+            None => new_basename.clone(),
+        }
+    } else {
+        new_basename.clone()
+    };
+
+    let new_path = parent.join(&final_name);
+    if new_path == src {
+        // No-op rename.
+        return to_sub_path(&project_canon, &src);
+    }
+    if new_path.exists() {
+        return Err(format!("`{final_name}` already exists in this folder"));
+    }
+    if !new_path.starts_with(&project_canon) {
+        return Err("target path is outside the project root".into());
+    }
+    std::fs::rename(&src, &new_path).map_err(|e| format!("rename: {e}"))?;
+    to_sub_path(&project_canon, &new_path)
+}
+
+/// Move a file or directory into a different parent directory,
+/// keeping its basename. `target_sub` is the project-relative path
+/// of the destination folder (empty string = project root).
+///
+/// Validates:
+///   - source exists and target is a directory inside the project
+///   - target is not the source itself, nor any descendant of it
+///   - destination doesn't already exist (no silent overwrite)
+#[tauri::command]
+fn move_project_path(
+    path: String,
+    source_sub: String,
+    target_sub: String,
+) -> Result<String, String> {
+    let project_path = Path::new(&path);
+    let project_canon = project_path
+        .canonicalize()
+        .map_err(|e| format!("project path: {e}"))?;
+    let src = resolve_existing_subpath(&path, &source_sub)?;
+    let target_dir = if target_sub.is_empty() {
+        project_canon.clone()
+    } else {
+        let abs = project_canon.join(&target_sub);
+        let canon = abs
+            .canonicalize()
+            .map_err(|e| format!("target path: {e}"))?;
+        if !canon.starts_with(&project_canon) {
+            return Err("target path is outside the project root".into());
+        }
+        if !canon.is_dir() {
+            return Err("target path is not a directory".into());
+        }
+        canon
+    };
+
+    if target_dir == src {
+        return Err("cannot move a folder into itself".into());
+    }
+    if target_dir.starts_with(&src) {
+        return Err("cannot move a folder into one of its descendants".into());
+    }
+
+    let basename = src
+        .file_name()
+        .ok_or_else(|| "source has no basename".to_string())?
+        .to_owned();
+    let new_path = target_dir.join(&basename);
+
+    // Same-parent move is a no-op.
+    if let Some(parent) = src.parent() {
+        if parent == target_dir {
+            return to_sub_path(&project_canon, &src);
+        }
+    }
+    if new_path.exists() {
+        return Err(format!(
+            "`{}` already exists in the destination",
+            basename.to_string_lossy()
+        ));
+    }
+    if !new_path.starts_with(&project_canon) {
+        return Err("destination is outside the project root".into());
+    }
+    std::fs::rename(&src, &new_path).map_err(|e| format!("move: {e}"))?;
+    to_sub_path(&project_canon, &new_path)
+}
+
+/// Move a file or directory to the OS trash. Recoverable via
+/// Finder/Explorer — the same semantics as Cmd+Delete in a file
+/// manager. `trash::delete` is synchronous, so we wrap it in
+/// `spawn_blocking` to keep the runtime responsive for big folders.
+#[tauri::command]
+async fn trash_project_path(path: String, sub_path: String) -> Result<(), String> {
+    let abs = resolve_existing_subpath(&path, &sub_path)?;
+    tokio::task::spawn_blocking(move || trash::delete(&abs))
+        .await
+        .map_err(|e| format!("join trash worker: {e}"))?
+        .map_err(|e| format!("move to trash: {e}"))
 }
 
 /// Launch an external code editor on `path` (the project root) by
@@ -3453,6 +3736,11 @@ pub fn run() {
                         list_directory,
                         read_project_file,
                         write_project_file,
+                        create_project_file,
+                        create_project_dir,
+                        rename_project_path,
+                        move_project_path,
+                        trash_project_path,
                         search_file_contents,
                         stop_content_search,
                         open_in_editor,

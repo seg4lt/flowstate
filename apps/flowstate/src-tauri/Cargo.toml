@@ -147,6 +147,12 @@ globset = "0.4.18"
 # and content search go through fff-search now.
 ignore = "0.4"
 
+# Move-to-trash for the /code file tree's "Move to trash" context-menu
+# action. Recoverable via the OS trash so a misclick doesn't lose work.
+# Synchronous API; we wrap calls in `tokio::task::spawn_blocking` so a
+# big directory doesn't block the runtime.
+trash = "5"
+
 # Process enumeration for the startup orphan scan (see
 # `src/orphan_scan.rs`). The scan walks every running process at
 # startup and SIGTERMs any `opencode serve` / `flowstate mcp-server`
