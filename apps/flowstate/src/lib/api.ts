@@ -499,6 +499,63 @@ export function listDirectory(
   return invoke<DirEntry[]>("list_directory", { path, subPath });
 }
 
+// /code file-tree mutations. `path` is the project root absolute path;
+// every other path argument is a forward-slash project-relative
+// sub-path (the same shape `listDirectory` already speaks). Each
+// command returns the resulting entry's new sub-path so callers can
+// re-target open tabs without re-listing.
+
+/** Create an empty file under `<path>/<subPath>`. Returns the new
+ *  sub-path. Errors if a sibling with `name` already exists. */
+export function createProjectFile(
+  path: string,
+  subPath: string,
+  name: string,
+): Promise<string> {
+  return invoke<string>("create_project_file", { path, subPath, name });
+}
+
+/** Create an empty directory under `<path>/<subPath>`. Returns the
+ *  new sub-path. */
+export function createProjectDir(
+  path: string,
+  subPath: string,
+  name: string,
+): Promise<string> {
+  return invoke<string>("create_project_dir", { path, subPath, name });
+}
+
+/** Rename a file or directory in place. `newName` is basename-only;
+ *  for files, the original extension is preserved if `newName` doesn't
+ *  carry one. Returns the new sub-path. */
+export function renameProjectPath(
+  path: string,
+  subPath: string,
+  newName: string,
+): Promise<string> {
+  return invoke<string>("rename_project_path", { path, subPath, newName });
+}
+
+/** Move a file or directory into a different parent directory.
+ *  `targetSub` may be `""` for the project root. Returns the new
+ *  sub-path. Errors if `targetSub` is a descendant of `sourceSub`. */
+export function moveProjectPath(
+  path: string,
+  sourceSub: string,
+  targetSub: string,
+): Promise<string> {
+  return invoke<string>("move_project_path", { path, sourceSub, targetSub });
+}
+
+/** Move a file or directory to the OS trash (recoverable via the
+ *  system file manager). */
+export function trashProjectPath(
+  path: string,
+  subPath: string,
+): Promise<void> {
+  return invoke<void>("trash_project_path", { path, subPath });
+}
+
 // Flowstate-app-owned key/value store. Backed by SQLite at
 // <app_data_dir>/user_config.sqlite — separate from the agent
 // SDK's daemon database. SDK and app each own their own SQLite;

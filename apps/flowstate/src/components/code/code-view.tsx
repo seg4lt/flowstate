@@ -465,6 +465,107 @@ export function CodeView(props: CodeViewProps) {
     });
   }, [gitModeEnabled, projectPath, queryClient]);
 
+  // ─── file-tree mutation hooks ────────────────────────────────
+  // The /code file tree creates / renames / moves / trashes files
+  // through Tauri commands; the tree component handles its own
+  // listing-cache invalidation per-directory. The two callbacks
+  // below let it tell us about open editor tabs that need to be
+  // closed (path was removed) or re-targeted (path moved/renamed)
+  // so the tab bar stays in sync with disk.
+  //
+  // `closeMatchingTabs` walks every pane and closes any tab whose
+  // path equals or sits under the removed sub-path (a single-file
+  // delete and a folder-trash both flow through this helper). We
+  // also drop file-content + file-error cache entries for the
+  // affected paths so a subsequent re-create doesn't hand back a
+  // stale buffer.
+  const closeMatchingTabs = React.useCallback(
+    (subPath: string) => {
+      if (!subPath) return;
+      const prefix = `${subPath}/`;
+      const matches = (p: string) => p === subPath || p.startsWith(prefix);
+      // Snapshot panes outside the dispatch loop so we don't iterate
+      // a value that mutates underneath us.
+      const panes = layout.panes;
+      panes.forEach((pane, idx) => {
+        const paneIdx = idx as PaneIndex;
+        for (const tab of pane.tabs) {
+          if (matches(tab.path)) {
+            tabs.closeTab(tab.path, paneIdx);
+          }
+        }
+      });
+      // Drop cached buffers + errors for any matching path.
+      const cache = fileCacheRef.current;
+      for (const key of Array.from(cache.keys())) {
+        if (matches(key)) cache.delete(key);
+      }
+      setFileErrors((prev) => {
+        let mutated = false;
+        const next = new Map(prev);
+        for (const key of Array.from(next.keys())) {
+          if (matches(key)) {
+            next.delete(key);
+            mutated = true;
+          }
+        }
+        return mutated ? next : prev;
+      });
+      setCacheVersion((v) => v + 1);
+    },
+    [layout.panes, tabs],
+  );
+
+  // `retargetMatchingTabs` covers rename + move. Any tab whose
+  // path starts with the old sub-path is re-opened at the new
+  // path (preserving the active pane / focus context) and the old
+  // tab is closed. Cache entries are similarly migrated so the new
+  // tab opens against a warm buffer rather than re-fetching.
+  const retargetMatchingTabs = React.useCallback(
+    (oldSubPath: string, newSubPath: string) => {
+      if (!oldSubPath || oldSubPath === newSubPath) return;
+      const oldPrefix = `${oldSubPath}/`;
+      const rewrite = (p: string): string | null => {
+        if (p === oldSubPath) return newSubPath;
+        if (p.startsWith(oldPrefix)) {
+          return `${newSubPath}/${p.slice(oldPrefix.length)}`;
+        }
+        return null;
+      };
+      // Migrate cache entries first so the re-opened tab finds its
+      // buffer immediately (the editor reads from `fileCacheRef`).
+      const cache = fileCacheRef.current;
+      for (const key of Array.from(cache.keys())) {
+        const next = rewrite(key);
+        if (next !== null) {
+          const value = cache.get(key)!;
+          cache.delete(key);
+          cache.set(next, { ...value, path: next });
+        }
+      }
+      // Then re-open / close on each pane. The pane's active path is
+      // tracked via `tabs.openFile`, so re-opening the new path on
+      // the same pane that owned the old one preserves focus.
+      const panes = layout.panes;
+      panes.forEach((pane, idx) => {
+        const paneIdx = idx as PaneIndex;
+        const wasActive = pane.activePath;
+        for (const tab of pane.tabs) {
+          const next = rewrite(tab.path);
+          if (next !== null) {
+            tabs.openFile(next, paneIdx);
+            tabs.closeTab(tab.path, paneIdx);
+            if (wasActive === tab.path) {
+              tabs.activateTab(next, paneIdx);
+            }
+          }
+        }
+      });
+      setCacheVersion((v) => v + 1);
+    },
+    [layout.panes, tabs],
+  );
+
   // Confirm-close-with-unsaved-changes dialog state. This only
   // appears in the rare case where auto-save-on-blur has FAILED
   // (e.g., file became read-only on disk), leaving the tab dirty.
@@ -1608,6 +1709,8 @@ export function CodeView(props: CodeViewProps) {
                       setMultibufferOverride(false);
                       setQuery("");
                     }}
+                    onPathRemoved={closeMatchingTabs}
+                    onPathRenamed={retargetMatchingTabs}
                   />
                 )}
               </div>
