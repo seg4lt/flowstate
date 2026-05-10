@@ -368,6 +368,31 @@ pub enum RuntimeEvent {
         session_id: String,
         wakeup_id: String,
     },
+    /// The runtime observed a Claude Code `CronCreate` tool call and
+    /// persisted an active recurring schedule. UIs can use this to
+    /// render a "⏱ — every <expr>" chip on the session row.
+    CronScheduled {
+        session_id: String,
+        cron_id: String,
+        cron_expr: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A persisted cron schedule just fired — the runtime is about to
+    /// deliver the cron's prompt as a user turn on `session_id`. Fires
+    /// once per tick (the row stays active and re-arms for the next).
+    CronFired {
+        session_id: String,
+        cron_id: String,
+        fire_at_unix: i64,
+    },
+    /// A cron schedule was cancelled (`CronDelete` observed, session
+    /// archived, or session deleted). Frontend should drop any pending
+    /// "next fire" indicator for `cron_id`.
+    CronCancelled {
+        session_id: String,
+        cron_id: String,
+    },
     /// A persisted thread goal was created, updated, or transitioned to a
     /// new status. Frontend stores one goal per session_id and replaces
     /// the prior value on each event. Gated on

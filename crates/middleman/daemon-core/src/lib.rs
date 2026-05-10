@@ -322,6 +322,12 @@ pub async fn bootstrap_core_async(config: &DaemonConfig) -> Result<InProcessCore
     // first scheduler tick. Must come after `install_self_ref` since
     // the fire handler holds a `Weak<RuntimeCore>`.
     runtime_core.init_wakeup_scheduler().await;
+    // Boot the cron scheduler. Same lifecycle as wakeups —
+    // rehydrates `scheduled_crons` rows and arms an in-memory tokio
+    // timer for each, so a daemon restart resumes recurring `/loop
+    // <interval>` and `/schedule` jobs from the cron expression
+    // (computed strictly after `last_fired_at_unix`).
+    runtime_core.init_cron_scheduler().await;
 
     // Subscribe to spontaneous turns from adapters that support
     // between-turn notifications (e.g. the Claude SDK adapter's

@@ -134,7 +134,8 @@ pub enum TurnStatus {
 /// Authorship of a turn's user-side input. Distinguishes turns the
 /// human typed (`User`) from turns flowstate injected on the user's
 /// behalf — wakeups (`Wakeup`) re-firing a `ScheduleWakeup` prompt,
-/// peer `Send` (`PeerSend`) and peer `Spawn` (`PeerSpawn`) deliveries
+/// crons (`Cron`) re-firing a recurring `CronCreate` prompt, peer
+/// `Send` (`PeerSend`) and peer `Spawn` (`PeerSpawn`) deliveries
 /// from the orchestrator. Persisted on `TurnRecord` so the chat UI
 /// can disambiguate authorship and render system-injected turns with
 /// a distinct chip / muted bubble — without that, dynamic `/loop`
@@ -147,6 +148,7 @@ pub enum TurnStatus {
 pub enum TurnSource {
     User,
     Wakeup,
+    Cron,
     PeerSend,
     PeerSpawn,
 }

@@ -92,6 +92,7 @@ pub(crate) fn turn_source_to_str(source: TurnSource) -> &'static str {
     match source {
         TurnSource::User => "user",
         TurnSource::Wakeup => "wakeup",
+        TurnSource::Cron => "cron",
         TurnSource::PeerSend => "peer_send",
         TurnSource::PeerSpawn => "peer_spawn",
     }
@@ -105,6 +106,7 @@ pub(crate) fn turn_source_to_str(source: TurnSource) -> &'static str {
 pub(crate) fn turn_source_from_str(value: Option<&str>) -> TurnSource {
     match value {
         Some("wakeup") => TurnSource::Wakeup,
+        Some("cron") => TurnSource::Cron,
         Some("peer_send") => TurnSource::PeerSend,
         Some("peer_spawn") => TurnSource::PeerSpawn,
         _ => TurnSource::User,

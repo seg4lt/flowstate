@@ -161,6 +161,84 @@ impl ScheduledWakeupStatus {
     }
 }
 
+/// Row decoder for `scheduled_crons`. Mirrors `wakeup_row_from_sqlite`
+/// — kept as a free function so list / per-id reads share one column
+/// order without duplicating the SELECT shape.
+fn cron_row_from_sqlite(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduledCronRow> {
+    let status_str: String = r.get(6)?;
+    let status = ScheduledCronStatus::from_str(&status_str).unwrap_or(ScheduledCronStatus::Active);
+    Ok(ScheduledCronRow {
+        cron_id: r.get(0)?,
+        session_id: r.get(1)?,
+        origin_turn_id: r.get(2)?,
+        cron_expr: r.get(3)?,
+        prompt: r.get(4)?,
+        reason: r.get(5)?,
+        status,
+        last_fired_at_unix: r.get(7)?,
+        created_at_unix: r.get(8)?,
+    })
+}
+
+/// A row in the `scheduled_crons` table. The runtime's cron scheduler
+/// OBSERVES Claude Code's native `CronCreate` tool call (emitted by
+/// the model when the user invokes `/loop <interval> ...` or
+/// `/schedule ...`) and writes a row here so it can fire the recurring
+/// follow-up turns even after flowstate's `ProcessCache` reaps the
+/// bridge.
+///
+/// Unlike `ScheduledWakeupRow`, cron rows fire repeatedly: the
+/// scheduler computes the next fire time from `cron_expr` after every
+/// fire and re-arms its timer. `status` is a two-state enum
+/// (`active` | `cancelled`) — there's no terminal "fired" state
+/// because a recurring schedule that's still active will fire again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledCronRow {
+    pub cron_id: String,
+    pub session_id: String,
+    pub origin_turn_id: Option<String>,
+    /// 5- or 6-field cron expression (the `cron` crate accepts 6-field
+    /// `sec min hour day-of-month month day-of-week`). Stored as the
+    /// raw string the agent passed so a future `CronList` pass-through
+    /// can echo it back verbatim.
+    pub cron_expr: String,
+    /// The `prompt` to inject as a user turn each time the cron fires.
+    pub prompt: String,
+    pub reason: Option<String>,
+    pub status: ScheduledCronStatus,
+    /// Unix-seconds of the most recent fire, or `None` if the cron has
+    /// never fired. Used by `reload_active` on daemon restart so the
+    /// scheduler can compute "next fire after `last_fired_at_unix`"
+    /// rather than re-firing every backlog tick.
+    pub last_fired_at_unix: Option<i64>,
+    pub created_at_unix: i64,
+}
+
+/// State machine for [`ScheduledCronRow::status`]. Stored as a
+/// lowercase string in SQLite (`active` | `cancelled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduledCronStatus {
+    Active,
+    Cancelled,
+}
+
+impl ScheduledCronStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ScheduledCronStatus::Active => "active",
+            ScheduledCronStatus::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_str(raw: &str) -> Option<Self> {
+        match raw {
+            "active" => Some(ScheduledCronStatus::Active),
+            "cancelled" => Some(ScheduledCronStatus::Cancelled),
+            _ => None,
+        }
+    }
+}
+
 /// A row in the `file_state` cache. One per canonicalized absolute path
 /// we've ever captured; updated in place when a file's mtime/size moves.
 #[derive(Debug, Clone)]
@@ -1116,6 +1194,145 @@ impl PersistenceService {
         ids
     }
 
+    // ---------- scheduled_crons -------------------------------------
+
+    /// Insert a freshly-observed active cron row. Fails with UNIQUE on
+    /// `cron_id` collisions — callers generate a fresh UUID per
+    /// observed `CronCreate` tool call so flowstate retains ownership
+    /// of the id namespace independent of Claude Code's tool-call ids.
+    pub async fn insert_cron(&self, row: ScheduledCronRow) -> Result<()> {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "INSERT INTO scheduled_crons
+                    (cron_id, session_id, origin_turn_id, cron_expr, prompt,
+                     reason, status, last_fired_at_unix, created_at_unix)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    row.cron_id,
+                    row.session_id,
+                    row.origin_turn_id,
+                    row.cron_expr,
+                    row.prompt,
+                    row.reason,
+                    row.status.as_str(),
+                    row.last_fired_at_unix,
+                    row.created_at_unix,
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "insert cron row (session={}, cron={})",
+                    row.session_id, row.cron_id
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Every active cron row, oldest-first by creation time. Used at
+    /// daemon startup to rehydrate the cron scheduler's heap and
+    /// recompute the next fire instant for each row from `cron_expr`.
+    pub async fn list_active_crons(&self) -> Vec<ScheduledCronRow> {
+        let connection = self.connection.lock();
+        let mut statement = match connection.prepare(
+            "SELECT cron_id, session_id, origin_turn_id, cron_expr, prompt,
+                    reason, status, last_fired_at_unix, created_at_unix
+             FROM scheduled_crons
+             WHERE status = 'active'
+             ORDER BY created_at_unix ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = statement.query_map([], cron_row_from_sqlite);
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Active cron count for one session. Used by the observer to
+    /// enforce a per-session cap so a runaway agent can't queue
+    /// unlimited recurring jobs.
+    pub async fn count_active_crons_for_session(&self, session_id: &str) -> i64 {
+        let connection = self.connection.lock();
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM scheduled_crons
+                 WHERE session_id = ?1 AND status = 'active'",
+                params![session_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Stamp `last_fired_at_unix` after a successful fire. The
+    /// scheduler uses this on restart to compute the next fire instant
+    /// from the cron expression — without it, a daemon restart would
+    /// either re-fire backlog ticks or skip an ambiguous "did we
+    /// already fire at 12:00?" boundary.
+    ///
+    /// Returns `true` iff the row was active and got updated. A
+    /// `false` result means the row was cancelled out from under us
+    /// between heap pop and persistence — the caller should skip the
+    /// dispatch.
+    pub async fn mark_cron_fired(&self, cron_id: &str, fired_at_unix: i64) -> bool {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "UPDATE scheduled_crons SET last_fired_at_unix = ?2
+                 WHERE cron_id = ?1 AND status = 'active'",
+                params![cron_id, fired_at_unix],
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    /// Mark a single cron row as cancelled. Returns `true` iff a row
+    /// flipped — used by the `CronDelete` observer to skip the publish
+    /// when the cron id was unknown or already cancelled.
+    pub async fn cancel_cron(&self, cron_id: &str) -> bool {
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "UPDATE scheduled_crons SET status = 'cancelled'
+                 WHERE cron_id = ?1 AND status = 'active'",
+                params![cron_id],
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
+    /// Cancel every active cron for a session. Returns the cancelled
+    /// ids so callers can publish matching `CronCancelled` events.
+    /// Invoked when a session is archived or deleted.
+    pub async fn cancel_crons_for_session(&self, session_id: &str) -> Vec<String> {
+        let connection = self.connection.lock();
+        let ids: Vec<String> = {
+            let mut statement = match connection.prepare(
+                "SELECT cron_id FROM scheduled_crons
+                 WHERE session_id = ?1 AND status = 'active'",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows = statement.query_map(params![session_id], |r| r.get::<_, String>(0));
+            match rows {
+                Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+                Err(_) => Vec::new(),
+            }
+        };
+        let _ = connection.execute(
+            "UPDATE scheduled_crons SET status = 'cancelled'
+             WHERE session_id = ?1 AND status = 'active'",
+            params![session_id],
+        );
+        ids
+    }
+
     pub async fn get_file_state(&self, abs_path: &str) -> Option<FileStateRow> {
         let connection = self.connection.lock();
         connection
@@ -1629,6 +1846,28 @@ impl PersistenceService {
                 ON scheduled_wakeups(status, fire_at_unix);
             CREATE INDEX IF NOT EXISTS idx_wakeups_session
                 ON scheduled_wakeups(session_id);
+
+            -- Observed scheduled crons. Same observe-and-own pattern
+            -- as `scheduled_wakeups` but for recurring schedules. The
+            -- runtime sees Claude Code's native `CronCreate` tool call
+            -- in a turn's stream, persists a row, and arms a tokio
+            -- timer that re-fires on every cron tick. Cascade on
+            -- session delete so archival can't leave dangling timers.
+            CREATE TABLE IF NOT EXISTS scheduled_crons (
+                cron_id            TEXT PRIMARY KEY,
+                session_id         TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                origin_turn_id     TEXT,
+                cron_expr          TEXT NOT NULL,
+                prompt             TEXT NOT NULL,
+                reason             TEXT,
+                status             TEXT NOT NULL,
+                last_fired_at_unix INTEGER,
+                created_at_unix    INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_crons_active
+                ON scheduled_crons(status);
+            CREATE INDEX IF NOT EXISTS idx_crons_session
+                ON scheduled_crons(session_id);
             ",
             )
             .context("failed to run sqlite migrations")?;

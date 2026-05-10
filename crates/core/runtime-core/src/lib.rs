@@ -1,4 +1,5 @@
 mod internals;
+pub mod cron;
 pub mod orchestration;
 pub mod session_events;
 pub mod session_ops;
@@ -407,6 +408,12 @@ pub struct RuntimeCore {
     /// that nobody reads, deadlocking the pipe) dies with the
     /// subprocess. Our persisted wakeup is now the only timer.
     pending_wakeup_invalidations: Arc<Mutex<HashSet<String>>>,
+    /// Scheduler for Claude Code's `CronCreate` tool. Sibling of
+    /// `wakeup_scheduler` for *recurring* schedules — same observe-
+    /// and-own contract, but each fire stamps `last_fired_at_unix`
+    /// and re-arms from the cron expression instead of marking the
+    /// row terminal. Installed by `init_cron_scheduler`.
+    cron_scheduler: std::sync::RwLock<Option<cron::CronScheduler>>,
     /// Per-session bounded ring of recent events for replay on
     /// webview reconnect (Phase 5.5.7). Populated by [`publish`] for
     /// events that carry a `session_id`; global events bypass the
@@ -477,6 +484,7 @@ impl RuntimeCore {
             )),
             wakeup_scheduler: std::sync::RwLock::new(None),
             pending_wakeup_invalidations: Arc::new(Mutex::new(HashSet::new())),
+            cron_scheduler: std::sync::RwLock::new(None),
             session_events: Arc::new(session_events::SessionEventStore::default_capacity()),
         }
     }
@@ -599,6 +607,28 @@ impl RuntimeCore {
 
     fn wakeup_scheduler(&self) -> Option<wakeup::WakeupScheduler> {
         self.wakeup_scheduler.read().ok()?.clone()
+    }
+
+    /// Boot the cron scheduler. Sibling of [`Self::init_wakeup_scheduler`]
+    /// — call once from the daemon bootstrap after [`install_self_ref`].
+    /// Past-due ticks (daemon was down across one or more cron boundaries)
+    /// fire on the first scheduler tick because `next_fire_after_unix`
+    /// of `last_fired_at_unix` (or wall-clock now if never fired) almost
+    /// always lands within the next-second floor.
+    pub async fn init_cron_scheduler(self: &Arc<Self>) {
+        let fire_handler: Arc<dyn cron::CronFireHandler> =
+            Arc::new(cron::RuntimeCoreFireHandler {
+                runtime: Arc::downgrade(self),
+            });
+        let scheduler = cron::CronScheduler::spawn(Arc::clone(&self.persistence), fire_handler);
+        scheduler.reload_active(&self.persistence).await;
+        if let Ok(mut slot) = self.cron_scheduler.write() {
+            *slot = Some(scheduler);
+        }
+    }
+
+    fn cron_scheduler(&self) -> Option<cron::CronScheduler> {
+        self.cron_scheduler.read().ok()?.clone()
     }
 
     /// Subscribe to spontaneous turns emitted by provider adapters that
@@ -843,6 +873,130 @@ impl RuntimeCore {
                 .lock()
                 .await
                 .insert(row.session_id.clone());
+        });
+    }
+
+    /// Observe a Claude Code `CronCreate` tool call surfaced by the
+    /// adapter's stream. Parses the tool args, persists a row, arms
+    /// the scheduler, and publishes `CronScheduled`. Mirrors
+    /// [`Self::observe_schedule_wakeup_tool_call`] for recurring
+    /// schedules — but **does not** trigger bridge invalidation,
+    /// because crons fire repeatedly and we'd otherwise force a
+    /// cold-start respawn on every fire. Self-delivery only.
+    pub(crate) fn observe_cron_create_tool_call(
+        self: &Arc<Self>,
+        session_id: &str,
+        origin_turn_id: &str,
+        args: &serde_json::Value,
+    ) {
+        let Some((cron_expr, prompt, reason)) = cron::parse_cron_create_args(args) else {
+            tracing::warn!(
+                session_id,
+                "ignoring malformed or unparseable CronCreate tool call args"
+            );
+            return;
+        };
+
+        let Some(scheduler) = self.cron_scheduler() else {
+            tracing::warn!(
+                session_id,
+                "observed CronCreate but scheduler is not installed; dropping"
+            );
+            return;
+        };
+
+        let now = wakeup::now_unix_secs();
+        let cron_id = uuid::Uuid::new_v4().to_string();
+        let row = zenui_persistence::ScheduledCronRow {
+            cron_id: cron_id.clone(),
+            session_id: session_id.to_string(),
+            origin_turn_id: Some(origin_turn_id.to_string()),
+            cron_expr: cron_expr.clone(),
+            prompt,
+            reason: reason.clone(),
+            status: zenui_persistence::ScheduledCronStatus::Active,
+            last_fired_at_unix: None,
+            created_at_unix: now,
+        };
+
+        let rc = Arc::clone(self);
+        tokio::spawn(async move {
+            // Per-session cap, same shape as the wakeup observer.
+            // Over-cap drops the observation with a log; the tool
+            // call has already been emitted by the model and the user
+            // just sees a missing `CronScheduled` event.
+            let active = rc
+                .persistence
+                .count_active_crons_for_session(&row.session_id)
+                .await;
+            if active >= cron::CRON_MAX_ACTIVE_PER_SESSION {
+                tracing::warn!(
+                    session_id = %row.session_id,
+                    active,
+                    cap = cron::CRON_MAX_ACTIVE_PER_SESSION,
+                    "active cron cap exceeded; dropping observation"
+                );
+                return;
+            }
+
+            if let Err(err) = rc.persistence.insert_cron(row.clone()).await {
+                tracing::error!(
+                    session_id = %row.session_id,
+                    error = %err,
+                    "failed to persist observed cron; dropping"
+                );
+                return;
+            }
+            scheduler.arm(&row);
+            cron::publish_cron_scheduled(
+                &rc,
+                &row.session_id,
+                &row.cron_id,
+                &row.cron_expr,
+                reason.as_deref(),
+            );
+        });
+    }
+
+    /// Observe a Claude Code `CronDelete` tool call. Parses the cron
+    /// id, marks the row cancelled in persistence, cancels the
+    /// scheduler entry, and publishes `CronCancelled`. Safe for
+    /// unknown ids (no-op + warn).
+    pub(crate) fn observe_cron_delete_tool_call(
+        self: &Arc<Self>,
+        session_id: &str,
+        args: &serde_json::Value,
+    ) {
+        let Some(cron_id) = cron::parse_cron_delete_args(args) else {
+            tracing::warn!(
+                session_id,
+                "ignoring malformed CronDelete tool call args"
+            );
+            return;
+        };
+
+        let Some(scheduler) = self.cron_scheduler() else {
+            tracing::warn!(
+                session_id,
+                "observed CronDelete but scheduler is not installed; dropping"
+            );
+            return;
+        };
+
+        let session_id = session_id.to_string();
+        let rc = Arc::clone(self);
+        tokio::spawn(async move {
+            let cancelled = rc.persistence.cancel_cron(&cron_id).await;
+            scheduler.cancel(&cron_id);
+            if cancelled {
+                cron::publish_cron_cancelled(&rc, &session_id, &cron_id);
+            } else {
+                tracing::info!(
+                    session_id = %session_id,
+                    cron_id = %cron_id,
+                    "CronDelete observed but no active row to cancel (already cancelled or unknown id)"
+                );
+            }
         });
     }
 
@@ -2784,6 +2938,22 @@ impl RuntimeCore {
                     if name == "ScheduleWakeup" {
                         if let Some(rc) = self.self_arc() {
                             rc.observe_schedule_wakeup_tool_call(&sid, &tid, &args);
+                        }
+                    }
+                    // Sibling observation for `/loop <interval>` and
+                    // `/schedule` — Claude Code emits `CronCreate` /
+                    // `CronDelete` and we own the recurring fire path
+                    // so it survives bridge reaps. `CronList` is read-
+                    // only and answered from Claude Code's own state;
+                    // not observed here.
+                    if name == "CronCreate" {
+                        if let Some(rc) = self.self_arc() {
+                            rc.observe_cron_create_tool_call(&sid, &tid, &args);
+                        }
+                    }
+                    if name == "CronDelete" {
+                        if let Some(rc) = self.self_arc() {
+                            rc.observe_cron_delete_tool_call(&sid, &args);
                         }
                     }
                     self.publish(RuntimeEvent::ToolCallStarted {

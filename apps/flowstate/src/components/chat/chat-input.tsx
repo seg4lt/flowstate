@@ -1141,6 +1141,20 @@ export function ChatInput({
     }
     const invocation = formatSkillInvocation(name, provider);
     const token = `${invocation} `;
+    // Preserve in-flight args. If the user has already typed
+    // `/<name> <args>` and the popup is still open (because the
+    // popup is triggered by ANY non-empty `/...` token, not just
+    // a bare `/`), clobbering the input would silently drop their
+    // args — this is exactly the `/loop ping the build` regression
+    // where Enter wiped everything past `/loop`. Treat that case as
+    // a no-op selection: the existing input is already the canonical
+    // invocation form, and the surrounding Enter/click handler will
+    // route the next keystroke through to handleSubmit.
+    const trimmed = value.trimStart();
+    if (trimmed.startsWith(token) && trimmed.length > token.length) {
+      lastSelectedSkillTokenRef.current = invocation;
+      return;
+    }
     lastSelectedSkillTokenRef.current = invocation;
     setValue(token);
     requestAnimationFrame(() => {
@@ -1256,7 +1270,21 @@ export function ChatInput({
           handleSubmit();
           return;
         }
+        // If the user already typed args after the highlighted command
+        // (e.g. `/loop ping the build`), pressing Enter must SEND, not
+        // re-select. Re-selecting routes through handlePopupSelect's
+        // setValue, which would wipe the args — that's the original
+        // /loop bug. Submit-as-typed and let the slash-command resolver
+        // in chat-view forward the verbatim invocation.
         const selected = matches[popupIndex];
+        if (selected && !isCoreCommand(selected.name)) {
+          const head = `/${selected.name} `;
+          if (value.startsWith(head) && value.length > head.length) {
+            lastSelectedSkillTokenRef.current = null;
+            handleSubmit();
+            return;
+          }
+        }
         if (selected) {
           handlePopupSelect(selected.name);
         }
