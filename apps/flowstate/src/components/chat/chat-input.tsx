@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
+import { ArrowUp, Clock, Pencil, Send, Square, Trash2 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import type {
@@ -1373,17 +1373,7 @@ export function ChatInput({
           </div>
         </div>
       )}
-      <div
-        className={cn(
-          "flex min-h-0 min-w-0 flex-1 flex-col border-t border-border px-3 pb-2 pt-3 transition-colors",
-          // While a drag is over the window we paint a subtle
-          // primary-tinted tint + border over the composer surface
-          // to signal "drop here to attach". Cleared on leave/drop
-          // via the Tauri `onDragDropEvent` listener above.
-          isDragOver &&
-            "border-primary/70 bg-primary/5 ring-1 ring-primary/40",
-        )}
-      >
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col px-3 pb-2 pt-3">
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           {(attachedImages.length > 0 ||
             attachedFiles.length > 0 ||
@@ -1421,8 +1411,31 @@ export function ChatInput({
                 ))}
             </div>
           )}
-          <div className="relative flex min-h-0 min-w-0 flex-1 items-end gap-2">
-            {/* Autocomplete popup — positioned above the textarea */}
+          {/* Unified composer surface. Single rounded container holds
+              the textarea on top and a footer row beneath it (chips on
+              the left, ContextDisplay + Send on the right). Mode tint
+              lives on this container border + a subtle L→R gradient,
+              not on the textarea itself, so the whole composer reads
+              as one zone. The drag-over tint also lands here so the
+              drop affordance still surrounds the entire composer. */}
+          <div
+            className={cn(
+              "relative flex min-h-0 min-w-0 flex-col rounded-2xl border bg-background transition-colors focus-within:ring-2 focus-within:ring-offset-0",
+              permissionMode === "plan" &&
+                "border-blue-500/60 bg-gradient-to-r from-blue-500/10 to-transparent focus-within:ring-blue-500/40",
+              permissionMode === "bypass" &&
+                "border-orange-500/60 bg-gradient-to-r from-orange-500/10 to-transparent focus-within:ring-orange-500/40",
+              permissionMode === "auto" &&
+                "border-green-500/60 bg-gradient-to-r from-green-500/10 to-transparent focus-within:ring-green-500/40",
+              permissionMode !== "plan" &&
+                permissionMode !== "bypass" &&
+                permissionMode !== "auto" &&
+                "border-input focus-within:ring-ring/40",
+              isDragOver &&
+                "border-primary/70 bg-primary/5 ring-1 ring-primary/40",
+            )}
+          >
+            {/* Autocomplete popups — positioned above the container */}
             {showPopup && matches.length > 0 && (
               <SlashCommandPopup
                 matches={matches}
@@ -1439,7 +1452,7 @@ export function ChatInput({
               />
             )}
 
-            <div className="relative flex min-h-0 min-w-0 flex-1">
+            <div className="relative px-3 pt-2.5">
               <textarea
                 ref={textareaRef}
                 value={value}
@@ -1481,31 +1494,16 @@ export function ChatInput({
                 }
                 disabled={disabled || providerDisabled || archived}
                 rows={1}
-                className={cn(
-                  // No fixed `h-10` here on purpose — the JS autosizer
-                  // (`autosizeTextarea`) is the sole source of truth
-                  // for the height. A class-set height fights the
-                  // inline `style.height` until the first input event,
-                  // producing a one-frame jump on draft restore.
-                  // `min-h-10` keeps the empty-state floor; `w-full`
-                  // makes the textarea fill the flex wrapper around
-                  // it (which carries the width).
-                  "block min-h-10 min-w-0 w-full resize-none rounded-lg border px-3 py-2 text-sm leading-5 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-50",
-                  // Mode tint. Plan, bypass, and auto are the modes
-                  // where the next send behaves *differently* from the
-                  // defaults, so they each get a coloured border and a
-                  // subtle L→R fade matching the WorkingIndicator's
-                  // spinner tone (see `toneForMode` / BrailleSpinner).
-                  // Default / accept_edits keep the neutral look so the
-                  // tint only draws the eye when it matters.
-                  permissionMode === "plan"
-                    ? "border-blue-500/60 bg-gradient-to-r from-blue-500/10 to-transparent focus-visible:ring-blue-500/60"
-                    : permissionMode === "bypass"
-                      ? "border-orange-500/60 bg-gradient-to-r from-orange-500/10 to-transparent focus-visible:ring-orange-500/60"
-                      : permissionMode === "auto"
-                        ? "border-green-500/60 bg-gradient-to-r from-green-500/10 to-transparent focus-visible:ring-green-500/60"
-                        : "border-input bg-background focus-visible:ring-ring",
-                )}
+                // No fixed `h-10` here on purpose — the JS autosizer
+                // (`autosizeTextarea`) is the sole source of truth
+                // for the height. A class-set height fights the
+                // inline `style.height` until the first input event,
+                // producing a one-frame jump on draft restore.
+                // `min-h-10` keeps the empty-state floor; `w-full`
+                // makes the textarea fill the wrapper around it.
+                // The container owns the border, focus ring, and mode
+                // tint now — the textarea is just transparent text.
+                className="block min-h-10 w-full resize-none border-0 bg-transparent p-0 text-sm leading-5 placeholder:text-muted-foreground focus:outline-none focus-visible:outline-none focus-visible:ring-0 disabled:cursor-not-allowed disabled:opacity-50"
               />
               {/* Ghost-text overlay for prompt-suggestion. Only
                   shown when the composer is empty and a suggestion
@@ -1521,7 +1519,7 @@ export function ChatInput({
                 !archived && (
                   <div
                     aria-hidden
-                    className="pointer-events-none absolute inset-0 flex items-start px-3 py-2 text-sm text-muted-foreground/50"
+                    className="pointer-events-none absolute inset-0 flex items-start px-3 pt-2.5 text-sm text-muted-foreground/50"
                   >
                     <span className="truncate">
                       {promptSuggestion}
@@ -1533,46 +1531,57 @@ export function ChatInput({
                 )}
             </div>
 
-            {showStop ? (
-              <button
-                type="button"
-                onClick={onInterrupt}
-                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                title="Interrupt (Esc Esc)"
-              >
-                <Square className="h-4 w-4" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={handleSubmit}
-                disabled={sendDisabled}
-                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:pointer-events-none disabled:opacity-50"
-                title={
-                  isRunning || queued.length > 0
-                    ? "Add to queue (fires when current turn ends)"
-                    : "Send"
-                }
-              >
-                <Send className="h-4 w-4" />
-              </button>
-            )}
-          </div>
-          {/* Indent the toolbar so its left edge lines up with the
-              textarea's *text* (textarea = rounded border + px-3
-              inside, so text sits 13px inside the textarea wrapper).
-              Right padding mirrors the left so `-- / --` stays inside
-              the composer outline rather than bleeding past the send
-              button. Inline style, not a Tailwind arbitrary value,
-              so the class is guaranteed to ship even if JIT fails. */}
-          {toolbar && (
-            <div
-              className="mt-1.5"
-              style={{ paddingLeft: 13, paddingRight: 13 }}
-            >
-              {toolbar}
+            {/* Footer: chip toolbar (with ContextDisplay) on the left,
+                Send/Stop button on the right. Lives inside the same
+                rounded container as the textarea so the whole composer
+                reads as one zone — matching modern chat composer
+                patterns (Cursor / ChatGPT). */}
+            <div className="flex items-center gap-1 px-2 pb-1.5 pt-1">
+              {toolbar && (
+                <div className="min-w-0 flex-1 overflow-x-auto">{toolbar}</div>
+              )}
+              {showStop ? (
+                <button
+                  type="button"
+                  onClick={onInterrupt}
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-destructive text-destructive-foreground transition-colors hover:bg-destructive/90"
+                  title="Interrupt (Esc Esc)"
+                >
+                  <Square className="h-3.5 w-3.5" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleSubmit}
+                  disabled={sendDisabled}
+                  className={cn(
+                    "inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:pointer-events-none disabled:opacity-50",
+                    // Send button tone tracks permission mode so the
+                    // primary action visually agrees with the
+                    // container border + chip color. Stop variant
+                    // stays destructive red regardless of mode.
+                    permissionMode === "plan" &&
+                      "bg-blue-500 text-white hover:bg-blue-500/90",
+                    permissionMode === "bypass" &&
+                      "bg-orange-500 text-white hover:bg-orange-500/90",
+                    permissionMode === "auto" &&
+                      "bg-green-500 text-white hover:bg-green-500/90",
+                    permissionMode !== "plan" &&
+                      permissionMode !== "bypass" &&
+                      permissionMode !== "auto" &&
+                      "bg-primary text-primary-foreground hover:bg-primary/90",
+                  )}
+                  title={
+                    isRunning || queued.length > 0
+                      ? "Add to queue (fires when current turn ends)"
+                      : "Send"
+                  }
+                >
+                  <ArrowUp className="h-4 w-4" />
+                </button>
+              )}
             </div>
-          )}
+          </div>
         </div>
       </div>
       {lightboxSource && (

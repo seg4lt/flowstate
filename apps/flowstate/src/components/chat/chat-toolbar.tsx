@@ -77,13 +77,14 @@ export function ChatToolbar({
   ).entry;
   const supportedEffortLevels = modelEntry?.supportedEffortLevels ?? [];
 
+  // Whether the optional groups render — used to decide whether each
+  // divider has neighbours on both sides. A divider with nothing to
+  // its right (e.g. on Copilot, where the effort/thinking group is
+  // hidden and Mode is the next chip) would be a stray vertical line.
+  const hasReasoningGroup = features.thinkingEffort;
   return (
-    <div className="flex items-center gap-1.5">
-      {/* Provider chip lives next to the model chip — picking a
-          different provider naturally cascades into a default model
-          for that provider. The chip fires `update_session_provider`
-          and notifies the parent via `onProviderChange` after the
-          ack lands so the parent's mirrored state stays in sync. */}
+    <div className="flex min-w-0 items-center gap-0.5">
+      {/* Provider + Model are the always-on left group. */}
       <ProviderSelector
         provider={provider}
         sessionId={sessionId}
@@ -101,38 +102,33 @@ export function ChatToolbar({
           SDK's thinking config). On Copilot/Claude-CLI the setting
           silently did nothing, so hiding it stops the user from
           tuning a control with no effect. */}
-      {features.thinkingEffort && (
-        <EffortSelector
-          value={effort}
-          onChange={onEffortChange}
-          supportedEffortLevels={supportedEffortLevels}
-        />
+      {hasReasoningGroup && (
+        <>
+          <ToolbarDivider />
+          <EffortSelector
+            value={effort}
+            onChange={onEffortChange}
+            supportedEffortLevels={supportedEffortLevels}
+          />
+          {/* Thinking-mode dial (Always vs. Adaptive). Orthogonal to
+              effort — effort is *how much*, mode is *when*. Same
+              capability gate as Effort, plus a Claude-only check
+              because Codex's backend ignores the adaptive/always
+              switch even though it honours thinkingEffort. */}
+          {provider === "claude" && (
+            <ThinkingModeSelector
+              value={thinkingMode}
+              onChange={onThinkingModeChange}
+              // Per-model gate on top of the provider-level
+              // `thinkingEffort` flag. When the active model doesn't
+              // advertise `supportsAdaptiveThinking`, the Adaptive
+              // pill renders disabled (see ThinkingModeSelector).
+              supportsAdaptive={modelEntry?.supportsAdaptiveThinking ?? false}
+            />
+          )}
+        </>
       )}
-      {/* Thinking-mode dial (Always vs. Adaptive). Orthogonal to
-          effort — effort is *how much*, mode is *when*. Gated on the
-          same capability flag as the effort selector: only providers
-          that honour thinking config (Claude Agent SDK today) get
-          the control. Codex exposes `thinkingEffort` but its backend
-          doesn't take an adaptive/always switch, so the value is
-          silently ignored there — no dead control. */}
-      {features.thinkingEffort && provider === "claude" && (
-        <ThinkingModeSelector
-          value={thinkingMode}
-          onChange={onThinkingModeChange}
-          // Per-model gate on top of the provider-level
-          // `thinkingEffort` flag. When the active model doesn't
-          // advertise `supportsAdaptiveThinking`, the Adaptive pill
-          // renders disabled (see ThinkingModeSelector) — and
-          // chat-view's clamp effect auto-flips a stale `adaptive`
-          // stored value to `always` on model change, so the
-          // disabled pill never ends up looking "selected".
-          // Defaults to `false` when we don't have a catalog entry
-          // yet (bootstrap) to fail safe — showing Adaptive enabled
-          // for a model whose capability we don't know risks a
-          // silent SDK rejection on the next turn.
-          supportsAdaptive={modelEntry?.supportsAdaptiveThinking ?? false}
-        />
-      )}
+      <ToolbarDivider />
       <ModeSelector
         value={permissionMode}
         onChange={onPermissionModeChange}
@@ -150,5 +146,20 @@ export function ChatToolbar({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Hairline vertical divider used between chip groups in the toolbar.
+ * Mirrors the `|` glyph in the reference composer screenshot —
+ * subtle enough to not draw the eye, present enough to visually group
+ * related chips (Provider+Model | Effort+ThinkingMode | Mode+Goal).
+ */
+function ToolbarDivider() {
+  return (
+    <span
+      aria-hidden
+      className="mx-1 inline-block h-3.5 w-px shrink-0 bg-border/60"
+    />
   );
 }

@@ -121,7 +121,7 @@ export function ProviderSelector({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-accent"
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-foreground/85 hover:text-foreground"
         >
           {showSpinner ? (
             <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />

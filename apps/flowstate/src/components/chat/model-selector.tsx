@@ -136,7 +136,7 @@ export function ModelSelector({
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-accent"
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs font-medium text-foreground hover:text-foreground"
         >
           {currentLabel}
           <ChevronDown className="h-3 w-3 text-muted-foreground" />
