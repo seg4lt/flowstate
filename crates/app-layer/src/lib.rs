@@ -27,6 +27,7 @@
 pub mod caffeinate;
 pub mod git_worktree;
 pub mod http;
+pub mod kanban;
 pub mod orchestration_adapters;
 pub mod provision;
 pub mod usage;

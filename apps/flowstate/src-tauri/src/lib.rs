@@ -2266,6 +2266,35 @@ async fn set_user_config(
     base_url.client().set_user_config(key, value).await
 }
 
+/// Generic proxy for the orchestrator/kanban HTTP surface.
+///
+/// The kanban feature exposes ~14 endpoints (status, tasks CRUD,
+/// comments, sessions, approve, resolve, cancel, memory). Wiring
+/// each one through a typed `DaemonClient` method + a dedicated
+/// `#[tauri::command]` would be ~300 lines of pure boilerplate
+/// that adds no safety beyond what the axum router already
+/// validates. Instead, a single proxy forwards arbitrary method
+/// + path + JSON body to the loopback HTTP surface; the front-end
+/// has a typed wrapper (`apps/flowstate/src/lib/api/orchestrator.ts`)
+/// that knows the routes' shapes.
+///
+/// Locking the path prefix to `/api/orchestrator/` so this command
+/// can't be misused to forward arbitrary daemon calls.
+#[tauri::command]
+async fn orchestrator_request(
+    base_url: State<'_, DaemonBaseUrl>,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    if !path.starts_with("/api/orchestrator/") {
+        return Err(format!(
+            "orchestrator_request: path '{path}' must start with /api/orchestrator/"
+        ));
+    }
+    base_url.client().raw_request(&method, &path, body).await
+}
+
 // ─────────────────────────────────────────────────────────────────
 // user MCP — global MCP-server list at ~/.flowstate/mcp.json
 // ─────────────────────────────────────────────────────────────────
@@ -3185,6 +3214,25 @@ pub fn run() {
             // `app.manage` takes ownership but UserConfigStore is
             // cheap to clone (Arc<Mutex<Connection>> inside).
             let user_config_for_orch = user_config_store.clone();
+
+            // Open the kanban orchestrator store. Lives in its own
+            // SQLite file at <app_data_dir>/kanban.sqlite, ships
+            // OFF by default behind a feature flag, and is touched
+            // only by the new `/api/orchestrator/*` HTTP routes
+            // mounted further down in `loopback_http::spawn`.
+            // Failure is non-fatal: we log and skip — the rest of
+            // flowstate is independent of this feature.
+            let kanban_store_for_orch = match flowstate_app_layer::kanban::KanbanStore::open(
+                &flowstate_root,
+            ) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!(
+                        "failed to open kanban store: {e}; orchestrator feature will be unavailable"
+                    );
+                    None
+                }
+            };
             // Same trick for the sleep-prevention controller: it
             // reads the `system.caffeinate` toggle on every turn
             // boundary to decide whether to arm the OS hook (macOS
@@ -3652,6 +3700,46 @@ pub fn run() {
                             None
                         }
                     };
+                // Spawn the orchestrator tick loop if the kanban
+                // store opened. The async closure captures a
+                // clone of the `RuntimeCore` so the merge step
+                // can resolve a project's filesystem path on
+                // demand. Async (Pin<Box<dyn Future>>) instead
+                // of sync because `snapshot()` is async and we'd
+                // deadlock the tokio runtime calling `block_on`
+                // from inside one of its own worker tasks.
+                let kanban_tick = kanban_store_for_orch.as_ref().map(|store| {
+                    let rc = core.runtime_core.clone();
+                    let find_project_path: flowstate_app_layer::kanban::tick::ProjectPathResolver =
+                        std::sync::Arc::new(move |project_id: String| {
+                            let rc = rc.clone();
+                            Box::pin(async move {
+                                rc.snapshot()
+                                    .await
+                                    .projects
+                                    .into_iter()
+                                    .find(|p| p.project_id == project_id)
+                                    .and_then(|p| p.path.map(std::path::PathBuf::from))
+                            })
+                        });
+                    // Build the AgentSpawner that connects the
+                    // tick loop to RuntimeCore for real session
+                    // spawning. The user_config injection lets
+                    // the spawner persist a sidebar title on each
+                    // spawned session so they don't show up as
+                    // unnamed entries in the threads list.
+                    let agent_spawner = flowstate_app_layer::kanban::AgentSpawner::new(
+                        core.runtime_core.clone(),
+                        store.clone(),
+                    )
+                    .with_user_config(user_config_for_orch.clone());
+                    flowstate_app_layer::kanban::spawn_tick_task(
+                        store.clone(),
+                        find_project_path,
+                        Some(agent_spawner),
+                    )
+                });
+
                 let _loopback = match loopback_http::spawn(
                     &flowstate_root,
                     core.runtime_core.clone(),
@@ -3659,6 +3747,8 @@ pub fn run() {
                     ipc_handle.clone(),
                     user_config_for_orch.clone(),
                     usage_http,
+                    kanban_store_for_orch.clone(),
+                    kanban_tick,
                     daemon_base_url.clone(),
                     open_project_tx.clone(),
                 ) {
@@ -3970,6 +4060,7 @@ pub fn run() {
                         set_window_always_on_top,
                         get_user_config,
                         set_user_config,
+                        orchestrator_request,
                         get_user_mcp_servers,
                         set_user_mcp_servers,
                         set_session_display,

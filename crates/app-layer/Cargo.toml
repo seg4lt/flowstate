@@ -63,6 +63,12 @@ chrono = { workspace = true }
 # versions, and it's easier to just pin.
 rusqlite = { version = "0.37", features = ["bundled"] }
 
+# Stable, collision-resistant IDs for kanban tasks, comments, and
+# session-link rows. v4 (random) is good enough — these IDs are
+# never user-typed and never appear in URLs that must stay short.
+uuid = { workspace = true }
+
+
 # The orchestration-adapter impls are `async_trait`-decorated so they
 # can satisfy the runtime's `WorktreeProvisioner` trait.
 async-trait.workspace = true
@@ -109,3 +115,8 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 # In-memory SQLite for unit tests (no temp files on disk).
 tempfile.workspace = true
+# `tower::ServiceExt::oneshot` for axum route tests in kanban::http.
+# Pinned to a 0.5-compatible version — axum 0.8 uses tower 0.5.
+tower = "0.5"
+# `#[tokio::test]` for the async route tests.
+tokio = { workspace = true, features = ["macros", "rt"] }

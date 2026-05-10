@@ -40,6 +40,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use flowstate_app_layer::http::{router as app_layer_router, AppLayerApiState, OpenProjectSender};
+use flowstate_app_layer::kanban::{
+    self as kanban, router as kanban_router, KanbanApiState, KanbanStore, OrchestratorTickKick,
+    TickHandle,
+};
 use flowstate_app_layer::usage::UsageStore;
 use flowstate_app_layer::user_config::UserConfigStore;
 use serde::Serialize;
@@ -123,6 +127,8 @@ pub fn spawn(
     ipc_handle: OrchestrationIpcHandle,
     user_config: UserConfigStore,
     usage: Option<Arc<UsageStore>>,
+    kanban: Option<KanbanStore>,
+    kanban_tick: Option<TickHandle>,
     daemon_base_url: crate::daemon_client::DaemonBaseUrl,
     open_project: OpenProjectSender,
 ) -> Result<LoopbackHttp> {
@@ -133,11 +139,39 @@ pub fn spawn(
     // loopback port the transport-http orchestration routes use.
     // The router is pre-`.with_state()`-stamped, so the HttpTransport
     // just needs to merge the raw `Router<()>` at serve time.
-    let extra_router = app_layer_router(AppLayerApiState {
+    //
+    // The kanban router is a separate sibling router merged in here
+    // so its handlers can carry their own state (`KanbanStore`)
+    // without polluting `AppLayerApiState`. Both routers are
+    // `Router<()>` after `.with_state()`, which is exactly what
+    // `axum::Router::merge` wants — no state-type gymnastics.
+    let app_router = app_layer_router(AppLayerApiState {
         user_config,
         usage,
         open_project: Some(open_project),
     });
+    // Merge the kanban router only when the store opened. A startup
+    // that failed to open `kanban.sqlite` (rare — e.g. disk full)
+    // still serves the rest of flowstate normally; the orchestrator
+    // feature is just not reachable until the next launch.
+    let extra_router = match kanban {
+        Some(kanban) => {
+            // Reference the kanban module so the import doesn't get
+            // marked unused on stable when no other symbols from it
+            // are touched.
+            let _: &str = kanban::settings_keys::FEATURE_ENABLED;
+            // Convert the optional `TickHandle` into the trait
+            // object the router expects. When the tick task didn't
+            // start (kanban store failed to open earlier), we run
+            // without a kick handle and the loop simply isn't
+            // woken on state mutations — state still persists fine.
+            let tick: Option<Arc<dyn OrchestratorTickKick>> = kanban_tick
+                .map(|h| Arc::new(h) as Arc<dyn OrchestratorTickKick>);
+            let kanban_router = kanban_router(KanbanApiState { kanban, tick });
+            app_router.merge(kanban_router)
+        }
+        None => app_router,
+    };
     let transport: Box<dyn Transport> =
         Box::new(HttpTransport::new(bind_addr).with_extra_router(extra_router));
     let bound = transport.bind().context("bind loopback HTTP listener")?;

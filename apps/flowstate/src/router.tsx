@@ -28,6 +28,7 @@ import { ProjectHomeView } from "@/components/project/project-home-view";
 import { SettingsView } from "@/components/settings/settings-view";
 import { UsageView } from "@/components/usage/usage-view";
 import { FeaturesView } from "@/components/features/features-view";
+import { KanbanView } from "@/components/kanban/kanban-view";
 import { Toaster } from "@/components/ui/toaster";
 import { UpdateBanner } from "@/components/update-banner";
 import { ProvisioningSplash } from "@/components/provisioning-splash";
@@ -595,6 +596,17 @@ const featuresRoute = createRoute({
   component: FeaturesView,
 });
 
+// Orchestrator + kanban board. Behind a per-user feature flag
+// (stored server-side in `orchestrator_settings.feature_enabled`).
+// The route always mounts — when the flag is OFF the view itself
+// renders a single "Enable orchestrator" CTA so the user has an
+// in-app path to turn it on without diving into Settings.
+const orchestratorRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/orchestrator",
+  component: KanbanView,
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
@@ -604,6 +616,7 @@ const routeTree = rootRoute.addChildren([
   settingsRoute,
   usageRoute,
   featuresRoute,
+  orchestratorRoute,
 ]);
 
 export const router = createRouter({ routeTree });

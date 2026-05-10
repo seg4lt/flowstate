@@ -10,6 +10,7 @@ import {
   EllipsisVertical,
   FolderIcon,
   FolderMinus,
+  KanbanSquare,
   MoreHorizontal,
   Plus,
   Settings,
@@ -1076,7 +1077,7 @@ function MoreMenu({
   hasProvisionFailures: boolean;
   provisionFailureCount: number;
   onNavigate: (
-    to: "/usage" | "/settings" | "/features",
+    to: "/usage" | "/settings" | "/features" | "/orchestrator",
   ) => void;
 }) {
   const [open, setOpen] = React.useState(false);
@@ -1122,6 +1123,13 @@ function MoreMenu({
           // instead of the cramped default.
           className="w-56 p-1.5"
         >
+          <DropdownMenuItem
+            onClick={() => onNavigate("/orchestrator")}
+            className="gap-2.5 px-2.5 py-2 text-sm"
+          >
+            <KanbanSquare className="h-4 w-4" />
+            <span>Orchestrator</span>
+          </DropdownMenuItem>
           <DropdownMenuItem
             onClick={() => onNavigate("/usage")}
             className="gap-2.5 px-2.5 py-2 text-sm"

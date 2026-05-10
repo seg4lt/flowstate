@@ -126,6 +126,60 @@ impl DaemonClient {
             .map_err(|e| format!("daemon response from {path} was not valid JSON: {e}"))
     }
 
+    /// Generic loopback-HTTP forwarder used by the orchestrator
+    /// Tauri command. Method is one of `GET` / `POST` / `PUT` /
+    /// `DELETE`; `body` is serialized as JSON when present.
+    /// Returns the raw response body as a `serde_json::Value` so
+    /// the webview can decode it with `JSON.parse`-shaped logic
+    /// (the orchestrator surface has many endpoints with similar
+    /// shapes; writing 14 typed methods would be busywork).
+    ///
+    /// Errors are stringified the same way the typed methods do —
+    /// connect refused, non-2xx with the response body as the
+    /// message, or a deserialize failure.
+    pub async fn raw_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        let url = self.url(path)?;
+        let m = match method.to_ascii_uppercase().as_str() {
+            "GET" => reqwest::Method::GET,
+            "POST" => reqwest::Method::POST,
+            "PUT" => reqwest::Method::PUT,
+            "DELETE" => reqwest::Method::DELETE,
+            "PATCH" => reqwest::Method::PATCH,
+            other => return Err(format!("unsupported HTTP method '{other}'")),
+        };
+        let mut req = self.http.request(m, &url);
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("daemon request {path}: {e}"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(if text.is_empty() {
+                format!("daemon returned HTTP {status} for {path}")
+            } else {
+                // Preserve the loopback response body so the front-
+                // end can show the precise reason (e.g. "task is in
+                // Open; approve only valid from HumanReview").
+                format!("HTTP {status}: {text}")
+            });
+        }
+        if text.is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            format!("daemon response from {path} was not valid JSON: {e}; body: {text}")
+        })
+    }
+
     // ── user_config kv ─────────────────────────────────────────
 
     pub async fn get_user_config(&self, key: String) -> Result<Option<String>, String> {

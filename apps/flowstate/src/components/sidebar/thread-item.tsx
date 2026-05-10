@@ -214,10 +214,17 @@ export function ThreadItem({
                 {(() => {
                   const link = state.sessionLinks.get(sessionId)!;
                   const parent = state.sessions.get(link.fromSessionId);
+                  // Special-case the kanban orchestrator's stable
+                  // sentinel parent id so the tooltip reads cleanly.
+                  // Otherwise fall back to the parent session's
+                  // display title, then a sliced raw id, then a
+                  // generic label.
                   const parentLabel =
-                    state.sessionDisplay.get(link.fromSessionId)?.title ||
-                    parent?.sessionId.slice(0, 8) ||
-                    "another session";
+                    link.fromSessionId === "flowstate-orchestrator"
+                      ? "Flowstate orchestrator"
+                      : state.sessionDisplay.get(link.fromSessionId)?.title ||
+                        parent?.sessionId.slice(0, 8) ||
+                        "another session";
                   return (
                     <div className="space-y-0.5">
                       <div className="font-medium">

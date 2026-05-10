@@ -1,5 +1,10 @@
 import * as React from "react";
 import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import {
   AlertCircle,
   ArrowUpCircle,
   ChevronDown,
@@ -12,6 +17,12 @@ import {
   RefreshCw,
   Sun,
 } from "lucide-react";
+import {
+  getStatus as getOrchestratorStatus,
+  setFeatureFlag as setOrchestratorFeatureFlag,
+  setMaxParallelTasks as setOrchestratorMaxParallelTasks,
+  setTickIntervalMs as setOrchestratorTickIntervalMs,
+} from "@/lib/api/orchestrator";
 import { Button } from "@/components/ui/button";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { isMacOS } from "@/lib/popout";
@@ -2101,6 +2112,14 @@ export function SettingsView() {
             />
           </SettingsGroup>
           <SettingsGroup
+            title="Orchestrator"
+            description="Experimental kanban + agent orchestration. When enabled, drop free-text tasks on a board and Flowstate routes them through triage / coding / review / merge with real provider sessions. Spawned agents use your default provider, model, reasoning effort, and permission mode (configured in the Defaults section). The coder role overrides Default permission to AcceptEdits — otherwise it would deadlock waiting for human approval that never comes."
+          >
+            <OrchestratorFeatureFlagRow />
+            <OrchestratorMaxParallelRow />
+            <OrchestratorTickIntervalRow />
+          </SettingsGroup>
+          <SettingsGroup
             title="Updates"
             description="Keep Flowstate up to date. Updates are cryptographically signed and delivered via GitHub Releases."
           >
@@ -2108,6 +2127,160 @@ export function SettingsView() {
           </SettingsGroup>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── Orchestrator settings rows ────────────────────────────────────
+// Mirrors the toggle on the kanban view itself so users who never
+// open /orchestrator can still opt into the feature. Reads/writes
+// through the same `/api/orchestrator/*` HTTP surface — single
+// source of truth (server-side SQLite settings table).
+
+function OrchestratorFeatureFlagRow() {
+  const qc = useQueryClient();
+  const statusQuery = useQuery({
+    queryKey: ["orchestrator", "status"],
+    queryFn: getOrchestratorStatus,
+  });
+  const setFlagMutation = useMutation({
+    mutationFn: (enabled: boolean) => setOrchestratorFeatureFlag(enabled),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["orchestrator"] }),
+    onError: (e) =>
+      toast({ title: "Could not update orchestrator", description: String(e) }),
+  });
+  const enabled = statusQuery.data?.featureEnabled ?? false;
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Enable orchestrator</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          Surface the kanban panel and start the per-task triage / coder
+          / reviewer agent flow. Off by default. The actual loop also
+          has a separate ON/OFF toggle inside the kanban window.
+        </div>
+      </div>
+      <Switch
+        checked={enabled}
+        onCheckedChange={(v) => setFlagMutation.mutate(Boolean(v))}
+        aria-label="Enable orchestrator feature"
+      />
+    </div>
+  );
+}
+
+function OrchestratorMaxParallelRow() {
+  const qc = useQueryClient();
+  const statusQuery = useQuery({
+    queryKey: ["orchestrator", "status"],
+    queryFn: getOrchestratorStatus,
+  });
+  const setMutation = useMutation({
+    mutationFn: (n: number) => setOrchestratorMaxParallelTasks(n),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["orchestrator", "status"] }),
+    onError: (e) =>
+      toast({ title: "Could not update parallelism", description: String(e) }),
+  });
+  const value = statusQuery.data?.maxParallelTasks ?? 3;
+  const featureOn = statusQuery.data?.featureEnabled ?? false;
+  const [draft, setDraft] = React.useState<string>(String(value));
+  React.useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Max tasks running in parallel</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          How many tasks can be in active agent states (Code / AgentReview /
+          Merge) at once. Tasks beyond this stay parked at Ready until a
+          slot frees. Range 1-50; default 3.
+        </div>
+      </div>
+      <input
+        type="number"
+        min={1}
+        max={50}
+        disabled={!featureOn || setMutation.isPending}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const n = Number.parseInt(draft, 10);
+          if (Number.isFinite(n) && n >= 1 && n <= 50 && n !== value) {
+            setMutation.mutate(n);
+          } else {
+            setDraft(String(value));
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          if (e.key === "Escape") {
+            setDraft(String(value));
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className="h-8 w-16 rounded-md border border-input bg-background px-2 text-sm tabular-nums"
+      />
+    </div>
+  );
+}
+
+function OrchestratorTickIntervalRow() {
+  const qc = useQueryClient();
+  const statusQuery = useQuery({
+    queryKey: ["orchestrator", "status"],
+    queryFn: getOrchestratorStatus,
+  });
+  const setMutation = useMutation({
+    mutationFn: (ms: number) => setOrchestratorTickIntervalMs(ms),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["orchestrator", "status"] }),
+    onError: (e) =>
+      toast({ title: "Could not update interval", description: String(e) }),
+  });
+  const value = statusQuery.data?.tickIntervalMs ?? 10_000;
+  const featureOn = statusQuery.data?.featureEnabled ?? false;
+  const [draft, setDraft] = React.useState<string>(String(value));
+  React.useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+  return (
+    <div className="flex items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+      <div className="min-w-0 flex-1">
+        <div className="text-sm font-medium">Tick interval (ms)</div>
+        <div className="mt-0.5 text-xs text-muted-foreground">
+          How often the orchestrator loop scans for work. Lower = more
+          responsive but more provider polls. Range 1000-300000; default
+          10000.
+        </div>
+      </div>
+      <input
+        type="number"
+        min={1000}
+        max={300_000}
+        step={500}
+        disabled={!featureOn || setMutation.isPending}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          const n = Number.parseInt(draft, 10);
+          if (Number.isFinite(n) && n >= 1000 && n <= 300_000 && n !== value) {
+            setMutation.mutate(n);
+          } else {
+            setDraft(String(value));
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          if (e.key === "Escape") {
+            setDraft(String(value));
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className="h-8 w-24 rounded-md border border-input bg-background px-2 text-sm tabular-nums"
+      />
     </div>
   );
 }
