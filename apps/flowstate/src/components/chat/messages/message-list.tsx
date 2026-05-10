@@ -14,10 +14,11 @@ interface MessageListProps {
   loading: boolean;
   pendingInput: string | null;
   onOpenAttachment?: (attachment: AttachmentRef) => void;
-  /** Identity of the currently-visible session. Used as the
-   *  scroll-reset trigger so switching threads always lands the
-   *  user at the bottom-most (latest) message, even though
-   *  MessageList itself doesn't remount between sessions. */
+  /** Identity of the currently-visible session. Threaded through to
+   *  Virtuoso as `key={sessionId}` so each thread gets a fresh
+   *  Virtuoso instance — that's how switching tabs reliably lands
+   *  the user at the bottom-most (latest) message. MessageList
+   *  itself does NOT remount between sessions; only Virtuoso does. */
   sessionId: string;
   /** Number of older turns the daemon still has that haven't been
    *  fetched yet. Zero means the full history is in memory. Non-zero
@@ -142,105 +143,38 @@ export function MessageList({
     return items;
   }, [turns, pendingInput, providerKind, sessionModel]);
 
-  // Single user-initiated "scroll to latest" implementation. Consolidates
-  // the four invariants every user-driven jump needs:
-  //   1. Bail if the list is transiently empty — otherwise Virtuoso
-  //      resolves `index: "LAST"` against a zero-length data array and
-  //      can land on index 0 (the TOP of the list).
-  //   2. Suppress the "Jump to latest" affordance for 400ms so the
-  //      button doesn't flash while Virtuoso's atBottomStateChange
-  //      settles, and a double-click is a no-op.
-  //   3. Retry the scroll across several frames. On a session switch
-  //      (or any case where Virtuoso just received a new `data` prop),
-  //      Virtuoso renders/measures asynchronously — a single rAF often
-  //      fires before measurement, the scrollToIndex resolves against
-  //      stale layout and silently no-ops, and Virtuoso stays parked
-  //      at the previous scroll offset. With the new dataset that
-  //      offset is usually past the end of content, so the viewport
-  //      virtualises nothing → blank pane until the user scrolls.
-  //      scrollToIndex with index: "LAST" is idempotent, so retrying
-  //      across ~6 frames (~100 ms) is safe: the call lands as soon
-  //      as Virtuoso is ready, and subsequent attempts are no-ops at
-  //      the same offset (no flicker).
-  //   4. `behavior: "auto"` (instant). Smooth scroll across Virtuoso's
-  //      virtualized list leaves the in-between items unrendered
-  //      during the animation, which is what made "Jump to latest"
-  //      look like it was dumping users at the top.
-  const scrollAttemptRef = React.useRef<{
-    cancelled: boolean;
-    frame: number;
-  } | null>(null);
+  // Imperative scroll-to-latest used by the "Jump to latest" pill and the
+  // userSendTick effect. Session-switch landing is NOT done here — it's
+  // handled natively by Virtuoso via `key={sessionId}` + `initialTopMost-
+  // ItemIndex={length-1}`, which is bulletproof because it runs once on
+  // mount with the full data already in place. This callback only fires
+  // for *user-initiated* jumps where the data is already laid out and a
+  // single rAF is enough to let Virtuoso measure any newly-appended row
+  // (e.g., the optimistic pending turn after `handleSend`).
+  //
+  // Notes:
+  //   * Bail if the list is transiently empty — `index: "LAST"` against a
+  //     zero-length data array can land on index 0 (the TOP of the list).
+  //   * Suppress the "Jump to latest" affordance for 400 ms so the button
+  //     doesn't flash while Virtuoso's atBottomStateChange settles, and
+  //     a double-click is a no-op.
+  //   * `behavior: "auto"` (instant). Smooth scroll across Virtuoso's
+  //     virtualized list leaves the in-between items unrendered during
+  //     the animation, which made "Jump to latest" look like it was
+  //     dumping users at the top.
   const scrollToLatest = React.useCallback(() => {
     if (displayItems.length === 0) return;
     setSuppressJump(true);
     if (suppressTimerRef.current) clearTimeout(suppressTimerRef.current);
     suppressTimerRef.current = setTimeout(() => setSuppressJump(false), 400);
-
-    // Cancel any in-flight retry chain from a previous call so we don't
-    // pile up duplicate rAF loops on rapid thread switches.
-    if (scrollAttemptRef.current) {
-      scrollAttemptRef.current.cancelled = true;
-      cancelAnimationFrame(scrollAttemptRef.current.frame);
-    }
-    const handle: { cancelled: boolean; frame: number } = {
-      cancelled: false,
-      frame: 0,
-    };
-    scrollAttemptRef.current = handle;
-    let attempts = 0;
-    const MAX_ATTEMPTS = 6;
-    const tick = () => {
-      if (handle.cancelled) return;
-      const v = virtuosoRef.current;
-      if (v) {
-        v.scrollToIndex({
-          index: "LAST",
-          align: "end",
-          behavior: "auto",
-        });
-      }
-      attempts += 1;
-      if (attempts < MAX_ATTEMPTS) {
-        handle.frame = requestAnimationFrame(tick);
-      }
-    };
-    handle.frame = requestAnimationFrame(tick);
+    requestAnimationFrame(() => {
+      virtuosoRef.current?.scrollToIndex({
+        index: "LAST",
+        align: "end",
+        behavior: "auto",
+      });
+    });
   }, [displayItems.length]);
-
-  // Always jump to the latest message when the user clicks a thread.
-  // MessageList doesn't remount between sessions (that design choice is
-  // what makes re-visits render instantly), so Virtuoso's
-  // `initialTopMostItemIndex` — which only applies on mount — can't
-  // drive this on its own.
-  //
-  // We re-scroll on every `sessionId` change rather than gating to
-  // first-visit-only. Earlier code used a `Set<sessionId>` to dedup
-  // the scroll, citing "huge thread re-measure lag" on revisits, but
-  // Virtuoso virtualises by viewport — `scrollToIndex({index: "LAST"})`
-  // is bounded by what's visible, not by total list length. The dedup
-  // produced a worse UX (revisits could land mid-history at whatever
-  // offset Virtuoso happened to be at, sometimes blank because the new
-  // dataset's height didn't reach the parked offset) and contradicted
-  // the natural user expectation that clicking a thread shows the
-  // newest message.
-  //
-  // Cold-cache handling: the session may be selected before its turns
-  // arrive, so we can't unconditionally fire on `sessionId` change —
-  // an empty list resolves `index: "LAST"` to nothing useful. We track
-  // the last sessionId we *successfully* drove a scroll for in a single-
-  // slot ref. When sessionId changes, the slot mismatches; when items
-  // arrive (length 0 → N) we stamp and scroll. Length changes within
-  // the same session (streaming tokens, new turns) DON'T re-fire,
-  // because the slot already matches — `followOutput` handles the
-  // "you were at bottom, stay at bottom" case, and `userSendTick`
-  // handles "user sent, force-jump".
-  const lastScrolledSessionRef = React.useRef<string | null>(null);
-  React.useEffect(() => {
-    if (displayItems.length === 0) return;
-    if (lastScrolledSessionRef.current === sessionId) return;
-    lastScrolledSessionRef.current = sessionId;
-    scrollToLatest();
-  }, [sessionId, displayItems.length, scrollToLatest]);
 
   // Force a scroll to the latest message every time the user dispatches
   // a new message. Unlike Virtuoso's `followOutput`, this fires even
@@ -267,12 +201,19 @@ export function MessageList({
   }, []);
 
   // Cold-cache case: no turns in hand yet AND the daemon hasn't
-  // replied. Render a small loader inline in the scroll region
-  // rather than an early return that unmounts Virtuoso — that way
-  // the chat shell (header, composer, toolbar) stays mounted and
-  // interactive while we wait, and a rapidly-switched-back-to
-  // thread that *does* have cached turns skips this branch entirely.
+  // replied. We render a loader instead of Virtuoso — Virtuoso's
+  // mount is intentionally gated on `displayItems.length > 0` so
+  // that `initialTopMostItemIndex={length-1}` (see <Virtuoso/> below)
+  // resolves against the *real* last item, not against an empty array
+  // that would land it on index 0. The chat shell (header, composer,
+  // toolbar) stays mounted regardless because they live above this
+  // component in the tree.
   const showColdLoader = loading && displayItems.length === 0;
+  // "Fresh thread, no messages yet" — the daemon has answered and
+  // confirmed the thread is empty. Render the static placeholder
+  // ourselves rather than via Virtuoso's `components.EmptyPlaceholder`,
+  // since we don't mount Virtuoso when there's nothing to show.
+  const showEmptyPlaceholder = !loading && displayItems.length === 0;
 
   return (
     <div className="relative min-h-0 min-w-0 flex-1">
@@ -324,26 +265,56 @@ export function MessageList({
           </button>
         </div>
       )}
-      <Virtuoso
-        ref={virtuosoRef}
-        className="h-full"
-        data={displayItems}
-        computeItemKey={(_, item) => item.turnId}
-        itemContent={(_, item) => (
-          <div className="px-6 py-2">
-            <TurnView
-              item={item}
-              onOpenAttachment={onOpenAttachment}
-            />
-          </div>
-        )}
-        followOutput={(isAtBottom) => (isAtBottom ? "auto" : false)}
-        atBottomThreshold={120}
-        atBottomStateChange={setAtBottom}
-        initialTopMostItemIndex={Math.max(0, displayItems.length - 1)}
-        increaseViewportBy={{ top: 600, bottom: 600 }}
-        components={{ EmptyPlaceholder }}
-      />
+      {showEmptyPlaceholder && <EmptyPlaceholder />}
+      {displayItems.length > 0 && (
+        // `key={sessionId}` is the load-bearing piece of the "always
+        // land at the latest message on tab switch" contract. Without
+        // it, switching threads keeps the same Virtuoso instance, which
+        // preserves its pixel scroll offset across the data swap — and
+        // since the new dataset rarely has the same total height, that
+        // offset usually points past the end of content (blank pane) or
+        // mid-history (stranded above the latest message). Re-keying
+        // forces a clean mount per session, which lets Virtuoso's own
+        // `initialTopMostItemIndex={length-1}` do its job: lay out from
+        // the bottom on first render, no imperative scroll dance
+        // required. Only Virtuoso re-mounts — chat-view, MessageList,
+        // and TurnView's memoised render outputs are unaffected, and
+        // Virtuoso virtualises by viewport so the per-switch render
+        // cost is bounded by what's visible, not by total list length.
+        //
+        // The render gate (`displayItems.length > 0`) matters: mounting
+        // Virtuoso with empty data would resolve `initialTopMostItem-
+        // Index={Math.max(0, -1)} = 0` and stick on item 0 even after
+        // turns arrive (initialTopMostItemIndex only applies on mount).
+        // Cold-cache loads show the loader above instead, then mount
+        // Virtuoso once `displayItems` is populated.
+        <Virtuoso
+          key={sessionId}
+          ref={virtuosoRef}
+          className="h-full"
+          data={displayItems}
+          computeItemKey={(_, item) => item.turnId}
+          itemContent={(_, item) => (
+            <div className="px-6 py-2">
+              <TurnView item={item} onOpenAttachment={onOpenAttachment} />
+            </div>
+          )}
+          followOutput={(isAtBottom) => (isAtBottom ? "auto" : false)}
+          atBottomThreshold={120}
+          atBottomStateChange={setAtBottom}
+          // `align: "end"` is what actually pins the latest item to the
+          // BOTTOM of the viewport. The bare-number form
+          // (`initialTopMostItemIndex={length-1}`) defaults to
+          // `align: "start"` which puts the last item at the *top* of
+          // the viewport — fine for short turns, but on long replies it
+          // lands the user at the beginning of the latest message
+          // instead of the end of it (which felt like "I'm not at the
+          // latest"). Using "LAST" + end matches what the imperative
+          // `scrollToIndex` calls elsewhere in this file do.
+          initialTopMostItemIndex={{ index: "LAST", align: "end" }}
+          increaseViewportBy={{ top: 600, bottom: 600 }}
+        />
+      )}
 
       {!atBottom && !suppressJump && displayItems.length > 0 && (
         <button
