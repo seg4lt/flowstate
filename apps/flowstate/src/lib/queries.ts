@@ -112,6 +112,124 @@ export function prefetchSession(client: QueryClient, sessionId: string) {
   void client.prefetchQuery(sessionQueryOptions(sessionId));
 }
 
+// Background warm-up for the most-likely-clicked sessions. Used at
+// boot from the sidebar so that by the time the user mouses toward a
+// thread, its `load_session` round-trip is already in cache and the
+// click→paint budget is bound by React render cost (~ms), not by the
+// daemon RPC (~1–2s on cold).
+//
+// Why a separate helper from `prefetchSession`:
+//   * **Idle scheduling.** `prefetchSession` is called from a user
+//     gesture (hover) and should run immediately — the user's signal
+//     IS the priority. Boot prefetch runs without any user signal, so
+//     it must defer to first paint and any in-flight foreground work.
+//     We use `requestIdleCallback` when available (Chromium / Firefox /
+//     Tauri's WebView2 on Win) and fall back to a 50 ms `setTimeout`
+//     on Safari / WKWebView where rIC is unimplemented.
+//   * **Concurrency cap.** The daemon handles parallel `load_session`
+//     fine (independent Tauri invokes; SQLite serialises writes), but
+//     a 50-thread sidebar firing 50 concurrent RPCs in one tick would
+//     starve any foreground click that races in. A small in-flight cap
+//     keeps the warm-up as background work.
+//   * **Skip-warm gate.** `prefetchQuery` already short-circuits on
+//     warm cache, but checking `getQueryState` first avoids even
+//     queueing the rIC callback for entries we already have. Important
+//     for re-renders (e.g. a new session arrives via stream) so the
+//     re-armed batch only does work for *new* ids.
+//
+// Returns a cancel function. Effect cleanup must call this so a
+// re-render's stale batch is torn down before the next batch arms.
+// In-flight RPCs that have already left the rIC queue are not aborted
+// (TanStack would just write the result to cache, which is what we
+// want anyway), but pending queue entries are skipped.
+type IdleScheduler = (cb: () => void) => () => void;
+const scheduleIdle: IdleScheduler =
+  typeof window !== "undefined" &&
+  typeof (window as unknown as { requestIdleCallback?: unknown })
+    .requestIdleCallback === "function"
+    ? (cb) => {
+        const id = (
+          window as unknown as {
+            requestIdleCallback: (cb: () => void) => number;
+          }
+        ).requestIdleCallback(cb);
+        return () => {
+          (
+            window as unknown as { cancelIdleCallback: (id: number) => void }
+          ).cancelIdleCallback(id);
+        };
+      }
+    : (cb) => {
+        const id = setTimeout(cb, 50);
+        return () => clearTimeout(id);
+      };
+
+export function prefetchSessionsBackground(
+  client: QueryClient,
+  sessionIds: readonly string[],
+  opts?: { concurrency?: number },
+): () => void {
+  const concurrency = Math.max(1, opts?.concurrency ?? 4);
+  // Snapshot the input so callers can mutate their array without
+  // affecting our queue. Skip ids already warm at queue-build time;
+  // we'll re-check inside the worker too in case another call
+  // (hover prefetch) populated the cache while we waited.
+  const queue = sessionIds.filter((id) => {
+    const state = client.getQueryState(sessionQueryKey(id));
+    return state?.data === undefined;
+  });
+
+  let cancelled = false;
+  const cancelHandles: Array<() => void> = [];
+  const cancel = () => {
+    cancelled = true;
+    while (cancelHandles.length > 0) {
+      const h = cancelHandles.pop();
+      h?.();
+    }
+  };
+
+  const pump = () => {
+    if (cancelled) return;
+    if (queue.length === 0) return;
+    const id = queue.shift()!;
+    // Re-check warmth at dispatch time — hover or another batch may
+    // have populated this entry while we were waiting in the rIC queue.
+    const state = client.getQueryState(sessionQueryKey(id));
+    if (state?.data !== undefined) {
+      pump();
+      return;
+    }
+    void client
+      .prefetchQuery(sessionQueryOptions(id))
+      .catch(() => {
+        /* swallow — boot prefetch must never crash the UI; the next
+         * user-driven access will retry through the normal
+         * useQuery / prefetchSession path and surface the error
+         * there if it persists. */
+      })
+      .finally(() => {
+        if (cancelled) return;
+        // Chain the next id rather than queueing all `concurrency`
+        // workers up front — this naturally drains the queue with
+        // exactly `concurrency` in-flight at any moment, and lets
+        // a fast cancel from a re-render stop further work cleanly.
+        pump();
+      });
+  };
+
+  // Defer the *first* worker per concurrency slot to idle so the
+  // burst doesn't compete with React's first paint. Subsequent calls
+  // chain via `.finally(pump)` and inherit the deferral implicitly.
+  for (let i = 0; i < concurrency; i++) {
+    if (queue.length === 0) break;
+    const handle = scheduleIdle(pump);
+    cancelHandles.push(handle);
+  }
+
+  return cancel;
+}
+
 // Resolve the git repository root for `path` via
 // `git rev-parse --show-toplevel`. Returns the repo root when the
 // path is inside a submodule or linked worktree (where `.git` is

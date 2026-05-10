@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
@@ -80,6 +81,7 @@ import {
 import { ADD_PROJECT_EVENT } from "@/lib/keyboard-shortcuts";
 import { useDefaultProvider } from "@/hooks/use-default-provider";
 import { startThreadOnProject } from "@/lib/start-thread";
+import { prefetchSessionsBackground } from "@/lib/queries";
 import { toast } from "@/hooks/use-toast";
 import type { SessionSummary } from "@/lib/types";
 import type { SessionDisplay } from "@/lib/api/display";
@@ -208,6 +210,7 @@ function AppSidebarBody() {
     useApp();
   const navigate = useNavigate();
   const location = useLocation();
+  const queryClient = useQueryClient();
   const { defaultProvider, loaded: defaultProviderLoaded } =
     useDefaultProvider();
   // Stable notify wrapper for `startThreadOnProject`. The General
@@ -270,6 +273,46 @@ function AppSidebarBody() {
         return oa - ob;
       });
   }, [state.projects, state.projectDisplay, state.projectWorktrees]);
+
+  // Boot/idle prefetch of the most-recently-active sessions so that
+  // clicking a thread feels instant (the per-row hover prefetch in
+  // `thread-item.tsx:119` only helps when the cursor dwells long
+  // enough; fast clickers and keyboard users still pay the cold
+  // `load_session` round-trip without this).
+  //
+  // We sort by `updatedAt` (touched on every turn) rather than
+  // `createdAt` so a long-lived thread that's still being used
+  // outranks a recently-spawned-but-idle one. The cap (top 20) is a
+  // soft ceiling chosen because it covers virtually any user's
+  // active working set while still finishing in a few seconds at
+  // ~1s per cold RPC with concurrency 4.
+  //
+  // We `.join('|')` the id list before memoising so the dependency
+  // is a single string — without that, `recentSessionIds` would get
+  // a new array identity on every minor `state.sessions` mutation
+  // (a stream event touching one session re-creates the Map) and the
+  // effect would tear down + re-arm its prefetch batch on every
+  // tick. With the join, the effect re-runs only when the *set* of
+  // top-20 ids actually changes.
+  const recentSessionIds = React.useMemo(() => {
+    const ids: { id: string; updatedAt: number }[] = [];
+    for (const s of state.sessions.values()) {
+      ids.push({ id: s.sessionId, updatedAt: new Date(s.updatedAt).getTime() });
+    }
+    ids.sort((a, b) => b.updatedAt - a.updatedAt);
+    return ids.slice(0, 20).map((x) => x.id);
+  }, [state.sessions]);
+  const recentSessionKey = recentSessionIds.join("|");
+  React.useEffect(() => {
+    if (recentSessionIds.length === 0) return;
+    const cancel = prefetchSessionsBackground(queryClient, recentSessionIds, {
+      concurrency: 4,
+    });
+    return cancel;
+    // recentSessionIds is derived from recentSessionKey; depending on
+    // the key keeps the effect stable across unrelated re-renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recentSessionKey, queryClient]);
 
   const handleProjectDragEnd = React.useCallback(
     (event: DragEndEvent) => {
