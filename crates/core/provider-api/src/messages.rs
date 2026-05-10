@@ -44,6 +44,16 @@ pub enum RuntimeEvent {
         args: Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_call_id: Option<String>,
+        /// True when the model invoked this tool with
+        /// `run_in_background: true` (Claude SDK only). Lets the
+        /// frontend chat surface decorate the matching tool-call
+        /// card with a "background" badge in the same render pass
+        /// that creates it, rather than waiting for the matching
+        /// `BackgroundTaskUpdated` event to arrive on a separate
+        /// reducer pass. Defaulted on deserialization so older
+        /// persisted streams replay cleanly.
+        #[serde(default, skip_serializing_if = "is_false_msg")]
+        is_background: bool,
     },
     ToolCallCompleted {
         session_id: String,
@@ -380,6 +390,90 @@ pub enum RuntimeEvent {
     /// The active goal for the session was cleared. Frontend drops its
     /// per-session goal entry on receipt.
     ThreadGoalCleared { session_id: String },
+    /// Aggregated background-task projection. Emitted by runtime-core
+    /// each time a background-Bash tool call's lifecycle state changes
+    /// (started, shell id resolved, output snapshot updated, completed,
+    /// failed, killed). Frontends maintain a per-session
+    /// `Record<call_id, BackgroundTask>` and replace the entry whose
+    /// `call_id` matches; rows whose status is `Completed`/`Failed`/`Killed`
+    /// stay visible for history but are styled as inactive.
+    ///
+    /// Source of truth lives on the matching `ToolCall` inside the
+    /// turn record (`is_background`, `bash_id`, `latest_bash_output`).
+    /// This event is a derived projection — convenient for the panel,
+    /// not a replacement for the persisted ToolCall data.
+    BackgroundTaskUpdated {
+        session_id: String,
+        turn_id: String,
+        task: BackgroundTaskSnapshot,
+    },
+}
+
+/// Per-row payload for `RuntimeEvent::BackgroundTaskUpdated`.
+///
+/// Carries only the fields the panel renders — the originating
+/// `ToolCall` on the turn record holds the full args/output/blocks.
+/// Frontends key by `call_id`; replacement on match yields a stable
+/// row identity across status transitions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundTaskSnapshot {
+    /// Originating `Bash { run_in_background: true }` tool_use
+    /// call_id. Stable for the lifetime of the row.
+    pub call_id: String,
+    /// SDK-issued shell id, once the originating Bash tool result has
+    /// resolved. `None` for the brief window between the model
+    /// requesting the background tool and the SDK acknowledging it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_id: Option<String>,
+    /// Short excerpt of the command the model invoked. Truncated to
+    /// keep panel rows tidy; the full args remain on the ToolCall.
+    pub command_excerpt: String,
+    /// Wall-clock timestamp (RFC 3339) the originating tool started.
+    pub started_at: String,
+    /// Lifecycle phase of the row.
+    pub status: BackgroundTaskStatus,
+    /// Latest stdout/stderr snapshot the SDK delivered via a
+    /// `BashOutput` invocation. `None` until the model first asks
+    /// for output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_output: Option<BashOutputSnapshot>,
+}
+
+/// Lifecycle phase for a row in `BackgroundTaskSnapshot`. Frontend
+/// uses this to drive the status pip and the kill-button enablement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundTaskStatus {
+    /// The originating Bash tool call hasn't returned yet — we know
+    /// the model asked for background execution but haven't yet
+    /// learned the SDK's shell id.
+    Pending,
+    /// Shell is running. The originating Bash tool resolved with a
+    /// shell id; the model can call `BashOutput` and `KillShell`
+    /// against it.
+    Running,
+    /// Shell exited normally; the SDK's spontaneous-turn pipeline
+    /// surfaced the completion notification.
+    Completed,
+    /// Shell exited with a non-zero status or the tool reported an
+    /// error.
+    Failed,
+    /// Shell was killed via the model's `KillShell` tool — typically
+    /// triggered by the user's panel kill button (which sends a
+    /// "please kill bash_<id>" prompt that the model fulfills).
+    Killed,
+}
+
+/// Helper for `#[serde(skip_serializing_if)]` on plain `bool` fields
+/// where the default (`false`) shouldn't take wire space. Mirrors
+/// the `is_false` helper in `types.rs` — kept module-local so the
+/// two struct trees can stay independent.
+fn is_false_msg(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

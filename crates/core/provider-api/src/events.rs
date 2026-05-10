@@ -29,9 +29,85 @@ pub enum ProviderTurnEvent {
         /// Parent Task/Agent call_id when this tool call originates
         /// from a sub-agent; `None` for main-agent calls.
         parent_call_id: Option<String>,
+        /// True when the model invoked `Bash` with
+        /// `run_in_background: true`. Drives the host's background-
+        /// task panel — the runtime indexes the matching `ToolCall`
+        /// row separately so it can be displayed alongside (and
+        /// outlive) the originating turn. False for every other
+        /// tool call. Adapters that don't model background tasks
+        /// always emit `false`.
+        is_background: bool,
     },
     ToolCallCompleted {
         call_id: String,
+        output: String,
+        error: Option<String>,
+    },
+    /// The provider has acknowledged a previously-emitted
+    /// `ToolCallStarted { is_background: true }` — i.e. the SDK
+    /// returned the originating `Bash` tool's result, which means the
+    /// shell is actually running. Fired exactly once per background-
+    /// bash, immediately after that tool result lands. The runtime
+    /// uses this as the Pending → Running transition for the panel
+    /// row; without it the row would sit on "Starting…" forever.
+    ///
+    /// `bash_id` is `Some` when the bridge could parse the SDK-issued
+    /// shell identifier from the result text and `None` when it
+    /// couldn't (the SDK has shifted that wording across versions).
+    /// A `None` row is still legitimately Running — the user just
+    /// can't ask the model to kill it from the panel because the
+    /// model's `KillShell` tool needs the shell id as input.
+    BackgroundBashRegistered {
+        /// The originating `Bash` tool_use call id.
+        call_id: String,
+        /// SDK-issued shell identifier (e.g. `bash_1`), when the
+        /// bridge could parse it. `None` means the row transitions
+        /// to Running without a kill affordance.
+        bash_id: Option<String>,
+    },
+    /// Live stdout/stderr snapshot for a running background shell.
+    /// Synthesized by the Claude SDK adapter from the model's
+    /// `BashOutput` tool results — that tool carries only `bash_id`
+    /// in its input, so the adapter pre-correlates to the originating
+    /// `Bash` call_id before forwarding. The host-side background-
+    /// task panel renders this as the row's "latest output" and
+    /// resets its stalled-shell timer.
+    BackgroundBashOutput {
+        /// Originating background-`Bash` tool_use call id.
+        call_id: String,
+        /// SDK-issued shell identifier; mirrors what the model passed
+        /// to `BashOutput`. Surfaced for the kill action which has to
+        /// pass it back to the model.
+        bash_id: String,
+        /// Concatenated stdout+stderr the SDK delivered. Adapters
+        /// pass it through verbatim — no length cap here; the
+        /// frontend is responsible for clamping if needed.
+        output: String,
+        /// Set when the BashOutput tool_result itself was flagged as
+        /// an error. Lets the panel mark the row as failed without
+        /// inspecting the raw output.
+        error: Option<String>,
+        /// Coarse SDK-reported shell state parsed from the BashOutput
+        /// tool result (the SDK embeds it inline as
+        /// `<status>...</status>` or a JSON `status` field; the
+        /// bridge does the parsing). Drives the panel row's terminal
+        /// transition: `Running` keeps the row live; `Completed` /
+        /// `Failed` / `Killed` retire it. Defaults to Running on the
+        /// adapter side when nothing parses, so a future SDK shape
+        /// the parser doesn't recognize fails open (the row stays
+        /// visible) rather than fails closed (rows vanish).
+        shell_status: BackgroundShellStatus,
+    },
+    /// Terminal status for a background shell — the model invoked
+    /// `KillShell` against it (typically because the user pressed
+    /// the panel's kill button, which dispatched a "please kill"
+    /// prompt). The runtime transitions the matching row to
+    /// `Killed` and drops it from the active-tasks index. Carries
+    /// the kill tool's output for posterity (usually the SDK's
+    /// "shell terminated" acknowledgement).
+    BackgroundBashKilled {
+        call_id: String,
+        bash_id: String,
         output: String,
         error: Option<String>,
     },
@@ -231,6 +307,27 @@ pub enum ProviderTurnEvent {
     /// codex on `thread/goal/cleared`. Adapters that don't support
     /// goal tracking never emit this.
     ThreadGoalCleared,
+}
+
+/// SDK-reported shell state for a `BackgroundBashOutput` event.
+/// Coarse on purpose — the bridge collapses the various SDK
+/// versions' status shapes (`<status>...</status>`,
+/// `"status": "..."`, exit-code probes) into these four values so
+/// runtime-core doesn't have to re-parse the raw output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundShellStatus {
+    /// Shell is still alive — BashOutput is just a snapshot. The
+    /// panel row stays in `Running`.
+    Running,
+    /// Shell exited cleanly (status text said completed/finished and
+    /// no non-zero exit code). Row transitions to `Completed`.
+    Completed,
+    /// Shell exited with a non-zero exit code or the SDK reported a
+    /// failure status. Row transitions to `Failed`.
+    Failed,
+    /// Shell was killed (KillShell, or SDK reported `terminated` /
+    /// `killed` directly). Row transitions to `Killed`.
+    Killed,
 }
 
 /// Phase of a turn between streams. Deliberately coarse — only

@@ -470,6 +470,61 @@ pub struct ToolCall {
     /// stuck detector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_progress_at: Option<String>,
+    /// True when the model invoked this tool with
+    /// `run_in_background: true` (Claude SDK only today). The host
+    /// indexes background tool calls separately so the
+    /// background-task panel can list them across turns. `false` for
+    /// every other tool call. Defaulted on deserialization so older
+    /// persisted turns load cleanly.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_background: bool,
+    /// SDK-issued shell identifier for a background-Bash tool call,
+    /// once the originating tool result has resolved (which is when
+    /// the SDK reveals it). `None` until then, and `None` for every
+    /// non-background tool call. Required for the kill action — the
+    /// model's `KillShell` tool takes `bash_id` as input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_id: Option<String>,
+    /// Most recent stdout/stderr snapshot for a running background
+    /// shell, sourced from the model's `BashOutput` tool calls.
+    /// `None` until the first BashOutput lands. The panel renders
+    /// this verbatim; the chat surface ignores it (the BashOutput
+    /// tool call itself renders independently in the turn stream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_bash_output: Option<BashOutputSnapshot>,
+}
+
+/// Snapshot of a background shell's live output. Stamped on
+/// `ToolCall::latest_bash_output` whenever the bridge reports a
+/// `bash_output` event for the originating background-`Bash` call.
+/// Each snapshot replaces the previous one — we don't accumulate
+/// history here; the SDK already returns the cumulative output on
+/// each `BashOutput` invocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "camelCase")]
+pub struct BashOutputSnapshot {
+    /// Output text the SDK delivered for this snapshot. May contain
+    /// interleaved stdout and stderr — the SDK doesn't separate them
+    /// for background shells.
+    pub output: String,
+    /// Wall-clock timestamp (RFC 3339) at which the runtime received
+    /// the bridge's `bash_output` event. Drives an "updated Ns ago"
+    /// label on the panel row.
+    pub received_at: String,
+    /// Set when the underlying BashOutput / KillShell tool result was
+    /// flagged as an error. Lets the panel mark a row as failed even
+    /// when the originating Bash tool call is still pending (the
+    /// shell may have errored and been auto-reaped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Helper for `#[serde(skip_serializing_if)]` on plain `bool` fields
+/// where the default (`false`) shouldn't take wire space.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// One element of an assistant turn's ordered content stream.

@@ -482,6 +482,9 @@ impl GitHubCopilotAdapter {
                                     name: n,
                                     args: args.unwrap_or(serde_json::Value::Null),
                                     parent_call_id: None,
+                                    // GitHub Copilot CLI has no background-tool
+                                    // concept; every tool runs in the foreground.
+                                    is_background: false,
                                 })
                                 .await;
                         }

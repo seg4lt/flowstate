@@ -169,6 +169,14 @@ export function applyEventToTurns(
                   args: event.args,
                   status: "pending" as const,
                   parentCallId: event.parent_call_id,
+                  // Carry the background flag so the chat-side
+                  // tool-call card can render a "background" badge
+                  // and the panel can find the row from a freshly-
+                  // streamed event without waiting for the matching
+                  // `background_task_updated` to land. Defaulted
+                  // false for events from older daemons that don't
+                  // emit it.
+                  isBackground: event.is_background ?? false,
                 },
               ],
               blocks: [

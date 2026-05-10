@@ -23,7 +23,9 @@ use chrono::Utc;
 use tokio::sync::{Mutex, Notify, broadcast};
 use zenui_persistence::PersistenceService;
 use zenui_provider_api::{
-    AppSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock, FileChangeRecord,
+    AppSnapshot, BackgroundShellStatus, BackgroundTaskSnapshot, BackgroundTaskStatus,
+    BashOutputSnapshot, BootstrapPayload, ClientMessage, CommandCatalog, ContentBlock,
+    FileChangeRecord,
     ImageAttachment, PermissionDecision, PermissionMode, PlanRecord, PlanStatus, PollOutcome,
     ProviderAdapter, ProviderKind, ProviderSessionState, ProviderStatus, ProviderTurnEvent,
     ReasoningEffort, RewindConflictWire, RewindOutcomeWire, RewindUnavailableReason, RuntimeCall,
@@ -245,6 +247,36 @@ where it left off.\n\n=== Prior conversation (verbatim) ===\n\n",
     }
     out.push_str("=== End of prior conversation ===\n]\n\n");
     out
+}
+
+/// Build a short command excerpt for a background-task panel row from a
+/// `Bash { run_in_background: true }` tool's `args`. The full args
+/// remain on the `ToolCall`; this excerpt is what shows up in the
+/// panel row's headline so a row tells you "what shell" at a glance.
+///
+/// Falls back to `"(background task)"` when the args don't carry a
+/// recognizable `command` (defensive — the SDK always includes one,
+/// but a future schema tweak shouldn't blank the panel row).
+fn bg_command_excerpt(args: &serde_json::Value) -> String {
+    const MAX_LEN: usize = 80;
+    let cmd = args
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if cmd.is_empty() {
+        return "(background task)".to_string();
+    }
+    if cmd.len() <= MAX_LEN {
+        return cmd.to_string();
+    }
+    // Truncate on a char boundary, not a byte index — `Bash` commands
+    // can carry non-ASCII paths or quoted strings.
+    let mut end = MAX_LEN;
+    while !cmd.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &cmd[..end])
 }
 
 /// No-op `ConnectionObserver`. Hand this to a transport when you don't care
@@ -2734,7 +2766,9 @@ impl RuntimeCore {
                     name,
                     args,
                     parent_call_id,
+                    is_background,
                 } => {
+                    let started_at = chrono::Utc::now().to_rfc3339();
                     tool_calls.push(ToolCall {
                         call_id: call_id.clone(),
                         name: name.clone(),
@@ -2749,7 +2783,7 @@ impl RuntimeCore {
                         // haven't opted into the `tool_progress`
                         // feature flag get a reasonable "Bash ·
                         // 12s" if the UI ever unhides the timer.
-                        started_at: Some(chrono::Utc::now().to_rfc3339()),
+                        started_at: Some(started_at.clone()),
                         // Heartbeat tracker. None on creation; gets
                         // stamped by ProviderTurnEvent::ToolProgress
                         // events for providers that opt into
@@ -2758,6 +2792,12 @@ impl RuntimeCore {
                         // against wall time (≈30s threshold) while
                         // the call is still pending.
                         last_progress_at: None,
+                        is_background,
+                        // bash_id is unknown at start time — it
+                        // arrives on `BackgroundBashRegistered` once
+                        // the SDK acks the originating Bash call.
+                        bash_id: None,
+                        latest_bash_output: None,
                     });
                     blocks.push(ContentBlock::ToolCall {
                         call_id: call_id.clone(),
@@ -2777,11 +2817,30 @@ impl RuntimeCore {
                     self.publish(RuntimeEvent::ToolCallStarted {
                         session_id: sid.clone(),
                         turn_id: tid.clone(),
-                        call_id,
+                        call_id: call_id.clone(),
                         name,
-                        args,
+                        args: args.clone(),
                         parent_call_id,
+                        is_background,
                     });
+                    if is_background {
+                        // Derived projection for the background-tasks
+                        // panel. Source of truth stays on `ToolCall`
+                        // we just pushed; this event is purely a
+                        // convenience for the panel reducer.
+                        self.publish(RuntimeEvent::BackgroundTaskUpdated {
+                            session_id: sid.clone(),
+                            turn_id: tid.clone(),
+                            task: BackgroundTaskSnapshot {
+                                call_id,
+                                bash_id: None,
+                                command_excerpt: bg_command_excerpt(&args),
+                                started_at,
+                                status: BackgroundTaskStatus::Pending,
+                                latest_output: None,
+                            },
+                        });
+                    }
                 }
                 ProviderTurnEvent::ToolCallCompleted {
                     call_id,
@@ -2796,6 +2855,53 @@ impl RuntimeCore {
                         } else {
                             ToolCallStatus::Completed
                         };
+                        // Important: do NOT transition the panel row
+                        // here for background-Bash invocations. The
+                        // SDK resolves the originating `Bash` tool the
+                        // moment the shell is *started* (the result
+                        // text is the shell id, not the shell exit) —
+                        // the actual shell keeps running and may live
+                        // for many turns. The chat-side ToolCall is
+                        // legitimately Completed (its invocation
+                        // wrapper finished, matching Claude Code's
+                        // chat card behavior); the panel row stays
+                        // `Running` until either:
+                        //   - a `BashOutput` reports a non-running
+                        //     SDK status (handled in the
+                        //     `BackgroundBashOutput` arm),
+                        //   - or `KillShell` lands (handled in the
+                        //     `BackgroundBashKilled` arm).
+                        // If `error` was set on the *invocation*
+                        // itself (e.g. invalid command), the row
+                        // never reached Running, so we mark it Failed
+                        // explicitly rather than leaving it stuck on
+                        // Pending.
+                        if tc.is_background && error.is_some() {
+                            let snapshot = BackgroundTaskSnapshot {
+                                call_id: tc.call_id.clone(),
+                                bash_id: tc.bash_id.clone(),
+                                command_excerpt: bg_command_excerpt(&tc.args),
+                                started_at: tc
+                                    .started_at
+                                    .clone()
+                                    .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                                status: BackgroundTaskStatus::Failed,
+                                latest_output: tc.latest_bash_output.clone(),
+                            };
+                            self.publish(RuntimeEvent::ToolCallCompleted {
+                                session_id: sid.clone(),
+                                turn_id: tid.clone(),
+                                call_id,
+                                output,
+                                error,
+                            });
+                            self.publish(RuntimeEvent::BackgroundTaskUpdated {
+                                session_id: sid.clone(),
+                                turn_id: tid.clone(),
+                                task: snapshot,
+                            });
+                            continue;
+                        }
                     }
                     self.publish(RuntimeEvent::ToolCallCompleted {
                         session_id: sid.clone(),
@@ -2804,6 +2910,150 @@ impl RuntimeCore {
                         output,
                         error,
                     });
+                }
+                ProviderTurnEvent::BackgroundBashRegistered { call_id, bash_id } => {
+                    let mut snapshot: Option<BackgroundTaskSnapshot> = None;
+                    if let Some(tc) =
+                        tool_calls.iter_mut().find(|tc| tc.call_id == call_id)
+                    {
+                        // `bash_id` is `Some` when the bridge could
+                        // parse the SDK's shell id, `None` when it
+                        // couldn't. Either way the SDK has
+                        // acknowledged the call so the row leaves
+                        // Pending — the kill button just won't be
+                        // wireable for the no-bash_id row.
+                        if let Some(ref bid) = bash_id {
+                            tc.bash_id = Some(bid.clone());
+                        }
+                        snapshot = Some(BackgroundTaskSnapshot {
+                            call_id: tc.call_id.clone(),
+                            bash_id: bash_id.clone(),
+                            command_excerpt: bg_command_excerpt(&tc.args),
+                            started_at: tc
+                                .started_at
+                                .clone()
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                            status: BackgroundTaskStatus::Running,
+                            latest_output: tc.latest_bash_output.clone(),
+                        });
+                    } else {
+                        tracing::warn!(
+                            session_id = %sid,
+                            turn_id = %tid,
+                            call_id,
+                            "BackgroundBashRegistered for unknown call_id — bridge raced ahead of ToolCallStarted?"
+                        );
+                    }
+                    if let Some(task) = snapshot {
+                        self.publish(RuntimeEvent::BackgroundTaskUpdated {
+                            session_id: sid.clone(),
+                            turn_id: tid.clone(),
+                            task,
+                        });
+                    }
+                }
+                ProviderTurnEvent::BackgroundBashOutput {
+                    call_id,
+                    bash_id: _,
+                    output,
+                    error,
+                    shell_status,
+                } => {
+                    let snapshot_payload = BashOutputSnapshot {
+                        output,
+                        received_at: chrono::Utc::now().to_rfc3339(),
+                        error: error.clone(),
+                    };
+                    // Map the bridge-parsed shell status into the
+                    // panel row's terminal state. An invocation-level
+                    // BashOutput error overrides the parsed status —
+                    // if the SDK said the call itself errored, the
+                    // shell is in an unknown state and we surface
+                    // that as Failed.
+                    let row_status = if error.is_some() {
+                        BackgroundTaskStatus::Failed
+                    } else {
+                        match shell_status {
+                            BackgroundShellStatus::Running => {
+                                BackgroundTaskStatus::Running
+                            }
+                            BackgroundShellStatus::Completed => {
+                                BackgroundTaskStatus::Completed
+                            }
+                            BackgroundShellStatus::Failed => {
+                                BackgroundTaskStatus::Failed
+                            }
+                            BackgroundShellStatus::Killed => {
+                                BackgroundTaskStatus::Killed
+                            }
+                        }
+                    };
+                    let mut snapshot: Option<BackgroundTaskSnapshot> = None;
+                    if let Some(tc) =
+                        tool_calls.iter_mut().find(|tc| tc.call_id == call_id)
+                    {
+                        tc.latest_bash_output = Some(snapshot_payload.clone());
+                        snapshot = Some(BackgroundTaskSnapshot {
+                            call_id: tc.call_id.clone(),
+                            bash_id: tc.bash_id.clone(),
+                            command_excerpt: bg_command_excerpt(&tc.args),
+                            started_at: tc
+                                .started_at
+                                .clone()
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                            status: row_status,
+                            latest_output: Some(snapshot_payload),
+                        });
+                    }
+                    if let Some(task) = snapshot {
+                        self.publish(RuntimeEvent::BackgroundTaskUpdated {
+                            session_id: sid.clone(),
+                            turn_id: tid.clone(),
+                            task,
+                        });
+                    }
+                }
+                ProviderTurnEvent::BackgroundBashKilled {
+                    call_id,
+                    bash_id: _,
+                    output,
+                    error,
+                } => {
+                    let snapshot_payload = BashOutputSnapshot {
+                        output,
+                        received_at: chrono::Utc::now().to_rfc3339(),
+                        error: error.clone(),
+                    };
+                    let mut snapshot: Option<BackgroundTaskSnapshot> = None;
+                    if let Some(tc) =
+                        tool_calls.iter_mut().find(|tc| tc.call_id == call_id)
+                    {
+                        tc.latest_bash_output = Some(snapshot_payload.clone());
+                        // Mark the originating ToolCall as completed
+                        // too — the SDK won't deliver another
+                        // tool_result for the originating Bash once
+                        // it's killed. Without this the chat-side
+                        // Bash card stays "pending" forever.
+                        tc.status = ToolCallStatus::Completed;
+                        snapshot = Some(BackgroundTaskSnapshot {
+                            call_id: tc.call_id.clone(),
+                            bash_id: tc.bash_id.clone(),
+                            command_excerpt: bg_command_excerpt(&tc.args),
+                            started_at: tc
+                                .started_at
+                                .clone()
+                                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                            status: BackgroundTaskStatus::Killed,
+                            latest_output: Some(snapshot_payload),
+                        });
+                    }
+                    if let Some(task) = snapshot {
+                        self.publish(RuntimeEvent::BackgroundTaskUpdated {
+                            session_id: sid.clone(),
+                            turn_id: tid.clone(),
+                            task,
+                        });
+                    }
                 }
                 ProviderTurnEvent::ToolProgress {
                     call_id,
@@ -4988,6 +5238,7 @@ mod tests {
                     name: "search".to_string(),
                     args: serde_json::json!({"q": "x"}),
                     parent_call_id: None,
+                    is_background: false,
                 })
                 .await;
             events
@@ -5008,6 +5259,7 @@ mod tests {
                     name: "edit".to_string(),
                     args: serde_json::json!({"path": "f"}),
                     parent_call_id: None,
+                    is_background: false,
                 })
                 .await;
             events
@@ -5078,6 +5330,7 @@ mod tests {
                     call_id: "stuck-call".to_string(),
                     name: "search".to_string(),
                     args: serde_json::json!({}),
+                    is_background: false,
                     parent_call_id: None,
                 })
                 .await;
@@ -5522,6 +5775,7 @@ mod tests {
                     call_id: "tool-1".to_string(),
                     name: "search".to_string(),
                     args: serde_json::json!({"q": "z"}),
+                    is_background: false,
                     parent_call_id: None,
                 })
                 .await;
@@ -6629,6 +6883,7 @@ mod tests {
                         "reason": "polling the build",
                     }),
                     parent_call_id: None,
+                    is_background: false,
                 })
                 .await;
             events
@@ -6754,6 +7009,7 @@ mod tests {
                         name: "Read".to_string(),
                         args: serde_json::json!({"file_path": "/tmp/x"}),
                         parent_call_id: None,
+                        is_background: false,
                     })
                     .await;
                 events

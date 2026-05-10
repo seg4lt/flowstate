@@ -764,6 +764,9 @@ impl ClaudeSdkAdapter {
                     elapsed_time_seconds: _elapsed_time_seconds,
                     occurred_at,
                     call_ids,
+                    is_background,
+                    bash_id,
+                    shell_status,
                 } => {
                     // Log every non-delta stream event so "stuck"
                     // bugs are diagnosable from the log alone: if the
@@ -1052,6 +1055,9 @@ impl ClaudeSdkAdapter {
                                 raw,
                                 nested_event,
                                 model,
+                                is_background,
+                                bash_id,
+                                shell_status,
                             )
                             .await;
                         }

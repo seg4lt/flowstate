@@ -103,7 +103,87 @@ startedAt?: string,
  * heartbeats — the UI then falls back to the session-wide
  * stuck detector.
  */
-lastProgressAt?: string, };
+lastProgressAt?: string, 
+/**
+ * True when the model invoked this tool with
+ * `run_in_background: true` (Claude SDK only today). The host
+ * indexes background tool calls separately so the
+ * background-task panel can list them across turns. `false` for
+ * every other tool call. Defaulted on deserialization so older
+ * persisted turns load cleanly.
+ */
+isBackground: boolean, 
+/**
+ * SDK-issued shell identifier for a background-Bash tool call,
+ * once the originating tool result has resolved (which is when
+ * the SDK reveals it). `None` until then, and `None` for every
+ * non-background tool call. Required for the kill action — the
+ * model's `KillShell` tool takes `bash_id` as input.
+ */
+bashId?: string, 
+/**
+ * Most recent stdout/stderr snapshot for a running background
+ * shell, sourced from the model's `BashOutput` tool calls.
+ * `None` until the first BashOutput lands. The panel renders
+ * this verbatim; the chat surface ignores it (the BashOutput
+ * tool call itself renders independently in the turn stream).
+ */
+latestBashOutput?: BashOutputSnapshot, };
+
+export type BashOutputSnapshot = { 
+/**
+ * Output text the SDK delivered for this snapshot. May contain
+ * interleaved stdout and stderr — the SDK doesn't separate them
+ * for background shells.
+ */
+output: string, 
+/**
+ * Wall-clock timestamp (RFC 3339) at which the runtime received
+ * the bridge's `bash_output` event. Drives an "updated Ns ago"
+ * label on the panel row.
+ */
+receivedAt: string, 
+/**
+ * Set when the underlying BashOutput / KillShell tool result was
+ * flagged as an error. Lets the panel mark a row as failed even
+ * when the originating Bash tool call is still pending (the
+ * shell may have errored and been auto-reaped).
+ */
+error?: string, };
+
+export type BackgroundTaskStatus = "pending" | "running" | "completed" | "failed" | "killed";
+
+export type BackgroundTaskSnapshot = { 
+/**
+ * Originating `Bash { run_in_background: true }` tool_use
+ * call_id. Stable for the lifetime of the row.
+ */
+callId: string, 
+/**
+ * SDK-issued shell id, once the originating Bash tool result has
+ * resolved. `None` for the brief window between the model
+ * requesting the background tool and the SDK acknowledging it.
+ */
+bashId?: string, 
+/**
+ * Short excerpt of the command the model invoked. Truncated to
+ * keep panel rows tidy; the full args remain on the ToolCall.
+ */
+commandExcerpt: string, 
+/**
+ * Wall-clock timestamp (RFC 3339) the originating tool started.
+ */
+startedAt: string, 
+/**
+ * Lifecycle phase of the row.
+ */
+status: BackgroundTaskStatus, 
+/**
+ * Latest stdout/stderr snapshot the SDK delivered via a
+ * `BashOutput` invocation. `None` until the model first asks
+ * for output.
+ */
+latestOutput?: BashOutputSnapshot, };
 
 export type AgentUsage = { 
 /**
@@ -498,7 +578,18 @@ export type RewindOutcomeWire = { "kind": "applied", paths_restored: Array<strin
 
 export type CheckpointSettings = { globalEnabled: boolean, };
 
-export type RuntimeEvent = { "type": "runtime_ready", message: string, } | { "type": "daemon_shutting_down", reason: string, } | { "type": "session_started", session: SessionSummary, } | { "type": "turn_started", session_id: string, turn: TurnRecord, } | { "type": "content_delta", session_id: string, turn_id: string, delta: string, accumulated_output: string, } | { "type": "reasoning_delta", session_id: string, turn_id: string, delta: string, } | { "type": "tool_call_started", session_id: string, turn_id: string, call_id: string, name: string, args: JsonValue, parent_call_id?: string, } | { "type": "tool_call_completed", session_id: string, turn_id: string, call_id: string, output: string, error?: string, } | { "type": "tool_progress", session_id: string, turn_id: string, call_id: string, tool_name: string, parent_call_id?: string, occurred_at: string, } | { "type": "turn_completed", session_id: string, session: SessionSummary, turn: TurnRecord, } | { "type": "session_interrupted", session: SessionSummary, message: string, } | { "type": "session_deleted", session_id: string, } | { "type": "permission_requested", session_id: string, turn_id: string, request_id: string, tool_name: string, input: JsonValue, suggested: PermissionDecision, } | { "type": "user_question_asked", session_id: string, turn_id: string, request_id: string, questions: Array<UserInputQuestion>, } | { "type": "file_changed", session_id: string, turn_id: string, call_id: string, path: string, operation: FileOperation, before?: string, after?: string, } | { "type": "checkpoint_captured", session_id: string, turn_id: string, } | { "type": "checkpoint_enablement_changed", settings: CheckpointSettings, } | { "type": "subagent_started", session_id: string, turn_id: string, parent_call_id: string, agent_id: string, agent_type: string, prompt: string, model?: string, } | { "type": "subagent_event", session_id: string, turn_id: string, agent_id: string, event: JsonValue, } | { "type": "subagent_completed", session_id: string, turn_id: string, agent_id: string, output: string, error?: string, } | { "type": "subagent_model_observed", session_id: string, turn_id: string, agent_id: string, model: string, } | { "type": "plan_proposed", session_id: string, turn_id: string, plan_id: string, title: string, steps: Array<PlanStep>, raw: string, } | { "type": "compact_updated", session_id: string, turn_id: string, trigger: CompactTrigger, pre_tokens?: number, post_tokens?: number, duration_ms?: number, summary?: string, } | { "type": "memory_recalled", session_id: string, turn_id: string, mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, } | { "type": "tool_use_summary", session_id: string, turn_id: string, summary: string, call_ids: Array<string>, } | { "type": "turn_status_changed", session_id: string, turn_id: string, phase: TurnPhase, } | { "type": "turn_usage_updated", session_id: string, turn_id: string, usage: TokenUsage, } | { "type": "turn_retrying", session_id: string, turn_id: string, attempt: number, max_retries: number, retry_delay_ms: number, error_status?: number, error: string, } | { "type": "prompt_suggested", session_id: string, turn_id: string, suggestion: string, } | { "type": "error", message: string, } | { "type": "info", message: string, } | { "type": "provider_models_updated", provider: ProviderKind, models: Array<ProviderModel>, } | { "type": "provider_health_updated", status: ProviderStatus, } | { "type": "rate_limit_updated", info: RateLimitInfo, } | { "type": "project_created", project: ProjectRecord, } | { "type": "project_deleted", project_id: string, reassigned_session_ids: Array<string>, } | { "type": "session_project_assigned", session_id: string, project_id?: string, } | { "type": "session_model_updated", session_id: string, model: string, } | { "type": "session_provider_updated", session_id: string, provider: ProviderKind, model?: string, } | { "type": "session_archived", session_id: string, } | { "type": "session_unarchived", session: SessionSummary, } | { "type": "session_command_catalog_updated", session_id: string, catalog: CommandCatalog, } | { "type": "session_linked", from_session_id: string, to_session_id: string, reason: SessionLinkReason, } | { "type": "peer_message_injected", session_id: string, from_session_id: string, message: string, } | { "type": "wakeup_scheduled", session_id: string, wakeup_id: string, fire_at_unix: number, reason?: string, } | { "type": "wakeup_fired", session_id: string, wakeup_id: string, } | { "type": "thread_goal_updated", session_id: string, goal: ThreadGoal, } | { "type": "thread_goal_cleared", session_id: string, };
+export type RuntimeEvent = { "type": "runtime_ready", message: string, } | { "type": "daemon_shutting_down", reason: string, } | { "type": "session_started", session: SessionSummary, } | { "type": "turn_started", session_id: string, turn: TurnRecord, } | { "type": "content_delta", session_id: string, turn_id: string, delta: string, accumulated_output: string, } | { "type": "reasoning_delta", session_id: string, turn_id: string, delta: string, } | { "type": "tool_call_started", session_id: string, turn_id: string, call_id: string, name: string, args: JsonValue, parent_call_id?: string, 
+/**
+ * True when the model invoked this tool with
+ * `run_in_background: true` (Claude SDK only). Lets the
+ * frontend chat surface decorate the matching tool-call
+ * card with a "background" badge in the same render pass
+ * that creates it, rather than waiting for the matching
+ * `BackgroundTaskUpdated` event to arrive on a separate
+ * reducer pass. Defaulted on deserialization so older
+ * persisted streams replay cleanly.
+ */
+is_background: boolean, } | { "type": "tool_call_completed", session_id: string, turn_id: string, call_id: string, output: string, error?: string, } | { "type": "tool_progress", session_id: string, turn_id: string, call_id: string, tool_name: string, parent_call_id?: string, occurred_at: string, } | { "type": "turn_completed", session_id: string, session: SessionSummary, turn: TurnRecord, } | { "type": "session_interrupted", session: SessionSummary, message: string, } | { "type": "session_deleted", session_id: string, } | { "type": "permission_requested", session_id: string, turn_id: string, request_id: string, tool_name: string, input: JsonValue, suggested: PermissionDecision, } | { "type": "user_question_asked", session_id: string, turn_id: string, request_id: string, questions: Array<UserInputQuestion>, } | { "type": "file_changed", session_id: string, turn_id: string, call_id: string, path: string, operation: FileOperation, before?: string, after?: string, } | { "type": "checkpoint_captured", session_id: string, turn_id: string, } | { "type": "checkpoint_enablement_changed", settings: CheckpointSettings, } | { "type": "subagent_started", session_id: string, turn_id: string, parent_call_id: string, agent_id: string, agent_type: string, prompt: string, model?: string, } | { "type": "subagent_event", session_id: string, turn_id: string, agent_id: string, event: JsonValue, } | { "type": "subagent_completed", session_id: string, turn_id: string, agent_id: string, output: string, error?: string, } | { "type": "subagent_model_observed", session_id: string, turn_id: string, agent_id: string, model: string, } | { "type": "plan_proposed", session_id: string, turn_id: string, plan_id: string, title: string, steps: Array<PlanStep>, raw: string, } | { "type": "compact_updated", session_id: string, turn_id: string, trigger: CompactTrigger, pre_tokens?: number, post_tokens?: number, duration_ms?: number, summary?: string, } | { "type": "memory_recalled", session_id: string, turn_id: string, mode: MemoryRecallMode, memories: Array<MemoryRecallItem>, } | { "type": "tool_use_summary", session_id: string, turn_id: string, summary: string, call_ids: Array<string>, } | { "type": "turn_status_changed", session_id: string, turn_id: string, phase: TurnPhase, } | { "type": "turn_usage_updated", session_id: string, turn_id: string, usage: TokenUsage, } | { "type": "turn_retrying", session_id: string, turn_id: string, attempt: number, max_retries: number, retry_delay_ms: number, error_status?: number, error: string, } | { "type": "prompt_suggested", session_id: string, turn_id: string, suggestion: string, } | { "type": "error", message: string, } | { "type": "info", message: string, } | { "type": "provider_models_updated", provider: ProviderKind, models: Array<ProviderModel>, } | { "type": "provider_health_updated", status: ProviderStatus, } | { "type": "rate_limit_updated", info: RateLimitInfo, } | { "type": "project_created", project: ProjectRecord, } | { "type": "project_deleted", project_id: string, reassigned_session_ids: Array<string>, } | { "type": "session_project_assigned", session_id: string, project_id?: string, } | { "type": "session_model_updated", session_id: string, model: string, } | { "type": "session_provider_updated", session_id: string, provider: ProviderKind, model?: string, } | { "type": "session_archived", session_id: string, } | { "type": "session_unarchived", session: SessionSummary, } | { "type": "session_command_catalog_updated", session_id: string, catalog: CommandCatalog, } | { "type": "session_linked", from_session_id: string, to_session_id: string, reason: SessionLinkReason, } | { "type": "peer_message_injected", session_id: string, from_session_id: string, message: string, } | { "type": "wakeup_scheduled", session_id: string, wakeup_id: string, fire_at_unix: number, reason?: string, } | { "type": "wakeup_fired", session_id: string, wakeup_id: string, } | { "type": "thread_goal_updated", session_id: string, goal: ThreadGoal, } | { "type": "thread_goal_cleared", session_id: string, } | { "type": "background_task_updated", session_id: string, turn_id: string, task: BackgroundTaskSnapshot, };
 
 export type ClientMessage = { "type": "ping" } | { "type": "load_snapshot" } | { "type": "load_session", session_id: string, 
 /**
