@@ -14,7 +14,8 @@ import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { rememberPickedModel } from "@/lib/model-settings";
 import { readDefaultModel } from "@/lib/defaults-settings";
 import { FOCUS_CHAT_INPUT_EVENT } from "@/lib/keyboard-shortcuts";
-import { ALL_PROVIDERS, PROVIDER_COLORS } from "@/lib/providers";
+import { ALL_PROVIDERS } from "@/lib/providers";
+import { ProviderIcon, PROVIDER_ICON_COLOR_CLASS } from "./provider-icon";
 import { toast } from "@/hooks/use-toast";
 import type { ProviderKind } from "@/lib/types";
 
@@ -125,8 +126,9 @@ export function ProviderSelector({
           {showSpinner ? (
             <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
           ) : (
-            <span
-              className={`inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[provider]}`}
+            <ProviderIcon
+              kind={provider}
+              className={`h-3.5 w-3.5 shrink-0 ${PROVIDER_ICON_COLOR_CLASS[provider]}`}
             />
           )}
           {currentLabel}
@@ -183,9 +185,12 @@ export function ProviderSelector({
                   ) : (
                     <span className="mr-2 w-3" />
                   )}
-                  <span
-                    className={`mr-2 inline-block h-2 w-2 shrink-0 rounded-full ${
-                      isReady ? PROVIDER_COLORS[kind] : "bg-muted-foreground/30"
+                  <ProviderIcon
+                    kind={kind}
+                    className={`mr-2 h-3.5 w-3.5 shrink-0 ${
+                      isReady
+                        ? PROVIDER_ICON_COLOR_CLASS[kind]
+                        : "text-muted-foreground/40"
                     }`}
                   />
                   <span className="flex-1 truncate">{label}</span>

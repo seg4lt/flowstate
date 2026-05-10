@@ -98,10 +98,13 @@ import type {
 } from "@/lib/types";
 
 import {
-  PROVIDER_COLORS,
   PROVIDER_KINDS as PROVIDER_ORDER,
   PROVIDER_META,
 } from "@/lib/providers";
+import {
+  ProviderIcon,
+  PROVIDER_ICON_COLOR_CLASS,
+} from "@/components/chat/provider-icon";
 
 const PROVIDER_LABELS: Record<ProviderKind, string> = Object.fromEntries(
   PROVIDER_ORDER.map((k) => [k, PROVIDER_META[k].label]),
@@ -866,8 +869,9 @@ function DefaultModelRow() {
                 key={kind}
                 className="flex items-center gap-3"
               >
-                <span
-                  className={`inline-block h-2 w-2 shrink-0 rounded-full ${PROVIDER_COLORS[kind]}`}
+                <ProviderIcon
+                  kind={kind}
+                  className={`h-3.5 w-3.5 shrink-0 ${PROVIDER_ICON_COLOR_CLASS[kind]}`}
                 />
                 <span className="min-w-0 flex-1 truncate text-xs font-medium">
                   {PROVIDER_LABELS[kind]}
@@ -1001,19 +1005,20 @@ function ProviderRow({
         !enabled ? "opacity-60" : ""
       }`}
     >
-      <span
+      <ProviderIcon
+        kind={kind}
         // Colored when the provider is actually usable — enabled
         // and has at least one model in the catalog. We deliberately
         // don't gate on `provider.status === "ready"` because that's
         // a snapshot of the *last* health probe, which may be
         // transiently "warning" while a re-probe is in flight after
         // a Refresh click or a fresh-from-cache-bust startup. A
-        // gray dot next to "4 models" is just confusing — the
+        // gray icon next to "4 models" is just confusing — the
         // provider is plainly working.
-        className={`inline-block h-2 w-2 shrink-0 rounded-full ${
+        className={`h-4 w-4 shrink-0 ${
           enabled && modelCount > 0
-            ? PROVIDER_COLORS[kind]
-            : "bg-muted-foreground/30"
+            ? PROVIDER_ICON_COLOR_CLASS[kind]
+            : "text-muted-foreground/40"
         }`}
       />
       <div className="min-w-0 flex-1">
