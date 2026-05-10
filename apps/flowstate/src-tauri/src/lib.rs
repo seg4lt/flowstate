@@ -179,13 +179,25 @@ async fn read_file_as_base64(path: String) -> Result<DroppedFilePayload, String>
                 DROP_MAX_BYTES, size
             ));
         }
+        // Decide the media type *before* reading the bytes. The
+        // frontend already filters non-media paths via its own
+        // extension allowlist (`MEDIA_FILE_EXTENSIONS` in
+        // `chat-input.tsx`), but enforcing the same contract here is
+        // cheap and protects future callers from accidentally
+        // round-tripping a 50 MB file just to discover it's not media.
+        // Returning an error here is safe — the chat composer's
+        // `catch` branch in `handleDroppedPaths` already routes
+        // failures to `appendPathMention`.
+        let media_type = match media_type_for_extension(abs) {
+            Some(m) => m,
+            None => return Err("unsupported file type for inline attachment".to_string()),
+        };
         let bytes = std::fs::read(abs).map_err(|e| format!("read: {e}"))?;
         let name = abs
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("file")
             .to_string();
-        let media_type = media_type_for_extension(abs).unwrap_or_default();
         Ok(DroppedFilePayload {
             name,
             media_type,

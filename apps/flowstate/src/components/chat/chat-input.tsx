@@ -147,6 +147,46 @@ const ALLOWED_IMAGE_MEDIA_TYPES = new Set([
  *  `Read` tool rather than us bundling the bytes. */
 const MEDIA_MIME_PREFIXES = ["image/", "audio/", "video/"];
 
+/** File-extension allowlist used as a *pre-flight* gate before the
+ *  drag-and-drop IPC. Mirrors the Rust-side `media_type_for_extension`
+ *  matcher in `src-tauri/src/lib.rs` exactly — keep them in sync.
+ *
+ *  Why this exists: without a TS-side check, dropping a 30 MB JSON
+ *  file used to call `read_file_as_base64`, which read the whole file
+ *  into memory, base64-encoded it (~40 MB string), and shipped it
+ *  across the Tauri IPC bridge — only for the frontend to discover
+ *  the MIME type was empty, throw the payload away, and fall back to
+ *  inserting the path as an `@file` mention. The wasted round-trip
+ *  froze the UI for several seconds on large files. Filtering by
+ *  extension up front means non-media drops are O(string) — no disk
+ *  read, no IPC, instant chip. */
+const MEDIA_FILE_EXTENSIONS = new Set([
+  // Images.
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  // Audio.
+  "mp3",
+  "wav",
+  "ogg",
+  "oga",
+  "m4a",
+  "flac",
+  "aac",
+  "opus",
+  // Video. `webm` belongs to both audio and video on the Rust side
+  // (the matcher routes via `is_probably_audio`); listed once here
+  // since we only care whether to call `read_file_as_base64` at all.
+  "mp4",
+  "m4v",
+  "mov",
+  "webm",
+  "mkv",
+  "avi",
+]);
+
 /** Stable empty-array sentinel for the `@mention` autocomplete's
  *  ranking memo: keeps the dependency identity steady when the
  *  query hasn't returned yet, so we don't re-rank-and-rerender on
@@ -176,6 +216,26 @@ function autosizeTextarea(el: HTMLTextAreaElement, hardCap = 200) {
 /** Does `mediaType` classify as drag-and-drop media (image/audio/video)? */
 function isMediaMimeType(mediaType: string): boolean {
   return MEDIA_MIME_PREFIXES.some((prefix) => mediaType.startsWith(prefix));
+}
+
+/** Pull the lowercase extension off `absPath`, or "" if there isn't one.
+ *  Handles both POSIX and Windows separators because Tauri hands us the
+ *  OS-native absolute path. A leading `.` (e.g. `.gitignore`) is *not*
+ *  treated as an extension — `dot > 0` enforces that. */
+function extensionOf(absPath: string): string {
+  const slash = Math.max(absPath.lastIndexOf("/"), absPath.lastIndexOf("\\"));
+  const base = slash >= 0 ? absPath.slice(slash + 1) : absPath;
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot + 1).toLowerCase() : "";
+}
+
+/** Pre-flight gate for `handleDroppedPaths`: does this path's extension
+ *  look like something `read_file_as_base64` will actually inline? If
+ *  not, we route straight to the `@file` mention flow without paying
+ *  for the IPC round-trip. The Rust side enforces the same allowlist
+ *  as a defense-in-depth check. */
+function isLikelyMediaPath(absPath: string): boolean {
+  return MEDIA_FILE_EXTENSIONS.has(extensionOf(absPath));
 }
 
 function suggestedFilename(mediaType: string): string {
@@ -841,6 +901,15 @@ export function ChatInput({
   async function handleDroppedPaths(paths: string[]) {
     if (providerDisabled || archived || disabled) return;
     for (const absPath of paths) {
+      // Pre-flight: only call `read_file_as_base64` for paths whose
+      // extension is on the media allowlist. Non-media drops (JSON,
+      // source files, PDFs, etc.) skip the IPC round-trip entirely
+      // and become `@file` mentions immediately — see the
+      // `MEDIA_FILE_EXTENSIONS` doc-comment for the rationale.
+      if (!isLikelyMediaPath(absPath)) {
+        appendPathMention(absPath);
+        continue;
+      }
       try {
         const payload = await readFileAsBase64(absPath);
         if (payload.mediaType && isMediaMimeType(payload.mediaType)) {
