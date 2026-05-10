@@ -273,7 +273,7 @@ export function TerminalDock() {
   // below so hidden tabs don't hold a GPU context.
   return (
     <div
-      className="relative z-20 shrink-0 flex-col border-t border-border bg-[#0f0f10] text-xs"
+      className="relative z-20 shrink-0 flex-col border-t border-border bg-background text-xs"
       style={{
         height: state.dockHeight,
         display: dockOpen ? "flex" : "none",

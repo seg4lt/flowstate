@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -14,6 +14,28 @@ import {
   writePty,
   type PtyId,
 } from "@/lib/api";
+import { useTheme } from "@/hooks/use-theme";
+
+// Hex equivalents of the OKLCH tokens in src/index.css. Kept here as
+// concrete color strings because xterm.js does not re-resolve CSS
+// variables — it parses the values once and feeds them to the WebGL
+// texture atlas / DOM renderer.
+const TERMINAL_THEMES: Record<"light" | "dark", ITheme> = {
+  dark: {
+    background: "#252525", // sRGB equivalent of oklch(0.145 0 0) = --background.dark
+    foreground: "#fafafa", // ~ oklch(0.985 0 0)
+    cursor: "#fafafa",
+    cursorAccent: "#252525",
+    selectionBackground: "#3a3a3d",
+  },
+  light: {
+    background: "#ffffff", // oklch(1 0 0)
+    foreground: "#252525", // ~ oklch(0.145 0 0)
+    cursor: "#252525",
+    cursorAccent: "#ffffff",
+    selectionBackground: "#d4d4d4", // ~ oklch(0.85 0 0), readable on white
+  },
+};
 
 interface TerminalTabProps {
   /** Stable tab id from the store — used only for keying. */
@@ -52,12 +74,49 @@ export function TerminalTab({
   const onTitleChangeRef = React.useRef(onTitleChange);
   const onExitRef = React.useRef(onExit);
 
+  const { resolvedTheme } = useTheme();
+  // Track the active theme via a ref so the mount effect can read the
+  // current value at construction time without taking a dependency on it
+  // (which would tear down the PTY on every theme flip).
+  const themeRef = React.useRef(resolvedTheme);
+  themeRef.current = resolvedTheme;
+
   React.useEffect(() => {
     onTitleChangeRef.current = onTitleChange;
   }, [onTitleChange]);
   React.useEffect(() => {
     onExitRef.current = onExit;
   }, [onExit]);
+
+  // Live-update the xterm theme when the app theme flips. Setting
+  // `term.options.theme` is the supported xterm.js v6 path for runtime
+  // theme changes — both the WebGL renderer and the DOM fallback re-paint
+  // on the next frame.
+  React.useEffect(() => {
+    const term = termRef.current;
+    if (!term) return;
+    term.options.theme = TERMINAL_THEMES[resolvedTheme];
+  }, [resolvedTheme]);
+
+  // Refit only when the host actually has non-zero dimensions. When the
+  // OS minimises the window the host <div> collapses to ~0×0 and a naive
+  // `fit.fit()` would compute a tiny cols/rows, push it through
+  // `term.onResize → resizePty` (SIGWINCH the child at the bogus size),
+  // and corrupt the buffer on restore. Skipping zero-sized fits leaves
+  // the previous good size in place until the host has real dimensions
+  // again.
+  const safeFit = React.useCallback(() => {
+    const host = hostRef.current;
+    const fit = fitRef.current;
+    if (!host || !fit) return;
+    if (!host.isConnected) return;
+    if (host.clientWidth <= 0 || host.clientHeight <= 0) return;
+    try {
+      fit.fit();
+    } catch {
+      // FitAddon can still throw if a measurement races with layout.
+    }
+  }, []);
 
   // One-time setup: create the xterm instance, open it on the host
   // div, spawn the pty, wire I/O, dispose on unmount. WebGL is
@@ -76,13 +135,7 @@ export function TerminalTab({
       lineHeight: 1.2,
       scrollback: 5000,
       allowTransparency: false,
-      theme: {
-        background: "#0f0f10",
-        foreground: "#e5e5e6",
-        cursor: "#e5e5e6",
-        cursorAccent: "#0f0f10",
-        selectionBackground: "#3a3a3d",
-      },
+      theme: TERMINAL_THEMES[themeRef.current],
     });
     termRef.current = term;
 
@@ -164,11 +217,7 @@ export function TerminalTab({
     // cols/rows to hand to the pty.
     const rafId = requestAnimationFrame(async () => {
       if (disposed) return;
-      try {
-        fit.fit();
-      } catch {
-        // host might be zero-sized (dock still animating in)
-      }
+      safeFit();
       const cols = term.cols || 80;
       const rows = term.rows || 24;
       try {
@@ -255,11 +304,11 @@ export function TerminalTab({
       if (pendingRaf != null) cancelAnimationFrame(pendingRaf);
       pendingRaf = requestAnimationFrame(() => {
         pendingRaf = null;
-        try {
-          fit.fit();
-        } catch {
-          // ignore — may fire with zero size during hide animation
-        }
+        // safeFit skips firings where the host is hidden / 0×0 (e.g.
+        // during the OS minimise → restore animation), which would
+        // otherwise SIGWINCH the PTY at a bogus size and corrupt the
+        // visible buffer on restore.
+        safeFit();
       });
     });
     observer.observe(host);
@@ -281,7 +330,7 @@ export function TerminalTab({
       term.dispose();
       termRef.current = null;
     };
-  }, [cwd]);
+  }, [cwd, safeFit]);
 
   // Attach/dispose the WebGL renderer when visibility flips. Hidden
   // tabs drop the GPU context to free texture atlas memory; the
@@ -309,11 +358,7 @@ export function TerminalTab({
         }
       }
       const handle = requestAnimationFrame(() => {
-        try {
-          fitRef.current?.fit();
-        } catch {
-          // ignore
-        }
+        safeFit();
         term.focus();
       });
       return () => cancelAnimationFrame(handle);
@@ -322,7 +367,7 @@ export function TerminalTab({
       webglRef.current = null;
       return undefined;
     }
-  }, [isVisible]);
+  }, [isVisible, safeFit]);
 
   return (
     <div
