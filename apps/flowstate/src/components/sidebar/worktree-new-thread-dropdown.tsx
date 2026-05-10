@@ -19,6 +19,8 @@ import {
 import { CreateWorktreeDialog } from "@/components/project/create-worktree-dialog";
 import { samePath } from "@/lib/worktree-utils";
 import { toast } from "@/hooks/use-toast";
+import { useDefaultProvider } from "@/hooks/use-default-provider";
+import { startThreadOnProject } from "@/lib/start-thread";
 import { useSuppressSidebarDrag } from "./drag-suppression";
 
 interface WorktreeAwareNewThreadProps {
@@ -28,17 +30,22 @@ interface WorktreeAwareNewThreadProps {
 
 /**
  * Sidebar "new thread" pencil button. Provider selection has been
- * deferred to the chat view's toolbar, so this dropdown's only job
- * now is to pick *where* the new thread runs:
+ * deferred to the chat view's toolbar (see commit 83c9f97 for the
+ * mid-session swap support), so this dropdown's only job now is to
+ * pick *where* the new thread runs:
  *
  *   - On the main project's directory (the default).
  *   - On a specific git worktree (when the project has more than one).
  *   - On a brand-new worktree (via the create-worktree dialog).
  *
  * After the pick we provision the worktree-as-project if needed and
- * navigate straight to `/chat/draft/$projectId` — no `start_session`
- * RPC fires here. The chat view materializes the real session on the
- * user's first message send.
+ * eagerly call `start_session` (via `startThreadOnProject`) to spawn
+ * the real thread — same flow ⌘N uses. The session row appears in
+ * the sidebar instantly and ChatView mounts on the real
+ * `/chat/$sessionId` route, so the daemon's first stream of
+ * permission / tool-call events lands on a fully-mounted view
+ * instead of racing the deferred-create navigation that the old
+ * `/chat/draft/$projectId` path suffered.
  */
 export function WorktreeAwareNewThread({
   projectId,
@@ -55,19 +62,38 @@ export function WorktreeAwareNewThread({
   );
 }
 
-// ── No-path projects: bare button straight to draft route ──────────
+// ── No-path projects: bare button that eager-creates a thread ──────
+//
+// Folder-less and path-less projects skip the worktree dropdown
+// entirely (no worktrees to enumerate). Click-to-eager-create mirrors
+// the ⌘N flow: spawn the session with the user's default provider,
+// then navigate straight into `/chat/$sessionId`.
 
 function DirectDraftButton({ projectId }: { projectId: string }) {
   const navigate = useNavigate();
+  const { send } = useApp();
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
+  const notify = React.useCallback((message: string) => {
+    toast({ title: "New thread", description: message, duration: 4000 });
+  }, []);
   return (
     <button
       type="button"
       className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
       onClick={(e) => {
         e.stopPropagation();
-        void navigate({
-          to: "/chat/draft/$projectId",
-          params: { projectId },
+        void startThreadOnProject({
+          projectId,
+          defaultProvider,
+          defaultProviderLoaded,
+          send,
+          navigate: (sessionId) =>
+            navigate({
+              to: "/chat/$sessionId",
+              params: { sessionId },
+            }),
+          notify,
         });
       }}
       aria-label="New thread"
@@ -93,9 +119,20 @@ function WorktreeDropdownInner({
   // focused sortable project row and start a keyboard drag.
   useSuppressSidebarDrag(createWtOpen);
 
-  const { state, createProject, linkProjectWorktree } = useApp();
+  const { state, send, createProject, linkProjectWorktree } = useApp();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
+  const notify = React.useCallback((message: string) => {
+    toast({ title: "New thread", description: message, duration: 4000 });
+  }, []);
+  const navigateToSession = React.useCallback(
+    (sessionId: string) => {
+      navigate({ to: "/chat/$sessionId", params: { sessionId } });
+    },
+    [navigate],
+  );
 
   // Fire-and-forget: the ChatView we're about to navigate into reads
   // the cached branch for its project path. Poking the cache here means
@@ -125,11 +162,14 @@ function WorktreeDropdownInner({
   });
   const currentBranch = branchQuery.data ?? "";
 
-  // ── Navigate to draft on a specific worktree ──────────────────
+  // ── Eager-create a thread on a specific worktree ──────────────
   // Provisions the worktree-as-project record if needed (so its
-  // threads run with cwd = worktree folder) and then navigates to
-  // the draft route on that project.
-  const startDraftOnWorktree = React.useCallback(
+  // threads run with cwd = worktree folder), then `start_session`s
+  // immediately and navigates straight to `/chat/$sessionId`. Order
+  // matters: the worktree project record MUST exist before
+  // `start_session` references its `projectId`, otherwise the daemon
+  // can't resolve the cwd and the spawn fails.
+  const startThreadOnWorktree = React.useCallback(
     async (wt: GitWorktree) => {
       try {
         refreshBranchAsync(wt.path);
@@ -168,9 +208,13 @@ function WorktreeDropdownInner({
           await linkProjectWorktree(wtProjectId, projectId, wt.branch);
         }
 
-        navigate({
-          to: "/chat/draft/$projectId",
-          params: { projectId: wtProjectId },
+        await startThreadOnProject({
+          projectId: wtProjectId,
+          defaultProvider,
+          defaultProviderLoaded,
+          send,
+          navigate: navigateToSession,
+          notify,
         });
       } catch (err) {
         toast({
@@ -187,17 +231,25 @@ function WorktreeDropdownInner({
       state.projectWorktrees,
       createProject,
       linkProjectWorktree,
-      navigate,
       refreshBranchAsync,
+      defaultProvider,
+      defaultProviderLoaded,
+      send,
+      navigateToSession,
+      notify,
     ],
   );
 
-  // Direct draft on the main project (no worktree provisioning).
-  function startDraftDirect() {
+  // Eager-create on the main project (no worktree provisioning).
+  function startThreadOnMain() {
     refreshBranchAsync(projectPath);
-    navigate({
-      to: "/chat/draft/$projectId",
-      params: { projectId },
+    void startThreadOnProject({
+      projectId,
+      defaultProvider,
+      defaultProviderLoaded,
+      send,
+      navigate: navigateToSession,
+      notify,
     });
   }
 
@@ -235,7 +287,7 @@ function WorktreeDropdownInner({
               <DropdownMenuItem
                 onClick={() => {
                   setOpen(false);
-                  startDraftDirect();
+                  startThreadOnMain();
                 }}
               >
                 <SquarePen className="mr-2 h-3.5 w-3.5" />
@@ -253,7 +305,7 @@ function WorktreeDropdownInner({
                 <DropdownMenuItem
                   onClick={() => {
                     setOpen(false);
-                    startDraftDirect();
+                    startThreadOnMain();
                   }}
                 >
                   <SquarePen className="mr-2 h-3.5 w-3.5" />
@@ -290,7 +342,7 @@ function WorktreeDropdownInner({
                       key={wt.path}
                       onClick={() => {
                         setOpen(false);
-                        void startDraftOnWorktree(wt);
+                        void startThreadOnWorktree(wt);
                       }}
                     >
                       <GitBranch className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -324,9 +376,10 @@ function WorktreeDropdownInner({
         projectPath={projectPath}
         currentBranch={currentBranch}
         onCreated={(wt) => {
-          // Newly-created worktree → straight into a draft on it. The
-          // user picks their provider in the chat toolbar.
-          void startDraftOnWorktree(wt);
+          // Newly-created worktree → eager-create a thread on it
+          // using the user's default provider/model. The chat toolbar
+          // still allows swapping provider mid-thread.
+          void startThreadOnWorktree(wt);
         }}
       />
     </>

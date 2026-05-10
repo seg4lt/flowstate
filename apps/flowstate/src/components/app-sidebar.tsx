@@ -78,6 +78,9 @@ import {
   useSidebarDragSuppressed,
 } from "@/components/sidebar/drag-suppression";
 import { ADD_PROJECT_EVENT } from "@/lib/keyboard-shortcuts";
+import { useDefaultProvider } from "@/hooks/use-default-provider";
+import { startThreadOnProject } from "@/lib/start-thread";
+import { toast } from "@/hooks/use-toast";
 import type { SessionSummary } from "@/lib/types";
 import type { SessionDisplay } from "@/lib/api/display";
 
@@ -205,6 +208,14 @@ function AppSidebarBody() {
     useApp();
   const navigate = useNavigate();
   const location = useLocation();
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
+  // Stable notify wrapper for `startThreadOnProject`. The General
+  // pencil is the only call site here; keep the helper hoisted so a
+  // future "new thread" entry inside this component can reuse it.
+  const notifyNewThread = React.useCallback((message: string) => {
+    toast({ title: "New thread", description: message, duration: 4000 });
+  }, []);
   // Red dot on the footer Settings icon when one or more
   // runtime-provisioning phases failed at boot. Drives only the
   // visual indicator below; the Settings page itself renders the
@@ -605,18 +616,31 @@ function AppSidebarBody() {
                     </SidebarMenuButton>
                   </CollapsibleTrigger>
                   <div className="absolute right-1 top-1">
-                    {/* Project-less new-thread button. Goes to the
-                        /chat/draft route (no projectId param), which
-                        renders DraftChatView with projectId=undefined
-                        and creates a session with project_id: null on
-                        first send. Provider/model are picked in the
-                        chat toolbar. */}
+                    {/* Project-less ("General") new-thread button.
+                        Eager-creates a session with `project_id:
+                        undefined` (folder-less; the daemon allows
+                        this) using the user's default provider, then
+                        navigates straight to `/chat/$sessionId` —
+                        same flow as ⌘N and the per-project pencil.
+                        Provider/model can be swapped from the chat
+                        toolbar after the thread exists. */}
                     <button
                       type="button"
                       className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover/project:opacity-100"
                       onClick={(e) => {
                         e.stopPropagation();
-                        void navigate({ to: "/chat/draft" });
+                        void startThreadOnProject({
+                          projectId: undefined,
+                          defaultProvider,
+                          defaultProviderLoaded,
+                          send,
+                          navigate: (sessionId) =>
+                            navigate({
+                              to: "/chat/$sessionId",
+                              params: { sessionId },
+                            }),
+                          notify: notifyNewThread,
+                        });
                       }}
                       aria-label="New thread"
                     >

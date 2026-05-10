@@ -3,7 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useApp } from "@/stores/app-store";
 import { toast } from "@/hooks/use-toast";
 import { useDefaultProvider } from "@/hooks/use-default-provider";
-import { readDefaultModel } from "@/lib/defaults-settings";
+import { startThreadOnProject } from "@/lib/start-thread";
 import { isPopoutWindow } from "@/lib/popout";
 import {
   SHORTCUTS,
@@ -333,31 +333,18 @@ function buildCtx(args: BuildCtxArgs): ShortcutCtx {
         notify("Open a thread first to start one in its project");
         return;
       }
-      if (!defaultProviderLoaded) {
-        // Keep the UX honest — falling through to the constant
-        // DEFAULT_PROVIDER would silently disregard a saved choice
-        // that just hadn't loaded yet. Same guard the sidebar's
-        // worktree-new-thread dropdown uses for the same reason.
-        notify("Default provider still loading… try again in a moment");
-        return;
-      }
-      try {
-        const model = await readDefaultModel(defaultProvider);
-        const res = await sendMsg({
-          type: "start_session",
-          provider: defaultProvider,
-          model: model ?? undefined,
-          project_id: projectId,
-        });
-        if (res?.type === "session_created") {
+      await startThreadOnProject({
+        projectId,
+        defaultProvider,
+        defaultProviderLoaded,
+        send: sendMsg,
+        navigate: (sessionId) =>
           navigate({
             to: "/chat/$sessionId",
-            params: { sessionId: res.session.sessionId },
-          } as unknown as Parameters<typeof navigate>[0]);
-        }
-      } catch (err) {
-        notify(`Failed to start thread: ${String(err)}`);
-      }
+            params: { sessionId },
+          } as unknown as Parameters<typeof navigate>[0]),
+        notify,
+      });
     },
   };
 }

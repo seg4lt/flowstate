@@ -17,6 +17,9 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { useApp } from "@/stores/app-store";
+import { useDefaultProvider } from "@/hooks/use-default-provider";
+import { startThreadOnProject } from "@/lib/start-thread";
+import { toast } from "@/hooks/use-toast";
 
 interface ProjectPickerProps {
   open: boolean;
@@ -41,19 +44,23 @@ interface ProjectRow {
  *
  * Lists every active project (worktree-children roll up under their
  * parents and ARE pickable as their own row, so the user can jump
- * straight to a specific worktree). Selecting a row navigates to
- * `/chat/draft/$projectId` — provider selection happens in the chat
- * toolbar from there. No `start_session` fires here.
- *
- * The component name still includes "Provider" for back-compat with
- * its sole import site (router.tsx); rename is a follow-up cleanup.
+ * straight to a specific worktree). Selecting a row eagerly calls
+ * `start_session` with the user's default provider/model and
+ * navigates straight to `/chat/$sessionId` — same flow ⌘N uses. The
+ * chat toolbar lets the user swap provider/model on the live thread
+ * if they want to.
  */
 export function ProjectPicker({
   open,
   onOpenChange,
 }: ProjectPickerProps) {
-  const { state } = useApp();
+  const { state, send } = useApp();
   const navigate = useNavigate();
+  const { defaultProvider, loaded: defaultProviderLoaded } =
+    useDefaultProvider();
+  const notify = React.useCallback((message: string) => {
+    toast({ title: "New thread", description: message, duration: 4000 });
+  }, []);
 
   const projects = React.useMemo<ProjectRow[]>(() => {
     const nameFor = (projectId: string) =>
@@ -146,12 +153,27 @@ export function ProjectPicker({
   const handlePick = React.useCallback(
     (row: ProjectRow) => {
       onOpenChange(false);
-      navigate({
-        to: "/chat/draft/$projectId",
-        params: { projectId: row.projectId },
+      void startThreadOnProject({
+        projectId: row.projectId,
+        defaultProvider,
+        defaultProviderLoaded,
+        send,
+        navigate: (sessionId) =>
+          navigate({
+            to: "/chat/$sessionId",
+            params: { sessionId },
+          }),
+        notify,
       });
     },
-    [navigate, onOpenChange],
+    [
+      navigate,
+      onOpenChange,
+      defaultProvider,
+      defaultProviderLoaded,
+      send,
+      notify,
+    ],
   );
 
   return (

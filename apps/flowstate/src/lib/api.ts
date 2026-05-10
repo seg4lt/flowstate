@@ -578,8 +578,9 @@ export function trashProjectPath(
 // `readDefaultModel(p.kind)` for every ready provider. (The dropdown
 // has since been replaced by the in-toolbar `ProviderSelector`,
 // which only resolves the model on user pick, but the cache is
-// still load-bearing for `useDefaultProvider` and the
-// `DraftChatView` per-provider effect that picks an initial model.)
+// still load-bearing for `useDefaultProvider` and for
+// `lib/start-thread.ts`, which resolves the user's default model on
+// every eager-create click.)
 // As providers transition to `ready` one by
 // one (one `state.providers` identity change per transition), the
 // effect re-fires; multiplied across multiple sidebar instances and

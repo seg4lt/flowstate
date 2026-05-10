@@ -18,6 +18,7 @@ import {
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { isMacOS } from "@/lib/popout";
 import { useApp } from "@/stores/app-store";
+import { startThreadOnProject } from "@/lib/start-thread";
 import { BranchSwitcher } from "@/components/chat/branch-switcher";
 import {
   DiffPanel,
@@ -89,7 +90,8 @@ interface ProjectHomeViewProps {
 }
 
 export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
-  const { state, dispatch, createProject, linkProjectWorktree } = useApp();
+  const { state, send, dispatch, createProject, linkProjectWorktree } =
+    useApp();
   const { dispatch: terminalDispatch } = useTerminal();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -140,6 +142,17 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
   // first in `state.providers` / first to reach ready.
   const { defaultProvider, loaded: defaultProviderLoaded } =
     useDefaultProvider();
+  // Stable notify wrapper for `startThreadOnProject` call sites
+  // below (worktree-pick path, "New thread" header button).
+  const notifyNewThread = React.useCallback((message: string) => {
+    toast({ title: "New thread", description: message, duration: 4000 });
+  }, []);
+  const navigateToSession = React.useCallback(
+    (sessionId: string) => {
+      navigate({ to: "/chat/$sessionId", params: { sessionId } });
+    },
+    [navigate],
+  );
 
   // Threads grouped by the SDK project's filesystem path. Used to
   // render the per-worktree thread chips — each worktree owns its
@@ -327,9 +340,13 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           await linkProjectWorktree(wtProjectId, projectId, wt.branch);
         }
 
-        navigate({
-          to: "/chat/draft/$projectId",
-          params: { projectId: wtProjectId },
+        await startThreadOnProject({
+          projectId: wtProjectId,
+          defaultProvider,
+          defaultProviderLoaded,
+          send,
+          navigate: navigateToSession,
+          notify: notifyNewThread,
         });
       } catch (err) {
         toast({
@@ -349,7 +366,11 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
       state.projectWorktrees,
       createProject,
       linkProjectWorktree,
-      navigate,
+      defaultProvider,
+      defaultProviderLoaded,
+      send,
+      navigateToSession,
+      notifyNewThread,
     ],
   );
 
@@ -462,14 +483,21 @@ export function ProjectHomeView({ projectId }: ProjectHomeViewProps) {
           className="ml-auto flex items-center gap-1"
           data-tauri-drag-region={false}
         >
-          {/* Direct navigation to the draft route — provider /
-              model are picked in the chat toolbar, not here. */}
+          {/* Eager-create on this project. Same flow as ⌘N / sidebar
+              pencil: spawns the session with the user's default
+              provider/model and navigates straight into
+              /chat/$sessionId, so the daemon's first stream of
+              events lands on a fully-mounted ChatView. */}
           <button
             type="button"
             onClick={() => {
-              navigate({
-                to: "/chat/draft/$projectId",
-                params: { projectId },
+              void startThreadOnProject({
+                projectId,
+                defaultProvider,
+                defaultProviderLoaded,
+                send,
+                navigate: navigateToSession,
+                notify: notifyNewThread,
               });
             }}
             className="inline-flex h-6 shrink-0 items-center gap-1 rounded-[min(var(--radius-md),10px)] border border-border bg-background px-2 text-xs font-medium hover:bg-muted hover:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50"

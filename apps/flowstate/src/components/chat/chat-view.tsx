@@ -491,6 +491,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // render, and an auto-persist effect would write it to the new
   // thread's storage key before the reset has a chance to fix it.)
 
+  // Optimistic in-flight composer state — set when the user dispatches
+  // a message via handleSend so their bubble paints immediately; the
+  // real `turn_started` event clears it back to null. Always starts
+  // null because eager-create (lib/start-thread.ts) routes the user
+  // into a real session BEFORE they have any input to optimistically
+  // render — the previous `consumePendingFirstInput(sessionId)` seed
+  // was specific to the now-deleted DraftChatView handoff.
   const [pendingInput, setPendingInput] = React.useState<string | null>(null);
   // Monotonically-increasing tick bumped each time the user dispatches a
   // message via handleSend. MessageList watches this to force a scroll-
@@ -1240,7 +1247,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // thread B. Missing even one field means that field bleeds into
   // every subsequent thread the user switches to.
   React.useEffect(() => {
-    // Watchdog / optimistic composer bookkeeping.
+    // Watchdog / optimistic composer bookkeeping — clear the
+    // pending-input bubble on every session switch. Eager-create
+    // means we never have a pre-mount handoff to honor anymore;
+    // anything in pendingInput belongs to the thread we're leaving
+    // and would bleed into the next.
     setPendingInput(null);
     setLastEventAt(Date.now());
     setStuckSince(null);
