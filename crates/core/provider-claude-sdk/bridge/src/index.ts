@@ -792,6 +792,38 @@ class ClaudeBridge {
    * label). Available since SDK v0.2.113.
    */
   private title?: string;
+  /**
+   * Background-bash correlation state. Three maps cooperate to thread
+   * the SDK's shell id (`bash_id`) back to the originating
+   * `Bash { run_in_background: true }` tool_use `call_id`, so
+   * `BashOutput` / `KillShell` calls (which carry only `bash_id`)
+   * can be attributed to the right background task on the host side.
+   *
+   * Lifecycle: populated as background-bash tool_use blocks stream in,
+   * resolved once the SDK returns the `Bash` tool_result with the
+   * shell id embedded in its output text. Persists across turns
+   * because a long-running background shell started in turn N may
+   * emit output / be killed many turns later. Bridge-instance scope
+   * (one bridge process per session) makes session-level cleanup a
+   * no-op — a fresh process starts with empty maps.
+   */
+  /** call_ids of `Bash { run_in_background: true }` tool_uses whose
+   * tool_result we haven't yet parsed. Once parsed, we extract the
+   * shell id from output text and move the mapping into
+   * `bashIdToBgCallId`. */
+  private bgBashCallIdsPending: Set<string> = new Set();
+  /** Resolved correlation: SDK `bash_id` → originating Bash tool_use
+   * `call_id`. Survives across turns. */
+  private bashIdToBgCallId: Map<string, string> = new Map();
+  /** Transient: BashOutput / KillShell tool_use `call_id` →
+   * `{ bash_id, kind }` from its input. `kind` discriminates a live
+   * output snapshot ('output') from a terminal kill ('killed') so the
+   * runtime can transition the row's status correctly when the
+   * tool_result lands. Cleared as each entry is consumed. */
+  private bashOutputCallIdToBashId: Map<
+    string,
+    { bashId: string; kind: 'output' | 'killed' }
+  > = new Map();
 
   createSession(
     cwd: string,
@@ -1365,6 +1397,82 @@ class ClaudeBridge {
   async getContextUsage(): Promise<unknown | null> {
     if (!this.activeQuery) return null;
     return await this.activeQuery.getContextUsage();
+  }
+
+  /**
+   * Scan a text block from a user-role SDK message for background-
+   * shell completion notifications. The Claude Agent SDK injects
+   * system-reminder-style text whenever a background shell exits
+   * (so the model knows on its next iteration); the exact wording
+   * varies by SDK version but always includes the shell id and a
+   * status word like "completed", "exited", "terminated", or
+   * "killed". This method matches against the bash ids we already
+   * track, so a textual hit can only ever retire a row we own.
+   *
+   * Emits `bash_killed` (terminal-status event) for each matched
+   * shell so the runtime transitions the panel row out of Running.
+   * Idempotent: removes the bash_id from `bashIdToBgCallId` after
+   * firing so a second mention in a later message doesn't
+   * re-deliver the event for an already-retired row.
+   */
+  private scanTextForBackgroundExits(text: string): void {
+    if (this.bashIdToBgCallId.size === 0) return;
+    // Iterate over a snapshot so deletes during the loop don't
+    // disturb iteration order.
+    const snapshot = Array.from(this.bashIdToBgCallId.entries());
+    for (const [bashId, bgCallId] of snapshot) {
+      // Only scan if this id is mentioned somewhere — short-circuit
+      // before running the more expensive completion-pattern probe.
+      if (!text.includes(bashId)) continue;
+      // Look for completion keywords within ~120 chars of the
+      // bash_id mention. The SDK groups id + status close together
+      // (`bash_1 completed (exit 0)`, `<bash-input-id-1>...
+      // <status>completed</status>`), so a small window has
+      // negligible false-positive risk while tolerating wording
+      // drift across SDK versions.
+      const idIdx = text.indexOf(bashId);
+      const window = text.slice(
+        Math.max(0, idIdx - 120),
+        Math.min(text.length, idIdx + 240),
+      );
+      const completed =
+        /\b(?:completed|exited|finished|terminated|done|killed|ended)\b/i.test(
+          window,
+        ) ||
+        /<status>\s*(?:completed|killed|terminated|exited|failed)\s*<\/status>/i.test(
+          window,
+        );
+      if (!completed) continue;
+      // Distinguish killed from completed/failed by keyword
+      // presence — both transition the row to a terminal status,
+      // but the panel renders them differently and we want the
+      // label to match what actually happened.
+      const looksKilled = /\b(?:killed|terminated|reaped)\b/i.test(window);
+      const looksFailed =
+        /\b(?:failed|error|errored)\b/i.test(window) ||
+        /\bexit[_\s]?code\s*[:=]?\s*(?!0\b)-?\d+/i.test(window);
+      const status = looksKilled
+        ? 'killed'
+        : looksFailed
+          ? 'failed'
+          : 'completed';
+      console.error(
+        `[bridge] auto-detected background shell exit from user-text scan (bash_id=${bashId}, status=${status})`,
+      );
+      writeStream({
+        event: status === 'killed' ? 'bash_killed' : 'bash_output',
+        call_id: bgCallId,
+        bash_id: bashId,
+        // Surface the SDK's text verbatim — gives the user something
+        // to read in the panel's expanded output view, even if we
+        // never see a real BashOutput tool result.
+        output: window.trim(),
+        shell_status: status,
+      });
+      // Retire the correlation so we don't re-fire on subsequent
+      // mentions in later messages.
+      this.bashIdToBgCallId.delete(bashId);
+    }
   }
 
   /**
@@ -2009,12 +2117,37 @@ class ClaudeBridge {
               continue;
             }
             const input = (block.input as Record<string, unknown>) ?? {};
+            // Flag background-bash invocations so the host can index
+            // them separately. The SDK's actual shell id (`bash_id`)
+            // arrives later in the tool_result; we only know at this
+            // point that the model asked for background execution.
+            const isBackgroundBash =
+              name === 'Bash' && input.run_in_background === true;
+            if (isBackgroundBash) {
+              this.bgBashCallIdsPending.add(callId);
+            }
+            // For BashOutput / KillShell, the SDK's input carries the
+            // `bash_id` of the background shell being inspected/killed.
+            // Stash it (with a discriminator so the tool_result handler
+            // can route to the right event) so when the tool_result
+            // lands we can correlate the live stdout/stderr back to
+            // the originating Bash call_id.
+            if (name === 'BashOutput' || name === 'KillShell') {
+              const bashId = input.bash_id as string | undefined;
+              if (typeof bashId === 'string' && bashId.length > 0) {
+                this.bashOutputCallIdToBashId.set(callId, {
+                  bashId,
+                  kind: name === 'KillShell' ? 'killed' : 'output',
+                });
+              }
+            }
             writeStream({
               event: 'tool_started',
               call_id: callId,
               name,
               args: input,
               ...(parentToolUseId ? { parent_call_id: parentToolUseId } : {}),
+              ...(isBackgroundBash ? { is_background: true } : {}),
             });
 
             // Structured file-change extraction for Write/Edit/Delete tools.
@@ -2122,6 +2255,96 @@ class ClaudeBridge {
               ...(isError ? { error: 'tool returned an error' } : {}),
             });
 
+            // Background-bash correlation. Three independent cases:
+            //
+            //   (a) The original Bash { run_in_background: true } just
+            //       resolved with a shell id. Parse the id out of the
+            //       result text and remember it so future BashOutput /
+            //       KillShell calls can be attributed back.
+            //
+            //   (b) A BashOutput just delivered live stdout/stderr.
+            //       Emit a `bash_output` companion event keyed to the
+            //       originating Bash call_id so the host can update
+            //       the right background-task row.
+            //
+            //   (c) A KillShell just resolved. Emit a terminal
+            //       `bash_output` event with status='killed' so the
+            //       row transitions cleanly even though the original
+            //       background-Bash tool_completed never arrives (the
+            //       shell was reaped, not finished naturally).
+            if (this.bgBashCallIdsPending.has(cid)) {
+              this.bgBashCallIdsPending.delete(cid);
+              if (!isError) {
+                const bashId = parseBashShellId(output);
+                if (bashId) {
+                  this.bashIdToBgCallId.set(bashId, cid);
+                } else {
+                  // Loud regression signal — log the full output so a
+                  // future SDK format change is debuggable. We still
+                  // emit `background_bash_registered` below (without a
+                  // bash_id) so the panel row exits "Starting…" and
+                  // shows Running. The kill button will be disabled
+                  // for that row since we can't address the shell.
+                  console.error(
+                    `[bridge] background bash completed but no shell id parsed from output (call_id=${cid}, output=${JSON.stringify(output.slice(0, 400))})`,
+                  );
+                }
+                // Always emit the registration event — fail-open
+                // semantics so the panel row leaves the Pending
+                // ("Starting…") state regardless of whether parsing
+                // succeeded. A null bash_id means "running but
+                // un-killable from here"; the panel surfaces that
+                // by disabling the Kill button.
+                writeStream({
+                  event: 'background_bash_registered',
+                  call_id: cid,
+                  ...(bashId ? { bash_id: bashId } : {}),
+                });
+              }
+            } else {
+              const inspector = this.bashOutputCallIdToBashId.get(cid);
+              if (inspector) {
+                this.bashOutputCallIdToBashId.delete(cid);
+                const bgCallId = this.bashIdToBgCallId.get(inspector.bashId);
+                if (bgCallId) {
+                  // KillShell takes the row terminal; BashOutput
+                  // depends on the SDK-reported shell status (which
+                  // we parse out of the tool result text — see
+                  // `parseBashShellStatus`). A `running` BashOutput
+                  // is just a snapshot; `completed` / `failed` carry
+                  // the row to its terminal status.
+                  const shellStatus =
+                    inspector.kind === 'killed'
+                      ? 'killed'
+                      : parseBashShellStatus(output);
+                  writeStream({
+                    event:
+                      inspector.kind === 'killed' ? 'bash_killed' : 'bash_output',
+                    call_id: bgCallId,
+                    bash_id: inspector.bashId,
+                    output,
+                    shell_status: shellStatus,
+                    ...(isError ? { error: 'bash output error' } : {}),
+                  });
+                  if (
+                    inspector.kind === 'killed' ||
+                    shellStatus === 'completed' ||
+                    shellStatus === 'failed'
+                  ) {
+                    // Row is now terminal — drop the correlation entry
+                    // so any stray future BashOutput against the same
+                    // bash_id surfaces a loud warning instead of
+                    // silently re-attaching to a dead row.
+                    this.bashIdToBgCallId.delete(inspector.bashId);
+                  }
+                } else {
+                  console.error(
+                    `[bridge] BashOutput/KillShell tool_result for unknown bash_id=${inspector.bashId} (no prior background-Bash registration). Dropping bash_output event.`,
+                  );
+                }
+              }
+            }
+
             // If this user message is nested under a parent tool, mark subagent completion.
             if (m.parent_tool_use_id) {
               writeStream({
@@ -2130,6 +2353,27 @@ class ClaudeBridge {
                 output,
                 ...(isError ? { error: 'tool error' } : {}),
               });
+            }
+          } else if (block.type === 'text') {
+            // Auto-detect SDK-pushed completion notifications. When a
+            // background shell exits naturally, the Claude Agent SDK
+            // injects a system-reminder text block into the next user
+            // turn so the model knows the shell has finished. We
+            // scan that text for any `bash_id` we currently track —
+            // a hit means we should retire the matching panel row
+            // even if the model never bothers to call BashOutput.
+            //
+            // This is a best-effort path: if the SDK changes its
+            // wording we just stop auto-detecting (the row stays
+            // Running until the user clicks Refresh or the agent
+            // checks). Since we only fire on a known bash_id, false
+            // positives are bounded — random text mentioning
+            // "bash_1" can never match a shell we don't actually
+            // own, because `bashIdToBgCallId` is the only source of
+            // candidate ids.
+            const textValue = block.text;
+            if (typeof textValue === 'string' && textValue.length > 0) {
+              this.scanTextForBackgroundExits(textValue);
             }
           }
         }
@@ -2614,6 +2858,110 @@ function parsePlanSteps(raw: string): Array<{ title: string; detail?: string }> 
     }
   }
   return steps;
+}
+
+/**
+ * Extract the SDK-reported shell status from a `BashOutput` tool result.
+ *
+ * The Claude Agent SDK's `BashOutput` tool returns the current shell
+ * state alongside its stdout. The exact format has shifted across SDK
+ * versions; we accept the three shapes we've seen in the wild:
+ *
+ *   • XML-ish:   `<status>running</status>` / `<status>completed</status>`
+ *   • Labelled:  `Status: completed` / `status=killed`
+ *   • JSON:      `"status":"completed"` / `"status":"running"`
+ *
+ * A non-zero exit code in any of those shapes is normalized to
+ * `'failed'` so the panel row reads "Failed" instead of "Completed"
+ * for an error exit. Defaults to `'running'` when nothing parses —
+ * the row stays Running until a later snapshot resolves it.
+ */
+function parseBashShellStatus(
+  output: string,
+): 'running' | 'completed' | 'failed' | 'killed' {
+  if (!output) return 'running';
+  // Try every shape; first hit wins. Status strings are normalized
+  // to lower-case before mapping.
+  const xml = output.match(/<status>\s*([A-Za-z_]+)\s*<\/status>/i);
+  const labelled = output.match(/\bstatus\s*[:=]\s*"?([A-Za-z_]+)"?/i);
+  const json = output.match(/"status"\s*:\s*"([A-Za-z_]+)"/i);
+  const raw = (xml?.[1] ?? labelled?.[1] ?? json?.[1] ?? '').toLowerCase();
+  // Exit-code probe — if the SDK reports a non-zero code, treat the
+  // row as failed even when status text says "completed". This lets
+  // a script that exits 1 surface as a failure in the panel rather
+  // than a green-pip "completed" row.
+  const exitMatch =
+    output.match(/<exit_code>\s*(-?\d+)\s*<\/exit_code>/i) ??
+    output.match(/"exit_code"\s*:\s*(-?\d+)/i) ??
+    output.match(/\bexit[_\s]?code\s*[:=]\s*(-?\d+)/i);
+  const exitCode = exitMatch ? parseInt(exitMatch[1], 10) : null;
+  switch (raw) {
+    case 'completed':
+    case 'completed_successfully':
+    case 'finished':
+    case 'exited':
+      return exitCode !== null && exitCode !== 0 ? 'failed' : 'completed';
+    case 'failed':
+    case 'error':
+      return 'failed';
+    case 'killed':
+    case 'terminated':
+      return 'killed';
+    case 'running':
+    case 'pending':
+      return 'running';
+    default:
+      // No status text but a non-zero exit code → that's still a
+      // failure signal worth surfacing.
+      if (exitCode !== null && exitCode !== 0) return 'failed';
+      return 'running';
+  }
+}
+
+/**
+ * Extract the SDK's background-shell id from a Bash tool_result body.
+ *
+ * The Claude Agent SDK's `Bash { run_in_background: true }` tool returns
+ * the shell id in one of several textual shapes (the SDK has tweaked
+ * the exact wording across versions). We try every probe in order and
+ * accept the first that hits:
+ *
+ *   • JSON forms:   `"bash_id":"bash_1"`, `"shell_id":"bash_1"`,
+ *                   `"id":"bash_1"`
+ *   • Labelled:     `Background shell ID: bash_1`,
+ *                   `bash_id: bash_1`, `shell_id=bash_1`
+ *   • XML-ish:      `<bash_id>bash_1</bash_id>`,
+ *                   `<shell_id>bash_1</shell_id>`
+ *   • Bare token:   any standalone `bash_<id>` or `bash-<id>` slug
+ *
+ * Returns `null` when nothing matches. The caller logs the offending
+ * output verbatim so a future SDK format change is visible.
+ */
+function parseBashShellId(output: string): string | null {
+  if (!output) return null;
+  // Character class for the id itself: alphanumerics + `_-:.` so we
+  // catch SDKs that hyphenate (`bash-abc-123`), namespace
+  // (`bash_default_1`), or use UUID-style tokens. Anchored with
+  // word-boundaries / quote-boundaries by each probe.
+  const ID = `[A-Za-z0-9][A-Za-z0-9_\\-:.]*`;
+  const probes: RegExp[] = [
+    // JSON: any of bash_id / shell_id / id keys.
+    new RegExp(`"(?:bash_id|shell_id|id)"\\s*:\\s*"(${ID})"`, 'i'),
+    // Labelled: optional "background ", then "shell"/"bash" + id, then : or =.
+    new RegExp(
+      `(?:background\\s+)?(?:bash|shell)[\\s_-]*id\\s*[:=]\\s*"?(${ID})"?`,
+      'i',
+    ),
+    // XML-ish: <bash_id>...</bash_id> / <shell_id>...
+    new RegExp(`<(?:bash_id|shell_id)>\\s*(${ID})\\s*<`, 'i'),
+    // Bare slug starting with `bash_` or `bash-` — last chance.
+    new RegExp(`\\b(bash[_-]${ID})\\b`),
+  ];
+  for (const re of probes) {
+    const m = output.match(re);
+    if (m) return m[1];
+  }
+  return null;
 }
 
 async function main(): Promise<void> {

@@ -1854,6 +1854,12 @@ async fn map_codex_notification(method: &str, params: &Value, events: &TurnEvent
                             name,
                             args,
                             parent_call_id: None,
+                            // Codex doesn't model background-tool execution
+                            // the way Claude SDK does — every tool runs in
+                            // the model's foreground turn. Adapters that
+                            // gain a background-task concept later can flip
+                            // this per-call.
+                            is_background: false,
                         })
                         .await;
                 }

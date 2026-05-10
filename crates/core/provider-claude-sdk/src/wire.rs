@@ -480,6 +480,27 @@ pub(crate) enum BridgeResponse {
         /// existing `summary` field above.
         #[serde(default)]
         call_ids: Option<Vec<String>>,
+        /// Populated on `tool_started` events for
+        /// `Bash { run_in_background: true }` invocations. Lets the
+        /// runtime index the tool call as a background task without
+        /// re-parsing `args`. Absent (None) on every other event.
+        #[serde(default)]
+        is_background: Option<bool>,
+        /// Populated on `background_bash_registered` and `bash_output`
+        /// events. The SDK's shell id (e.g. `bash_1`) for the
+        /// originating background-Bash tool call. Surface for the
+        /// host's background-task panel and for the model-mediated
+        /// "kill" path.
+        #[serde(default)]
+        bash_id: Option<String>,
+        /// Populated on `bash_output` events. Coarse SDK-reported
+        /// shell state parsed from the BashOutput tool result —
+        /// `'running' | 'completed' | 'failed' | 'killed'`. Drives
+        /// the panel row's terminal-status transition without us
+        /// having to hand the runtime the raw output text and
+        /// re-parse it there. Absent on every other event.
+        #[serde(default)]
+        shell_status: Option<String>,
     },
 }
 

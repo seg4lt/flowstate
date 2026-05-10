@@ -617,6 +617,9 @@ async fn dispatch_frame(
                                         name,
                                         args: input,
                                         parent_call_id: None,
+                                        // opencode has no background-tool concept;
+                                        // every tool runs in the model's foreground turn.
+                                        is_background: false,
                                     })
                                     .await;
                             }
@@ -641,6 +644,7 @@ async fn dispatch_frame(
                                         name: name.clone(),
                                         args: input,
                                         parent_call_id: None,
+                                        is_background: false,
                                     })
                                     .await;
                             }
@@ -672,6 +676,7 @@ async fn dispatch_frame(
                                         name: name.clone(),
                                         args: input,
                                         parent_call_id: None,
+                                        is_background: false,
                                     })
                                     .await;
                             }

@@ -74,6 +74,9 @@ fn export_ts_bindings() {
     push(&mut out, ContextCategory::decl(&cfg));
     push(&mut out, ContextBreakdown::decl(&cfg));
     push(&mut out, ToolCall::decl(&cfg));
+    push(&mut out, BashOutputSnapshot::decl(&cfg));
+    push(&mut out, BackgroundTaskStatus::decl(&cfg));
+    push(&mut out, BackgroundTaskSnapshot::decl(&cfg));
     push(&mut out, AgentUsage::decl(&cfg));
     push(&mut out, TokenUsage::decl(&cfg));
     push(&mut out, RateLimitInfo::decl(&cfg));
