@@ -339,6 +339,11 @@ export function applyEventToTurns(
         input: `[peer ${event.from_session_id}] ${event.message}`,
         output: "",
         status: "completed",
+        // The peer's `Send` ran as a `peer_send` turn on the target
+        // session — mirror that here so the synthetic local row
+        // renders with the same authorship chip + muted bubble as
+        // the real persisted turn does on reload.
+        source: "peer_send",
         createdAt: now,
         updatedAt: now,
         toolCalls: [],

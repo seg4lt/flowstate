@@ -9,7 +9,7 @@ use chrono::Utc;
 use uuid::Uuid;
 use zenui_provider_api::{
     ProviderKind, ReasoningEffort, SessionDetail, SessionStatus, SessionSummary, TurnRecord,
-    TurnStatus,
+    TurnSource, TurnStatus,
 };
 
 #[derive(Debug, Default)]
@@ -52,6 +52,7 @@ impl OrchestrationService {
         input: String,
         permission_mode: Option<zenui_provider_api::PermissionMode>,
         reasoning_effort: Option<ReasoningEffort>,
+        source: TurnSource,
     ) -> TurnRecord {
         let now = Utc::now().to_rfc3339();
         let turn = TurnRecord {
@@ -59,6 +60,7 @@ impl OrchestrationService {
             input,
             output: String::new(),
             status: TurnStatus::Running,
+            source,
             created_at: now.clone(),
             updated_at: now.clone(),
             reasoning: None,

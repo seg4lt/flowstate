@@ -131,6 +131,32 @@ pub enum TurnStatus {
     Failed,
 }
 
+/// Authorship of a turn's user-side input. Distinguishes turns the
+/// human typed (`User`) from turns flowstate injected on the user's
+/// behalf — wakeups (`Wakeup`) re-firing a `ScheduleWakeup` prompt,
+/// peer `Send` (`PeerSend`) and peer `Spawn` (`PeerSpawn`) deliveries
+/// from the orchestrator. Persisted on `TurnRecord` so the chat UI
+/// can disambiguate authorship and render system-injected turns with
+/// a distinct chip / muted bubble — without that, dynamic `/loop`
+/// runs make it look like the human re-typed the same prompt many
+/// times in a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
+#[serde(rename_all = "snake_case")]
+pub enum TurnSource {
+    User,
+    Wakeup,
+    PeerSend,
+    PeerSpawn,
+}
+
+impl Default for TurnSource {
+    fn default() -> Self {
+        Self::User
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(optional_fields))]
@@ -1309,6 +1335,10 @@ pub struct TurnRecord {
     pub input: String,
     pub output: String,
     pub status: TurnStatus,
+    /// Authorship of the input. Defaults to `User` for legacy rows
+    /// loaded from a pre-migration DB (the `source` column is NULL).
+    #[serde(default)]
+    pub source: TurnSource,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

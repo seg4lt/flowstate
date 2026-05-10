@@ -76,6 +76,11 @@ function turnToItem(
     model: turn.usage?.model ?? sessionModel,
     providerKind,
     subagents: turn.subagents,
+    // Authorship — drives the chip + muted-bubble variant on
+    // wakeup / peer turns. Legacy turns from before the column
+    // existed deserialize as `"user"` thanks to the Rust
+    // `#[serde(default)]` on `TurnRecord::source`.
+    source: turn.source,
   };
 }
 

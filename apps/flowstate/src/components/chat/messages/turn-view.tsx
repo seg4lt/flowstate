@@ -1,11 +1,12 @@
 import * as React from "react";
-import { ChevronDown, ChevronUp, Timer } from "lucide-react";
+import { AlarmClock, ChevronDown, ChevronUp, Send, Sparkles, Timer } from "lucide-react";
 import type {
   AttachmentRef,
   ContentBlock,
   ProviderKind,
   SubagentRecord,
   ToolCall,
+  TurnSource,
   TurnStatus,
 } from "@/lib/types";
 import { ToolCallCard } from "../tool-call-card";
@@ -524,6 +525,15 @@ export interface MessageItem {
   /** Subagents spawned during this turn, carried forward so the
    *  per-subagent model can show up in the subagent box header. */
   subagents?: SubagentRecord[];
+  /** Authorship of the user-side input. `"user"` is the human typing
+   *  in the composer (or clicking Accept-plan / Steer); other values
+   *  mean the runtime synthesized this turn — see `TurnSource` in
+   *  `provider-api/src/types.rs`. The chat UI uses this to render an
+   *  authorship chip and a muted bubble for non-user turns so a
+   *  `/loop` re-firing the same prompt doesn't look like the user
+   *  re-typed it many times. Defaults to `"user"` when absent (legacy
+   *  rows persisted before the column existed). */
+  source?: TurnSource;
 }
 
 function formatTurnDuration(ms: number): string {
@@ -532,6 +542,51 @@ function formatTurnDuration(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   const seconds = Math.round((ms % 60_000) / 1000);
   return `${minutes}m ${seconds}s`;
+}
+
+/** Tiny authorship chip rendered above the user bubble for turns the
+ *  runtime injected on the user's behalf. Without it, a `/loop`
+ *  re-firing the same `ScheduleWakeup` prompt looks like the user
+ *  retyped the same message N times in a row — same bubble, same
+ *  rewind divider, no disambiguation. The chip + the muted bubble
+ *  variant on `<UserMessage>` are what tell those apart. */
+function TurnSourceChip({ source }: { source: TurnSource }) {
+  let label: string;
+  let title: string;
+  let Icon: typeof AlarmClock;
+  switch (source) {
+    case "wakeup":
+      label = "wakeup";
+      title =
+        "Re-injected by ScheduleWakeup — the model self-paced this turn via /loop or a timer.";
+      Icon = AlarmClock;
+      break;
+    case "peer_send":
+      label = "peer send";
+      title = "Delivered by another session via the orchestrator's `send` call.";
+      Icon = Send;
+      break;
+    case "peer_spawn":
+      label = "peer spawn";
+      title =
+        "Delivered as the opening message of a session another agent spawned.";
+      Icon = Sparkles;
+      break;
+    default:
+      // `user` should never reach here — the caller gates on source !== "user".
+      return null;
+  }
+  return (
+    <div className="flex justify-end">
+      <span
+        title={title}
+        className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground"
+      >
+        <Icon className="h-3 w-3" />
+        {label}
+      </span>
+    </div>
+  );
 }
 
 interface TurnViewProps {
@@ -583,12 +638,24 @@ function TurnViewInner({ item, onOpenAttachment }: TurnViewProps) {
               next and makes the rewind affordance the first thing
               the eye lands on when scanning the thread. The divider
               itself no-ops when we don't have a turn id yet (the
-              streaming-echo row before turn_started lands). */}
+              streaming-echo row before turn_started lands).
+
+              We deliberately keep the divider for system-injected
+              turns (wakeup / peer): the user may still want to roll
+              back the side effects of a fired turn even though they
+              didn't type its prompt. The chip below disambiguates
+              authorship — that's enough. */}
           <RewindDivider turnId={item.turnId} />
+          {item.source && item.source !== "user" && (
+            <TurnSourceChip source={item.source} />
+          )}
           <UserMessage
             input={item.input}
             attachments={item.inputAttachments}
             onOpenAttachment={onOpenAttachment}
+            variant={
+              item.source && item.source !== "user" ? "injected" : "default"
+            }
           />
         </>
       )}
@@ -696,6 +763,7 @@ export const TurnView = React.memo(TurnViewInner, (prev, next) => {
     // stream in and flips `model` when SubagentModelObserved fires.
     a.model === b.model &&
     a.providerKind === b.providerKind &&
-    a.subagents === b.subagents
+    a.subagents === b.subagents &&
+    a.source === b.source
   );
 });

@@ -10,7 +10,7 @@
 
 use zenui_provider_api::{
     ContentBlock, PermissionMode, ProviderKind, ReasoningEffort, SessionStatus, ToolCall,
-    TurnStatus,
+    TurnSource, TurnStatus,
 };
 
 pub(crate) fn ext_for_media_type(media_type: &str) -> &'static str {
@@ -85,6 +85,29 @@ pub(crate) fn turn_status_from_str(value: &str) -> TurnStatus {
         "interrupted" => TurnStatus::Interrupted,
         "failed" => TurnStatus::Failed,
         _ => TurnStatus::Completed,
+    }
+}
+
+pub(crate) fn turn_source_to_str(source: TurnSource) -> &'static str {
+    match source {
+        TurnSource::User => "user",
+        TurnSource::Wakeup => "wakeup",
+        TurnSource::PeerSend => "peer_send",
+        TurnSource::PeerSpawn => "peer_spawn",
+    }
+}
+
+/// `value == None` corresponds to a row written before the `source`
+/// column was added — defaults to `User`, matching the
+/// `#[serde(default)]` on `TurnRecord::source`. Unknown strings also
+/// fall back to `User` so a forward-compat downgrade can't crash the
+/// reader.
+pub(crate) fn turn_source_from_str(value: Option<&str>) -> TurnSource {
+    match value {
+        Some("wakeup") => TurnSource::Wakeup,
+        Some("peer_send") => TurnSource::PeerSend,
+        Some("peer_spawn") => TurnSource::PeerSpawn,
+        _ => TurnSource::User,
     }
 }
 

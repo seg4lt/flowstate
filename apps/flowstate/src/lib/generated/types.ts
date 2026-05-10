@@ -12,6 +12,8 @@ export type SessionStatus = "ready" | "running" | "interrupted";
 
 export type TurnStatus = "running" | "completed" | "interrupted" | "failed";
 
+export type TurnSource = "user" | "wakeup" | "peer_send" | "peer_spawn";
+
 export type ToolCallStatus = "pending" | "completed" | "failed";
 
 export type PermissionDecision = "allow" | "allow_always" | "deny" | "deny_always";
@@ -426,7 +428,12 @@ export type SessionSummary = { sessionId: string, provider: ProviderKind, status
 
 export type ProviderSessionState = { nativeThreadId?: string, metadata?: JsonValue, };
 
-export type TurnRecord = { turnId: string, input: string, output: string, status: TurnStatus, createdAt: string, updatedAt: string, reasoning?: string, toolCalls: Array<ToolCall>, fileChanges: Array<FileChangeRecord>, subagents: Array<SubagentRecord>, plan?: PlanRecord, permissionMode?: PermissionMode, reasoningEffort?: ReasoningEffort, 
+export type TurnRecord = { turnId: string, input: string, output: string, status: TurnStatus, 
+/**
+ * Authorship of the input. Defaults to `User` for legacy rows
+ * loaded from a pre-migration DB (the `source` column is NULL).
+ */
+source: TurnSource, createdAt: string, updatedAt: string, reasoning?: string, toolCalls: Array<ToolCall>, fileChanges: Array<FileChangeRecord>, subagents: Array<SubagentRecord>, plan?: PlanRecord, permissionMode?: PermissionMode, reasoningEffort?: ReasoningEffort, 
 /**
  * Ordered content stream — text, reasoning, and tool calls in the
  * exact order the provider emitted them. Canonical view for UIs

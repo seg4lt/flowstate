@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use zenui_provider_api::{
     PermissionMode, PollOutcome, ReasoningEffort, RuntimeCall, RuntimeCallError, RuntimeCallOrigin,
-    RuntimeCallResult, TurnEventSink, TurnStatus,
+    RuntimeCallResult, TurnEventSink, TurnSource, TurnStatus,
 };
 
 use crate::RuntimeCore;
@@ -250,11 +250,15 @@ pub fn poll_result_from_turn(turn_id: &str, output: &str) -> RuntimeCallResult {
 /// paths pass `PermissionMode::Default` + `None` to preserve historical
 /// behavior, while the spawn dispatchers forward the caller-chosen
 /// values coming off `RuntimeCall::Spawn{,AndAwait,InWorktree}`.
+///
+/// `source` is persisted on the resulting `TurnRecord` so the chat UI
+/// can disambiguate authorship (wakeup re-fire vs peer send/spawn vs
+/// the human typing). It also flows into the failure-path tracing log.
 pub fn spawn_peer_turn(
     rc: Arc<RuntimeCore>,
     session_id: String,
     message: String,
-    label: &'static str,
+    source: TurnSource,
     permission_mode: PermissionMode,
     reasoning_effort: Option<ReasoningEffort>,
 ) {
@@ -267,10 +271,11 @@ pub fn spawn_peer_turn(
                 permission_mode,
                 reasoning_effort,
                 None,
+                source,
             )
             .await
         {
-            tracing::warn!(label, error = %err, "peer turn failed");
+            tracing::warn!(?source, error = %err, "peer turn failed");
         }
     });
 }

@@ -65,7 +65,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 use zenui_persistence::{PersistenceService, ScheduledWakeupRow};
-use zenui_provider_api::{PermissionMode, RuntimeEvent};
+use zenui_provider_api::{PermissionMode, RuntimeEvent, TurnSource};
 
 use crate::RuntimeCore;
 
@@ -206,7 +206,7 @@ impl WakeupFireHandler for RuntimeCoreFireHandler {
             rc,
             fired.session_id,
             fired.prompt,
-            "wakeup",
+            TurnSource::Wakeup,
             PermissionMode::Default,
             None,
         );

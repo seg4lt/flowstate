@@ -47,6 +47,7 @@ fn export_ts_bindings() {
     push(&mut out, ProviderStatusLevel::decl(&cfg));
     push(&mut out, SessionStatus::decl(&cfg));
     push(&mut out, TurnStatus::decl(&cfg));
+    push(&mut out, TurnSource::decl(&cfg));
     push(&mut out, ToolCallStatus::decl(&cfg));
     push(&mut out, PermissionDecision::decl(&cfg));
     push(&mut out, PermissionMode::decl(&cfg));

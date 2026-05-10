@@ -29,8 +29,8 @@ use zenui_provider_api::{
     ReasoningEffort, RewindConflictWire, RewindOutcomeWire, RewindUnavailableReason, RuntimeCall,
     RuntimeCallError, RuntimeCallOrigin, RuntimeCallResult, RuntimeEvent, ServerMessage,
     SessionDetail, SessionLinkReason, SessionStatus, SubagentRecord, SubagentStatus, ThinkingMode,
-    TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnStatus, UserInput,
-    UserInputAnswer,
+    TokenUsage, ToolCall, ToolCallStatus, TurnEventSink, TurnRecord, TurnSource, TurnStatus,
+    UserInput, UserInputAnswer,
 };
 
 use crate::orchestration::{
@@ -685,6 +685,11 @@ impl RuntimeCore {
             input: String::new(),
             output: output.clone(),
             status: TurnStatus::Completed,
+            // No user input on this turn (the model spoke
+            // spontaneously) — the chip is a no-op since the
+            // user-bubble is hidden, but `User` keeps the field
+            // semantically honest for callers that inspect it.
+            source: TurnSource::User,
             created_at: now.clone(),
             updated_at: now,
             reasoning: None,
@@ -734,7 +739,7 @@ impl RuntimeCore {
                 rc,
                 session_id,
                 next.message,
-                "spontaneous_mailbox_drain",
+                TurnSource::PeerSend,
                 PermissionMode::Default,
                 None,
             );
@@ -1542,6 +1547,7 @@ impl RuntimeCore {
                         mode,
                         reasoning_effort,
                         thinking_mode,
+                        TurnSource::User,
                     )
                     .await
                 {
@@ -2351,6 +2357,10 @@ impl RuntimeCore {
             PermissionMode::AcceptEdits,
             None,
             None,
+            // The user clicked "Accept plan" in the UI — treat the
+            // synthetic follow-up as user-authored so it renders as a
+            // normal user bubble (no chip).
+            TurnSource::User,
         )
         .await
     }
@@ -2467,6 +2477,7 @@ impl RuntimeCore {
         permission_mode: PermissionMode,
         reasoning_effort: Option<ReasoningEffort>,
         thinking_mode: Option<ThinkingMode>,
+        source: TurnSource,
     ) -> Result<String, String> {
         let trimmed = input.trim().to_string();
         if trimmed.is_empty() && images.is_empty() {
@@ -2544,6 +2555,7 @@ impl RuntimeCore {
             trimmed.clone(),
             Some(permission_mode),
             reasoning_effort,
+            source,
         );
 
         // Persist any pasted images to disk before the adapter runs.
@@ -3556,7 +3568,7 @@ impl RuntimeCore {
                         rc,
                         target,
                         next.message,
-                        "mailbox_drain",
+                        TurnSource::PeerSend,
                         PermissionMode::Default,
                         None,
                     );
@@ -3883,7 +3895,7 @@ impl RuntimeCore {
             rc_for_turn,
             peer_sid,
             initial_message,
-            "spawn_and_await",
+            TurnSource::PeerSpawn,
             permission_mode.unwrap_or(PermissionMode::Default),
             reasoning_effort,
         );
@@ -3945,7 +3957,7 @@ impl RuntimeCore {
             rc_for_turn,
             peer_sid,
             initial_message,
-            "spawn",
+            TurnSource::PeerSpawn,
             permission_mode.unwrap_or(PermissionMode::Default),
             reasoning_effort,
         );
@@ -4100,7 +4112,7 @@ impl RuntimeCore {
                 rc_for_turn,
                 target,
                 message,
-                "send_and_await",
+                TurnSource::PeerSend,
                 PermissionMode::Default,
                 None,
             );
@@ -4174,7 +4186,7 @@ impl RuntimeCore {
                 rc_for_turn,
                 target,
                 message,
-                "send",
+                TurnSource::PeerSend,
                 PermissionMode::Default,
                 None,
             );
@@ -4566,7 +4578,7 @@ impl RuntimeCore {
                 self.clone(),
                 new_sid.clone(),
                 initial_message,
-                "spawn_in_worktree",
+                TurnSource::PeerSpawn,
                 permission_mode.unwrap_or(PermissionMode::Default),
                 reasoning_effort,
             );
@@ -4592,7 +4604,7 @@ impl RuntimeCore {
                 self.clone(),
                 new_sid.clone(),
                 initial_message,
-                "spawn_in_worktree",
+                TurnSource::PeerSpawn,
                 permission_mode.unwrap_or(PermissionMode::Default),
                 reasoning_effort,
             );
@@ -4827,6 +4839,10 @@ impl RuntimeCore {
             permission_mode,
             reasoning_effort,
             thinking_mode,
+            // Steer is a user-initiated action (the frontend's
+            // "interrupt + send" combo) — render the resulting turn
+            // as a normal user bubble.
+            TurnSource::User,
         )
         .await
     }
@@ -4890,7 +4906,8 @@ mod tests {
     use zenui_provider_api::{
         ClientMessage, ContentBlock, PermissionMode, ProviderAdapter, ProviderKind, ProviderStatus,
         ProviderStatusLevel, ProviderTurnEvent, ProviderTurnOutput, ReasoningEffort, RuntimeEvent,
-        SessionDetail, ThinkingMode, ToolCallStatus, TurnEventSink, TurnStatus, UserInput,
+        SessionDetail, ThinkingMode, ToolCallStatus, TurnEventSink, TurnSource, TurnStatus,
+        UserInput,
     };
 
     use super::RuntimeCore;
@@ -6173,6 +6190,7 @@ mod tests {
             input: "hi".to_string(),
             output: String::new(),
             status: TurnStatus::Running,
+            source: TurnSource::User,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
             reasoning: None,

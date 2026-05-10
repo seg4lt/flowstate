@@ -62,7 +62,7 @@ mod codecs;
 use codecs::{
     ext_for_media_type, permission_mode_from_str, permission_mode_to_str, provider_kind_from_str,
     reasoning_effort_from_str, session_status_from_str, session_status_to_str, synthesize_blocks,
-    turn_status_from_str, turn_status_to_str,
+    turn_source_from_str, turn_source_to_str, turn_status_from_str, turn_status_to_str,
 };
 
 #[derive(Debug)]
@@ -323,8 +323,8 @@ impl PersistenceService {
                     "INSERT INTO turns (
                         turn_id, session_id, input, output, status, created_at, updated_at,
                         reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                        plan_json, permission_mode, reasoning_effort, blocks_json
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        plan_json, permission_mode, reasoning_effort, blocks_json, source
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                     params![
                         turn.turn_id,
                         session.summary.session_id,
@@ -341,6 +341,7 @@ impl PersistenceService {
                         permission_mode_str,
                         reasoning_effort_str,
                         blocks_json,
+                        turn_source_to_str(turn.source),
                     ],
                 )
                 .is_err()
@@ -403,8 +404,8 @@ impl PersistenceService {
                 "INSERT INTO turns (
                     turn_id, session_id, input, output, status, created_at, updated_at,
                     reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                    plan_json, permission_mode, reasoning_effort, blocks_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                    plan_json, permission_mode, reasoning_effort, blocks_json, source
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     turn.turn_id,
                     session_id,
@@ -421,6 +422,7 @@ impl PersistenceService {
                     permission_mode_str,
                     reasoning_effort_str,
                     blocks_json,
+                    turn_source_to_str(turn.source),
                 ],
             )
             .is_err()
@@ -1647,6 +1649,11 @@ impl PersistenceService {
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN reasoning_effort TEXT", []);
         let _ = connection.execute("ALTER TABLE turns ADD COLUMN blocks_json TEXT", []);
         let _ = connection.execute("ALTER TABLE archived_turns ADD COLUMN blocks_json TEXT", []);
+        // Authorship column — distinguishes user-typed turns from
+        // wakeup / peer-injected ones. NULL on legacy rows is decoded
+        // as `TurnSource::User` (see `turn_source_from_str`).
+        let _ = connection.execute("ALTER TABLE turns ADD COLUMN source TEXT", []);
+        let _ = connection.execute("ALTER TABLE archived_turns ADD COLUMN source TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN path TEXT", []);
         let _ = connection.execute("ALTER TABLE projects ADD COLUMN deleted_at TEXT", []);
 
@@ -1720,10 +1727,10 @@ impl PersistenceService {
             "INSERT INTO archived_turns
                 (turn_id, session_id, input, output, status, created_at, updated_at,
                  reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                 plan_json, permission_mode, reasoning_effort, blocks_json)
+                 plan_json, permission_mode, reasoning_effort, blocks_json, source)
              SELECT turn_id, session_id, input, output, status, created_at, updated_at,
                     reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                    plan_json, permission_mode, reasoning_effort, blocks_json
+                    plan_json, permission_mode, reasoning_effort, blocks_json, source
              FROM turns WHERE session_id = ?1",
             params![session_id],
         );
@@ -1767,10 +1774,10 @@ impl PersistenceService {
                 "INSERT INTO turns
                     (turn_id, session_id, input, output, status, created_at, updated_at,
                      reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                     plan_json, permission_mode, reasoning_effort, blocks_json)
+                     plan_json, permission_mode, reasoning_effort, blocks_json, source)
                  SELECT turn_id, session_id, input, output, status, created_at, updated_at,
                         reasoning_json, tool_calls_json, file_changes_json, subagents_json,
-                        plan_json, permission_mode, reasoning_effort, blocks_json
+                        plan_json, permission_mode, reasoning_effort, blocks_json, source
                  FROM archived_turns WHERE session_id = ?1",
                 params![session_id],
             );
@@ -1901,7 +1908,7 @@ fn load_session_from(
             format!(
                 "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
                         tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
-                        reasoning_effort, blocks_json
+                        reasoning_effort, blocks_json, source
                  FROM {turns_table} WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2"
             ),
             Some(n as i64),
@@ -1911,7 +1918,7 @@ fn load_session_from(
             format!(
                 "SELECT turn_id, input, output, status, created_at, updated_at, reasoning_json,
                         tool_calls_json, file_changes_json, subagents_json, plan_json, permission_mode,
-                        reasoning_effort, blocks_json
+                        reasoning_effort, blocks_json, source
                  FROM {turns_table} WHERE session_id = ?1 ORDER BY created_at ASC"
             ),
             None,
@@ -1930,6 +1937,7 @@ fn load_session_from(
         let permission_mode_str: Option<String> = row.get(11)?;
         let reasoning_effort_str: Option<String> = row.get(12)?;
         let blocks_json: Option<String> = row.get(13)?;
+        let source_str: Option<String> = row.get(14)?;
         let tool_calls: Vec<ToolCall> = tool_calls_json
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default();
@@ -1958,6 +1966,10 @@ fn load_session_from(
             input: row.get(1)?,
             output,
             status: turn_status_from_str(&row.get::<_, String>(3)?),
+            // NULL on legacy rows (column added after the original
+            // schema) decodes to `TurnSource::User` — see
+            // `turn_source_from_str`.
+            source: turn_source_from_str(source_str.as_deref()),
             created_at: row.get(4)?,
             updated_at: row.get(5)?,
             reasoning,
@@ -2237,6 +2249,125 @@ mod tests {
         assert!(
             service.list_pending_wakeups().await.is_empty(),
             "fired row leaves pending set"
+        );
+    }
+
+    /// `TurnRecord.source` survives a write/read round-trip through
+    /// the live `turns` table — guards against a future column-list
+    /// edit dropping the bind site or row index.
+    #[tokio::test]
+    async fn turn_source_round_trips_through_live_turns() {
+        use zenui_provider_api::{
+            SessionDetail, SessionStatus, SessionSummary, TurnSource, TurnStatus,
+        };
+
+        let service = PersistenceService::in_memory().expect("in-memory service");
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut session = SessionDetail {
+            summary: SessionSummary {
+                session_id: "s-src".to_string(),
+                provider: ProviderKind::Claude,
+                status: SessionStatus::Ready,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                turn_count: 0,
+                model: None,
+                project_id: None,
+            },
+            turns: Vec::new(),
+            provider_state: None,
+            cwd: None,
+        };
+        let mk_turn = |id: &str, source: TurnSource| TurnRecord {
+            turn_id: id.to_string(),
+            input: format!("input for {id}"),
+            output: String::new(),
+            status: TurnStatus::Completed,
+            source,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            file_changes: Vec::new(),
+            subagents: Vec::new(),
+            plan: None,
+            permission_mode: None,
+            reasoning_effort: None,
+            blocks: Vec::new(),
+            input_attachments: Vec::new(),
+            usage: None,
+        };
+        session.turns.push(mk_turn("t-user", TurnSource::User));
+        session.turns.push(mk_turn("t-wake", TurnSource::Wakeup));
+        session.turns.push(mk_turn("t-send", TurnSource::PeerSend));
+        session.turns.push(mk_turn("t-spawn", TurnSource::PeerSpawn));
+        session.summary.turn_count = session.turns.len();
+
+        service.upsert_session(session).await;
+
+        let loaded = service
+            .get_session("s-src")
+            .await
+            .expect("session loads back");
+        let by_id: std::collections::HashMap<_, _> = loaded
+            .turns
+            .iter()
+            .map(|t| (t.turn_id.as_str(), t.source))
+            .collect();
+        assert_eq!(by_id.get("t-user"), Some(&TurnSource::User));
+        assert_eq!(by_id.get("t-wake"), Some(&TurnSource::Wakeup));
+        assert_eq!(by_id.get("t-send"), Some(&TurnSource::PeerSend));
+        assert_eq!(by_id.get("t-spawn"), Some(&TurnSource::PeerSpawn));
+    }
+
+    /// A row written before the `source` column existed (NULL in
+    /// SQLite) decodes to `TurnSource::User`, matching the
+    /// `#[serde(default)]` on the wire type. This is the legacy-data
+    /// safety net — without it, every pre-migration turn would
+    /// suddenly render with a wakeup chip.
+    #[tokio::test]
+    async fn legacy_turn_with_null_source_decodes_as_user() {
+        use zenui_provider_api::TurnSource;
+
+        let service = PersistenceService::in_memory().expect("in-memory service");
+        service.insert_session_row_for_tests("s-legacy").unwrap();
+
+        // Hand-craft an INSERT that omits the `source` column entirely
+        // — sqlite stores NULL — to simulate a row written by the
+        // pre-migration daemon.
+        {
+            let connection = service.connection.lock();
+            connection
+                .execute(
+                    "INSERT INTO turns (
+                        turn_id, session_id, input, output, status, created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        "t-legacy",
+                        "s-legacy",
+                        "old prompt",
+                        "",
+                        "completed",
+                        "2020-01-01T00:00:00Z",
+                        "2020-01-01T00:00:00Z",
+                    ],
+                )
+                .unwrap();
+        }
+
+        let loaded = service
+            .get_session("s-legacy")
+            .await
+            .expect("session loads back");
+        let turn = loaded
+            .turns
+            .iter()
+            .find(|t| t.turn_id == "t-legacy")
+            .expect("legacy turn loads");
+        assert_eq!(
+            turn.source,
+            TurnSource::User,
+            "NULL source must decode as User"
         );
     }
 
