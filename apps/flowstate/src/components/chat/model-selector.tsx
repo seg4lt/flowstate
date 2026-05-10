@@ -18,16 +18,9 @@ import {
 import type { ProviderKind } from "@/lib/types";
 
 interface ModelSelectorProps {
-  /** Draft mode = no session yet; picks call `onModelChange` and never
-   *  fire `update_session_model`. Active mode (default) preserves the
-   *  long-standing behavior. */
-  mode?: "draft" | "active";
   sessionId: string;
   provider: ProviderKind;
   currentModel: string | undefined;
-  /** Required in draft mode (the parent owns the model state).
-   *  Ignored in active mode. */
-  onModelChange?: (model: string) => void;
 }
 
 // Threshold above which the popup grows wider + shows the search
@@ -37,11 +30,9 @@ interface ModelSelectorProps {
 const SEARCH_RELEVANT_MODEL_COUNT = 8;
 
 export function ModelSelector({
-  mode = "active",
   sessionId,
   provider,
   currentModel,
-  onModelChange,
 }: ModelSelectorProps) {
   const { state, send } = useApp();
   const [open, setOpen] = useState(false);
@@ -126,13 +117,6 @@ export function ModelSelector({
 
   async function handleSelect(model: string) {
     setOpen(false);
-    if (mode === "draft") {
-      // Draft mode: parent owns state. No session id to remember
-      // against, no wire RPC — the chosen model is captured in the
-      // `start_session` call when the user sends their first message.
-      onModelChange?.(model);
-      return;
-    }
     // Stash the alias BEFORE sending so the capability lookups in
     // chat-toolbar / chat-view's clamp effect see the pick on the
     // very next render. The SDK will later emit `model_resolved` with

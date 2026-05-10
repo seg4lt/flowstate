@@ -18,27 +18,17 @@ import type {
 } from "@/lib/types";
 
 interface ChatToolbarProps {
-  /** Draft mode = there is no session yet (we're at /chat/draft/...).
-   *  The provider chip mutates parent state instead of firing
-   *  `update_session_provider`, and session-bound chips
-   *  (ContextDisplay, GoalChip, ModelSelector's update_session_model)
-   *  are hidden. Defaults to "active" so existing call sites keep
-   *  their semantics. */
-  mode?: "draft" | "active";
-  /** Required in active mode; ignored / may be empty in draft mode. */
+  /** Live session this toolbar is bound to. Always present — the
+   *  draft-mode ("no session yet") branch went away with the
+   *  `/chat/draft/...` route; every entry point now eager-creates a
+   *  real session before mounting the toolbar. */
   sessionId: string;
   provider: ProviderKind;
   currentModel: string | undefined;
-  /** Draft-mode callbacks. The provider chip uses
-   *  `onProviderChange(kind, defaultModel?)` to update parent state in
-   *  draft mode; ignored in active mode (the chip fires the wire
-   *  message itself and only notifies via the same callback after the
-   *  ack lands, so the parent stays in lock-step). */
+  /** Optional notifier fired AFTER `update_session_provider` acks so
+   *  the parent (ChatView) can refresh its mirrored provider/model
+   *  state without waiting for the runtime event to round-trip. */
   onProviderChange?: (provider: ProviderKind, defaultModel?: string) => void;
-  /** Draft-mode model selection. The active-mode ModelSelector uses
-   *  `update_session_model` directly; in draft mode the parent owns
-   *  the value, so the chip needs a callback. */
-  onModelChange?: (model: string) => void;
   effort: ReasoningEffort;
   onEffortChange: (effort: ReasoningEffort) => void;
   thinkingMode: ThinkingMode;
@@ -48,12 +38,10 @@ interface ChatToolbarProps {
 }
 
 export function ChatToolbar({
-  mode = "active",
   sessionId,
   provider,
   currentModel,
   onProviderChange,
-  onModelChange,
   effort,
   onEffortChange,
   thinkingMode,
@@ -81,10 +69,7 @@ export function ChatToolbar({
   // `supportedEffortLevels` to `[]` and disabling Adaptive on every
   // model after the first turn. The full rationale for the cache
   // lives in `lib/model-settings.ts`.
-  //
-  // In draft mode there's no sessionId yet, so the picked-alias
-  // lookup is a no-op and falls through to currentModel.
-  const pickedModel = sessionId ? readPickedModel(sessionId) : undefined;
+  const pickedModel = readPickedModel(sessionId);
   const modelEntry = resolveModelDisplay(
     pickedModel ?? currentModel,
     provider,
@@ -96,23 +81,20 @@ export function ChatToolbar({
     <div className="flex items-center gap-1.5">
       {/* Provider chip lives next to the model chip — picking a
           different provider naturally cascades into a default model
-          for that provider. In active mode, the chip fires
-          `update_session_provider`; in draft mode it just mutates
-          parent state. */}
+          for that provider. The chip fires `update_session_provider`
+          and notifies the parent via `onProviderChange` after the
+          ack lands so the parent's mirrored state stays in sync. */}
       <ProviderSelector
-        mode={mode}
         provider={provider}
-        sessionId={mode === "active" ? sessionId : undefined}
+        sessionId={sessionId}
         onProviderChange={(p, m) => {
           onProviderChange?.(p, m);
         }}
       />
       <ModelSelector
-        mode={mode}
         sessionId={sessionId}
         provider={provider}
         currentModel={currentModel}
-        onModelChange={onModelChange}
       />
       {/* Effort selector only renders for providers whose adapter
           honours reasoning_effort (Codex's turn/start payload, Claude
@@ -160,13 +142,9 @@ export function ChatToolbar({
           on `goalTracking` so providers without a goal-tracking primitive
           (everyone but Codex today) don't expose a non-functional
           affordance — the chip stays absent rather than rendering a
-          control that would error on click. Hidden in draft mode —
-          there's no session yet for a goal to live on. */}
-      {mode === "active" && features.goalTracking && (
-        <GoalChip sessionId={sessionId} />
-      )}
-      {/* Context display also requires a live session. */}
-      {mode === "active" && showContextDisplay && (
+          control that would error on click. */}
+      {features.goalTracking && <GoalChip sessionId={sessionId} />}
+      {showContextDisplay && (
         <div className="ml-auto">
           <ContextDisplay sessionId={sessionId} />
         </div>

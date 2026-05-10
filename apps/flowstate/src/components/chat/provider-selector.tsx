@@ -19,20 +19,15 @@ import { toast } from "@/hooks/use-toast";
 import type { ProviderKind } from "@/lib/types";
 
 interface ProviderSelectorProps {
-  /** Draft mode = no session yet; mutations stay local. Active mode =
-   *  the chip is bound to a live session and a pick fires
-   *  `update_session_provider` over the wire. */
-  mode: "draft" | "active";
   provider: ProviderKind;
-  /** Required in active mode (the session whose provider we're
-   *  swapping). Ignored in draft mode. */
-  sessionId?: string;
-  /** Notify the parent of the user's pick. In draft mode the parent
-   *  uses this to update its `provider` / `model` state; in active
-   *  mode the parent receives this AFTER the backend swap acks so the
-   *  toolbar repaints in lock-step. The optional second argument is
-   *  the resolved default model for the new provider — handy in draft
-   *  mode so the model chip can update without an extra round-trip. */
+  /** The session whose provider we're swapping. Always required —
+   *  ChatToolbar only mounts on a live session now. */
+  sessionId: string;
+  /** Notify the parent AFTER the backend swap acks so the toolbar
+   *  repaints in lock-step with the runtime. The optional second
+   *  argument is the resolved default model for the new provider, so
+   *  the parent can update its mirrored model state without a second
+   *  round-trip. */
   onProviderChange: (provider: ProviderKind, defaultModel?: string) => void;
 }
 
@@ -43,17 +38,15 @@ interface ProviderSelectorProps {
 const SEARCH_RELEVANT_PROVIDER_COUNT = 8;
 
 /**
- * Toolbar provider chip. In draft mode the parent owns provider /
- * model state — picking here is a local mutation. In active mode a
- * pick fires `update_session_provider`, which the runtime forwards to
- * the new adapter's `start_session` so any per-session bridge state is
- * (re-)initialized with the existing transcript intact.
+ * Toolbar provider chip. A pick fires `update_session_provider`,
+ * which the runtime forwards to the new adapter's `start_session` so
+ * any per-session bridge state is (re-)initialized with the existing
+ * transcript intact.
  *
  * Mirrors `ModelSelector` (Popover + cmdk + autofocus invisible
  * input) so the two chips look and keyboard-navigate identically.
  */
 export function ProviderSelector({
-  mode,
   provider,
   sessionId,
   onProviderChange,
@@ -90,22 +83,6 @@ export function ProviderSelector({
     const saved = await readDefaultModel(next);
     const fallback = providerMap.get(next)?.models[0]?.value;
     const resolvedModel = saved ?? fallback;
-
-    if (mode === "draft") {
-      onProviderChange(next, resolvedModel);
-      return;
-    }
-
-    if (!sessionId) {
-      // Defensive — active mode without a session id is a programmer
-      // error. Toast and bail rather than silently dropping the pick.
-      toast({
-        title: "Cannot switch provider",
-        description: "Active provider switch is missing a session id.",
-        duration: 4000,
-      });
-      return;
-    }
 
     setPendingProvider(next);
     try {
@@ -195,11 +172,10 @@ export function ProviderSelector({
                 <CommandItem
                   key={kind}
                   value={searchValue}
-                  // Active-mode swaps need an actual healthy adapter
-                  // on the other end. Draft-mode picks can target a
-                  // not-yet-ready provider — `start_session` itself
-                  // will surface the error at first send.
-                  disabled={mode === "active" && !isReady}
+                  // Swaps need a healthy adapter on the other end —
+                  // disable rows whose provider isn't ready so the
+                  // user can't pick one and immediately hit an error.
+                  disabled={!isReady}
                   onSelect={() => handleSelect(kind)}
                 >
                   {isSelected ? (
