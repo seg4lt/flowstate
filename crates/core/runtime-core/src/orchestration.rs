@@ -55,6 +55,50 @@ pub struct QueuedMessage {
     pub message: String,
 }
 
+/// A wakeup or cron tick that fired while the target session was
+/// already mid-turn. Held in `RuntimeCore::deferred_fires` and
+/// drained one-at-a-time at turn-end (alongside the peer-send
+/// mailbox). Each deferred fire spawns a fresh turn whose
+/// `TurnSource` matches the `kind` — no synthetic user-bubble
+/// appears mid-task, and the model sees the prompt as a normal
+/// user input the moment the in-flight turn finishes.
+///
+/// Coalescing: cron entries dedup by `cron_id` (a 1Hz cron during a
+/// 60s task should fire once after the task ends, not 60 times).
+/// Wakeup entries are one-shot by construction and never coalesce.
+#[derive(Debug, Clone)]
+pub struct DeferredFire {
+    pub kind: DeferredFireKind,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeferredFireKind {
+    Wakeup { wakeup_id: String },
+    Cron { cron_id: String },
+}
+
+impl DeferredFire {
+    /// `TurnSource` to stamp on the spawned turn so the chat UI
+    /// renders the right authorship chip.
+    pub fn source(&self) -> TurnSource {
+        match self.kind {
+            DeferredFireKind::Wakeup { .. } => TurnSource::Wakeup,
+            DeferredFireKind::Cron { .. } => TurnSource::Cron,
+        }
+    }
+
+    /// Coalescing key. `Some(cron_id)` for crons (dedup duplicates
+    /// while a previous tick is still queued); `None` for wakeups
+    /// (each is one-shot, never dedups).
+    pub fn dedup_key(&self) -> Option<&str> {
+        match &self.kind {
+            DeferredFireKind::Wakeup { .. } => None,
+            DeferredFireKind::Cron { cron_id } => Some(cron_id.as_str()),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct OrchestrationState {
     /// Sessions waiting for a reply from another session, keyed by the

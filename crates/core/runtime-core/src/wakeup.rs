@@ -65,7 +65,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 use zenui_persistence::{PersistenceService, ScheduledWakeupRow};
-use zenui_provider_api::{PermissionMode, RuntimeEvent, TurnSource};
+use zenui_provider_api::RuntimeEvent;
 
 use crate::RuntimeCore;
 
@@ -179,9 +179,11 @@ pub trait WakeupFireHandler: Send + Sync + 'static {
 }
 
 /// Production fire handler. Publishes `RuntimeEvent::WakeupFired` and
-/// calls [`crate::orchestration::spawn_peer_turn`] with self-delivery
-/// semantics so the prompt lands as a user turn on the originating
-/// session.
+/// hands the fire to [`RuntimeCore::spawn_or_defer_fire`], which
+/// either spawns a peer turn immediately (target idle) or queues the
+/// fire for the turn-end drain (target mid-turn). The latter avoids
+/// the "synthetic user bubble appears mid-task and just sits there"
+/// UX wart from earlier — see the addendum in the plan file.
 pub struct RuntimeCoreFireHandler {
     pub runtime: Weak<RuntimeCore>,
 }
@@ -199,17 +201,20 @@ impl WakeupFireHandler for RuntimeCoreFireHandler {
         };
         publish_wakeup_fired(&rc, &fired.session_id, &fired.wakeup_id);
         // Wakeups re-deliver a prompt to the same session — they
-        // don't carry mode/effort overrides, so run the turn with
-        // the session's strictest permission mode and no effort
-        // override (historical behavior pre-spawn-config refactor).
-        crate::orchestration::spawn_peer_turn(
-            rc,
+        // don't carry mode/effort overrides, so the spawn path runs
+        // the turn with the session's strictest permission mode and
+        // no effort override (historical behavior pre-spawn-config
+        // refactor). `spawn_or_defer_fire` carries that policy.
+        rc.spawn_or_defer_fire(
             fired.session_id,
-            fired.prompt,
-            TurnSource::Wakeup,
-            PermissionMode::Default,
-            None,
-        );
+            crate::orchestration::DeferredFire {
+                kind: crate::orchestration::DeferredFireKind::Wakeup {
+                    wakeup_id: fired.wakeup_id,
+                },
+                prompt: fired.prompt,
+            },
+        )
+        .await;
     }
 }
 

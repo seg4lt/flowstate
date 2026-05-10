@@ -7,12 +7,12 @@ interface UserMessageProps {
   input: string;
   attachments?: AttachmentRef[];
   onOpenAttachment?: (attachment: AttachmentRef) => void;
-  /** `"injected"` paints the bubble in muted neutral colors and adds
-   *  a subtle left-border accent so it's visually clear the human
-   *  did not type this turn — runtime-injected wakeups (and peer
-   *  sends/spawns) use this. Default is the standard primary
-   *  bubble. The authorship chip above the bubble carries the
-   *  textual label; this only handles the bubble itself. */
+  /** `"injected"` paints the bubble in a muted neutral background so
+   *  it's visually distinguishable from the user's own primary-tinted
+   *  bubbles — runtime-injected wakeups, crons, and peer sends/spawns
+   *  use this. Default is the standard primary bubble. The authorship
+   *  chip above the bubble carries the textual label; this only
+   *  handles the bubble itself. */
   variant?: "default" | "injected";
 }
 
@@ -25,7 +25,7 @@ function UserMessageInner({
   const hasAttachments = attachments && attachments.length > 0;
   const bubbleClass =
     variant === "injected"
-      ? "max-w-[80%] rounded-lg border-l-2 border-muted-foreground/40 bg-muted/40 px-3 py-2 text-sm text-foreground"
+      ? "max-w-[80%] rounded-lg bg-muted/40 px-3 py-2 text-sm text-foreground"
       : "max-w-[80%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground";
   return (
     <div className="group flex items-start justify-end gap-1">

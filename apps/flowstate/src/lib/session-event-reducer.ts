@@ -327,6 +327,78 @@ export function applyEventToTurns(
     // show up as a TurnRecord on session reload). Acceptable for
     // v1 — the bug being closed is "I can't see peer messages
     // until I type"; a reload-survives version is a follow-up.
+    // Cron lifecycle visibility. The runtime publishes these whenever
+    // a cron is created, ticks, or is cancelled — but only the
+    // "cron-fired-and-then-spawned-a-turn" path produces a TurnRecord
+    // the user sees. While the session is busy, ticks defer silently
+    // and stale fires after CronDelete were leaving the user blind.
+    // Synthesize tiny system rows so every cron lifecycle change
+    // shows up inline in the chat. Same one-shot pattern as
+    // `peer_message_injected` — these are live-only and don't
+    // round-trip through TurnRecord persistence.
+    case "cron_scheduled": {
+      const now = new Date().toISOString();
+      const synthetic: TurnRecord = {
+        turnId: `cron-scheduled-${event.cron_id}-${Date.now()}`,
+        input: `⏱ Cron scheduled — \`${event.cron_expr}\` — job ${event.cron_id.slice(0, 8)}${
+          event.reason ? ` · ${event.reason}` : ""
+        }`,
+        output: "",
+        status: "completed",
+        source: "cron",
+        createdAt: now,
+        updatedAt: now,
+        toolCalls: [],
+        fileChanges: [],
+        subagents: [],
+        blocks: [],
+        inputAttachments: [],
+      };
+      return [...prev, synthetic];
+    }
+    case "cron_fired": {
+      // Two visibility cases collapse here:
+      //   * Idle session — the model will respond with its own
+      //     `Cron`-sourced turn shortly after this row, so the user
+      //     sees both the timer-pop marker and the response.
+      //   * Busy session — the fire is deferred (and may be coalesced
+      //     away). Without this marker the user has zero feedback
+      //     that a tick happened during a long task.
+      const now = new Date().toISOString();
+      const synthetic: TurnRecord = {
+        turnId: `cron-fired-${event.cron_id}-${event.fire_at_unix}`,
+        input: `⏱ Cron tick — job ${event.cron_id.slice(0, 8)}`,
+        output: "",
+        status: "completed",
+        source: "cron",
+        createdAt: now,
+        updatedAt: now,
+        toolCalls: [],
+        fileChanges: [],
+        subagents: [],
+        blocks: [],
+        inputAttachments: [],
+      };
+      return [...prev, synthetic];
+    }
+    case "cron_cancelled": {
+      const now = new Date().toISOString();
+      const synthetic: TurnRecord = {
+        turnId: `cron-cancelled-${event.cron_id}-${Date.now()}`,
+        input: `⏱ Cron cancelled — job ${event.cron_id.slice(0, 8)}`,
+        output: "",
+        status: "completed",
+        source: "cron",
+        createdAt: now,
+        updatedAt: now,
+        toolCalls: [],
+        fileChanges: [],
+        subagents: [],
+        blocks: [],
+        inputAttachments: [],
+      };
+      return [...prev, synthetic];
+    }
     case "peer_message_injected": {
       // Random suffix avoids id collisions when a peer fires two
       // identical messages back-to-back (each must render as its

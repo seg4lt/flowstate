@@ -17,7 +17,7 @@ use internals::{
     write_in_flight_snapshot,
 };
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -414,6 +414,19 @@ pub struct RuntimeCore {
     /// and re-arms from the cron expression instead of marking the
     /// row terminal. Installed by `init_cron_scheduler`.
     cron_scheduler: std::sync::RwLock<Option<cron::CronScheduler>>,
+    /// Wakeups & crons that fired while the target session was
+    /// already mid-turn. Drained one-at-a-time at turn-end (sibling
+    /// of the peer-send mailbox drain at the bottom of `send_turn`).
+    /// Without this queue, a wakeup firing during a long task would
+    /// race the in-flight `send_turn` and surface an immediate
+    /// synthetic user bubble that just sits at "Running" — exactly
+    /// the "queued up on our threads, looks odd" report. Cron
+    /// entries coalesce by `cron_id` so a fast cron doesn't stack a
+    /// backlog while a slow turn runs; wakeups are one-shot and
+    /// never dedup. In-memory only; a daemon restart drops the
+    /// queue (the persisted cron row is what survives, and its
+    /// next natural tick fires after restart).
+    deferred_fires: Arc<Mutex<HashMap<String, VecDeque<orchestration::DeferredFire>>>>,
     /// Per-session bounded ring of recent events for replay on
     /// webview reconnect (Phase 5.5.7). Populated by [`publish`] for
     /// events that carry a `session_id`; global events bypass the
@@ -485,6 +498,7 @@ impl RuntimeCore {
             wakeup_scheduler: std::sync::RwLock::new(None),
             pending_wakeup_invalidations: Arc::new(Mutex::new(HashSet::new())),
             cron_scheduler: std::sync::RwLock::new(None),
+            deferred_fires: Arc::new(Mutex::new(HashMap::new())),
             session_events: Arc::new(session_events::SessionEventStore::default_capacity()),
         }
     }
@@ -988,6 +1002,15 @@ impl RuntimeCore {
         tokio::spawn(async move {
             let cancelled = rc.persistence.cancel_cron(&cron_id).await;
             scheduler.cancel(&cron_id);
+            // Drain any tick that was already queued in `deferred_fires`
+            // before the CronDelete arrived — without this, a fire
+            // deferred during a busy turn would still drain at turn-end
+            // as a stale `Cron`-sourced turn, exactly the "stale
+            // two-minute loop fire keeps arriving" report. Always run
+            // even when `cancelled == false` (e.g. row was already
+            // cancelled or unknown id) so a second CronDelete acts as a
+            // belt-and-braces purge.
+            rc.purge_deferred_cron_fires(&session_id, &cron_id).await;
             if cancelled {
                 cron::publish_cron_cancelled(&rc, &session_id, &cron_id);
             } else {
@@ -998,6 +1021,107 @@ impl RuntimeCore {
                 );
             }
         });
+    }
+
+    /// Decide whether a fired wakeup or cron tick should spawn a
+    /// fresh peer turn immediately or be deferred until the in-flight
+    /// turn finishes. Called from `WakeupFireHandler::on_wakeup_fired`
+    /// and `CronFireHandler::on_cron_fired`. The dispatch policy:
+    ///
+    /// 1. **Idle target** (`active_sinks` empty for this session) →
+    ///    spawn a peer turn immediately, same shape as before. The
+    ///    fire becomes a normal `Wakeup`/`Cron`-sourced turn the
+    ///    user sees as a chip-tagged user bubble.
+    /// 2. **Busy target** → push onto `deferred_fires` and bail.
+    ///    The turn-end drain (sibling of the peer-send mailbox drain
+    ///    in `send_turn`) pops one entry per completed turn and
+    ///    spawns it then. Crons coalesce by `cron_id` so a fast
+    ///    schedule doesn't stack a backlog — only the *first* fire
+    ///    for a given cron stays queued; subsequent ticks are dropped
+    ///    with a debug log.
+    ///
+    /// Why no live injection: the user wants each fire to be its own
+    /// turn (with its own authorship chip and its own assistant
+    /// reply), not a mid-turn append onto the unrelated in-flight
+    /// task. That decision diverges intentionally from peer-send,
+    /// which DOES inject mid-turn — see `dispatch_send_and_await`.
+    pub(crate) async fn spawn_or_defer_fire(
+        self: &Arc<Self>,
+        session_id: String,
+        fire: orchestration::DeferredFire,
+    ) {
+        let busy = self.active_sinks.lock().await.contains_key(&session_id);
+        if !busy {
+            // Compute source before the move so we don't fight the
+            // partial-move borrow checker (`fire.prompt` is consumed
+            // by `spawn_peer_turn`).
+            let source = fire.source();
+            crate::orchestration::spawn_peer_turn(
+                Arc::clone(self),
+                session_id,
+                fire.prompt,
+                source,
+                PermissionMode::Default,
+                None,
+            );
+            return;
+        }
+        let mut queues = self.deferred_fires.lock().await;
+        let q = queues.entry(session_id.clone()).or_default();
+        if let Some(key) = fire.dedup_key() {
+            if q.iter().any(|f| f.dedup_key() == Some(key)) {
+                tracing::debug!(
+                    session_id = %session_id,
+                    dedup_key = %key,
+                    "coalescing duplicate deferred fire (a previous tick is still queued)"
+                );
+                return;
+            }
+        }
+        q.push_back(fire);
+    }
+
+    /// Pop the next deferred fire for `session_id`, if any. Called
+    /// from the turn-end drain. Returns `None` when the queue is
+    /// empty or absent. Safe to call when no deferred fires were
+    /// ever enqueued for this session — the entry is created lazily
+    /// in `spawn_or_defer_fire` and stays around (empty) afterward;
+    /// that's harmless.
+    pub(crate) async fn pop_deferred_fire(
+        &self,
+        session_id: &str,
+    ) -> Option<orchestration::DeferredFire> {
+        let mut queues = self.deferred_fires.lock().await;
+        queues.get_mut(session_id).and_then(|q| q.pop_front())
+    }
+
+    /// Drop every deferred fire targeting `session_id`. Called from
+    /// archive / delete paths so a deferred wakeup can't resurrect a
+    /// turn on a session the user just put away.
+    pub(crate) async fn clear_deferred_fires_for_session(&self, session_id: &str) {
+        self.deferred_fires.lock().await.remove(session_id);
+    }
+
+    /// Drop any deferred cron fires for `cron_id` on `session_id`.
+    /// Called from `observe_cron_delete_tool_call` so a `CronDelete`
+    /// also kills any tick that was already queued while the session
+    /// was busy. Without this, a fire that landed mid-turn before the
+    /// CronDelete arrived would still drain at turn-end as a stale
+    /// `Cron`-sourced turn — exactly the "two-minute loop fire keeps
+    /// arriving after I deleted it" report.
+    ///
+    /// Wakeups don't have a delete tool today, but if/when they do,
+    /// the symmetric helper would live next to this one.
+    pub(crate) async fn purge_deferred_cron_fires(&self, session_id: &str, cron_id: &str) {
+        let mut queues = self.deferred_fires.lock().await;
+        if let Some(q) = queues.get_mut(session_id) {
+            q.retain(|f| match &f.kind {
+                crate::orchestration::DeferredFireKind::Cron { cron_id: queued } => {
+                    queued != cron_id
+                }
+                crate::orchestration::DeferredFireKind::Wakeup { .. } => true,
+            });
+        }
     }
 
     /// Upgrade the back-reference into a live Arc. Returns `None` if
@@ -2365,6 +2489,50 @@ impl RuntimeCore {
             }
             ClientMessage::ArchiveSession { session_id } => {
                 if self.persistence.archive_session(&session_id).await {
+                    // Tear down every scheduled fire path tied to
+                    // this session. Three layers, all required:
+                    //
+                    //   1. Persisted `scheduled_wakeups` /
+                    //      `scheduled_crons` rows → flip to
+                    //      `cancelled` so a daemon restart doesn't
+                    //      rehydrate them. The schema's FK is
+                    //      `ON DELETE CASCADE`, but archive only
+                    //      moves the session row to a separate
+                    //      table — nothing cascades — so without
+                    //      this explicit cancel a "close the session
+                    //      to stop the cron" attempt is a no-op and
+                    //      the cron keeps firing forever.
+                    //   2. In-memory scheduler heap entries → the
+                    //      task that owns the heap doesn't watch
+                    //      session archive events, so we have to
+                    //      ask it to cancel each cron_id explicitly.
+                    //      Wakeup scheduler has the same shape
+                    //      (`cancel_wakeups_for_session` returns the
+                    //      ids it cancelled).
+                    //   3. In-memory deferred-fires queue → cleared
+                    //      so any tick already queued under
+                    //      `deferred_fires` for this session can't
+                    //      drain at turn-end after the user archived.
+                    let cancelled_wakeups = self
+                        .persistence
+                        .cancel_wakeups_for_session(&session_id)
+                        .await;
+                    let cancelled_crons = self
+                        .persistence
+                        .cancel_crons_for_session(&session_id)
+                        .await;
+                    if let Some(scheduler) = self.wakeup_scheduler() {
+                        for wid in &cancelled_wakeups {
+                            scheduler.cancel(wid);
+                        }
+                    }
+                    if let Some(scheduler) = self.cron_scheduler() {
+                        for cid in &cancelled_crons {
+                            scheduler.cancel(cid);
+                            cron::publish_cron_cancelled(self, &session_id, cid);
+                        }
+                    }
+                    self.clear_deferred_fires_for_session(&session_id).await;
                     self.publish(RuntimeEvent::SessionArchived {
                         session_id: session_id.clone(),
                     });
@@ -3746,6 +3914,32 @@ impl RuntimeCore {
             }
         }
 
+        // Sibling drain for wakeup/cron fires that landed while this
+        // turn was running. Pop ONE entry — its newly-spawned turn's
+        // own end-hook drains the next, so multiple deferred fires
+        // play back serially instead of stomping each other. We
+        // intentionally don't gate this on `status == Completed`:
+        // even if the in-flight turn ended Interrupted/Failed, the
+        // user still wants their scheduled wakeup to land (otherwise
+        // a flaky tool call could starve the loop).
+        if let Some(fire) = self
+            .pop_deferred_fire(&session.summary.session_id)
+            .await
+        {
+            if let Some(rc) = self.self_arc() {
+                let target = session.summary.session_id.clone();
+                let source = fire.source();
+                crate::orchestration::spawn_peer_turn(
+                    rc,
+                    target,
+                    fire.prompt,
+                    source,
+                    PermissionMode::Default,
+                    None,
+                );
+            }
+        }
+
         // Wake any `steer_turn` awaiting the turn's post-interrupt
         // unwind. `notify_waiters()` is a no-op when nobody is waiting,
         // so the normal (non-steer) completion path pays nothing for
@@ -5028,8 +5222,44 @@ impl RuntimeCore {
                 }
             }
 
+            // Snapshot the session's active scheduled-fire ids BEFORE
+            // delete_session FK-cascades the rows away — we still
+            // need the ids to cancel the in-memory scheduler heap
+            // entries (the heap doesn't watch the rows, just the
+            // explicit `scheduler.cancel(id)` calls). Without this,
+            // the scheduler keeps trying to fire into a deleted
+            // session until process shutdown.
+            let active_wakeups = self
+                .persistence
+                .list_pending_wakeups()
+                .await
+                .into_iter()
+                .filter(|w| w.session_id == session_id)
+                .map(|w| w.wakeup_id)
+                .collect::<Vec<_>>();
+            let active_crons = self
+                .persistence
+                .list_active_crons()
+                .await
+                .into_iter()
+                .filter(|c| c.session_id == session_id)
+                .map(|c| c.cron_id)
+                .collect::<Vec<_>>();
+
             if !self.persistence.delete_session(&session_id) {
                 return Err(format!("Session `{session_id}` could not be deleted."));
+            }
+
+            if let Some(scheduler) = self.wakeup_scheduler() {
+                for wid in &active_wakeups {
+                    scheduler.cancel(wid);
+                }
+            }
+            if let Some(scheduler) = self.cron_scheduler() {
+                for cid in &active_crons {
+                    scheduler.cancel(cid);
+                    cron::publish_cron_cancelled(self, &session_id, cid);
+                }
             }
         } else if !self.persistence.delete_archived_session(&session_id) {
             return Err(format!("Unknown session `{session_id}`."));
@@ -5050,6 +5280,9 @@ impl RuntimeCore {
 
         // Drop the session's permission policy so it doesn't grow forever.
         self.session_policies.lock().await.remove(&session_id);
+        // And drop any in-flight deferred wakeup/cron fires for this
+        // session — see the matching cleanup in `ArchiveSession`.
+        self.clear_deferred_fires_for_session(&session_id).await;
         // Drop the per-session steer-wakeup notifier. Any `steer_turn`
         // currently awaiting on it will be cancelled by its own session
         // lookup failing before it reaches the wait.
@@ -7371,5 +7604,246 @@ mod tests {
         // Cleanup: release the paused turn so the test exits cleanly.
         let _ = resume_tx.send(());
         let _ = turn_task.await;
+    }
+
+    // ----------------------------------------------------------------
+    // Defer-on-busy tests for `spawn_or_defer_fire`
+    //
+    // These exercise the addendum behavior added so wakeup/cron fires
+    // landing while a turn is already running don't surface a stray
+    // synthetic user bubble. We poke `active_sinks` directly to
+    // simulate "session busy" without standing up a real long-running
+    // turn — the unit-of-work here is just the queue manipulation
+    // and dedup logic, not the Tokio adapter machinery.
+    // ----------------------------------------------------------------
+
+    fn make_runtime() -> Arc<RuntimeCore> {
+        Arc::new(RuntimeCore::new(
+            vec![Arc::new(FakeAdapter)],
+            Arc::new(OrchestrationService::new()),
+            Arc::new(PersistenceService::in_memory().expect("in-memory db should initialize")),
+            Arc::new(zenui_checkpoints::NoopCheckpointStore),
+            None,
+            "/tmp/zenui-test/threads".to_string(),
+            "test-app".to_string(),
+        ))
+    }
+
+    /// Mark a session "busy" by inserting a dummy `TurnEventSink` into
+    /// `active_sinks`. The receiver is leaked into `_keepalive` so the
+    /// channel stays open for the duration of the test (closing it
+    /// would cause `sink.send` to silently drop, but we don't actually
+    /// drive the sink — we just need the entry present so the busy
+    /// check in `spawn_or_defer_fire` returns true).
+    async fn mark_session_busy(runtime: &Arc<RuntimeCore>, session_id: &str) -> SinkKeepalive {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ProviderTurnEvent>(8);
+        let sink = TurnEventSink::new(tx);
+        runtime
+            .active_sinks
+            .lock()
+            .await
+            .insert(session_id.to_string(), sink);
+        SinkKeepalive { _rx: rx }
+    }
+
+    /// Holds the receiver half of the dummy sink's channel so it stays
+    /// open. Drop = close = sink sends become no-ops (which is fine,
+    /// but be explicit by parking the rx for the duration of the test).
+    struct SinkKeepalive {
+        _rx: tokio::sync::mpsc::Receiver<ProviderTurnEvent>,
+    }
+
+    fn wakeup_fire(wakeup_id: &str, prompt: &str) -> crate::orchestration::DeferredFire {
+        crate::orchestration::DeferredFire {
+            kind: crate::orchestration::DeferredFireKind::Wakeup {
+                wakeup_id: wakeup_id.to_string(),
+            },
+            prompt: prompt.to_string(),
+        }
+    }
+
+    fn cron_fire(cron_id: &str, prompt: &str) -> crate::orchestration::DeferredFire {
+        crate::orchestration::DeferredFire {
+            kind: crate::orchestration::DeferredFireKind::Cron {
+                cron_id: cron_id.to_string(),
+            },
+            prompt: prompt.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_or_defer_enqueues_when_busy() {
+        let runtime = make_runtime();
+        let session_id = "s-busy";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), wakeup_fire("w-1", "tick"))
+            .await;
+
+        let popped = runtime
+            .pop_deferred_fire(session_id)
+            .await
+            .expect("busy session should have queued the fire");
+        assert_eq!(popped.prompt, "tick");
+        assert!(matches!(
+            popped.kind,
+            crate::orchestration::DeferredFireKind::Wakeup { .. }
+        ));
+        // Queue should be empty now.
+        assert!(runtime.pop_deferred_fire(session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cron_coalesces_duplicate_ids_while_busy() {
+        let runtime = make_runtime();
+        let session_id = "s-cron-busy";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        // Three fires for the same cron during a single busy window.
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-1", "tick A"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-1", "tick B"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-1", "tick C"))
+            .await;
+
+        let first = runtime
+            .pop_deferred_fire(session_id)
+            .await
+            .expect("first tick should have queued");
+        assert_eq!(first.prompt, "tick A", "the first tick wins; later are dropped");
+        assert!(
+            runtime.pop_deferred_fire(session_id).await.is_none(),
+            "no further entries — coalescing dropped ticks B and C"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_crons_do_not_coalesce() {
+        // Two different cron rows firing while busy should both queue —
+        // dedup is per cron_id, not per session.
+        let runtime = make_runtime();
+        let session_id = "s-multi-cron";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-A", "from A"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-B", "from B"))
+            .await;
+
+        let one = runtime.pop_deferred_fire(session_id).await.unwrap();
+        let two = runtime.pop_deferred_fire(session_id).await.unwrap();
+        assert_eq!(one.prompt, "from A");
+        assert_eq!(two.prompt, "from B");
+    }
+
+    #[tokio::test]
+    async fn wakeups_do_not_coalesce_even_with_same_prompt() {
+        // Wakeups are one-shot by construction (each has a unique
+        // wakeup_id from `Uuid::new_v4`) and must never dedup. Belt-
+        // and-braces: even if two arrive with the same prompt and the
+        // session is busy, both queue.
+        let runtime = make_runtime();
+        let session_id = "s-wake";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), wakeup_fire("w-1", "same prompt"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), wakeup_fire("w-2", "same prompt"))
+            .await;
+
+        assert!(runtime.pop_deferred_fire(session_id).await.is_some());
+        assert!(runtime.pop_deferred_fire(session_id).await.is_some());
+        assert!(runtime.pop_deferred_fire(session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn clear_deferred_fires_drops_queue() {
+        let runtime = make_runtime();
+        let session_id = "s-clear";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), wakeup_fire("w-1", "p1"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-1", "p2"))
+            .await;
+
+        runtime.clear_deferred_fires_for_session(session_id).await;
+        assert!(
+            runtime.pop_deferred_fire(session_id).await.is_none(),
+            "clear must drop every queued fire for the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_deferred_cron_fires_drops_only_matching_cron() {
+        // Mixed queue: cron c-A, wakeup w-1, cron c-B. Purging c-A
+        // must remove only c-A's entry; the wakeup and c-B stay.
+        let runtime = make_runtime();
+        let session_id = "s-purge";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-A", "from A"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), wakeup_fire("w-1", "from W"))
+            .await;
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-B", "from B"))
+            .await;
+
+        runtime
+            .purge_deferred_cron_fires(session_id, "c-A")
+            .await;
+
+        // Drain the queue and assert only the wakeup and c-B remain,
+        // in the same FIFO order they were enqueued.
+        let one = runtime.pop_deferred_fire(session_id).await.unwrap();
+        let two = runtime.pop_deferred_fire(session_id).await.unwrap();
+        assert!(runtime.pop_deferred_fire(session_id).await.is_none());
+        assert_eq!(one.prompt, "from W");
+        assert_eq!(two.prompt, "from B");
+    }
+
+    #[tokio::test]
+    async fn purge_deferred_cron_fires_unknown_id_is_noop() {
+        // CronDelete on an id that was never queued must not panic and
+        // must leave the existing queue untouched.
+        let runtime = make_runtime();
+        let session_id = "s-purge-noop";
+        let _keep = mark_session_busy(&runtime, session_id).await;
+
+        runtime
+            .spawn_or_defer_fire(session_id.to_string(), cron_fire("c-real", "p"))
+            .await;
+        runtime
+            .purge_deferred_cron_fires(session_id, "c-doesnt-exist")
+            .await;
+
+        let kept = runtime.pop_deferred_fire(session_id).await.unwrap();
+        assert_eq!(kept.prompt, "p");
+    }
+
+    #[test]
+    fn deferred_fire_dedup_keys() {
+        // Sanity: source/dedup_key behave per spec.
+        let w = wakeup_fire("w-1", "p");
+        assert_eq!(w.source(), TurnSource::Wakeup);
+        assert!(w.dedup_key().is_none());
+
+        let c = cron_fire("c-1", "p");
+        assert_eq!(c.source(), TurnSource::Cron);
+        assert_eq!(c.dedup_key(), Some("c-1"));
     }
 }

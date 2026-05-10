@@ -53,7 +53,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{Instant, sleep_until};
 use zenui_persistence::{PersistenceService, ScheduledCronRow};
-use zenui_provider_api::{PermissionMode, RuntimeEvent, TurnSource};
+use zenui_provider_api::RuntimeEvent;
 
 use crate::RuntimeCore;
 use crate::wakeup::now_unix_secs;
@@ -244,9 +244,11 @@ pub trait CronFireHandler: Send + Sync + 'static {
 }
 
 /// Production fire handler. Publishes `RuntimeEvent::CronFired` and
-/// calls [`crate::orchestration::spawn_peer_turn`] with self-delivery
-/// semantics so the prompt lands as a user turn on the originating
-/// session.
+/// hands the fire to [`RuntimeCore::spawn_or_defer_fire`], which
+/// either spawns a peer turn immediately (target idle) or queues
+/// the fire for the turn-end drain (target mid-turn). Cron entries
+/// coalesce by `cron_id` so a fast schedule against a slow turn
+/// fires once after the turn ends, not N times stacked.
 pub struct RuntimeCoreFireHandler {
     pub runtime: Weak<RuntimeCore>,
 }
@@ -263,18 +265,47 @@ impl CronFireHandler for RuntimeCoreFireHandler {
             return;
         };
         publish_cron_fired(&rc, &fired.session_id, &fired.cron_id, fired.fire_at_unix);
+        // Tag the fired prompt with the cron_id so the model can
+        // self-cancel reliably. Without this, the model receives the
+        // raw prompt the user wrote — which usually says "call
+        // CronDelete on this job" but never includes an id, leaving
+        // the model unable to actually cancel. Result: runaway crons
+        // the user has to kill via the DB. The bracket-prefix is
+        // both human- and model-readable; CronDelete takes the same
+        // id verbatim. See [`tagged_cron_prompt`] for the wrapping
+        // contract (kept as a free fn so tests can pin the format).
+        let tagged_prompt = tagged_cron_prompt(&fired.cron_id, &fired.prompt);
         // Same self-delivery shape as wakeups (`wakeup.rs`): no
-        // mode/effort overrides, the session's own permissions and
-        // model apply.
-        crate::orchestration::spawn_peer_turn(
-            rc,
+        // mode/effort overrides — the session's own permissions and
+        // model apply. `spawn_or_defer_fire` carries that policy and
+        // adds the busy-aware defer/coalesce logic.
+        rc.spawn_or_defer_fire(
             fired.session_id,
-            fired.prompt,
-            TurnSource::Cron,
-            PermissionMode::Default,
-            None,
-        );
+            crate::orchestration::DeferredFire {
+                kind: crate::orchestration::DeferredFireKind::Cron {
+                    cron_id: fired.cron_id,
+                },
+                prompt: tagged_prompt,
+            },
+        )
+        .await;
     }
+}
+
+/// Wrap a cron-fired prompt with a leading `[cron <id>]` tag so the
+/// model has the cron_id in plain text and can pass it to
+/// `CronDelete` when self-cancelling. Without this tag the original
+/// prompt usually says "call CronDelete on this job to stop" but
+/// never embeds the id — the model can't fulfil that instruction
+/// because it has nothing to pass.
+///
+/// The tag is on its own line followed by a blank line so the model
+/// reads the original prompt clean. Format pinned by `tests::tagged_cron_prompt_*`
+/// — change here only if you also change the tests.
+pub fn tagged_cron_prompt(cron_id: &str, original: &str) -> String {
+    format!(
+        "[cron {cron_id} fire — call CronDelete with cron_id=\"{cron_id}\" to stop]\n\n{original}"
+    )
 }
 
 /// Handle to the scheduler task. Cheap to clone; hands off every
@@ -590,6 +621,29 @@ mod tests {
     fn parse_create_args_rejects_unparseable_cron() {
         let args = json!({ "cron": "garbage", "prompt": "x" });
         assert!(parse_cron_create_args(&args).is_none());
+    }
+
+    #[test]
+    #[test]
+    fn tagged_cron_prompt_pins_format() {
+        // Format is load-bearing for the model's self-cancel: the
+        // first line must include the literal `cron <id>` so plain-
+        // text extraction works, and `cron_id="..."` must be the
+        // exact string CronDelete accepts. Other adapters parse this
+        // verbatim — change the format only with intent.
+        let tagged = tagged_cron_prompt("a9c66467-9fda", "say hello <counter>");
+        assert!(
+            tagged.starts_with("[cron a9c66467-9fda"),
+            "tag must be the leading bracketed token: got {tagged:?}"
+        );
+        assert!(
+            tagged.contains("CronDelete with cron_id=\"a9c66467-9fda\""),
+            "tag must spell out the CronDelete invocation verbatim"
+        );
+        assert!(
+            tagged.ends_with("\n\nsay hello <counter>"),
+            "original prompt must follow a blank-line separator so the model parses it clean"
+        );
     }
 
     #[test]
