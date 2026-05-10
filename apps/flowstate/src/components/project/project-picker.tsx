@@ -266,29 +266,38 @@ export function ProjectPicker({
                   // substring on `value`.
                   value={`${p.name} ${p.branch ?? ""} ${p.path ?? ""}`}
                   onSelect={() => handlePick(p)}
+                  className="items-start py-2"
                 >
                   {p.isWorktree && (
-                    <GitBranch className="mr-2 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <GitBranch className="mr-2 mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   )}
-                  <span
-                    className={
-                      p.isWorktree
-                        ? "truncate text-muted-foreground"
-                        : "flex-1 truncate"
-                    }
-                  >
-                    {p.name}
-                  </span>
-                  {p.isWorktree && (
-                    <span className="ml-1.5 flex-1 truncate text-xs">
-                      · {p.branch ?? "(detached)"}
-                    </span>
-                  )}
-                  {p.path && (
-                    <span className="ml-2 truncate text-[10px] text-muted-foreground">
-                      {p.path}
-                    </span>
-                  )}
+                  {/* Two-line stack: name (+ branch chip) on top,
+                      full path below with wrap. Path is no longer
+                      truncated — long worktree paths break across
+                      lines so they remain identifiable. */}
+                  <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                    <div className="flex min-w-0 items-baseline">
+                      <span
+                        className={
+                          p.isWorktree
+                            ? "truncate text-muted-foreground"
+                            : "truncate"
+                        }
+                      >
+                        {p.name}
+                      </span>
+                      {p.isWorktree && (
+                        <span className="ml-1.5 truncate text-xs text-muted-foreground">
+                          · {p.branch ?? "(detached)"}
+                        </span>
+                      )}
+                    </div>
+                    {p.path && (
+                      <span className="whitespace-normal break-all text-[10px] leading-snug text-muted-foreground">
+                        {p.path}
+                      </span>
+                    )}
+                  </div>
                 </CommandItem>
               ))}
             </CommandGroup>
