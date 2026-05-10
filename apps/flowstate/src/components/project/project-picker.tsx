@@ -1,5 +1,6 @@
 import * as React from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { invoke } from "@tauri-apps/api/core";
 import { GitBranch } from "lucide-react";
 import {
   Command,
@@ -62,6 +63,58 @@ export function ProjectPicker({
     toast({ title: "New thread", description: message, duration: 4000 });
   }, []);
 
+  // Paths confirmed to be missing on disk. Worktree directories
+  // deleted out-of-band (`git worktree remove`, `rm -rf`, branch
+  // cleanup) leave their `project_worktree` rows behind — without
+  // this filter the picker accumulates dozens of stale entries
+  // pointing at directories that no longer exist. We probe via the
+  // existing `path_exists` Tauri command rather than wiring a
+  // backend prune so the picker self-heals without coordinating
+  // with the daemon's own lifecycle. Only entries explicitly
+  // confirmed missing are filtered; pending probes render
+  // optimistically so the picker stays responsive on first open.
+  const [missingPaths, setMissingPaths] = React.useState<
+    ReadonlySet<string>
+  >(() => new Set());
+
+  React.useEffect(() => {
+    if (!open) {
+      // Reset on close so the next open re-probes — picks up any
+      // worktrees that have been re-created at the same path.
+      setMissingPaths(new Set());
+      return;
+    }
+    // Build the unique set of worktree paths to probe. Parents
+    // aren't in scope for this fix (the user's report is
+    // worktree-specific) and `path === undefined` rows have
+    // nothing to verify.
+    const paths = new Set<string>();
+    for (const p of state.projects) {
+      if (!state.projectWorktrees.has(p.projectId)) continue;
+      if (typeof p.path === "string" && p.path.length > 0) {
+        paths.add(p.path);
+      }
+    }
+    if (paths.size === 0) return;
+    let cancelled = false;
+    const pathList = Array.from(paths);
+    void Promise.all(
+      pathList.map((path) =>
+        invoke<boolean>("path_exists", { path }).catch(() => true),
+      ),
+    ).then((results) => {
+      if (cancelled) return;
+      const missing = new Set<string>();
+      results.forEach((exists, i) => {
+        if (!exists) missing.add(pathList[i]);
+      });
+      setMissingPaths(missing);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, state.projects, state.projectWorktrees]);
+
   const projects = React.useMemo<ProjectRow[]>(() => {
     const nameFor = (projectId: string) =>
       state.projectDisplay.get(projectId)?.name ?? "Untitled project";
@@ -74,6 +127,11 @@ export function ProjectPicker({
     for (const p of state.projects) {
       const link = state.projectWorktrees.get(p.projectId);
       if (!link) continue;
+      // Drop worktrees whose directory has been confirmed missing
+      // on disk. Pending probes (path not yet in the set) fall
+      // through and render — the effect re-runs and the row
+      // disappears once the probe resolves.
+      if (typeof p.path === "string" && missingPaths.has(p.path)) continue;
       const parent = projectById.get(link.parentProjectId);
       if (!parent) {
         // Defensive: parent project record is missing (shouldn't happen
@@ -148,7 +206,12 @@ export function ProjectPicker({
       });
     }
     return rows;
-  }, [state.projects, state.projectDisplay, state.projectWorktrees]);
+  }, [
+    state.projects,
+    state.projectDisplay,
+    state.projectWorktrees,
+    missingPaths,
+  ]);
 
   const handlePick = React.useCallback(
     (row: ProjectRow) => {
