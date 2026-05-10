@@ -145,7 +145,7 @@ export function GoalChip({ sessionId }: GoalChipProps) {
       <>
         <button
           type="button"
-          className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-accent text-muted-foreground"
+          className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:text-foreground"
           onClick={() => setDialogOpen(true)}
         >
           <Target className="h-3 w-3" />
@@ -177,7 +177,7 @@ export function GoalChip({ sessionId }: GoalChipProps) {
         <DropdownMenuTrigger asChild>
           <button
             type="button"
-            className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-accent ${meta.tone}`}
+            className={`inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs hover:text-foreground ${meta.tone}`}
             title={goal.objective}
           >
             <Target className="h-3 w-3" />
