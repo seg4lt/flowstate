@@ -505,7 +505,9 @@ export const SHORTCUTS: Shortcut[] = [
     group: "Navigation",
     fireInTextInputs: true,
     documentationOnly: true,
-    // Behavior: hooks/useModeCycleShortcut.ts (also wired in chat-view.tsx).
+    // Behavior: inline capture-phase keydown listener in chat-view.tsx
+    // (search for "Keyboard shortcut for mode cycling"). Always fires
+    // — no focus-target exemptions, no documentationOnly bypass here.
     run: () => {},
   },
 ];

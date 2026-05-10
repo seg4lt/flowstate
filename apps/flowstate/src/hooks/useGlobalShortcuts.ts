@@ -24,12 +24,15 @@ import type { ProviderKind, SessionSummary } from "@/lib/types";
 // help dialog's open state is owned by the caller so the same hook
 // can be tested in isolation.
 //
-// Pattern follows useModeCycleShortcut.ts: one useEffect, attaches
-// to `window`, returns a cleanup. Unlike that hook, we do NOT skip
-// when focus is on input/textarea — the user explicitly required
+// One useEffect, attaches to `window`, returns a cleanup. We do NOT
+// skip when focus is on input/textarea — the user explicitly required
 // every registered shortcut to fire even from inside the composer.
 // Each shortcut still calls preventDefault to suppress browser
 // defaults like ⌘P (print), ⌘[ / ⌘] (history nav), ⌘⇧F (fullscreen).
+//
+// Shift+Tab (mode cycling) is intentionally NOT in this dispatcher —
+// it's handled by an inline capture-phase listener in chat-view.tsx
+// so it can run ahead of Radix focus traps and tab-navigation.
 export function useGlobalShortcuts(params: {
   openShortcutsHelp: () => void;
   /** Open the project picker dialog used by ⌘⇧N. Owned by AppShell so

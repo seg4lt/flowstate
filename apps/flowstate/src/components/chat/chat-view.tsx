@@ -1048,7 +1048,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     [diffStream.diffs],
   );
 
-  // Keyboard shortcut for mode cycling (Shift+Tab)
+  // Keyboard shortcut for mode cycling (Shift+Tab).
+  //
+  // ALWAYS cycles the active thread's permission mode — no focus-target
+  // exemptions. An earlier version skipped INPUT and contenteditable
+  // elements so the browser could keep its default focus-backward
+  // behavior, but that meant focusing any tab-focusable button (sidebar
+  // row, toolbar chip, file-tree node, …) would also lose the keystroke
+  // — Shift+Tab would just shuffle DOM focus around instead of changing
+  // the mode. The user's mental model is "Shift+Tab = next permission
+  // mode, period," so we listen at the capture phase, preventDefault +
+  // stopPropagation unconditionally, and cycle. The only requirement is
+  // a live session in this view; archived/missing threads still fall
+  // through (no thread to cycle for).
   React.useEffect(() => {
     if (!session) return; // Only active when session exists
 
@@ -1056,19 +1068,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       // Only respond to Shift+Tab
       if (event.key !== "Tab" || !event.shiftKey) return;
 
-      // Skip when focus is on an INPUT or contenteditable — e.g.
-      // title-rename, branch switcher search, diff style toggles —
-      // where Shift+Tab should keep its default focus-navigation
-      // behavior. The composer <textarea> is the only textarea in
-      // the app and is intentionally NOT skipped: users want the
-      // mode to cycle while typing without losing their cursor.
-      const target = event.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.isContentEditable) {
-        return;
-      }
-
-      // Prevent default Tab behavior (focus navigation)
+      // Always intercept — no focus-target exemptions. See comment
+      // above for why the previous INPUT/contenteditable skip was
+      // wrong. Capture-phase + stopPropagation ensures no inner
+      // keymap (CodeMirror, command palette, etc.) eats the chord
+      // before we get to it.
       event.preventDefault();
+      event.stopPropagation();
 
       // Cycle to next mode. Always update local state so the toolbar
       // reflects the choice and the next `send_turn` sends it. If a
@@ -1092,8 +1098,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       });
     };
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+    window.addEventListener("keydown", handleKeyDown, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", handleKeyDown, { capture: true });
   }, [session, permissionMode, excludedModes]);
 
   // Escape interrupts the in-flight turn — but requires a *double* press
