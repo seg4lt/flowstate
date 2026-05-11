@@ -22,15 +22,32 @@ import type { SessionDetail } from "./types";
 // recent N turns on open keeps the round-trip small for long
 // threads; older turns load on demand when the user scrolls up.
 //
-// Sized small enough that the cold-cache `load_session` round-trip
-// stays cheap even on threads with rich turn payloads (long
-// reasoning, big tool-call traces, many file changes). The "Load
-// older" affordance covers anything beyond the initial window in a
-// single follow-up RPC, so this is purely a first-paint budget — not
-// a cap on history. 20 fills a viewport on a laptop display while
-// roughly halving wire payload + Rust JSON deserialization cost vs.
-// the previous 50.
-export const SESSION_PAGE_SIZE = 20;
+// Sized aggressively small (5) because cold-thread first-paint
+// is dominated by wire-payload size + Rust JSON deserialization
+// on threads with rich turn payloads. A single long-reasoning or
+// big-tool-call turn can be 100s of KB; multiplying by 20 puts
+// us in the multi-megabyte-blob territory that's directly
+// responsible for the "couple of seconds of empty pane" UX bug.
+//
+// Trade-offs at 5:
+//   * First paint shows the latest exchange — the part the user
+//     wants to see when they click a thread. Good signal-to-noise.
+//   * 5 turns doesn't fill a tall viewport, so the user would hit
+//     the "Load older" affordance immediately on any scroll-up.
+//     This is mitigated by chat-view's auto-prefetch effect, which
+//     fires `loadFullSession` in the background as soon as the
+//     first page lands — so by the time the user scrolls up the
+//     full history is usually already in cache, and the "Load
+//     older" banner stays hidden the whole time (see the
+//     `autoPrefetchingOlder` gate in chat-view.tsx).
+//   * Network/IPC error tolerance: a fast initial page that
+//     succeeds is better than a slow one that hangs. The auto-
+//     prefetch is fire-and-forget; if it fails, the user falls
+//     back to the existing manual "Load older" button.
+//
+// Was 20, was 50 before that. Each drop traded some "first-paint
+// is also fully-scrollable" property for less time-to-first-content.
+export const SESSION_PAGE_SIZE = 5;
 
 export interface SessionPage {
   detail: SessionDetail;

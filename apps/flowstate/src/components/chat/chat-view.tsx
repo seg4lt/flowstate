@@ -277,10 +277,6 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // with the full history. `loadingOlder` flips while the request
   // is in flight so the banner can show a spinner.
   const [loadingOlder, setLoadingOlder] = React.useState(false);
-  const hiddenOlderCount = Math.max(
-    0,
-    (sessionQuery.data?.totalTurns ?? 0) - turns.length,
-  );
   const handleLoadOlder = React.useCallback(async () => {
     if (loadingOlder) return;
     setLoadingOlder(true);
@@ -293,6 +289,82 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       setLoadingOlder(false);
     }
   }, [loadingOlder, queryClient, sessionId]);
+
+  // Auto-prefetch the rest of the history in the background after the
+  // first paginated page lands. SESSION_PAGE_SIZE was dropped to 5 so
+  // cold thread-switch first-paint stays under ~200 ms even on huge
+  // threads; this effect fills in the remaining history silently so
+  // the user can scroll up freely without ever seeing the "Load
+  // older" banner.
+  //
+  // Mechanics:
+  //   * Guard with a ref so this fires exactly ONCE per session id.
+  //     React-Query staleTime is Infinity, so re-renders of chat-view
+  //     against an already-prefetched session must NOT re-fetch — and
+  //     a useEffect that depends on `sessionQuery.data` would fire on
+  //     every event that mutates the cache (every streaming token).
+  //   * Skip when there's nothing to fetch (`!hasMoreOlder`).
+  //   * Skip when `loadingOlder === true` — the user clicked the
+  //     manual "Load older" button before our background fire could
+  //     reach the rIC slot. Theirs wins; we no-op.
+  //   * Set `autoPrefetchingOlder` so the "Load older" banner stays
+  //     hidden while the background fetch is in flight (see the
+  //     effective-hidden-older calculation below). Without this gate
+  //     the banner flashes for ~1 s on long threads — present at the
+  //     very moment the user first sees the chat, then vanishing as
+  //     the full payload lands. Much worse than just not showing it.
+  //   * Failures are swallowed: the manual "Load older" button still
+  //     works as the fallback, and `autoPrefetchedSessionRef` records
+  //     the attempt so we don't retry on every render.
+  const [autoPrefetchingOlder, setAutoPrefetchingOlder] = React.useState(false);
+  const autoPrefetchedSessionRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!sessionQuery.data) return;
+    if (!sessionQuery.data.hasMoreOlder) return;
+    if (loadingOlder) return;
+    if (autoPrefetchedSessionRef.current === sessionId) return;
+    autoPrefetchedSessionRef.current = sessionId;
+    setAutoPrefetchingOlder(true);
+    void loadFullSession(queryClient, sessionId)
+      .catch((err) => {
+        // Don't crash the view — the manual "Load older" button still
+        // works. Re-arm the ref so a later sessionId revisit (or the
+        // user clicking "Load older" themselves) gets a fresh chance.
+        console.warn("[chat] auto-prefetch full history failed:", err);
+        if (autoPrefetchedSessionRef.current === sessionId) {
+          autoPrefetchedSessionRef.current = null;
+        }
+      })
+      .finally(() => {
+        setAutoPrefetchingOlder(false);
+      });
+    // Intentionally exclude `loadingOlder` from deps — we read it as
+    // an entry-time guard, not a re-arm signal. If the user clicks
+    // "Load older" *after* our auto-prefetch began, both writes hit
+    // the same cache entry idempotently.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, sessionQuery.data, queryClient]);
+
+  // Reset the per-session guard when the user navigates away — if
+  // they come back, we want a fresh auto-prefetch chance. (React's
+  // mount-effect semantics mean the ref persists across sessionId
+  // changes; the explicit reset on cleanup handles re-entry.)
+  React.useEffect(() => {
+    return () => {
+      if (autoPrefetchedSessionRef.current === sessionId) {
+        autoPrefetchedSessionRef.current = null;
+      }
+    };
+  }, [sessionId]);
+
+  const rawHiddenOlderCount = Math.max(
+    0,
+    (sessionQuery.data?.totalTurns ?? 0) - turns.length,
+  );
+  // Hide the "Load older" banner while the background auto-prefetch
+  // is in flight. The data is on its way; showing a button for the
+  // user to do what we're already doing would be confusing UX.
+  const hiddenOlderCount = autoPrefetchingOlder ? 0 : rawHiddenOlderCount;
   // FIFO queue of outstanding permission requests + the in-flight
   // clarifying question, BOTH read from the global store. Lifting
   // them out of chat-view fixes the cross-thread drop bug: events

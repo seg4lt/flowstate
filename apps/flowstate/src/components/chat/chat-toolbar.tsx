@@ -78,68 +78,95 @@ export function ChatToolbar({
   const supportedEffortLevels = modelEntry?.supportedEffortLevels ?? [];
 
   // Whether the optional groups render — used to decide whether each
-  // divider has neighbours on both sides. A divider with nothing to
-  // its right (e.g. on Copilot, where the effort/thinking group is
-  // hidden and Mode is the next chip) would be a stray vertical line.
+  // group's trailing divider has anything to its right. A divider on
+  // the last group would be a stray vertical line.
   const hasReasoningGroup = features.thinkingEffort;
+  // Per-model gate for the Always/Adaptive selector. Today only models
+  // that advertise `ModelInfo.supportsAdaptiveThinking` (forwarded by
+  // the bridge at `crates/core/provider-claude-sdk/bridge/src/index.ts`)
+  // expose a meaningful choice — Always is the default and applies on
+  // any thinking-capable model, so when Adaptive isn't supported we
+  // hide the whole selector rather than render it with the only
+  // user-facing toggle disabled. `clampThinkingModeToModel` in
+  // `lib/model-settings.ts` coerces an in-memory `"adaptive"` back to
+  // `"always"` when the active model lacks the flag, so toggling
+  // models mid-session is safe.
+  const showThinkingMode =
+    hasReasoningGroup &&
+    provider === "claude" &&
+    (modelEntry?.supportsAdaptiveThinking ?? false);
   return (
-    <div className="flex min-w-0 items-center gap-0.5">
+    // `flex-wrap` lets chips flow to a second row on narrow widths
+    // instead of overflowing the chat header. `gap-y-1` gives wrapped
+    // rows breathing room; `gap-x-0.5` keeps the dense horizontal
+    // rhythm of the unwrapped layout. Each chip group is an atomic
+    // inline-flex so groups wrap together — never half a group on one
+    // row and the rest on the next. Trailing-divider pattern (rather
+    // than leading) ensures that when a group wraps to a new row, the
+    // separator stays attached to the prior group at the end of the
+    // previous row, never stranded as the first element of a row.
+    <div className="flex min-w-0 flex-wrap items-center gap-x-0.5 gap-y-1">
       {/* Provider + Model are the always-on left group. */}
-      <ProviderSelector
-        provider={provider}
-        sessionId={sessionId}
-        onProviderChange={(p, m) => {
-          onProviderChange?.(p, m);
-        }}
-      />
-      <ModelSelector
-        sessionId={sessionId}
-        provider={provider}
-        currentModel={currentModel}
-      />
+      <div className="flex items-center gap-0.5">
+        <ProviderSelector
+          provider={provider}
+          sessionId={sessionId}
+          onProviderChange={(p, m) => {
+            onProviderChange?.(p, m);
+          }}
+        />
+        <ModelSelector
+          sessionId={sessionId}
+          provider={provider}
+          currentModel={currentModel}
+        />
+        {/* Trailing divider — present iff at least one more group
+            (reasoning OR mode) renders to the right. Mode group is
+            always present, so this divider is unconditional. */}
+        <ToolbarDivider />
+      </div>
       {/* Effort selector only renders for providers whose adapter
           honours reasoning_effort (Codex's turn/start payload, Claude
           SDK's thinking config). On Copilot/Claude-CLI the setting
           silently did nothing, so hiding it stops the user from
           tuning a control with no effect. */}
       {hasReasoningGroup && (
-        <>
-          <ToolbarDivider />
+        <div className="flex items-center gap-0.5">
           <EffortSelector
             value={effort}
             onChange={onEffortChange}
             supportedEffortLevels={supportedEffortLevels}
           />
           {/* Thinking-mode dial (Always vs. Adaptive). Orthogonal to
-              effort — effort is *how much*, mode is *when*. Same
-              capability gate as Effort, plus a Claude-only check
-              because Codex's backend ignores the adaptive/always
-              switch even though it honours thinkingEffort. */}
-          {provider === "claude" && (
+              effort — effort is *how much*, mode is *when*. Hidden
+              entirely when the active model doesn't advertise
+              `supportsAdaptiveThinking`; see `showThinkingMode` for
+              the full gate. */}
+          {showThinkingMode && (
             <ThinkingModeSelector
               value={thinkingMode}
               onChange={onThinkingModeChange}
-              // Per-model gate on top of the provider-level
-              // `thinkingEffort` flag. When the active model doesn't
-              // advertise `supportsAdaptiveThinking`, the Adaptive
-              // pill renders disabled (see ThinkingModeSelector).
-              supportsAdaptive={modelEntry?.supportsAdaptiveThinking ?? false}
+              supportsAdaptive
             />
           )}
-        </>
+          {/* Trailing divider — Mode group always follows, so always
+              render. */}
+          <ToolbarDivider />
+        </div>
       )}
-      <ToolbarDivider />
-      <ModeSelector
-        value={permissionMode}
-        onChange={onPermissionModeChange}
-        features={features}
-      />
-      {/* Goal chip: display + create/pause/resume/clear controls. Gated
-          on `goalTracking` so providers without a goal-tracking primitive
-          (everyone but Codex today) don't expose a non-functional
-          affordance — the chip stays absent rather than rendering a
-          control that would error on click. */}
-      {features.goalTracking && <GoalChip sessionId={sessionId} />}
+      <div className="flex items-center gap-0.5">
+        <ModeSelector
+          value={permissionMode}
+          onChange={onPermissionModeChange}
+          features={features}
+        />
+        {/* Goal chip: display + create/pause/resume/clear controls. Gated
+            on `goalTracking` so providers without a goal-tracking primitive
+            (everyone but Codex today) don't expose a non-functional
+            affordance — the chip stays absent rather than rendering a
+            control that would error on click. */}
+        {features.goalTracking && <GoalChip sessionId={sessionId} />}
+      </div>
       {showContextDisplay && (
         <div className="ml-auto">
           <ContextDisplay sessionId={sessionId} />

@@ -10,6 +10,7 @@ import {
   readPoolSizeSetting,
 } from "@/lib/pierre-diffs-worker";
 import { PierrePoolProvider } from "@/lib/pierre-pool-controller";
+import { getHighlighter } from "@/lib/shiki-singleton";
 import { checkForUpdate } from "@/lib/updater";
 import "./index.css";
 
@@ -117,11 +118,38 @@ window.setTimeout(() => {
   void checkForUpdate();
 }, 5000);
 
-// The main-thread Shiki singleton used by <CodeBlock> (see
-// code-block.tsx) is intentionally NOT prewarmed at boot. It stays
-// unloaded until the first chat code block renders — users who
-// never open a chat pay nothing. First-block render pays a
-// one-time ~400-800 ms cold start (dynamic imports + WASM init +
-// grammar compile); during that window the block renders as plain
-// text via the existing html-null fallback in CodeBlockInner, then
-// flips to colored once tokenization finishes.
+// Fire-and-forget Shiki preload. The main-thread highlighter used
+// by <CodeBlock> (see code-block.tsx) pays a ~400-800 ms cold start
+// the first time it's resolved (dynamic imports + Oniguruma WASM
+// init + preloaded grammar compile). Previously this was deferred
+// to first-block render, which made cold thread-switches feel slow:
+// users land on the message list, see plain-text code, and watch
+// the highlighter swap to colored ~half a second later. We now
+// kick the singleton off during boot in the background:
+//
+//   * It's a `void` Promise — never awaited — so the React tree
+//     mounts immediately and the app shell paints without waiting.
+//   * The dynamic imports run in parallel with everything else
+//     happening at startup (worker pool warmup, router setup,
+//     SQLite hydration). On any device that isn't completely
+//     CPU-starved, Shiki is warm before the user clicks a thread.
+//   * Cost: the WASM blob + 7 preloaded grammars (~2-5 MB) become
+//     resident a bit earlier than they otherwise would have.
+//     That's amortized across the whole session — once initialized
+//     the singleton lives until tab close. Users who never open a
+//     chat still pay this; we accept that to make chat-heavy
+//     workflows (the dominant case) feel instant.
+//   * Failures are swallowed: the same lazy fallback in
+//     <CodeBlockInner> still runs if the prewarm errors out, so a
+//     bad import doesn't break code blocks — it just removes the
+//     speedup.
+//
+// requestIdleCallback would defer until the main thread is idle,
+// but it isn't available in WKWebView / Safari. setTimeout(0) is
+// good enough: by the time the macrotask fires, the React root
+// has begun rendering and the import chain runs alongside it.
+window.setTimeout(() => {
+  void getHighlighter().catch((err) => {
+    console.warn("[shiki] background preload failed:", err);
+  });
+}, 0);

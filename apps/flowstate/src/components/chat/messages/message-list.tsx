@@ -55,6 +55,25 @@ interface MessageListProps {
 const PENDING_KEY = "__pending__";
 const EMPTY_BLOCKS: ContentBlock[] = [];
 
+// Settle-window tuning. See the long comment on `settlingRef` inside
+// MessageList for the rationale; pulled out here so the numbers are
+// easy to find and don't get recreated each render.
+//
+// SETTLE_HARD_CEILING_MS: max wall-clock ms from initial mount that
+// `totalListHeightChanged` is allowed to keep re-pinning to LAST.
+// Past this, we hand back to the `followOutput` path so live streaming
+// (or a user that's scrolled up to read history mid-load) is not
+// yanked.
+//
+// SETTLE_QUIET_MS: idle quiet duration the debounce waits for before
+// declaring settling "done". Each height-change resets the timer.
+// 400ms is wide enough to bridge the gap between back-to-back async
+// Shiki highlights (~100-300ms cold per code block, see
+// `code-block.tsx`) without staying open through an actively
+// streaming turn.
+const SETTLE_HARD_CEILING_MS = 5000;
+const SETTLE_QUIET_MS = 400;
+
 function turnToItem(
   turn: TurnRecord,
   providerKind: ProviderKind | undefined,
@@ -134,6 +153,34 @@ export function MessageList({
     null,
   );
 
+  // "Settling window" refs — while `settlingRef` is true, the
+  // `totalListHeightChanged` callback below re-pins to LAST so that
+  // post-mount height measurements (markdown / reasoning / tool-call
+  // groups resolving to their real heights via ResizeObserver) don't
+  // leave the user stranded above the actual latest content. Virtuoso's
+  // `initialTopMostItemIndex` anchors against *estimated* heights at
+  // mount; once items measure, the resolved scroll offset drifts up.
+  //
+  // Why this is debounced, not a fixed one-shot timer: threads that
+  // contain CompactBlocks (auto-compaction recap dividers) are long by
+  // definition — they triggered the SDK's context compaction. Long
+  // threads tend to carry many code-blocks, and `code-block.tsx`
+  // highlights with Shiki asynchronously (~100-300ms cold per block,
+  // see `ensureLanguageLoaded`). Cumulative re-measurement easily
+  // outruns a fixed-duration window, leaving the user above the latest
+  // turn. Instead, every `totalListHeightChanged` while settling resets
+  // the close timer, so the window stays open as long as the list is
+  // still growing. The hard ceiling against `initialMountTsRef` caps
+  // the worst case — a stray height change minutes later (e.g., the
+  // user expanding a CompactBlock summary themselves) won't yank
+  // scroll.
+  const settlingRef = React.useRef(false);
+  const settleTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const initialMountTsRef = React.useRef(0);
+  const mountedItemsLenRef = React.useRef(0);
+
   // chat-view maintains turn.blocks live during streaming, so a single
   // pass over turns[] is enough. The pending optimistic row covers the
   // gap between sendMessage and turn_started; it's cleared the moment
@@ -195,6 +242,58 @@ export function MessageList({
     lastSendTickRef.current = userSendTick;
     scrollToLatest();
   }, [userSendTick, scrollToLatest]);
+
+  // Shared "bump the settle window" helper. Opens settling if it isn't
+  // already, and (re)arms the close timer for SETTLE_QUIET_MS of
+  // quiet. Called from: (a) the per-session-mount effect below,
+  // (b) the cold-preview-growth effect, and (c) `totalListHeight-
+  // Changed` itself while settling is active (so streaming async
+  // measurements — Shiki highlight, late images, expanded reasoning
+  // blocks — keep extending the window as long as content is still
+  // re-laying-out).
+  const bumpSettle = React.useCallback(() => {
+    settlingRef.current = true;
+    if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+    settleTimerRef.current = setTimeout(() => {
+      settlingRef.current = false;
+    }, SETTLE_QUIET_MS);
+  }, []);
+
+  // Per-session-mount settle window. Runs once when sessionId changes —
+  // Virtuoso has just re-mounted (`key={sessionId}`), its
+  // `initialTopMostItemIndex` has fired against estimated heights, and
+  // the first measurement pass is about to land. Opening the window
+  // lets `totalListHeightChanged` events re-pin to the bottom so the
+  // user lands on the *true* end of the latest turn, not on a position
+  // estimated from ~30px-per-item heuristics. The window stays open as
+  // long as content is still measuring (debounced via `bumpSettle`
+  // from `totalListHeightChanged`); a hard ceiling enforced in the
+  // callback caps it at SETTLE_HARD_CEILING_MS from mount.
+  React.useEffect(() => {
+    mountedItemsLenRef.current = displayItems.length;
+    initialMountTsRef.current = Date.now();
+    bumpSettle();
+    return () => {
+      if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
+      settlingRef.current = false;
+    };
+    // Intentionally only sessionId — we want a clean window per thread
+    // switch, not per turns update.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  // Cold-preview → full-transcript hydration: `loadFullSession` replaces
+  // the paginated tail with the full history, growing `displayItems`
+  // without re-keying Virtuoso. Re-arm the settle window so the freshly-
+  // rendered tail lands at the bottom. Only fires within ~1.5s of mount
+  // so streaming growth that lands minutes later does NOT re-pin and
+  // yank a history-reading user.
+  React.useEffect(() => {
+    if (displayItems.length <= mountedItemsLenRef.current) return;
+    if (Date.now() - initialMountTsRef.current > 1500) return;
+    mountedItemsLenRef.current = displayItems.length;
+    bumpSettle();
+  }, [displayItems.length, bumpSettle]);
 
   // Clear any pending suppression timer on unmount so we don't
   // setState on a torn-down component (e.g., if the user navigates
@@ -318,6 +417,57 @@ export function MessageList({
           // `scrollToIndex` calls elsewhere in this file do.
           initialTopMostItemIndex={{ index: "LAST", align: "end" }}
           increaseViewportBy={{ top: 600, bottom: 600 }}
+          // Post-mount height-settling: when items measure via
+          // ResizeObserver and the total list height changes, re-pin
+          // to LAST so the user lands at the true end of the latest
+          // turn (not the estimated-height-based offset that
+          // `initialTopMostItemIndex` resolved against at mount).
+          //
+          // Gated by `settlingRef` so this path is a no-op outside the
+          // initial landing window — streaming growth keeps using the
+          // existing `followOutput` contract. Each fire also bumps the
+          // settle debounce via `bumpSettle`, so as long as items are
+          // still measuring (Shiki async-highlighting code blocks one
+          // by one, images loading, summary blocks rendering markdown)
+          // the window stays open and we keep re-pinning. This is the
+          // load-bearing fix for "scroll doesn't land at latest in
+          // threads with summary/compact blocks" — those threads are
+          // long by construction (auto-compaction triggered them),
+          // carry many Shiki-highlighted code blocks, and the
+          // cumulative async re-measurement easily outruns any
+          // fixed-duration window.
+          //
+          // The hard ceiling (`SETTLE_HARD_CEILING_MS` from mount) is
+          // a safety brake: if a thread is *continuously* re-laying-
+          // out (live streaming, expanded summary edits) we stop
+          // forcing the user to the bottom so the existing
+          // `followOutput` semantics ("if user scrolled up to read
+          // history, don't yank them") take over. `behavior: "auto"`
+          // matches `scrollToLatest`'s instant pop; no animation
+          // jitter. We deliberately don't toggle `suppressJump` here
+          // — this path is invisible to the user (they're already
+          // expecting to be at the bottom on thread click) and mid-
+          // measurement state toggles can re-trigger renders.
+          totalListHeightChanged={() => {
+            if (!settlingRef.current) return;
+            if (
+              Date.now() - initialMountTsRef.current >
+              SETTLE_HARD_CEILING_MS
+            ) {
+              settlingRef.current = false;
+              if (settleTimerRef.current) {
+                clearTimeout(settleTimerRef.current);
+                settleTimerRef.current = null;
+              }
+              return;
+            }
+            virtuosoRef.current?.scrollToIndex({
+              index: "LAST",
+              align: "end",
+              behavior: "auto",
+            });
+            bumpSettle();
+          }}
         />
       )}
 

@@ -22,7 +22,12 @@ interface EditStandaloneSettingValue {
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY = "flowstate:edit-standalone";
-const DEFAULT_VALUE = true;
+// Off by default — the original tightly-packed tool-call grouping is
+// the calmer baseline. Users who prefer per-edit message-style blocks
+// can flip the toggle on in Settings; `readStored()` honors their
+// explicit "true" in localStorage so they keep that preference across
+// the default-flip. Only never-touched installs see the new default.
+const DEFAULT_VALUE = false;
 
 // ---------------------------------------------------------------------------
 // Helpers
