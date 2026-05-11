@@ -628,43 +628,27 @@ export function CodeView(props: CodeViewProps) {
   //     the same.
   const [paletteOpen, setPaletteOpen] = React.useState(false);
 
-  // Re-sync search mode when the route's `mode` search param changes
-  // while this view is already mounted. Pressing ⌘⇧F from /code/$id
-  // (already on the route) pushes a new search-param value but
-  // doesn't remount this component, so without this effect the second
-  // press would be a silent no-op.
+  // Re-sync search mode + open the palette whenever a fresh
+  // `initialSearchMode` value lands (URL-driven, standalone /code
+  // route) or a fresh `searchRequest` object lands (embedded
+  // chat-view path — ChatView mints a new object on every ⌘P /
+  // ⌘⇧F press so the reference change re-fires the effect even
+  // when the mode is unchanged).
   //
-  // Skip the FIRST run after mount, even when `initialSearchMode` is
-  // set: arriving at /code/$id by URL alone (no explicit shortcut
-  // press in this session) shouldn't auto-pop the palette over the
-  // editor. The palette only opens when a *fresh* mode value lands
-  // post-mount — i.e. after a ⌘P / ⌘⇧F press routes through.
-  const initialModeFirstRun = React.useRef(true);
+  // Stale-request safety: ChatView clears `searchRequest` to null
+  // in `toggleCodeView` (chat-view.tsx) before re-opening the panel
+  // via ⌘⌥E or the toolbar Code-icon click — so panel-toggle paths
+  // mount/re-render with a null request, the early-return below
+  // fires, and the palette stays closed. The press-driven paths
+  // (⌘P, ⌘⇧F) flow through `OPEN_CODE_VIEW_EVENT`, which sets a
+  // non-null `{mode}` object and IS the trigger we want to honour.
   React.useEffect(() => {
-    if (initialModeFirstRun.current) {
-      initialModeFirstRun.current = false;
-      if (props.initialSearchMode) setSearchMode(props.initialSearchMode);
-      return;
-    }
     if (!props.initialSearchMode) return;
     setSearchMode(props.initialSearchMode);
     setPaletteOpen(true);
   }, [props.initialSearchMode]);
 
-  // Embedded-mode counterpart: re-sync mode + open the palette when
-  // the parent dispatches a fresh `searchRequest` object. Same
-  // semantics as the URL-driven effect above — including the
-  // skip-first-mount guard, so a panel re-mount with a leftover
-  // request object never auto-pops the palette. ChatView clears the
-  // request on toggle (see chat-view.tsx `toggleCodeView`); this
-  // ref-guard is the belt-and-braces second line of defence.
-  const searchRequestFirstRun = React.useRef(true);
   React.useEffect(() => {
-    if (searchRequestFirstRun.current) {
-      searchRequestFirstRun.current = false;
-      if (props.searchRequest) setSearchMode(props.searchRequest.mode);
-      return;
-    }
     if (!props.searchRequest) return;
     setSearchMode(props.searchRequest.mode);
     setPaletteOpen(true);
