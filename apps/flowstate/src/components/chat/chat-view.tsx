@@ -59,7 +59,12 @@ import {
 import { toast } from "@/hooks/use-toast";
 import { useProviderEnabled } from "@/hooks/use-provider-enabled";
 import { useProviderFeatures } from "@/hooks/use-provider-features";
-import { MessageList } from "./messages/message-list";
+import {
+  MessageList,
+  PENDING_KEY,
+  type MessageListHandle,
+} from "./messages/message-list";
+import { StickyLastPrompt } from "./sticky-last-prompt";
 import { SessionProvider } from "./session-context";
 import { ChatInput, type QueuedMessage } from "./chat-input";
 import { PermissionPrompt } from "./permission-prompt";
@@ -577,6 +582,33 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // counter (rather than a boolean) ensures every send fires the effect
   // even when consecutive sends would otherwise debounce to the same value.
   const [userSendTick, setUserSendTick] = React.useState(0);
+  // Imperative handle into MessageList — used by StickyLastPrompt to
+  // jump the virtualised scroller back to a specific turn so the user
+  // can re-read the exchange from the top. See MessageListHandle in
+  // ./messages/message-list.tsx.
+  const messageListRef = React.useRef<MessageListHandle>(null);
+  // Most-recent user-role input — drives the sticky header above the
+  // message list. Prefers the optimistic `pendingInput` while a send
+  // is in flight so the sticky updates the instant the user hits send
+  // (PENDING_KEY is the synthetic turnId MessageList uses for the
+  // optimistic row, and scrollToTurn resolves it correctly). Falls
+  // back to the most recent persisted turn with non-empty input.
+  // Per design: ANY user-role turn counts here — wakeups, cron, peer-
+  // sends, and "user" — i.e. the most recent turn that had text.
+  const stickyPrompt = React.useMemo<
+    { text: string; turnId: string } | null
+  >(() => {
+    if (pendingInput !== null && pendingInput.length > 0) {
+      return { text: pendingInput, turnId: PENDING_KEY };
+    }
+    for (let i = turns.length - 1; i >= 0; i--) {
+      const t = turns[i];
+      if (t.input && t.input.length > 0) {
+        return { text: t.input, turnId: t.turnId };
+      }
+    }
+    return null;
+  }, [turns, pendingInput]);
   // Watchdog state: `lastEventAt` bumps on every stream event for this
   // session so the 45s inactivity timer resets. `stuckSince` is set
   // when the timer fires and a pending tool call exists; rendering the
@@ -1932,7 +1964,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             // intrinsic content height ignores the parent's `min-h-0`,
             // and the composer below this column punches out of
             // ChatView's `overflow-hidden` clip in short windows.
-            "flex min-h-0 min-w-0 flex-col",
+            // `relative` anchors the absolute-positioned
+            // StickyLastPrompt icon button (top-right corner) without
+            // disturbing the existing in-flow children.
+            "relative flex min-h-0 min-w-0 flex-col",
             diffFullscreen || contextFullscreen || codeViewFullscreen
               ? "hidden"
               : "flex-1",
@@ -1945,7 +1980,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               model: sessionQuery.data?.detail.summary.model,
             }}
           >
+            {stickyPrompt && (
+              // One-line "last prompt" band pinned above the message
+              // list. Hover expands the full text in-place (CSS-only
+              // overlay, no layout shift). The arrow button jumps the
+              // scroller back to that turn so the user can re-read
+              // the exchange from the top.
+              <StickyLastPrompt
+                text={stickyPrompt.text}
+                onJump={() =>
+                  messageListRef.current?.scrollToTurn(stickyPrompt.turnId)
+                }
+              />
+            )}
             <MessageList
+              ref={messageListRef}
               sessionId={sessionId}
               turns={turns}
               loading={loading}

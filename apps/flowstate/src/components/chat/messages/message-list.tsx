@@ -52,7 +52,15 @@ interface MessageListProps {
   coldPreview?: string | null;
 }
 
-const PENDING_KEY = "__pending__";
+export const PENDING_KEY = "__pending__";
+
+/** Imperative handle exposed by MessageList. Lets parents jump the
+ *  virtualised scroller to a specific turn by id without duplicating
+ *  the `turnId → index` map (which depends on the optimistic pending
+ *  row and lives inside MessageList's `displayItems` memo). */
+export interface MessageListHandle {
+  scrollToTurn: (turnId: string) => void;
+}
 const EMPTY_BLOCKS: ContentBlock[] = [];
 
 // Settle-window tuning. See the long comment on `settlingRef` inside
@@ -126,20 +134,24 @@ const EmptyPlaceholder = () => (
   </div>
 );
 
-export function MessageList({
-  turns,
-  loading,
-  pendingInput,
-  sessionId,
-  hiddenOlderCount = 0,
-  loadingOlder = false,
-  onLoadOlder,
-  onOpenAttachment,
-  userSendTick,
-  providerKind,
-  sessionModel,
-  coldPreview,
-}: MessageListProps) {
+export const MessageList = React.forwardRef<MessageListHandle, MessageListProps>(
+  function MessageList(
+    {
+      turns,
+      loading,
+      pendingInput,
+      sessionId,
+      hiddenOlderCount = 0,
+      loadingOlder = false,
+      onLoadOlder,
+      onOpenAttachment,
+      userSendTick,
+      providerKind,
+      sessionModel,
+      coldPreview,
+    },
+    ref,
+  ) {
   const virtuosoRef = React.useRef<VirtuosoHandle>(null);
   const [atBottom, setAtBottom] = React.useState(true);
   // `suppressJump` hides the "Jump to latest" affordance while a user-
@@ -227,6 +239,37 @@ export function MessageList({
       });
     });
   }, [displayItems.length]);
+
+  // Imperative handle: scroll the virtualised list so a specific turn
+  // lands at the *top* of the viewport. Used by the StickyLastPrompt
+  // header so the user can re-read the exchange downward from their
+  // prompt. `displayItems` (not `turns`) is the authoritative lookup
+  // because it includes the optimistic pending row (PENDING_KEY) the
+  // sticky may target during an in-flight send.
+  //
+  // Why `align: "start"` and `behavior: "auto"`:
+  //   * "start" matches the user-visible intent — the prompt lands at
+  //     the top of the pane, the agent reply flows below it.
+  //   * "auto" (instant) for the same reason `scrollToLatest` uses it
+  //     (see lines above): smooth scroll across Virtuoso's virtualised
+  //     list leaves intermediate items unrendered during the animation
+  //     and can land imprecisely. An instant jump is what users
+  //     actually want from a "go to this message" affordance anyway.
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      scrollToTurn: (turnId: string) => {
+        const idx = displayItems.findIndex((i) => i.turnId === turnId);
+        if (idx < 0) return;
+        virtuosoRef.current?.scrollToIndex({
+          index: idx,
+          align: "start",
+          behavior: "auto",
+        });
+      },
+    }),
+    [displayItems],
+  );
 
   // Force a scroll to the latest message every time the user dispatches
   // a new message. Unlike Virtuoso's `followOutput`, this fires even
@@ -483,4 +526,5 @@ export function MessageList({
       )}
     </div>
   );
-}
+  },
+);
