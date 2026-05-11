@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   Check,
   ChevronDown,
+  Code,
   Compass,
   Copy,
   Diff,
@@ -10,7 +11,6 @@ import {
   FolderOpen,
   Pin,
   PinOff,
-  Search,
   Terminal,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -384,18 +384,21 @@ export function HeaderActions({
         variant="outline"
         size="icon-xs"
         onClick={() =>
-          // Toggle the embedded code-view panel inside the chat —
+          // Toggle the embedded code-editor panel inside the chat —
           // same destination Cmd+Alt+E reaches. Replaces the older
-          // navigate-to-/code-route flow so the search/file-tree
-          // experience opens as a side panel without losing the
-          // chat composer underneath.
+          // navigate-to-/code-route flow so the file tree + editor
+          // open as a side panel without losing the chat composer
+          // underneath. Search is a feature of the editor (⌘P / ⌘⇧F
+          // open the search palette once the panel is mounted), so
+          // the icon advertises the editor itself rather than the
+          // search affordance it happens to host.
           window.dispatchEvent(new CustomEvent(TOGGLE_CODE_VIEW_EVENT))
         }
         onMouseEnter={handleSearchPrefetch}
         onFocus={handleSearchPrefetch}
-        title="Toggle code view panel (Cmd/Ctrl+Alt+E)"
+        title="Toggle code editor panel (Cmd/Ctrl+Alt+E)"
       >
-        <Search className="h-3 w-3" />
+        <Code className="h-3 w-3" />
       </Button>
       <Button
         variant="outline"
