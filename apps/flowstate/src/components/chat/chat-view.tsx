@@ -777,7 +777,16 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   // Code-view panel toggle. Mutually exclusive with diff/context —
   // the panel column has one slot. On open, drops the other panels
   // and any of their fullscreens; on close, drops fullscreen on
-  // self so a re-open isn't surprising.
+  // self so a re-open isn't surprising AND clears any stale
+  // searchRequest so the next plain toggle/open doesn't auto-pop
+  // the search palette. (Without this, a Cmd+P press writes a
+  // request object, the panel later closes, and the next ⌘⌥E /
+  // header-icon click re-mounts CodeView with the stale request
+  // still in scope — CodeView's searchRequest effect would then
+  // fire on mount and open the palette unexpectedly. The user
+  // wanted ⌘⌥E and the toolbar icon to open the editor only;
+  // ⌘P / ⌘⇧F still open the palette via OPEN_CODE_VIEW_EVENT,
+  // which re-sets the request to a fresh object.)
   const toggleCodeView = React.useCallback(() => {
     setCodeViewOpen((v) => {
       if (!v) {
@@ -785,8 +794,10 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         setDiffFullscreen(false);
         setContextOpen(false);
         setContextFullscreen(false);
+        setCodeViewSearchRequest(null);
       } else {
         setCodeViewFullscreen(false);
+        setCodeViewSearchRequest(null);
       }
       return !v;
     });
@@ -797,6 +808,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     setContextOpen,
     setContextFullscreen,
     setCodeViewFullscreen,
+    setCodeViewSearchRequest,
   ]);
 
   // Bridge for the global Mod+Alt+E shortcut. Same indirection

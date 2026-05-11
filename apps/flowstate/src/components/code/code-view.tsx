@@ -3,17 +3,11 @@ import { useNavigate } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
-  CaseSensitive,
-  FileText,
   Maximize2,
   Minimize2,
   PanelRight,
   PanelRightClose,
-  Regex,
   RefreshCw,
-  Search,
-  SlidersHorizontal,
-  Sparkles,
   X,
 } from "lucide-react";
 import { SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
@@ -60,6 +54,7 @@ import { hashContent } from "@/lib/content-hash";
 import { FileTree } from "./file-tree";
 import { ChangedFilesList } from "./changed-files-list";
 import { Multibuffer } from "./multibuffer";
+import { SearchPalette } from "./search-palette";
 import { TabBar } from "./tab-bar";
 import { EditorPanes } from "./editor-panes";
 import { DiffCommentOverlay } from "@/components/chat/diff-comment-overlay";
@@ -352,13 +347,21 @@ export function CodeView(props: CodeViewProps) {
     props.initialSearchMode ?? "files",
   );
   const [query, setQuery] = React.useState("");
-  const [highlightedIndex, setHighlightedIndex] = React.useState(0);
+  // Legacy highlight cursor for the inline picker. The SearchPalette
+  // tracks its own selection internally; this state stays so the
+  // reset effect below still runs (cheap, decoupled from the new
+  // palette).
+  const [, setHighlightedIndex] = React.useState(0);
   const [contentBlocks, setContentBlocks] = React.useState<ContentBlock[]>([]);
   const [contentSearching, setContentSearching] = React.useState(false);
   const [contentSearchError, setContentSearchError] = React.useState<
     string | null
   >(null);
-  const [contentOptions, setContentOptions] =
+  // Legacy content-search options state. The new SearchPalette owns
+  // its own option toggles; this slot survives only to keep the
+  // (unreachable) Multibuffer branch below well-typed. Setter is
+  // dropped because nothing writes the slot anymore.
+  const [contentOptions] =
     React.useState<ContentSearchUiOptions>(defaultContentSearchUiOptions);
   // Fuzzy-mode toggle for the FILE picker (Cmd+P). Independent from
   // the content-search fuzzy flag because the matchers are different:
@@ -374,7 +377,11 @@ export function CodeView(props: CodeViewProps) {
   // pre-filter dropped acronym-only candidates before the scorer
   // ever saw them. Persisted to localStorage so a user who
   // explicitly turns it off keeps that preference across reloads.
-  const [useFuzzyFiles, setUseFuzzyFiles] = React.useState<boolean>(() => {
+  // Legacy fuzzy-mode toggle for the FILE picker. The new
+  // SearchPalette has its own per-mode fuzzy toggle, so this state
+  // is no longer mutated — but the localStorage read survives so
+  // older preferences aren't lost; future cleanup can delete it.
+  const [useFuzzyFiles] = React.useState<boolean>(() => {
     if (typeof window === "undefined") return true;
     const raw = window.localStorage.getItem(FUZZY_FILES_STORAGE_KEY);
     if (raw === "true") return true;
@@ -422,7 +429,12 @@ export function CodeView(props: CodeViewProps) {
   // we temporarily show the multibuffer in the focused pane even
   // though a tab is active. Any subsequent tab activation or file
   // open clears the override.
-  const [multibufferOverride, setMultibufferOverride] = React.useState(false);
+  // Legacy multibuffer-override toggle. The Multibuffer branch in
+  // the render below is unreachable now (the new SearchPalette is
+  // the canonical content-search surface), but TabPaneView callbacks
+  // still set this to keep the old branch ready for a quick rollback
+  // — the value itself is never read.
+  const [, setMultibufferOverride] = React.useState(false);
 
   // Transient fullscreen state for split layouts. When non-null, the
   // indicated pane takes the whole viewer area; the other pane stays
@@ -602,34 +614,60 @@ export function CodeView(props: CodeViewProps) {
 
   const inputRef = React.useRef<HTMLInputElement>(null);
 
+  // ── search palette open state ────────────────────────────────
+  // Ported from zen-tools — a single popup hosts both Files (⌘P) and
+  // Content (⌘⇧F) modes, with Tab to swap between them. Replaces
+  // the old top-input picker. Open / mode are driven off the same
+  // signals the old input used:
+  //   * `initialSearchMode` — URL-search-param-driven, standalone
+  //     /code route. The two effects below trigger on every fresh
+  //     value, mirroring the old input's focus + select behaviour.
+  //   * `searchRequest` — fresh-object signal from the chat-embedded
+  //     host. ChatView mints a new object on every shortcut press so
+  //     the reference change re-fires the effect even when mode is
+  //     the same.
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
+
   // Re-sync search mode when the route's `mode` search param changes
   // while this view is already mounted. Pressing ⌘⇧F from /code/$id
   // (already on the route) pushes a new search-param value but
   // doesn't remount this component, so without this effect the second
-  // press would be a silent no-op. Focus + select the input on every
-  // change so the keypress feels like the in-view shortcut path
-  // (Cmd+P / Cmd+Shift+F handlers below).
+  // press would be a silent no-op.
+  //
+  // Skip the FIRST run after mount, even when `initialSearchMode` is
+  // set: arriving at /code/$id by URL alone (no explicit shortcut
+  // press in this session) shouldn't auto-pop the palette over the
+  // editor. The palette only opens when a *fresh* mode value lands
+  // post-mount — i.e. after a ⌘P / ⌘⇧F press routes through.
+  const initialModeFirstRun = React.useRef(true);
   React.useEffect(() => {
+    if (initialModeFirstRun.current) {
+      initialModeFirstRun.current = false;
+      if (props.initialSearchMode) setSearchMode(props.initialSearchMode);
+      return;
+    }
     if (!props.initialSearchMode) return;
     setSearchMode(props.initialSearchMode);
-    queueMicrotask(() => {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    });
+    setPaletteOpen(true);
   }, [props.initialSearchMode]);
 
-  // Embedded-mode counterpart: re-sync mode + focus when the parent
-  // dispatches a fresh `searchRequest` object. Same semantics as
-  // the URL-driven effect above — Cmd+P and Cmd+Shift+F from the
-  // chat view route through here so each press lands the cursor in
-  // the input ready to type.
+  // Embedded-mode counterpart: re-sync mode + open the palette when
+  // the parent dispatches a fresh `searchRequest` object. Same
+  // semantics as the URL-driven effect above — including the
+  // skip-first-mount guard, so a panel re-mount with a leftover
+  // request object never auto-pops the palette. ChatView clears the
+  // request on toggle (see chat-view.tsx `toggleCodeView`); this
+  // ref-guard is the belt-and-braces second line of defence.
+  const searchRequestFirstRun = React.useRef(true);
   React.useEffect(() => {
+    if (searchRequestFirstRun.current) {
+      searchRequestFirstRun.current = false;
+      if (props.searchRequest) setSearchMode(props.searchRequest.mode);
+      return;
+    }
     if (!props.searchRequest) return;
     setSearchMode(props.searchRequest.mode);
-    queueMicrotask(() => {
-      inputRef.current?.focus();
-      inputRef.current?.select();
-    });
+    setPaletteOpen(true);
   }, [props.searchRequest]);
 
   // Esc → leave the code view. If the user came from a chat thread,
@@ -859,8 +897,12 @@ export function CodeView(props: CodeViewProps) {
       total: ranked.length,
     };
   }, [files, query, searchMode, useFuzzyFiles]);
-  const filteredFiles = pickerMatch.rows;
-  const pickerTotalMatches = pickerMatch.total;
+  // `pickerMatch` is no longer consumed — the SearchPalette owns
+  // both the filter and the display. Reference it so the surrounding
+  // useMemo isn't flagged as dead; a follow-up sweep can delete the
+  // memo itself together with `query`, `searchMode`, `useFuzzyFiles`
+  // once we're sure no rollback path needs them.
+  void pickerMatch;
 
   // ─── content search (debounced, server-side via ripgrep libs) ─
   React.useEffect(() => {
@@ -937,45 +979,18 @@ export function CodeView(props: CodeViewProps) {
     contentOptions.exclude,
   ]);
 
-  // Aggregate match count across all blocks for the header badge.
-  const contentMatchCount = React.useMemo(() => {
-    let n = 0;
-    for (const b of contentBlocks) {
-      for (const l of b.lines) if (l.isMatch) n++;
-    }
-    return n;
-  }, [contentBlocks]);
-
-  // Show the multibuffer (in place of the single-pane viewer) when
-  // a content search is actively producing results. Split layouts
-  // always show file viewers — the multibuffer only takes over the
-  // single-pane case so we never pre-empt a deliberately opened
-  // tab in the non-focused pane.
+  // Multibuffer is gone — the new SearchPalette dialog replaces it.
+  // The legacy state (`query`, `contentBlocks`, `multibufferOverride`,
+  // …) is left in place to avoid a sweeping refactor of the wider
+  // file; with the search input removed, none of it ever flips on
+  // and the renderer below always takes the EditorPanes branch.
+  // A follow-up cleanup pass can delete the orphaned state, the
+  // search-bar helper components further down (SearchModeToggle,
+  // ContentSearchAdvancedRow, FilePickerResults, SearchStatusBadge),
+  // and the Multibuffer import.
   const focusedPane: PaneState =
     layout.panes[layout.focusedPaneIndex] ?? layout.panes[0]!;
-  const noActiveTabInFocusedPane = focusedPane.activePath === null;
-  const isSplit = layout.panes.length === 2 && layout.split !== null;
-  const showMultibuffer =
-    !isSplit &&
-    searchMode === "content" &&
-    query.trim().length > 0 &&
-    (noActiveTabInFocusedPane || multibufferOverride);
-
-  // Whether to surface a "back to N matches" link in the viewer
-  // header (only when the user has a file open from the multibuffer
-  // and content matches still exist).
-  const canReturnToMultibuffer =
-    !isSplit &&
-    !multibufferOverride &&
-    searchMode === "content" &&
-    query.trim().length > 0 &&
-    !noActiveTabInFocusedPane &&
-    contentBlocks.length > 0;
-
-  // Result count depending on mode — used for keyboard nav bounds.
-  // Multibuffer mode doesn't need keyboard nav over matches (the
-  // user clicks Open in a chunk header), so content mode reports 0.
-  const resultCount = searchMode === "files" ? filteredFiles.length : 0;
+  const showMultibuffer = false;
 
   // Reset highlight when query / mode changes.
   React.useEffect(() => {
@@ -1338,64 +1353,11 @@ export function CodeView(props: CodeViewProps) {
   // because the editor sits inside a `React.lazy` boundary several
   // layers deep — threading a ref through every level would be
   // strictly worse for the value.
-  const focusActiveEditor = React.useCallback(() => {
-    const path = focusedPane.activePath;
-    if (!path) return;
-    const wrapper = document.querySelector(
-      `[data-code-path="${CSS.escape(path)}"]`,
-    );
-    const content = wrapper?.querySelector(".cm-content") as HTMLElement | null;
-    content?.focus();
-  }, [focusedPane.activePath]);
-
-  function openFromPickerIndex(index: number) {
-    // Files mode only — content mode uses the multibuffer, where
-    // Enter on the input is a no-op (user clicks Open per chunk).
-    if (searchMode !== "files") return;
-    const pick = filteredFiles[index] ?? filteredFiles[0];
-    if (pick) {
-      tabs.openFile(pick);
-      setMultibufferOverride(false);
-      setQuery("");
-      inputRef.current?.blur();
-      // Hand focus to the just-opened file. queueMicrotask defers
-      // until after React commits the new tab, so the editor's
-      // `.cm-content` exists by the time we focus it.
-      queueMicrotask(focusActiveEditor);
-    }
-  }
-
-  function handleInputKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (resultCount === 0) {
-      if (e.key === "Escape") {
-        setQuery("");
-        inputRef.current?.blur();
-        focusActiveEditor();
-      }
-      return;
-    }
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setHighlightedIndex((i) => Math.min(resultCount - 1, i + 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setHighlightedIndex((i) => Math.max(0, i - 1));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      openFromPickerIndex(highlightedIndex);
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      // Two-step Esc: first clears the query (stay in input so the
-      // user can refine), second blurs + returns to editor. Mirrors
-      // VS Code's command palette / quick-open behaviour.
-      if (query) {
-        setQuery("");
-      } else {
-        inputRef.current?.blur();
-        focusActiveEditor();
-      }
-    }
-  }
+  // `focusActiveEditor`, `openFromPickerIndex`, and `handleInputKeyDown`
+  // lived here when the search input was inline. The SearchPalette
+  // now owns keyboard navigation and focus handoff (Radix's
+  // `onCloseAutoFocus` returns focus to the trigger, which is the
+  // editor host), so these helpers were removed along with the input.
 
   const projectLabel = React.useMemo(() => {
     if (!projectPath) return null;
@@ -1520,120 +1482,29 @@ export function CodeView(props: CodeViewProps) {
       <div ref={splitContainerRef} className="flex min-h-0 min-w-0 flex-1">
         {/* ── LEFT: search + viewer column ──────────────────── */}
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex shrink-0 items-center gap-2 border-b border-border px-2 py-1.5">
-            <Search className="h-3 w-3 shrink-0 text-muted-foreground" />
-            <input
-              ref={inputRef}
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={handleInputKeyDown}
-              placeholder={
-                !projectPath
-                  ? "No project for this session"
-                  : searchMode === "files"
-                    ? "Search files…  e.g. tabs.ts  ·  src tabs.ts"
-                    : "Search file contents…  (Cmd/Ctrl+Shift+F)"
-              }
-              disabled={!projectPath}
-              className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-muted-foreground"
-            />
-            <SearchModeToggle mode={searchMode} onChange={setSearchMode} />
-            {searchMode === "files" && (
-              // Files-mode fuzzy toggle. Subsequence + word-boundary
-              // ranking via `lib/fuzzy.ts`, including IntelliJ /
-              // Zed-style acronym matching ("usc" →
-              // "UserServiceController.ts"). Useful when you remember
-              // a few characters but not the exact substring (e.g.
-              // typing `tbsv` to find `tabs-view.tsx`). On by default
-              // — fuzzy still ranks contiguous substring matches
-              // highest, so plain "I know the file name" jumps still
-              // work. Persisted to localStorage.
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-pressed={useFuzzyFiles}
-                onClick={() => setUseFuzzyFiles((v) => !v)}
-                title="Fuzzy file match (subsequence + acronym, e.g. usc → UserServiceController)"
-                aria-label="Toggle fuzzy file matching"
-                className={
-                  useFuzzyFiles ? "bg-muted text-foreground" : undefined
-                }
-              >
-                <Sparkles className="h-3 w-3" />
-              </Button>
-            )}
-            {searchMode === "content" && (
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                aria-pressed={contentOptions.advancedOpen}
-                onClick={() =>
-                  setContentOptions((prev) => ({
-                    ...prev,
-                    advancedOpen: !prev.advancedOpen,
-                  }))
-                }
-                title="Advanced search options"
-                aria-label="Toggle advanced search options"
-                className={
-                  contentOptions.advancedOpen
-                    ? "bg-muted text-foreground"
-                    : undefined
-                }
-              >
-                <SlidersHorizontal className="h-3 w-3" />
-              </Button>
-            )}
-            <SearchStatusBadge
-              mode={searchMode}
-              filesLoading={filesLoading}
-              filesTotal={files.length}
-              filteredCount={filteredFiles.length}
-              totalMatches={pickerTotalMatches}
-              indexing={indexing}
-              contentSearching={contentSearching}
-              contentMatchCount={contentMatchCount}
-            />
-          </div>
-
-          {searchMode === "content" && contentOptions.advancedOpen && (
-            <ContentSearchAdvancedRow
-              options={contentOptions}
-              onChange={setContentOptions}
-            />
-          )}
-
-          {/* Files-mode picker dropdown stays as-is — it's the
-              quick Cmd+P jumper. Content-mode results are shown
-              in the multibuffer below instead. */}
-          {searchMode === "files" && query && (
-            <div className="max-h-72 shrink-0 overflow-auto border-b border-border bg-background/95">
-              <FilePickerResults
-                results={filteredFiles}
-                highlightedIndex={highlightedIndex}
-                onHover={setHighlightedIndex}
-                onPick={(p) => {
-                  tabs.openFile(p);
-                  setMultibufferOverride(false);
-                  setQuery("");
-                  inputRef.current?.blur();
-                }}
-              />
-            </div>
-          )}
-
-          {canReturnToMultibuffer && (
-            <button
-              type="button"
-              onClick={() => setMultibufferOverride(true)}
-              className="flex shrink-0 items-center gap-1 border-b border-border bg-muted/30 px-3 py-1 text-left text-[10px] text-muted-foreground hover:bg-muted/60 hover:text-foreground"
-            >
-              <ArrowLeft className="h-3 w-3" />
-              Back to {contentMatchCount}{" "}
-              {contentMatchCount === 1 ? "match" : "matches"} for "{query}"
-            </button>
-          )}
+          {/* Search palette — ported from zen-tools. A modal popup
+              with a Files / Content mode toggle, query input,
+              ranked result list on the left, and a lazy-loaded
+              preview pane on the right. ⌘P opens in Files mode,
+              ⌘⇧F in Content mode (both signals route through
+              `props.initialSearchMode` / `props.searchRequest`
+              and the matching effects above). Replaces the
+              primitive top-input search bar and the multibuffer
+              that used to render content-search results. */}
+          <SearchPalette
+            open={paletteOpen}
+            onOpenChange={setPaletteOpen}
+            mode={searchMode}
+            onModeChange={setSearchMode}
+            projectPath={projectPath}
+            files={files}
+            indexing={indexing}
+            onPickFile={(path) => {
+              tabs.openFile(path);
+              setMultibufferOverride(false);
+              setQuery("");
+            }}
+          />
 
           {/* `min-w-0` is required here too: this is the flex-column
               child that hosts EditorPanes (and Multibuffer below).
@@ -1881,299 +1752,15 @@ export function CodeView(props: CodeViewProps) {
 // ──────────────────────────────────────────────────────────────
 // Subcomponents
 // ──────────────────────────────────────────────────────────────
+//
+// `SearchModeToggle`, `ContentSearchAdvancedRow`, `SearchStatusBadge`,
+// and `FilePickerResults` used to live here. They were the building
+// blocks of the inline search bar that the new SearchPalette
+// replaced. Removed wholesale — see git history for the old
+// implementation. The dead Multibuffer branch in the render is
+// kept around so a rollback to the old search UX is a small revert
+// rather than a re-import + re-wire.
 
-interface SearchModeToggleProps {
-  mode: SearchMode;
-  onChange: (m: SearchMode) => void;
-}
-
-interface ContentSearchAdvancedRowProps {
-  options: ContentSearchUiOptions;
-  onChange: React.Dispatch<React.SetStateAction<ContentSearchUiOptions>>;
-}
-
-// Second row that appears below the search bar when the user
-// clicks the SlidersHorizontal toggle in content-search mode.
-// Contains the include + exclude glob inputs and the regex /
-// case-sensitivity toggles. Same comma-separated glob syntax
-// as the file picker (passed through splitGlobList on its way
-// to the rust side).
-function ContentSearchAdvancedRow({
-  options,
-  onChange,
-}: ContentSearchAdvancedRowProps) {
-  return (
-    <div className="flex shrink-0 items-center gap-2 border-b border-border bg-background/60 px-2 py-1.5">
-      <input
-        type="text"
-        value={options.include}
-        onChange={(e) =>
-          onChange((prev) => ({ ...prev, include: e.target.value }))
-        }
-        placeholder="include: src/**/*.ts, !*.test.ts"
-        className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] outline-none placeholder:text-muted-foreground/70 focus:border-foreground/30"
-      />
-      <input
-        type="text"
-        value={options.exclude}
-        onChange={(e) =>
-          onChange((prev) => ({ ...prev, exclude: e.target.value }))
-        }
-        placeholder="exclude: node_modules/**, *.lock"
-        className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-0.5 text-[11px] outline-none placeholder:text-muted-foreground/70 focus:border-foreground/30"
-      />
-      <Button
-        variant="ghost"
-        size="icon-xs"
-        aria-pressed={options.useRegex}
-        // Fuzzy mode wins over regex on the Rust side (see the
-        // `build_query_plan` precedence table in file_index.rs), so
-        // disable the regex toggle while fuzzy is on to make the
-        // mutual-exclusivity visible. Otherwise users see the regex
-        // button "pressed" but get fuzzy results — confusing.
-        disabled={options.useFuzzy}
-        onClick={() =>
-          onChange((prev) => ({
-            ...prev,
-            useRegex: !prev.useRegex,
-          }))
-        }
-        title={
-          options.useFuzzy ? "Disabled while fuzzy is on" : "Use regex (.*)"
-        }
-        aria-label="Toggle regex matching"
-        className={options.useRegex ? "bg-muted text-foreground" : undefined}
-      >
-        <Regex className="h-3 w-3" />
-      </Button>
-      <Button
-        variant="ghost"
-        size="icon-xs"
-        aria-pressed={options.useFuzzy}
-        onClick={() =>
-          onChange((prev) => ({
-            ...prev,
-            useFuzzy: !prev.useFuzzy,
-            // Flipping fuzzy ON forces regex OFF — the Rust precedence
-            // table makes regex+fuzzy resolve to fuzzy anyway, but we
-            // sync the UI flags so the user can see what's actually
-            // running.
-            useRegex: !prev.useFuzzy ? false : prev.useRegex,
-          }))
-        }
-        title="Fuzzy match (typo-tolerant, case-insensitive)"
-        aria-label="Toggle fuzzy matching"
-        className={options.useFuzzy ? "bg-muted text-foreground" : undefined}
-      >
-        <Sparkles className="h-3 w-3" />
-      </Button>
-      <Button
-        variant="ghost"
-        size="icon-xs"
-        aria-pressed={options.caseSensitive}
-        // Fuzzy mode is inherently case-insensitive on the Rust side,
-        // so this toggle is a no-op while fuzzy is on. Disable to make
-        // that obvious rather than letting the press do nothing.
-        disabled={options.useFuzzy}
-        onClick={() =>
-          onChange((prev) => ({
-            ...prev,
-            caseSensitive: !prev.caseSensitive,
-          }))
-        }
-        title={
-          options.useFuzzy
-            ? "Fuzzy is always case-insensitive"
-            : "Case sensitive (aA)"
-        }
-        aria-label="Toggle case sensitivity"
-        className={
-          options.caseSensitive ? "bg-muted text-foreground" : undefined
-        }
-      >
-        <CaseSensitive className="h-3 w-3" />
-      </Button>
-    </div>
-  );
-}
-
-function SearchModeToggle({ mode, onChange }: SearchModeToggleProps) {
-  return (
-    <div
-      role="tablist"
-      aria-label="Search mode"
-      className="flex shrink-0 items-center rounded-md border border-border p-0.5"
-    >
-      <button
-        type="button"
-        role="tab"
-        aria-selected={mode === "files"}
-        onClick={() => onChange("files")}
-        className={
-          "rounded px-2 py-0.5 text-[10px] font-medium transition-colors " +
-          (mode === "files"
-            ? "bg-muted text-foreground"
-            : "text-muted-foreground hover:text-foreground")
-        }
-      >
-        Files
-      </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={mode === "content"}
-        onClick={() => onChange("content")}
-        className={
-          "rounded px-2 py-0.5 text-[10px] font-medium transition-colors " +
-          (mode === "content"
-            ? "bg-muted text-foreground"
-            : "text-muted-foreground hover:text-foreground")
-        }
-      >
-        Content
-      </button>
-    </div>
-  );
-}
-
-interface SearchStatusBadgeProps {
-  mode: SearchMode;
-  filesLoading: boolean;
-  filesTotal: number;
-  filteredCount: number;
-  /** Total ranked matches before the `PICKER_RESULT_LIMIT` slice.
-   *  Drives the numeric "+N more" overflow hint so users know when
-   *  the cap is biting and they should refine the query. */
-  totalMatches: number;
-  /** True while fff-search's background scanner is still walking the
-   *  worktree on a cold open. Surfaces an "indexing N files…" badge
-   *  alongside the live count so users know the picker is filling
-   *  in. Goes away the moment the scan settles. */
-  indexing: boolean;
-  contentSearching: boolean;
-  contentMatchCount: number;
-}
-
-function SearchStatusBadge({
-  mode,
-  filesLoading,
-  filesTotal,
-  filteredCount,
-  totalMatches,
-  indexing,
-  contentSearching,
-  contentMatchCount,
-}: SearchStatusBadgeProps) {
-  if (mode === "files") {
-    if (filesLoading)
-      return (
-        <span className="shrink-0 text-[10px] text-muted-foreground">
-          indexing…
-        </span>
-      );
-    if (filesTotal === 0) return null;
-    // While the cold scan is still running show "indexing N files…"
-    // alongside the regular count so the live-fill is visible. We
-    // do NOT replace the count — partial results are real results
-    // and the user can already act on them.
-    const overflow =
-      filteredCount < totalMatches ? totalMatches - filteredCount : 0;
-    return (
-      <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
-        {filteredCount}
-        {overflow > 0 ? ` +${overflow}` : ""} / {filesTotal}
-        {indexing ? " · indexing…" : ""}
-      </span>
-    );
-  }
-  if (contentSearching)
-    return (
-      <span className="shrink-0 text-[10px] text-muted-foreground">
-        searching…
-      </span>
-    );
-  if (contentMatchCount === 0) return null;
-  return (
-    <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
-      {contentMatchCount} hit{contentMatchCount === 1 ? "" : "s"}
-    </span>
-  );
-}
-
-interface FilePickerResultsProps {
-  results: string[];
-  highlightedIndex: number;
-  onHover: (i: number) => void;
-  onPick: (path: string) => void;
-}
-
-const FilePickerResults = React.memo(function FilePickerResults({
-  results,
-  highlightedIndex,
-  onHover,
-  onPick,
-}: FilePickerResultsProps) {
-  if (results.length === 0) {
-    return (
-      <div className="px-3 py-3 text-center text-[11px] text-muted-foreground">
-        No files match.
-      </div>
-    );
-  }
-  return (
-    <>
-      {results.map((path, i) => {
-        const isHighlighted = i === highlightedIndex;
-        const basename = path.includes("/")
-          ? path.slice(path.lastIndexOf("/") + 1)
-          : path;
-        const dirname = path.includes("/")
-          ? path.slice(0, path.lastIndexOf("/"))
-          : "";
-        return (
-          <button
-            key={path}
-            type="button"
-            // mousedown rather than click so the input doesn't lose
-            // focus before the click registers (which would close
-            // the dropdown via blur).
-            onMouseDown={(e) => {
-              e.preventDefault();
-              onPick(path);
-            }}
-            onMouseEnter={() => onHover(i)}
-            className={
-              // `min-w-0 overflow-hidden` is load-bearing: without
-              // them the row's intrinsic width is `icon + basename +
-              // dirname` at full text width, which on narrow popout
-              // windows pushes the dropdown — and the popout window
-              // itself — wider than the viewport. With min-w-0 the
-              // row collapses to the parent's width and the truncate
-              // spans below clip cleanly via ellipsis.
-              "flex w-full min-w-0 items-baseline gap-2 overflow-hidden px-3 py-1 text-left text-[11px] " +
-              (isHighlighted
-                ? "bg-muted text-foreground"
-                : "text-muted-foreground hover:bg-muted/50")
-            }
-            title={path}
-          >
-            <FileText className="h-3 w-3 shrink-0" />
-            <span className="truncate font-mono">{basename}</span>
-            {dirname && (
-              // `shrink-0` removed: keeping it forced the dirname to
-              // its intrinsic width and made the row impossible to
-              // compress on narrow popouts. `min-w-0` + `truncate`
-              // lets it ellipsify instead.
-              <span className="ml-auto min-w-0 truncate font-mono text-[10px] text-muted-foreground/70">
-                {dirname}
-              </span>
-            )}
-          </button>
-        );
-      })}
-    </>
-  );
-});
 
 // One pane = tab strip + viewer. Owns no state itself; all inputs
 // come from the parent `CodeView`. The viewer reads the shared
